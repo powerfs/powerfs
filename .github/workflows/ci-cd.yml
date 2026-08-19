@@ -26,8 +26,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -38,31 +38,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Ensure Rust toolchain
@@ -100,8 +100,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -112,31 +112,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Ensure Rust toolchain
@@ -168,8 +168,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -180,31 +180,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Ensure Rust toolchain
@@ -263,8 +263,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -275,31 +275,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Ensure Rust toolchain
@@ -347,8 +347,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -359,31 +359,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Ensure Rust toolchain
@@ -442,8 +442,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -454,31 +454,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Ensure Rust toolchain
@@ -531,8 +531,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -543,31 +543,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Deploy to Test Cluster
@@ -585,8 +585,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -597,31 +597,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Create Release
@@ -644,8 +644,8 @@ jobs:
     - name: Configure Git for SSH
       run: |
         git config --global url."git@github.com:".insteadOf "https://github.com/"
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 60
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
 
     - name: Checkout code (local git clone — with retry)
       env:
@@ -656,31 +656,31 @@ jobs:
         git clean -ffdx 2>/dev/null || true
         rm -rf .git ./* ./.[!.]* 2>/dev/null || true
         sleep 1  # brief pause to release file handles
-        for ATTEMPT in 1 2 3; do
-          echo "--- Checkout attempt $ATTEMPT/3 ---"
+        for ATTEMPT in 1 2 3 4 5; do
+          echo "--- Checkout attempt $ATTEMPT/5 ---"
           git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
           if git fetch --depth 1 origin "$GITHUB_SHA" 2>&1; then
             git checkout FETCH_HEAD
             # Submodule update with retry
-            for SUB_ATTEMPT in 1 2 3; do
-              echo "  submodule update attempt $SUB_ATTEMPT/3"
+            for SUB_ATTEMPT in 1 2 3 4 5; do
+              echo "  submodule update attempt $SUB_ATTEMPT/5"
               rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
               if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
               fi
-              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 5))s..."
-              sleep $((SUB_ATTEMPT * 5))
+              echo "  submodule attempt $SUB_ATTEMPT failed, retrying in $((SUB_ATTEMPT * 10))s..."
+              sleep $((SUB_ATTEMPT * 10))
             done
           fi
-          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 5))s..."
+          echo "attempt $ATTEMPT failed, cleaning up and retrying in $((ATTEMPT * 10))s..."
           git clean -ffdx 2>/dev/null || true
           rm -rf .git ./* ./.[!.]* 2>/dev/null || true
-          sleep $((ATTEMPT * 5))
+          sleep $((ATTEMPT * 10))
         done
-        echo "::error::Checkout failed after 3 attempts"
+        echo "::error::Checkout failed after 5 attempts"
         exit 1
 
     - name: Ensure Node.js
