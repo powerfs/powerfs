@@ -3,6 +3,8 @@ members = [
     "powerfs-net",
     "powerfs-master-net",
     "powerfs-lease",
+    "powerfs-lock",
+    "powerfs-lock-net",
     "powerfs-core",
     "powerfs-master",
     "powerfs-volume",
