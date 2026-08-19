@@ -687,10 +687,9 @@ impl MasterNode {
         if self.raft_v2.is_leader() {
             return convert_to_grpc_addr(&self.raft_address);
         }
-        if let Some(first_peer) = self.peers.first() {
-            return convert_to_grpc_addr(&first_peer.address);
-        }
-        convert_to_grpc_addr(&self.raft_address)
+        // No leader and self is not leader: return empty string.
+        // (旧实现返回 first_peer 地址, 导致 follower 间互相 REDIRECT 形成循环)
+        String::new()
     }
 
     pub fn set_leader(&self, leader_addr: String) {
