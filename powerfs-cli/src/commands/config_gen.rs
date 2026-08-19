@@ -694,6 +694,7 @@ fn build_config(
             gc_grace_period_secs: None,
             inline_max_size: None,
             force_register: false,
+            metrics_port: None,
         },
         s3: S3Config {
             port: cfg.s3_port,
