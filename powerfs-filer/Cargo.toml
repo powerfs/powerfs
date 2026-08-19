@@ -51,6 +51,7 @@ powerfs-layout = { path = "../powerfs-layout" }
 powerfs-allocator = { path = "../powerfs-allocator" }
 powerfs-core = { path = "../powerfs-core" }
 powerfs-raft = { path = "../powerfs-raft" }
+powerfs-lease = { path = "../powerfs-lease" }
 openraft = { workspace = true }
 hex = "0.4"
 sha2 = "0.10"

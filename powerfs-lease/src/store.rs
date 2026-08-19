@@ -229,6 +229,32 @@ impl<K: LeaseKey> MemoryLeaseStore<K> {
         self
     }
 
+    /// Get ALL entries in a group, including expired ones still held in
+    /// memory (i.e., within the cleanup grace window).
+    ///
+    /// Unlike [`LeaseStore::get_entries_by_group`] (which filters out
+    /// expired entries), this returns every entry the store still has
+    /// indexed under `group_id`. Used by the filer's `InodeLeaseManager`
+    /// to implement grace-period protection (reject new acquires from a
+    /// different holder while the old lease is expired but within grace).
+    ///
+    /// Inherent method (not on the `LeaseStore` trait) to avoid widening
+    /// the trait surface for stores that don't need this.
+    pub fn get_all_entries_by_group(&self, group_id: u64) -> Vec<LeaseEntry<K>> {
+        let leases = self.leases.read().unwrap();
+        let group_index = self.group_index.read().unwrap();
+        let mut result = Vec::new();
+
+        if let Some(tokens) = group_index.get(&group_id) {
+            for token in tokens {
+                if let Some(entry) = leases.get(token) {
+                    result.push(entry.clone());
+                }
+            }
+        }
+        result
+    }
+
     /// Enable persistence backend. After this, acquire/renew/release will
     /// also persist to the backend, and `load_from_persistence` can be used
     /// on startup to recover lease state.
