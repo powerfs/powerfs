@@ -2434,6 +2434,71 @@ impl FilerNetHandler {
         }
     }
 
+    /// Handle RevokeInodeLeaseAck (phase 4 §5.2 — Early Grant).
+    ///
+    /// The current lease holder sends this after receiving a pushed
+    /// `Revoke` (Early Revoke) notification and flushing its dirty data.
+    /// The Filer releases the holder's lease and immediately grants
+    /// the next queued waiter (Early Grant), without waiting for the
+    /// old holder's dirty-page writeback. The SN on the new grant
+    /// preserves global IO ordering.
+    ///
+    /// Request TLV: Ino, ClientId, LeaseToken
+    /// Response: STATUS_OK / STATUS_ERR_SERVER_ERROR
+    async fn handle_revoke_ack_inode_lease(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+
+        if inode == 0 || client_id.is_empty() || token.is_empty() {
+            warn!(
+                "FILER_NET_REVOKE_ACK_INODE_LEASE: missing inode={} client_id={} token={}",
+                inode,
+                client_id,
+                !token.is_empty()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+            ));
+        }
+
+        // Route to shard leader (lease state lives on the leader).
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self
+            .inode_lease_mgr
+            .handle_revoke_ack(inode, &token, &client_id)
+        {
+            Ok(()) => {
+                debug!(
+                    "FILER_NET_REVOKE_ACK_INODE_LEASE: inode={} client={} (early-grant triggered)",
+                    inode, client_id
+                );
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!(
+                    "FILER_NET_REVOKE_ACK_INODE_LEASE: failed inode={} client={}: {}",
+                    inode, client_id, e
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    e.into_bytes(),
+                ))
+            }
+        }
+    }
+
     /// Deprecated: Raft inter-node messaging is now handled by openraft's gRPC
     /// RaftService (MultiRaftServiceImpl). TLV MsgType::RaftMessage is no longer used.
     async fn handle_raft_message(&self, msg: &NetMessage) -> NetResult<NetMessage> {
@@ -2615,6 +2680,7 @@ impl NetHandler for FilerNetHandler {
             MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
             MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,
             MsgType::RenewInodeLease => self.handle_renew_inode_lease(msg).await,
+            MsgType::RevokeInodeLeaseAck => self.handle_revoke_ack_inode_lease(msg).await,
             MsgType::RaftMessage => self.handle_raft_message(msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
