@@ -2,12 +2,23 @@
 # =============================================================================
 # PowerFS FUSE 文件系统全面功能测试
 #
-# 按照 docs/fuse-test-plan.md 方案执行 T1-T8 功能测试
+# 按照 docs/fuse-test-plan.md 方案执行 T1-T9 功能测试
 # 在 fuse-test 容器内运行：docker exec fuse-test /tmp/fuse_full_test.sh
+#
+# T1-T8: 基础功能（文件CRUD/目录/权限/边界/并发/压力）
+# T9:    内核源码 E2E（打包/解包/编译/删除）— 需要内核 tarball
 #
 # 用法：
 #   docker cp scripts/tests/fuse/run_fuse_full_test.sh fuse-test:/tmp/
 #   docker exec fuse-test /tmp/fuse_full_test.sh
+#
+# T9 内核 E2E 用法（需要 tarball + 编译工具）：
+#   docker cp linux-6.17.0.orig.tar.gz fuse-test:/tmp/
+#   docker exec -e KERNEL_TARBALL=/tmp/linux-6.17.0.orig.tar.gz \
+#     fuse-test /tmp/fuse_full_test.sh
+#
+# 快速测试（跳过 T9）：
+#   docker exec -e SKIP_KERNEL_E2E=1 fuse-test /tmp/fuse_full_test.sh
 # =============================================================================
 
 set -u
@@ -522,6 +533,100 @@ for i in $(seq 1 500); do
 done
 COUNT=$(find "$TEST_ROOT/t8/stress_dirs" -maxdepth 1 -type d 2>/dev/null | wc -l)
 assert_eq "501" "$COUNT" "T8.05 stress create 500 dirs"
+
+# ════════════════════════════════════════════════════════════════════
+# T9: 内核源码 E2E（打包 → 解包 → 编译 → 删除）
+# 需要 KERNEL_TARBALL 环境变量指向 .tar.gz 文件
+# 设置 SKIP_KERNEL_E2E=1 可跳过此阶段（快速测试时用）
+# ════════════════════════════════════════════════════════════════════
+echo ""
+echo "━━━ T9: 内核源码 E2E（打包/解包/编译/删除）━━━"
+
+KERNEL_TARBALL="${KERNEL_TARBALL:-/tmp/linux-6.17.0.orig.tar.gz}"
+T9_DIR="$TEST_ROOT/t9_kernel_e2e"
+T9_LOG="/tmp/t9_kernel_e2e.log"
+
+if [ "${SKIP_KERNEL_E2E:-0}" = "1" ]; then
+    echo "  SKIP  T9 内核 E2E (SKIP_KERNEL_E2E=1)"
+    record_skip
+elif [ ! -f "$KERNEL_TARBALL" ]; then
+    echo "  SKIP  T9 内核 E2E (tarball not found: $KERNEL_TARBALL)"
+    record_skip
+else
+    mkdir -p "$T9_DIR"
+
+    # T9.01 打包：拷贝 tarball 到 PowerFS
+    echo "  T9.01 拷贝 tarball 到 PowerFS..."
+    cp "$KERNEL_TARBALL" "$T9_DIR/" 2>/dev/null
+    if [ $? -eq 0 ]; then
+        record_pass
+    else
+        record_fail "T9.01 copy tarball to PowerFS"
+    fi
+
+    # T9.02 解包：在 PowerFS 上解压 tarball
+    echo "  T9.02 解压 tarball..."
+    T9_START=$(date +%s)
+    tar xf "$T9_DIR/$(basename "$KERNEL_TARBALL")" -C "$T9_DIR" >"$T9_LOG" 2>&1
+    T9_TAR_RC=$?
+    T9_TAR_DUR=$(($(date +%s) - T9_START))
+    T9_FILES=$(find "$T9_DIR" -type f 2>/dev/null | wc -l)
+    T9_EIO=$(grep -ciE 'input/output error|EIO' "$T9_LOG" 2>/dev/null || echo 0)
+    echo "    files=$T9_FILES, exit=$T9_TAR_RC, EIO=$T9_EIO, dur=${T9_TAR_DUR}s"
+    if [ "$T9_TAR_RC" -eq 0 ] && [ "$T9_EIO" -eq 0 ] && [ "$T9_FILES" -gt 100 ]; then
+        record_pass
+    else
+        record_fail "T9.02 unpack (files=$T9_FILES, EIO=$T9_EIO)"
+    fi
+
+    # 确定 source dir
+    T9_SRC=$(find "$T9_DIR" -maxdepth 1 -type d | tail -1)
+
+    # T9.03 编译：make defconfig
+    echo "  T9.03 make defconfig..."
+    if [ -n "$T9_SRC" ] && [ -d "$T9_SRC" ]; then
+        (cd "$T9_SRC" && make defconfig) >>"$T9_LOG" 2>&1
+        if [ $? -eq 0 ]; then
+            record_pass
+        else
+            record_fail "T9.03 make defconfig"
+        fi
+
+        # T9.04 编译：make -jN
+        T9_JOBS=$(nproc 2>/dev/null || echo 2)
+        echo "  T9.04 make -j$T9_JOBS..."
+        T9_BUILD_START=$(date +%s)
+        (cd "$T9_SRC" && make -j"$T9_JOBS") >>"$T9_LOG" 2>&1
+        T9_BUILD_RC=$?
+        T9_BUILD_DUR=$(($(date +%s) - T9_BUILD_START))
+        T9_OBJ=$(find "$T9_SRC" -name '*.o' -type f 2>/dev/null | wc -l)
+        T9_KO=$(find "$T9_SRC" -name '*.ko' -type f 2>/dev/null | wc -l)
+        T9_BUILD_EIO=$(grep -ciE 'input/output error|EIO' "$T9_LOG" 2>/dev/null || echo 0)
+        echo "    .o=$T9_OBJ, .ko=$T9_KO, exit=$T9_BUILD_RC, EIO=$T9_BUILD_EIO, dur=${T9_BUILD_DUR}s"
+        if [ "$T9_BUILD_RC" -eq 0 ] && [ "$T9_BUILD_EIO" -eq 0 ]; then
+            record_pass
+        else
+            record_fail "T9.04 make -j$T9_JOBS (exit=$T9_BUILD_RC, EIO=$T9_BUILD_EIO)"
+        fi
+    else
+        record_fail "T9.03/04 source dir not found after unpack"
+    fi
+
+    # T9.05 删除：rm -rf
+    echo "  T9.05 rm -rf 清理..."
+    T9_DEL_START=$(date +%s)
+    rm -rf "$T9_DIR" >>"$T9_LOG" 2>&1
+    T9_DEL_RC=$?
+    T9_DEL_DUR=$(($(date +%s) - T9_DEL_START))
+    T9_REMAINING=$(test -d "$T9_DIR" && echo EXISTS || echo GONE)
+    T9_DEL_EIO=$(grep -ciE 'input/output error|EIO' "$T9_LOG" 2>/dev/null || echo 0)
+    echo "    status=$T9_REMAINING, exit=$T9_DEL_RC, EIO=$T9_DEL_EIO, dur=${T9_DEL_DUR}s"
+    if [ "$T9_REMAINING" = "GONE" ] && [ "$T9_DEL_EIO" -eq 0 ]; then
+        record_pass
+    else
+        record_fail "T9.05 rm -rf (status=$T9_REMAINING, EIO=$T9_DEL_EIO)"
+    fi
+fi
 
 # ════════════════════════════════════════════════════════════════════
 # 汇总
