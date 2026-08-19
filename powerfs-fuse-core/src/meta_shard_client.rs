@@ -1315,10 +1315,11 @@ impl MetaShardClient {
                         powerfs_net::STATUS_ERR_IO,
                     ];
                     if attempt < MAX_ATTEMPTS && RETRYABLE_SERVER_STATUS.contains(&status) {
-                        last_err = format!(
-                            "server status {} (retry {}/{}): {}",
-                            status, attempt, MAX_ATTEMPTS, err_msg
-                        );
+                        // NOTE: `last_err` is intentionally NOT updated here.
+                        // This branch exhausts retries by returning Err(err_msg)
+                        // directly (the *latest* server response), whereas the
+                        // net-error branch below actually consumes `last_err`
+                        // via stats.record_complete + return.
                         log::warn!(
                             "send_coherence_msg: {:?} shard={} retryable server status={} \
                              attempt {}/{} on {}: {}; backing off then retrying",
