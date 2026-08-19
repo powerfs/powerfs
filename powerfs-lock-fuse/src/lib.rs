@@ -30,11 +30,18 @@
 //! `FuseClientFacade`.
 
 pub mod backend;
+pub mod lockify;
 pub mod manager;
 pub mod metrics;
 pub mod state;
 
+// Re-export the lock types callers need so they don't have to depend
+// on `powerfs-lock` directly (avoids adding a new dep edge just to
+// call `acquire_local`). The FUSE crate uses `LockMode` and
+// `LockGrant` for the §5.1 Lockify fast path.
 pub use backend::FuseLockBackend;
+pub use lockify::{Lockify, LOCAL_TOKEN_PREFIX};
 pub use manager::FuseLockManager;
 pub use metrics::{LockMetrics, LockMetricsSnapshot};
+pub use powerfs_lock::{LockError, LockGrant, LockMode, LockRequest};
 pub use state::ClientLeaseState;

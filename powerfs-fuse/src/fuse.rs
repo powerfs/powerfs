@@ -312,15 +312,24 @@ impl FuseApp {
         // using it directly. The new `lock_manager` is the entry point
         // for new code paths that prefer the unified trait (and for
         // the kernel C client's wire protocol when it lands in 阶段四).
+        //
+        // Phase-4 §5.1 Lockify: pass the sync_client's runtime handle
+        // so `acquire_local` can spawn the async ownership-sync task
+        // even when called from a sync FUSE callback (`block_on` runs
+        // inside this runtime, so `tokio::spawn` would also work, but
+        // the explicit handle is safer for non-tokio threads).
         let lock_backend = Arc::new(crate::lock_backend::FacadeLockBackend::new(
             sync_client.facade().clone(),
             cache.clone(),
         ));
-        let lock_manager = Arc::new(powerfs_lock_fuse::FuseLockManager::new(
-            lock_backend,
-            sync_client.client_id(),
-            30_000, // matches `lease_duration_ms`
-        ));
+        let lock_manager = Arc::new(
+            powerfs_lock_fuse::FuseLockManager::new(
+                lock_backend,
+                sync_client.client_id(),
+                30_000, // matches `lease_duration_ms`
+            )
+            .with_lockify(Some(sync_client.runtime().handle().clone())),
+        );
         // Clone the Arc before moving into `PowerFsFs` so the admin
         // server can keep a handle for `/lock-metrics` queries.
         let lock_manager_for_admin = lock_manager.clone();
@@ -531,14 +540,17 @@ struct PowerFsFs {
     /// lease 在 open→release 期间复用，release() 时 invalidate。
     lease_manager: Arc<VolumeLeaseManager>,
     /// Conservative adapter (§4.1): unified `LockManager` trait entry
-    /// point, backed by `FacadeLockBackend`. Currently NOT called by
-    /// the existing read/write/release paths (they use `lease_manager`
-    /// directly above — migrating them would split the cache and break
-    /// the read→release invariant). New code paths added in 阶段四
-    /// (kernel C client wire protocol, Early Grant, etc.) should call
-    /// this instead. s8 will wire `lock_manager.metrics().snapshot()`
-    /// to the Prometheus exporter.
-    #[allow(dead_code)]
+    /// point, backed by `FacadeLockBackend`. Not used by the existing
+    /// read/write/release paths (they use `lease_manager` directly
+    /// above — migrating them would split the cache and break the
+    /// read→release invariant).
+    ///
+    /// Phase-4 §5.1 Lockify: the manager is built with `with_lockify`
+    /// enabled, so `mkdir`/`create`/`mknod`/`symlink` paths call
+    /// `lock_manager.acquire_local(inode, ...)` to speculatively
+    /// populate the inode lease cache without an RPC. The async sync
+    /// (off the critical path) CAS-replaces the local token with a
+    /// server-issued token.
     lock_manager: Arc<powerfs_lock_fuse::FuseLockManager>,
     /// Phase 4.3/4.4: 当前已打开的 inode → open count。
     /// open() 时 count+1，release() 时 count-1（减到 0 时移除）。
@@ -863,6 +875,34 @@ impl PowerFsFs {
             .facade()
             .meta_shard_client()
             .calculate_shard_id(inode)
+    }
+
+    /// Phase-4 §5.1 Lockify fast path: speculatively populate the
+    /// inode lease cache with a local token after a fresh inode is
+    /// minted by the Filer (creat/mkdir/mknod/symlink). The async
+    /// sync RPC (off the critical path) CAS-replaces the local
+    /// token with a server-issued token. On conflict the local
+    /// entry is invalidated; on network error it remains valid
+    /// until TTL — graceful degradation in both cases.
+    ///
+    /// Errors are swallowed deliberately: Lockify is opportunistic.
+    /// If it fails (e.g. the manager was built without `with_lockify`,
+    /// or `duration_ms == 0`), the regular `acquire` path takes over
+    /// on the first read/write — correctness is preserved.
+    ///
+    /// Called from `mkdir`/`create`/`mknod`/`symlink` right after
+    /// the Filer RPC returns the new inode.
+    fn lockify_declare_new_inode(&self, inode: u64) {
+        if let Err(e) = self.lock_manager.acquire_local(
+            inode,
+            powerfs_lock_fuse::LockMode::Exclusive,
+            self.lease_duration_ms,
+        ) {
+            debug!(
+                "lockify self-declare skipped inode={}: {} (opportunistic, regular acquire will take over)",
+                inode, e
+            );
+        }
     }
 
     /// Check if the Filer leader has changed since the last call.
@@ -2454,6 +2494,11 @@ impl FileSystem for PowerFsFs {
             attr.inode, parent, attr.mode, attr.nlink, attr.size, attr.uid, attr.gid, attr.mtime, attr.atime, attr.ctime
         );
 
+        // Phase-4 §5.1 Lockify: speculatively self-declare inode
+        // ownership to avoid a synchronous lease-acquire RPC on the
+        // first write into the new directory. Async-synced to filer.
+        self.lockify_declare_new_inode(attr.inode);
+
         Ok(self.create_fuse_entry(&entry))
     }
 
@@ -2506,6 +2551,10 @@ impl FileSystem for PowerFsFs {
         let entry = attr_to_cached_entry(&attr, parent, name_str);
         self.cache.insert(entry.clone());
         debug!("mknod: RPC done, inode={}, parent={}", attr.inode, parent);
+
+        // Phase-4 §5.1 Lockify: speculatively self-declare inode
+        // ownership for the new special file. Async-synced to filer.
+        self.lockify_declare_new_inode(attr.inode);
 
         Ok(self.create_fuse_entry(&entry))
     }
@@ -2708,6 +2757,13 @@ impl FileSystem for PowerFsFs {
             })?;
         let create_ms = t_create.elapsed().as_millis();
         let inode = attr.inode;
+
+        // Phase-4 §5.1 Lockify: speculatively self-declare inode
+        // ownership for the new file before the Inline/Stripe/Flat
+        // placement branches diverge. Async-synced to filer; the
+        // first write into this inode will hit the lease cache
+        // instead of issuing a synchronous acquire RPC.
+        self.lockify_declare_new_inode(inode);
 
         // P2.5: Inline 模式分支。Filer 在 CREATE 响应中返回
         // Placement::Inline { max_size } (无 volume_id/needle_id)。
@@ -6236,6 +6292,11 @@ impl FileSystem for PowerFsFs {
             hold: HoldState::default(),
         };
         self.cache.insert(cached_entry.clone());
+
+        // Phase-4 §5.1 Lockify: speculatively self-declare inode
+        // ownership for the new symlink. Async-synced to filer.
+        self.lockify_declare_new_inode(inode);
+
         Ok(self.create_fuse_entry(&cached_entry))
     }
 

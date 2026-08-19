@@ -46,3 +46,8 @@ path = "benches/health_fencer.rs"
 name = "codec"
 harness = false
 path = "benches/codec.rs"
+
+[[bench]]
+name = "metadata_path"
+harness = false
+path = "benches/metadata_path.rs"
