@@ -35,6 +35,7 @@
 //! The public API (`acquire`/`release`/`renew`/`validate`/...) is preserved
 //! verbatim so `net_handler.rs` needs no changes.
 
+use crate::adaptive_grace::AdaptiveGrace;
 use crate::early_grant::{
     AcquireOutcome, LeaseRevoker, NoopRevoker, SnAllocator, WaitQueue, Waiter,
 };
@@ -42,7 +43,7 @@ use powerfs_lease::{
     LeaseError, LeaseKey, LeaseMode, LeasePersistence, LeaseStats, LeaseStore, MemoryLeaseStore,
 };
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// Default grace period after lease expiry before allowing a new holder.
@@ -124,6 +125,11 @@ pub struct InodeLeaseManager {
     /// notifies the holder, so waiters only progress via the holder's
     /// voluntary release or TTL expiry.
     revoker: Arc<dyn LeaseRevoker>,
+    /// Phase-4 P5: adaptive grace period tracker. Records how late
+    /// each renew arrives relative to the lease expiry, and computes
+    /// `max(DEFAULT_GRACE, 3 * p99_lateness)` as the effective grace
+    /// period. Used in `acquire` to replace the fixed `grace_period`.
+    adaptive_grace: Arc<AdaptiveGrace>,
 }
 
 /// Result of an acquire attempt.
@@ -166,6 +172,7 @@ impl InodeLeaseManager {
             sn: Arc::new(SnAllocator::default()),
             waiters: Arc::new(WaitQueue::new()),
             revoker: Arc::new(NoopRevoker),
+            adaptive_grace: Arc::new(AdaptiveGrace::new()),
         }
     }
 
@@ -188,6 +195,7 @@ impl InodeLeaseManager {
             sn: self.sn,
             waiters: self.waiters,
             revoker: self.revoker,
+            adaptive_grace: self.adaptive_grace,
         }
     }
 
@@ -311,11 +319,18 @@ impl InodeLeaseManager {
         // still in memory within the cleanup_grace window). If any is held by
         // a different client and is expired but NOT past grace, reject the
         // new acquire.
+        //
+        // Phase-4 P5: use the adaptive grace period (`max(configured,
+        // 3 * p99_renew_lateness)`) instead of the fixed `grace_period`.
+        // This expands the grace for slow networks where clients
+        // consistently renew late, while keeping the configured floor for
+        // fast networks.
+        let effective_grace = self.adaptive_grace.effective_grace(self.grace_period);
         for entry in self.store.get_all_entries_by_group(inode) {
             if entry.holder == client_id {
                 continue;
             }
-            if entry.is_expired() && !entry.is_expired_beyond(self.grace_period) {
+            if entry.is_expired() && !entry.is_expired_beyond(effective_grace) {
                 return Err(format!(
                     "inode {} lease in grace period (expired, holder={})",
                     inode, entry.holder
@@ -353,6 +368,97 @@ impl InodeLeaseManager {
             )),
             Err(e) => Err(format!("inode {} lease acquire failed: {}", inode, e)),
         }
+    }
+
+    /// Acquire leases for multiple inodes in sorted order (phase 4 P4).
+    ///
+    /// Sorts the inodes by number and acquires them in ascending order.
+    /// If any acquire fails, all previously acquired leases in the batch
+    /// are released (rollback). This prevents the classic A-B / B-A
+    /// deadlock when two clients each need locks on the same set of
+    /// inodes but acquire in different orders — by sorting, both clients
+    /// acquire in the same global order, so there's no circular wait.
+    ///
+    /// # Deadlock prevention
+    ///
+    /// The sort is by raw `u64` inode number (not a hash). Since all
+    /// clients use the same sort, the acquisition order is globally
+    /// consistent. A client that needs inodes {3, 1, 2} acquires
+    /// 1 → 2 → 3; another client needing {2, 3, 1} also acquires
+    /// 1 → 2 → 3. No circular wait is possible.
+    ///
+    /// # Rollback
+    ///
+    /// On failure, all already-acquired leases in this batch are
+    /// released via `release`. If a release fails (best-effort), the
+    /// lease remains on the server until TTL or the next explicit
+    /// release — the caller should log the orphaned tokens.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Vec<AcquireResult>)` — one result per input inode, in the
+    /// **input** order (not the sorted order). The caller doesn't need
+    /// to know the sort was applied.
+    pub fn acquire_ordered(
+        &self,
+        inodes: &[u64],
+        client_id: &str,
+        duration_ms: u64,
+    ) -> Result<Vec<AcquireResult>, String> {
+        if inodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Sort by inode number for globally consistent ordering.
+        // Use (original_index, inode) so we can restore input order
+        // in the result.
+        let mut sorted: Vec<(usize, u64)> = inodes.iter().copied().enumerate().collect();
+        sorted.sort_by_key(|&(_, inode)| inode);
+
+        let mut results_by_index: std::collections::HashMap<usize, AcquireResult> =
+            std::collections::HashMap::with_capacity(inodes.len());
+        let mut acquired: Vec<(u64, String)> = Vec::new();
+
+        for (orig_idx, inode) in &sorted {
+            match self.acquire(*inode, client_id, duration_ms) {
+                Ok(result) => {
+                    acquired.push((*inode, result.token.clone()));
+                    results_by_index.insert(*orig_idx, result);
+                }
+                Err(e) => {
+                    // Rollback: release all previously acquired leases.
+                    for (rb_inode, rb_token) in &acquired {
+                        if let Err(rb_err) = self.release(*rb_inode, client_id, rb_token) {
+                            log::warn!(
+                                "acquire_ordered rollback: failed to release \
+                                 inode={} token={:.16}...: {} (orphaned, will TTL)",
+                                rb_inode,
+                                rb_token,
+                                rb_err
+                            );
+                        }
+                    }
+                    return Err(format!(
+                        "acquire_ordered failed at inode={} (index {}): {}; \
+                         rolled back {} leases",
+                        inode,
+                        orig_idx,
+                        e,
+                        acquired.len()
+                    ));
+                }
+            }
+        }
+
+        // Restore input order.
+        let results = (0..inodes.len())
+            .map(|i| {
+                results_by_index
+                    .remove(&i)
+                    .expect("must have result for each index")
+            })
+            .collect();
+        Ok(results)
     }
 
     /// Acquire-or-wait (phase 4 §5.2 Early Grant + Early Revoke).
@@ -566,23 +672,36 @@ impl InodeLeaseManager {
             return Err(format!("inode {} lease holder mismatch on renew", inode));
         }
 
+        // Phase-4 P5: use the adaptive grace period for the past-grace
+        // check, and record the renew lateness after success.
+        let effective_grace = self.adaptive_grace.effective_grace(self.grace_period);
         // Reject renew if past grace — matches previous implementation's
         // `past_grace()` semantics.
-        if matched.is_expired_beyond(self.grace_period) {
+        if matched.is_expired_beyond(effective_grace) {
             return Err(format!(
                 "inode {} lease past grace period, cannot renew",
                 inode
             ));
         }
 
+        // Compute renew lateness BEFORE the store updates the expiry.
+        // If the renew arrived after the old expiry, lateness is the gap;
+        // otherwise zero (renewed early / on time).
+        let lateness = Instant::now().saturating_duration_since(matched.expire_at);
+
         let duration = Duration::from_millis(duration_ms);
         match self.store.renew(token, client_id, duration) {
             Ok(()) => {
+                // Phase-4 P5: record the lateness sample for adaptive
+                // grace computation. The next `acquire` will use the
+                // updated P99 to compute `max(grace, 3 * p99)`.
+                self.adaptive_grace.record(lateness);
                 log::debug!(
-                    "InodeLease: renewed inode={} holder={} duration_ms={}",
+                    "InodeLease: renewed inode={} holder={} duration_ms={} lateness_ms={}",
                     inode,
                     client_id,
-                    duration_ms
+                    duration_ms,
+                    lateness.as_millis()
                 );
                 Ok(())
             }
@@ -1492,5 +1611,93 @@ mod tests {
 
         // Cleanup.
         mgr.release(inode, "client-A", &first.token).ok();
+    }
+
+    /// Phase-4 P4: `acquire_ordered` should return results in the input
+    /// order regardless of how inodes were sorted internally. Verifies
+    /// the index-preserving sort.
+    #[test]
+    fn test_acquire_ordered_preserves_input_order() {
+        let mgr = InodeLeaseManager::new();
+        // Input in descending order on purpose.
+        let inodes = vec![30u64, 10, 20];
+
+        let results = mgr.acquire_ordered(&inodes, "client-A", 30000).unwrap();
+        assert_eq!(results.len(), 3);
+
+        // Results map back to input positions: result[i] corresponds
+        // to inodes[i]. We verify by re-acquiring each inode
+        // individually and asserting the token matches the i-th
+        // result (idempotent re-acquire hits the same lease entry).
+        let mut tokens = std::collections::HashSet::new();
+        for (i, r) in results.iter().enumerate() {
+            assert!(!r.token.is_empty(), "token {} empty", i);
+            assert!(tokens.insert(r.token.clone()), "token {} not unique", i);
+            let again = mgr.acquire(inodes[i], "client-A", 30000).unwrap();
+            assert_eq!(again.token, r.token, "result {} not idempotent", i);
+        }
+
+        // Cleanup: release each (inode, token) pair.
+        for (i, inode) in inodes.iter().enumerate() {
+            mgr.release(*inode, "client-A", &results[i].token).ok();
+        }
+    }
+
+    /// Phase-4 P4: `acquire_ordered` must roll back all previously
+    /// acquired leases when a later acquire in the batch fails, so the
+    /// caller doesn't leak half-acquired state.
+    #[test]
+    fn test_acquire_ordered_rollback_on_conflict() {
+        let mgr = InodeLeaseManager::new();
+        // client-B pre-holds inode=20 so client-A's batch fails at
+        // inode=20 (the last in sorted order).
+        let held = mgr.acquire(20, "client-B", 30000).unwrap();
+
+        // client-A tries to acquire [30, 10, 20] in one batch. Internally
+        // sorted to [10, 20, 30]; acquires 10 (ok), then 20 (conflict)
+        // → rollback releases 10.
+        let inodes = vec![30u64, 10, 20];
+        let err = mgr.acquire_ordered(&inodes, "client-A", 30000).unwrap_err();
+        assert!(
+            err.contains("rolled back"),
+            "expected rollback message, got: {}",
+            err
+        );
+
+        // inode=10 must be free (rolled back). client-B can acquire it.
+        let b10 = mgr.acquire(10, "client-B", 30000).unwrap();
+        assert!(!b10.token.is_empty());
+
+        // inode=30 was never reached (acquire failed at 20). Verify
+        // client-A doesn't hold it.
+        let b30 = mgr.acquire(30, "client-B", 30000).unwrap();
+        assert!(!b30.token.is_empty());
+
+        // Cleanup.
+        mgr.release(20, "client-B", &held.token).ok();
+        mgr.release(10, "client-B", &b10.token).ok();
+        mgr.release(30, "client-B", &b30.token).ok();
+    }
+
+    /// Phase-4 P4: `acquire_ordered` with empty input returns empty
+    /// results (no sort, no acquire).
+    #[test]
+    fn test_acquire_ordered_empty_input() {
+        let mgr = InodeLeaseManager::new();
+        let results = mgr.acquire_ordered(&[], "client-A", 30000).unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// Phase-4 P4: `acquire_ordered` with a single inode returns a
+    /// single result (no sort edge case).
+    #[test]
+    fn test_acquire_ordered_single_inode() {
+        let mgr = InodeLeaseManager::new();
+        let inode = 42u64;
+        let results = mgr.acquire_ordered(&[inode], "client-A", 30000).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].token.is_empty());
+        // Cleanup.
+        mgr.release(inode, "client-A", &results[0].token).ok();
     }
 }
