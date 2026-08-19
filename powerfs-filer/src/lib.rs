@@ -7,6 +7,7 @@ pub mod entry_manager;
 pub mod grpc_service;
 pub mod inode_lease_manager;
 pub mod inode_notifier;
+pub mod lease_persistence;
 pub mod meta_shard_manager;
 pub mod metadata_store;
 pub mod net_handler;
@@ -32,6 +33,7 @@ pub use crdt_orset::{
 };
 pub use entry_manager::EntryManager;
 pub use grpc_service::FilerMetaServiceImpl;
+pub use lease_persistence::RaftLeasePersistence;
 pub use meta_shard_manager::{FilerStatus, MetaShardManager, ShardDetail};
 pub use metadata_store::{BucketInfo, EntryInfo, MetadataStore, VolumeRoute};
 pub use net_handler::FilerNetHandler;

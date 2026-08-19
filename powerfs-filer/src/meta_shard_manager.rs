@@ -1346,6 +1346,19 @@ impl MetaShardManager {
         stores.get(&shard_id).map(|s| s.get_stats())
     }
 
+    /// Phase 5 §5.3: borrow a shard's `ShardStore` for direct
+    /// RocksDB access (used by `RaftLeasePersistence` for local
+    /// reads of `CF_LEASES`). Returns `None` if the shard isn't
+    /// initialized on this node.
+    ///
+    /// Sync variant of [`get_shard_store`]: that one is async and
+    /// creates the shard on-demand; this one is for callers that
+    /// already know the shard exists (the filer at startup) and
+    /// want a non-async path.
+    pub fn try_get_shard_store(&self, shard_id: ShardId) -> Option<Arc<ShardStore>> {
+        self.shard_stores.read().unwrap().get(&shard_id).cloned()
+    }
+
     pub fn list_shards(&self) -> Vec<ShardId> {
         self.shard_stores.read().unwrap().keys().cloned().collect()
     }

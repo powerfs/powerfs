@@ -246,6 +246,53 @@ pub enum ShardCommand {
         new_name: String,
         new_parent_inode: u64,
     },
+
+    // ----- Phase 5 §5.3: Lease state persistence via Raft -----
+    //
+    // The lease manager (`InodeLeaseManager`) keeps lease state in memory.
+    // Without persistence, a leader switch loses every active lease, forcing
+    // clients to retry acquire on the new leader. Worse, during the grace
+    // period that protects against double-writes, the new leader rejects
+    // re-acquires from a different holder, breaking forward progress until
+    // the grace expires (~5s). Persisting lease entries through Raft means
+    // the new leader observes the same lease state on takeover and continues
+    // honoring valid leases — no client-visible disruption, no grace-period
+    // stall, no risk of double-write (the lease is authoritative across
+    // leader switches, see docs/lock-optimization-plan.md §5.3 and the
+    // "Lessons Learned" entry in project_memory).
+    //
+    // The persistence backend (`RaftLeasePersistence`) is byte-keyed (token
+    // → serialized LeaseEntry), matching the `LeasePersistence` trait in
+    // powerfs-lease/src/persistence.rs. The three variants below are the
+    // Raft-side surface; apply handlers write/delete in `CF_LEASES`.
+    //
+    // Routing: a lease token's first 8 hex chars are derived from the
+    // inode (see `RaftLeasePersistence::token_shard_id`), so all
+    // mutations for a given inode land on the same shard — followers of
+    // that shard observe the same lease state and can serve acquire/release
+    // queries consistently (the existing in-memory store on followers is
+    // still authoritative for the local replica; the persisted copy is
+    // the source of truth on leader takeover).
+    /// Persist (or overwrite) a lease entry. `value` is the serialized
+    /// `LeaseEntry<InodeKey>` (see powerfs-lease/src/persistence.rs).
+    /// Idempotent: re-apply overwrites with the same content.
+    LeasePut {
+        token: String,
+        value: Vec<u8>,
+    },
+
+    /// Delete a persisted lease entry by token. Idempotent: deleting an
+    /// absent key is a no-op.
+    LeaseDelete {
+        token: String,
+    },
+
+    /// Persist the lease epoch counter (Fencer epoch, powerfs-lock-health).
+    /// Stored under a reserved key (`b"\x00epoch"`) in `CF_LEASES` so
+    /// `load_epoch` can locate it without scanning all entries.
+    LeaseSaveEpoch {
+        epoch: u64,
+    },
 }
 
 impl ShardCommand {

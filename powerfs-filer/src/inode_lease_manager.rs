@@ -1230,6 +1230,171 @@ mod tests {
         assert_eq!(backend.count(), 1);
     }
 
+    // =====================================================================
+    // Phase 5 §5.3: Raft lease persistence — leader switch replay tests
+    // =====================================================================
+    //
+    // These tests use the `InMemoryPersistence` mock to simulate a Raft-
+    // replicated backend. The real `RaftLeasePersistence` round-trips
+    // through Raft + RocksDB `CF_LEASES`; that path is exercised by the
+    // filer integration tests. Here we verify the manager-level contract:
+    //   1. Leases granted by the old leader survive a leader switch and
+    //      are honored by the new leader (no client disruption).
+    //   2. The Fencer epoch counter is strictly monotonic across leader
+    //      switches (no ABA reuse — zombie old leader can't fool the new
+    //      leader with a stale epoch).
+    //   3. Expired leases are filtered out during recovery — only
+    //      still-live leases are reloaded.
+
+    /// Parse the Fencer epoch out of a lease token. The token format is
+    /// `lease-{epoch}-{uuid}` (see `MemoryLeaseStore::generate_token`);
+    /// `splitn(3, '-')` keeps the UUID's embedded dashes in the third part.
+    fn epoch_from_token(token: &str) -> u64 {
+        let parts: Vec<&str> = token.splitn(3, '-').collect();
+        assert_eq!(parts.len(), 3, "token should be lease-{{epoch}}-{{uuid}}");
+        parts[1].parse::<u64>().expect("epoch should be numeric")
+    }
+
+    /// Simulate a Filer leader switch: the old leader (`mgr_a`) grants
+    /// several leases and persists them; the new leader (`mgr_b`) loads
+    /// them from the shared backend on takeover and must honor every one
+    /// — no client-visible disruption, no double-grant (the recovered
+    /// lease blocks conflicting acquires from a different holder). This
+    /// is the core correctness property of phase 5 §5.3.
+    #[test]
+    fn test_persistence_leader_switch_replay() {
+        let backend = Arc::new(InMemoryPersistence::new());
+        let mgr_a = InodeLeaseManager::new().with_persistence(PersistenceShim(backend.clone()));
+
+        // Grant leases for several inodes to different clients.
+        let inode1 = 1_000u64;
+        let inode2 = 2_000u64;
+        let inode3 = 3_000u64;
+
+        let r1 = mgr_a.acquire(inode1, "client-A", 30_000).unwrap();
+        let r2 = mgr_a.acquire(inode2, "client-B", 30_000).unwrap();
+        let r3 = mgr_a.acquire(inode3, "client-C", 30_000).unwrap();
+        assert_eq!(backend.count(), 3);
+        assert_eq!(mgr_a.active_count(), 3);
+
+        // --- Leader switch: discard mgr_a, build mgr_b from the same backend.
+        // A real leader switch creates a fresh in-memory store on the new
+        // leader and repopulates it from the Raft-replicated persistence.
+        let mgr_b = InodeLeaseManager::new().with_persistence(PersistenceShim(backend.clone()));
+        let loaded = mgr_b.load_from_persistence().unwrap();
+        assert_eq!(loaded, 3, "all 3 leases should survive leader switch");
+        assert_eq!(mgr_b.active_count(), 3);
+
+        // The new leader honors every recovered lease — holders can still
+        // validate against the same token they were granted.
+        mgr_b.validate(inode1, "client-A", &r1.token).unwrap();
+        mgr_b.validate(inode2, "client-B", &r2.token).unwrap();
+        mgr_b.validate(inode3, "client-C", &r3.token).unwrap();
+
+        // Double-write prevention: a different client cannot acquire an
+        // inode whose lease was recovered from the old leader. This is
+        // the "double-write consistency" hole phase 5 §5.3 closes.
+        let err = mgr_b.acquire(inode1, "client-X", 30_000).unwrap_err();
+        assert!(
+            err.contains("lease held by another client"),
+            "recovered lease should block conflicting acquire, got: {}",
+            err
+        );
+
+        // The original holder can still re-acquire (idempotent path returns
+        // the same token — no disruption to the active writer).
+        let r1_again = mgr_b.acquire(inode1, "client-A", 30_000).unwrap();
+        assert_eq!(
+            r1_again.token, r1.token,
+            "idempotent re-acquire returns same token"
+        );
+    }
+
+    /// The Fencer epoch counter (powerfs-lock-health) must be strictly
+    /// monotonic across leader switches: a zombie old leader must not be
+    /// able to reuse a stale epoch to fool the new leader into accepting
+    /// a stale token. `load_from_persistence` reseeds the epoch counter
+    /// to `max(persisted, recovered-entry-epoch) + 1`, so the new leader's
+    /// next grant uses a strictly higher epoch than any prior grant.
+    #[test]
+    fn test_persistence_epoch_survives_leader_switch() {
+        let backend = Arc::new(InMemoryPersistence::new());
+        let mgr_a = InodeLeaseManager::new().with_persistence(PersistenceShim(backend.clone()));
+
+        // Grant several leases on the old leader — each grant bumps the
+        // epoch counter (token format: "lease-{epoch}-{uuid}").
+        let r1 = mgr_a.acquire(10, "client-A", 30_000).unwrap();
+        let r2 = mgr_a.acquire(20, "client-B", 30_000).unwrap();
+        let r3 = mgr_a.acquire(30, "client-C", 30_000).unwrap();
+
+        let epoch1 = epoch_from_token(&r1.token);
+        let epoch2 = epoch_from_token(&r2.token);
+        let epoch3 = epoch_from_token(&r3.token);
+        // Epochs are allocated sequentially starting at 0.
+        let max_old_epoch = epoch1.max(epoch2).max(epoch3);
+        assert_eq!(epoch1, 0);
+        assert_eq!(epoch2, 1);
+        assert_eq!(epoch3, 2);
+
+        // Old leader persists its epoch counter to the backend. The
+        // persisted value is the current counter (one past the last grant).
+        mgr_a.persist_epoch().unwrap();
+        let persisted_epoch = backend.load_epoch().unwrap();
+        assert_eq!(
+            persisted_epoch, 3,
+            "persisted epoch counter should be one past the last granted epoch"
+        );
+
+        // --- Leader switch: new leader loads epoch + leases from backend ---
+        let mgr_b = InodeLeaseManager::new().with_persistence(PersistenceShim(backend.clone()));
+        mgr_b.load_from_persistence().unwrap();
+
+        // New grant on the new leader must use an epoch strictly greater
+        // than any epoch the old leader ever granted — no ABA reuse.
+        let r4 = mgr_b.acquire(40, "client-D", 30_000).unwrap();
+        let epoch4 = epoch_from_token(&r4.token);
+        assert!(
+            epoch4 > max_old_epoch,
+            "new leader epoch {} must be > old max epoch {} (fence token ABA safety)",
+            epoch4,
+            max_old_epoch
+        );
+    }
+
+    /// `decode_entry` skips entries whose `expire_at` is already in the
+    /// past, so a leader takeover after some leases have naturally expired
+    /// recovers only the still-live ones. Expired entries are also deleted
+    /// from the backend during load (best-effort cleanup).
+    #[test]
+    fn test_persistence_expired_leases_filtered_on_load() {
+        let backend = Arc::new(InMemoryPersistence::new());
+        let mgr_a = InodeLeaseManager::new().with_persistence(PersistenceShim(backend.clone()));
+
+        // One short-lived lease + one long-lived lease.
+        let short = mgr_a.acquire(5, "client-A", 1).unwrap(); // 1ms TTL
+        let long = mgr_a.acquire(6, "client-B", 30_000).unwrap(); // 30s TTL
+        assert_eq!(backend.count(), 2);
+
+        // Wait long enough for the short lease to be genuinely expired.
+        // `decode_entry` only checks `Instant::now() > expire_at`; no
+        // grace-period wait is needed.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // --- Leader switch: load only non-expired leases ---
+        let mgr_b = InodeLeaseManager::new().with_persistence(PersistenceShim(backend.clone()));
+        let loaded = mgr_b.load_from_persistence().unwrap();
+        assert_eq!(loaded, 1, "only the non-expired lease should be recovered");
+        assert_eq!(mgr_b.active_count(), 1);
+
+        // The long lease is honored; the short one is gone.
+        mgr_b.validate(6, "client-B", &long.token).unwrap();
+        let short_validate = mgr_b.validate(5, "client-A", &short.token);
+        assert!(
+            short_validate.is_err(),
+            "expired lease should not be recoverable"
+        );
+    }
+
     #[test]
     fn test_stats_counters_visible() {
         let mgr = InodeLeaseManager::new();

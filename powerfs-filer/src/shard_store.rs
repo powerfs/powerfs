@@ -14,6 +14,11 @@ const CF_METADATA: &str = "metadata"; // For storing root_inodes and other persi
 const CF_ORSET_STATE: &str = "orset_state"; // For storing CRDT OR-Set state
 const CF_TOMBSTONES: &str = "tombstones"; // For storing CRDT tombstones
 const CF_PENDING_RECLAIMS: &str = "pending_reclaims"; // Phase 5: WAL for GC data chunk reclamation
+const CF_LEASES: &str = "leases"; // Phase 5 §5.3: lease state persistence (token → serialized LeaseEntry)
+/// Reserved key in `CF_LEASES` for the persisted epoch counter. A NUL
+/// byte prefix ensures it can never collide with a real lease token
+/// (tokens are NUL-free opaque strings from `powerfs-lease`).
+const LEASE_EPOCH_KEY: &[u8] = b"\x00epoch";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeInfo {
@@ -186,6 +191,7 @@ impl ShardStore {
             ColumnFamilyDescriptor::new(CF_ORSET_STATE, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_TOMBSTONES, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_PENDING_RECLAIMS, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_LEASES, make_cf_opts()),
         ];
 
         let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
@@ -765,6 +771,138 @@ impl ShardStore {
                     );
                 }
             }
+            // ----- Phase 5 §5.3: lease state persistence -----
+            ShardCommand::LeasePut { token, value } => {
+                self.lease_put(&token, &value);
+            }
+            ShardCommand::LeaseDelete { token } => {
+                self.lease_delete(&token);
+            }
+            ShardCommand::LeaseSaveEpoch { epoch } => {
+                self.lease_save_epoch(epoch);
+            }
+        }
+    }
+
+    /// Persist (or overwrite) a serialized lease entry under `token`
+    /// in `CF_LEASES`. Called from `apply_command` when
+    /// `ShardCommand::LeasePut` is committed by Raft.
+    ///
+    /// The value bytes are opaque from the shard store's perspective —
+    /// the lease manager (`RaftLeasePersistence`) handles
+    /// serialization via `powerfs_lease::persistence::encode_entry`.
+    pub fn lease_put(&self, token: &str, value: &[u8]) {
+        let cf = match self.db.cf_handle(CF_LEASES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {} lease_put: CF_LEASES not found (token={})",
+                    self.shard_id.0,
+                    token
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.db.put_cf(cf, token.as_bytes(), value) {
+            log::error!(
+                "Shard {} lease_put failed (token={}): {}",
+                self.shard_id.0,
+                token,
+                e
+            );
+        }
+    }
+
+    /// Delete a persisted lease entry by token. Idempotent.
+    pub fn lease_delete(&self, token: &str) {
+        let cf = match self.db.cf_handle(CF_LEASES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {} lease_delete: CF_LEASES not found (token={})",
+                    self.shard_id.0,
+                    token
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.db.delete_cf(cf, token.as_bytes()) {
+            log::error!(
+                "Shard {} lease_delete failed (token={}): {}",
+                self.shard_id.0,
+                token,
+                e
+            );
+        }
+    }
+
+    /// Persist the Fencer epoch counter to `CF_LEASES` under the
+    /// reserved key `LEASE_EPOCH_KEY`. Used by the lease manager to
+    /// survive leader switches without resetting the epoch to 0
+    /// (which would permit zombie clients back into the cluster).
+    pub fn lease_save_epoch(&self, epoch: u64) {
+        let cf = match self.db.cf_handle(CF_LEASES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {} lease_save_epoch: CF_LEASES not found",
+                    self.shard_id.0
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.db.put_cf(cf, LEASE_EPOCH_KEY, epoch.to_le_bytes()) {
+            log::error!(
+                "Shard {} lease_save_epoch failed (epoch={}): {}",
+                self.shard_id.0,
+                epoch,
+                e
+            );
+        }
+    }
+
+    /// Local read: load all persisted lease entries from `CF_LEASES`
+    /// (excluding the reserved epoch key). Called by
+    /// `RaftLeasePersistence::load_all` on leader takeover.
+    ///
+    /// Returns `(token, value)` pairs in arbitrary order. The lease
+    /// manager re-decodes each entry via `decode_entry` and skips
+    /// already-expired ones.
+    pub fn lease_load_all(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let cf = self
+            .db
+            .cf_handle(CF_LEASES)
+            .ok_or_else(|| "CF_LEASES not found".to_string())?;
+
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item.map_err(|e| format!("rocksdb iter: {}", e))?;
+            // Skip the reserved epoch key.
+            if key.as_ref() == LEASE_EPOCH_KEY {
+                continue;
+            }
+            let token = String::from_utf8(key.to_vec())
+                .map_err(|e| format!("non-utf8 lease token: {}", e))?;
+            out.push((token, value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Local read: load the persisted Fencer epoch counter. Returns 0
+    /// if never persisted (first-ever leader takeover), matching the
+    /// in-memory initial value.
+    pub fn lease_load_epoch(&self) -> Result<u64, String> {
+        let cf = self
+            .db
+            .cf_handle(CF_LEASES)
+            .ok_or_else(|| "CF_LEASES not found".to_string())?;
+        match self.db.get_cf(cf, LEASE_EPOCH_KEY) {
+            Ok(Some(bytes)) if bytes.len() == 8 => {
+                Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            Ok(_) => Ok(0),
+            Err(e) => Err(format!("rocksdb get epoch: {}", e)),
         }
     }
 
