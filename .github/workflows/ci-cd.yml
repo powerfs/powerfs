@@ -47,8 +47,10 @@ jobs:
         if ! command -v rustc &>/dev/null; then
           echo "Rust not found, installing via rustup..."
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          source "$HOME/.cargo/env"
         fi
+        # Always source cargo env and persist PATH for subsequent steps
+        source "$HOME/.cargo/env"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup component add rustfmt clippy 2>/dev/null || true
         rustc --version && cargo --version
 
@@ -59,10 +61,14 @@ jobs:
         sudo chmod 666 /dev/fuse
 
     - name: Format Check
-      run: cargo fmt --check --all
+      run: |
+        source "$HOME/.cargo/env"
+        cargo fmt --check --all
 
     - name: Clippy
-      run: cargo clippy --all -- -D warnings
+      run: |
+        source "$HOME/.cargo/env"
+        cargo clippy --all -- -D warnings
 
   # 编译检查 (release)
   build:
@@ -93,8 +99,9 @@ jobs:
         if ! command -v rustc &>/dev/null; then
           echo "Rust not found, installing via rustup..."
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          source "$HOME/.cargo/env"
         fi
+        source "$HOME/.cargo/env"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustc --version && cargo --version
 
     - name: Install system dependencies
@@ -104,7 +111,9 @@ jobs:
         sudo chmod 666 /dev/fuse
 
     - name: Build All
-      run: cargo build --all --release
+      run: |
+        source "$HOME/.cargo/env"
+        cargo build --all --release
 
   # 单元测试 + FUSE 集成测试
   test:
@@ -135,8 +144,9 @@ jobs:
         if ! command -v rustc &>/dev/null; then
           echo "Rust not found, installing via rustup..."
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          source "$HOME/.cargo/env"
         fi
+        source "$HOME/.cargo/env"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustc --version && cargo --version
 
     - name: Install system dependencies
@@ -146,10 +156,14 @@ jobs:
         sudo chmod 666 /dev/fuse
 
     - name: Unit Tests
-      run: cargo test --all -- --test-threads=2
+      run: |
+        source "$HOME/.cargo/env"
+        cargo test --all -- --test-threads=2
 
     - name: Benchmark Tests
-      run: cargo test --package powerfs-core --test storage_benchmark_test -- --test-threads=1
+      run: |
+        source "$HOME/.cargo/env"
+        cargo test --package powerfs-core --test storage_benchmark_test -- --test-threads=1
 
     - name: Check if FUSE is available
       id: fuse-check
@@ -165,6 +179,7 @@ jobs:
     - name: Run FUSE integration tests
       if: steps.fuse-check.outputs.fuse_available == 'true'
       run: |
+        source "$HOME/.cargo/env"
         cargo test --package powerfs-fuse --test fuse_minimal_test --verbose
         cargo test --package powerfs-fuse --test fuse_basic_test --verbose
         cargo test --package powerfs-fuse --test coherence_phase0_test --verbose
@@ -202,8 +217,9 @@ jobs:
         if ! command -v rustc &>/dev/null; then
           echo "Rust not found, installing via rustup..."
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          source "$HOME/.cargo/env"
         fi
+        source "$HOME/.cargo/env"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustc --version && cargo --version
 
     - name: Install system dependencies
@@ -213,10 +229,13 @@ jobs:
         sudo chmod 666 /dev/fuse
 
     - name: Build Benchmark
-      run: cargo build --package powerfs-core --release --bench kv_benchmark
+      run: |
+        source "$HOME/.cargo/env"
+        cargo build --package powerfs-core --release --bench kv_benchmark
 
     - name: Run Benchmark
       run: |
+        source "$HOME/.cargo/env"
         mkdir -p benchmark-results
         cargo bench --package powerfs-core --bench kv_benchmark -- --save-baseline baseline
       env:
@@ -259,13 +278,16 @@ jobs:
         if ! command -v rustc &>/dev/null; then
           echo "Rust not found, installing via rustup..."
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          source "$HOME/.cargo/env"
         fi
+        source "$HOME/.cargo/env"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup component add llvm-tools-preview 2>/dev/null || true
         rustc --version && cargo --version
 
     - name: Install grcov
-      run: cargo install grcov
+      run: |
+        source "$HOME/.cargo/env"
+        cargo install grcov
 
     - name: Install system dependencies
       run: |
@@ -275,6 +297,7 @@ jobs:
 
     - name: Run Tests with Coverage
       run: |
+        source "$HOME/.cargo/env"
         cargo clean
         RUSTFLAGS="-C instrument-coverage" cargo build --all
         RUSTFLAGS="-C instrument-coverage" cargo test --all
@@ -282,7 +305,9 @@ jobs:
         LLVM_PROFILE_FILE: "powerfs-%p-%m.profraw"
 
     - name: Generate Coverage Report
-      run: grcov . --binary-path ./target/debug/deps/ -s . -t html --branch --ignore-not-existing -o ./coverage
+      run: |
+        source "$HOME/.cargo/env"
+        grcov . --binary-path ./target/debug/deps/ -s . -t html --branch --ignore-not-existing -o ./coverage
 
     - name: Save artifacts locally
       if: always()
