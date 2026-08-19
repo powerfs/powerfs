@@ -3114,6 +3114,68 @@ mod tests {
         }
     }
 
+    /// Phase 5 §5.3: `CF_LEASES` storage layer round-trip + restart
+    /// persistence. Verifies that lease entries and the Fencer epoch
+    /// survive a process restart via RocksDB — the property that lets
+    /// the new leader recover leases after a switch. Also confirms
+    /// the reserved epoch key (`\x00epoch`) is excluded from
+    /// `lease_load_all`.
+    #[test]
+    fn test_lease_cf_persistence_and_restart() {
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        let store = ShardStore::new(ShardId(0), (0, 16384), &db_path).unwrap();
+
+        // Round-trip: put two lease entries, load them back.
+        store.lease_put("token-alpha", b"lease-data-alpha");
+        store.lease_put("token-beta", b"lease-data-beta");
+
+        let entries = store.lease_load_all().unwrap();
+        assert_eq!(entries.len(), 2, "both leases should be persisted");
+        let mut tokens: Vec<String> = entries.iter().map(|(t, _)| t.clone()).collect();
+        tokens.sort();
+        assert_eq!(
+            tokens,
+            vec!["token-alpha".to_string(), "token-beta".to_string()]
+        );
+        // Values round-trip byte-for-byte.
+        for (token, value) in &entries {
+            let expected = match token.as_str() {
+                "token-alpha" => b"lease-data-alpha".to_vec(),
+                "token-beta" => b"lease-data-beta".to_vec(),
+                _ => panic!("unexpected token: {}", token),
+            };
+            assert_eq!(*value, expected, "value mismatch for {}", token);
+        }
+
+        // Epoch persistence — stored under the reserved \x00epoch key.
+        store.lease_save_epoch(42);
+        assert_eq!(store.lease_load_epoch().unwrap(), 42);
+
+        // Delete one lease; the other survives. This also proves the
+        // epoch key is excluded from lease_load_all (otherwise the
+        // count would be 2: token-beta + the epoch key).
+        store.lease_delete("token-alpha");
+        let entries = store.lease_load_all().unwrap();
+        assert_eq!(entries.len(), 1, "only token-beta should remain");
+        assert_eq!(entries[0].0, "token-beta");
+        // Epoch is untouched by a lease delete.
+        assert_eq!(store.lease_load_epoch().unwrap(), 42);
+
+        // --- Restart persistence: drop the store, reopen the same RocksDB ---
+        drop(store);
+        let store2 = ShardStore::new(ShardId(0), (0, 16384), &db_path).unwrap();
+
+        let entries2 = store2.lease_load_all().unwrap();
+        assert_eq!(entries2.len(), 1, "token-beta should survive restart");
+        assert_eq!(entries2[0].0, "token-beta");
+        assert_eq!(entries2[0].1, b"lease-data-beta");
+        // Epoch also survives the restart.
+        assert_eq!(store2.lease_load_epoch().unwrap(), 42);
+    }
+
     #[test]
     fn test_mark_tombstone_hides_entry_from_lookup() {
         let store = make_store();
