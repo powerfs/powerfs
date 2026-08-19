@@ -35,6 +35,10 @@ pub struct IoLoop {
     pub id: usize,
     /// 推送到 WorkQueue 的发送端
     work_tx: mpsc::Sender<Work>,
+    /// 独立锁接收队列发送端 (§8.4 方案 A). `None` 时锁消息回落到
+    /// `work_tx` (向后兼容). `Some` 时 `MsgType::is_lock_channel()` 的帧
+    /// 走此队列, 由独立锁 worker 线程池处理, 不被 IO 拥塞阻塞.
+    lock_work_tx: Option<mpsc::Sender<Work>>,
     /// 连接注册表 (断连清理时注销)
     registry: Arc<ConnRegistry>,
     /// 业务处理器 (断连通知)
@@ -54,9 +58,25 @@ impl IoLoop {
         manager: Option<Arc<ServerConnectionManager>>,
         flow_ctrl: Arc<FlowController>,
     ) -> Self {
+        Self::with_lock(id, work_tx, None, registry, handler, manager, flow_ctrl)
+    }
+
+    /// Construct with an optional dedicated lock receive queue
+    /// (§8.4 方案 A). When `lock_work_tx` is `Some`, lock/lease message
+    /// types are routed there instead of the shared `work_tx`.
+    pub fn with_lock(
+        id: usize,
+        work_tx: mpsc::Sender<Work>,
+        lock_work_tx: Option<mpsc::Sender<Work>>,
+        registry: Arc<ConnRegistry>,
+        handler: Arc<dyn NetHandler>,
+        manager: Option<Arc<ServerConnectionManager>>,
+        flow_ctrl: Arc<FlowController>,
+    ) -> Self {
         Self {
             id,
             work_tx,
+            lock_work_tx,
             registry,
             handler,
             manager,
@@ -77,6 +97,7 @@ impl IoLoop {
         outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) {
         let work_tx = self.work_tx.clone();
+        let lock_work_tx = self.lock_work_tx.clone();
         let registry = self.registry.clone();
         let handler = self.handler.clone();
         let manager = self.manager.clone();
@@ -97,6 +118,7 @@ impl IoLoop {
                 read_half,
                 write_half,
                 work_tx,
+                lock_work_tx,
                 shutdown_rx,
                 outbound_rx,
                 peer,
@@ -123,6 +145,7 @@ impl IoLoop {
         mut read_half: OwnedReadHalf,
         mut write_half: OwnedWriteHalf,
         work_tx: mpsc::Sender<Work>,
+        lock_work_tx: Option<mpsc::Sender<Work>>,
         mut shutdown_rx: mpsc::Receiver<()>,
         mut outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
         peer: std::net::SocketAddr,
@@ -145,6 +168,7 @@ impl IoLoop {
         // read_task: 读取帧 → Work → WorkQueue
         let read_conn = conn.clone();
         let read_flow_ctrl = flow_ctrl.clone();
+        let read_lock_tx = lock_work_tx;
         let read_task = tokio::spawn(async move {
             loop {
                 // 检查关闭信号 (非阻塞)
@@ -217,7 +241,17 @@ impl IoLoop {
 
                         // 封装 Work 推送到 WorkQueue
                         let work = Work::new(read_conn.clone(), msg);
-                        if work_tx.send(work).await.is_err() {
+                        // §8.4 方案 A: 锁/租约消息走独立接收队列, 由独立锁
+                        // worker 线程池处理, 不被 IO 拥塞阻塞. 队列未配置
+                        // (None) 时回落到共享 WorkQueue (向后兼容).
+                        let route_to_lock =
+                            should_route_to_lock(read_lock_tx.is_some(), work.msg.msg_type());
+                        let tx = if route_to_lock {
+                            read_lock_tx.as_ref().unwrap()
+                        } else {
+                            &work_tx
+                        };
+                        if tx.send(work).await.is_err() {
                             debug!("IoLoop: WorkQueue closed, stopping read loop");
                             break;
                         }
@@ -327,6 +361,20 @@ impl IoLoop {
     }
 }
 
+/// Decide whether a received frame should be routed to the dedicated lock
+/// receive queue (§8.4 方案 A). Pure function extracted for testability.
+///
+/// Routes to the lock queue iff:
+/// - a dedicated lock queue is configured (`lock_tx_available`), AND
+/// - the frame's `MsgType` is a lock/lease message (`is_lock_channel()`).
+///
+/// Unknown `msg_type` (None) and non-lock types fall back to the shared
+/// IO WorkQueue — preserving backward compatibility when the lock queue is
+/// absent (`num_lock_workers == 0`).
+fn should_route_to_lock(lock_tx_available: bool, msg_type: Option<MsgType>) -> bool {
+    lock_tx_available && msg_type.map(|t| t.is_lock_channel()).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,5 +467,60 @@ mod tests {
         assert_eq!(msg.msg_type(), Some(MsgType::Handshake));
         assert_eq!(msg.body.len(), HandshakeRequest::SIZE);
         assert!(msg.data.is_empty());
+    }
+
+    // ----- §8.4 CHANNEL_LOCK routing -----
+
+    #[test]
+    fn test_should_route_to_lock_lock_msg_when_queue_configured() {
+        // Lock queue present + lease msg → route to lock queue.
+        assert!(should_route_to_lock(true, Some(MsgType::AcquireLease)));
+        assert!(should_route_to_lock(true, Some(MsgType::RenewInodeLease)));
+        assert!(should_route_to_lock(true, Some(MsgType::Invalidate)));
+        assert!(should_route_to_lock(true, Some(MsgType::RangeLease)));
+    }
+
+    #[test]
+    fn test_should_route_to_lock_false_for_io_and_meta_msgs() {
+        // Lock queue present but IO/metadata msg → shared queue.
+        assert!(!should_route_to_lock(true, Some(MsgType::Lookup)));
+        assert!(!should_route_to_lock(true, Some(MsgType::WriteNeedle)));
+        assert!(!should_route_to_lock(true, Some(MsgType::Ping)));
+    }
+
+    #[test]
+    fn test_should_route_to_lock_false_when_queue_absent() {
+        // Lock queue absent (num_lock_workers=0) → lock msgs fall back to
+        // the shared WorkQueue (backward compatibility).
+        assert!(!should_route_to_lock(false, Some(MsgType::AcquireLease)));
+        assert!(!should_route_to_lock(false, Some(MsgType::Invalidate)));
+    }
+
+    #[test]
+    fn test_should_route_to_lock_false_for_unknown_msg_type() {
+        // Unknown msg_type (None) → never route to lock queue.
+        assert!(!should_route_to_lock(true, None));
+        assert!(!should_route_to_lock(false, None));
+    }
+
+    #[tokio::test]
+    async fn test_io_loop_with_lock_constructs() {
+        // IoLoop::with_lock must accept an optional lock queue sender
+        // without changing the existing constructor surface.
+        let (work_tx, _work_rx) = mpsc::channel::<Work>(16);
+        let (lock_tx, _lock_rx) = mpsc::channel::<Work>(16);
+        let registry = Arc::new(ConnRegistry::new());
+        let handler = Arc::new(EchoHandler) as Arc<dyn NetHandler>;
+        let flow_ctrl = Arc::new(FlowController::with_defaults());
+        let io_loop = Arc::new(IoLoop::with_lock(
+            0,
+            work_tx,
+            Some(lock_tx),
+            registry,
+            handler,
+            None,
+            flow_ctrl,
+        ));
+        assert_eq!(io_loop.id, 0);
     }
 }

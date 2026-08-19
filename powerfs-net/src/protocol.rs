@@ -154,9 +154,18 @@ pub struct HandshakeRequest {
     pub features: u32,   // Supported features
 }
 
-/// Channel constants (与内核 POWERFS_NET_CHANNEL_DATA/META 一致)
+/// Channel constants (与内核 POWERFS_NET_CHANNEL_DATA/META/LOCK 一致)
 pub const CHANNEL_DATA: u8 = 0;
 pub const CHANNEL_META: u8 = 1;
+/// Logical lock channel (§8.4 方案 A). Lock messages ride the same TCP
+/// connection as data/meta but are routed by `MsgType::is_lock_channel()`
+/// to an independent receive queue + dedicated worker pool, so IO
+/// congestion cannot block lock handoff (acquire/grant/revoke/release/renew).
+/// Value `2` is used for flow-control stats grouping only; it is NOT
+/// encoded into `route_hash` (which reserves only bit 0 for the physical
+/// data/meta path). A dedicated lock connection (方案 B) would handshake
+/// with `channel = CHANNEL_LOCK` and requires the 2-bit route_hash upgrade.
+pub const CHANNEL_LOCK: u8 = 2;
 
 impl HandshakeRequest {
     pub const SIZE: usize = 20;
@@ -709,6 +718,38 @@ impl MsgType {
         let v = self.as_u16();
         (0x0010..=0x001D).contains(&v)
     }
+
+    /// `true` for lock/lease message types that must be routed to the
+    /// independent lock receive queue + dedicated worker pool (§8.4/§8.6).
+    ///
+    /// Covers the existing lease ops (range + inode) and `Invalidate`
+    /// (the Early Revoke notification path — §8.5 P0 `LockRevoke`).
+    /// New lock wire types added by `powerfs-lock-net` should be listed
+    /// here too so they bypass the IO worker pool.
+    pub fn is_lock_channel(self) -> bool {
+        matches!(
+            self,
+            MsgType::Invalidate
+                | MsgType::RangeLease
+                | MsgType::AcquireLease
+                | MsgType::ReleaseLease
+                | MsgType::RenewLease
+                | MsgType::LeaseStatus
+                | MsgType::AcquireLeaseBatch
+                | MsgType::AcquireInodeLease
+                | MsgType::ReleaseInodeLease
+                | MsgType::RenewInodeLease
+        )
+    }
+}
+
+/// Free-function form of [`MsgType::is_lock_channel`] for call sites that
+/// only have the raw `u16` msg_type (e.g. before `NetMessage::msg_type()`
+/// decoding). Returns `false` for unknown/invalid msg_type values.
+pub fn is_lock_msg_type(msg_type: u16) -> bool {
+    MsgType::from_u16(msg_type)
+        .map(|t| t.is_lock_channel())
+        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -2346,5 +2387,56 @@ mod tests {
             0,
         );
         assert_eq!(hdr.load_factor(), 0);
+    }
+
+    // ----- §8.4 CHANNEL_LOCK routing -----
+
+    #[test]
+    fn test_channel_constants_distinct() {
+        assert_eq!(CHANNEL_DATA, 0);
+        assert_eq!(CHANNEL_META, 1);
+        assert_eq!(CHANNEL_LOCK, 2);
+        assert_ne!(CHANNEL_DATA, CHANNEL_META);
+        assert_ne!(CHANNEL_DATA, CHANNEL_LOCK);
+        assert_ne!(CHANNEL_META, CHANNEL_LOCK);
+    }
+
+    #[test]
+    fn test_is_lock_channel_for_lease_ops() {
+        // All lease/lock message types must route to the lock queue.
+        assert!(MsgType::AcquireLease.is_lock_channel());
+        assert!(MsgType::ReleaseLease.is_lock_channel());
+        assert!(MsgType::RenewLease.is_lock_channel());
+        assert!(MsgType::LeaseStatus.is_lock_channel());
+        assert!(MsgType::AcquireLeaseBatch.is_lock_channel());
+        assert!(MsgType::AcquireInodeLease.is_lock_channel());
+        assert!(MsgType::ReleaseInodeLease.is_lock_channel());
+        assert!(MsgType::RenewInodeLease.is_lock_channel());
+        assert!(MsgType::RangeLease.is_lock_channel());
+        // Invalidate = Early Revoke notification path (§8.5 P0).
+        assert!(MsgType::Invalidate.is_lock_channel());
+    }
+
+    #[test]
+    fn test_is_lock_channel_false_for_io_and_meta() {
+        // IO and metadata ops must NOT route to the lock queue.
+        assert!(!MsgType::Ping.is_lock_channel());
+        assert!(!MsgType::Lookup.is_lock_channel());
+        assert!(!MsgType::Create.is_lock_channel());
+        assert!(!MsgType::ReadDir.is_lock_channel());
+        assert!(!MsgType::WriteNeedle.is_lock_channel());
+        assert!(!MsgType::ReadNeedle.is_lock_channel());
+        assert!(!MsgType::StatFs.is_lock_channel());
+        assert!(!MsgType::GetTopology.is_lock_channel());
+    }
+
+    #[test]
+    fn test_is_lock_msg_type_free_function() {
+        // Free-function form must agree with the method form, and reject
+        // unknown msg_type values (returns false, not routed).
+        assert!(is_lock_msg_type(MsgType::AcquireLease.as_u16()));
+        assert!(is_lock_msg_type(MsgType::RenewInodeLease.as_u16()));
+        assert!(!is_lock_msg_type(MsgType::Lookup.as_u16()));
+        assert!(!is_lock_msg_type(0xFFFF)); // unknown
     }
 }
