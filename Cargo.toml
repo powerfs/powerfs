@@ -6,6 +6,7 @@ members = [
     "powerfs-lock",
     "powerfs-lock-net",
     "powerfs-lock-fuse",
+    "powerfs-lock-health",
     "powerfs-core",
     "powerfs-master",
     "powerfs-volume",
