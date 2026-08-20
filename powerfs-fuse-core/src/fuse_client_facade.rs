@@ -1302,10 +1302,7 @@ impl SyncFuseClientFacade {
         let seq = BLOCKON_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let lwp: i32 = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
         let t0 = std::time::Instant::now();
-        trace!(
-            "DBG-BLOCKON seq={} tid={} enter",
-            seq, lwp,
-        );
+        trace!("DBG-BLOCKON seq={} tid={} enter", seq, lwp,);
         let within_tokio = tokio::runtime::Handle::try_current().is_ok();
         // #endregion
 
@@ -1350,7 +1347,11 @@ impl SyncFuseClientFacade {
         } else {
             trace!(
                 "DBG-BLOCKON seq={} tid={} exit status={} elapsed_ms={} within_tokio={}",
-                seq, lwp, status, elapsed, within_tokio,
+                seq,
+                lwp,
+                status,
+                elapsed,
+                within_tokio,
             );
         }
 

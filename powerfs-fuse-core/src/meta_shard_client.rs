@@ -2093,7 +2093,10 @@ impl MetadataClient for MetaShardClient {
             // Slow path: two-phase mkdir across target_shard + parent_shard.
             log::debug!(
                 "mkdir two-phase: parent={} name={} parent_shard={} target_shard={}",
-                parent_ino, name, parent_shard, target_shard
+                parent_ino,
+                name,
+                parent_shard,
+                target_shard
             );
 
             // Phase A: allocate inode on target_shard, then CreateInode.
@@ -2152,7 +2155,9 @@ impl MetadataClient for MetaShardClient {
             // If we get here, Phase B succeeded.
             log::debug!(
                 "mkdir two-phase done: ino={} parent={} name={}",
-                ino, parent_ino, name
+                ino,
+                parent_ino,
+                name
             );
 
             Ok(attr)
@@ -2204,8 +2209,7 @@ impl MetadataClient for MetaShardClient {
         shard_id: u64,
     ) -> Pin<Box<dyn Future<Output = FsResult<Vec<u32>>> + Send + '_>> {
         Box::pin(async move {
-            let body =
-                serialize::encode_batch_unlink_req(&entries).map_err(map_err)?;
+            let body = serialize::encode_batch_unlink_req(&entries).map_err(map_err)?;
             let resp = self
                 .send_coherence_msg(MsgType::BatchUnlink, shard_id, body)
                 .await

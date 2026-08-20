@@ -71,11 +71,7 @@ impl DebugConfigStore {
 
     /// 应用一个更新请求（来自 HTTP PUT /admin/debug）
     pub fn apply_update(&self, update: DebugConfigUpdate) -> NodeDebugConfig {
-        let mut entry = self
-            .configs
-            .entry(update.node.clone())
-            .or_default()
-            .clone();
+        let mut entry = self.configs.entry(update.node.clone()).or_default().clone();
 
         if let Some(level) = update.level {
             entry.log_level = Some(level);
@@ -104,8 +100,7 @@ impl DebugConfigStore {
     pub fn effective_config(&self, node_id: &str) -> powerfs_net::serialize::DebugConfig {
         let mut level = None;
         let mut filter = None;
-        let mut flags: std::collections::HashMap<String, bool> =
-            std::collections::HashMap::new();
+        let mut flags: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
 
         // 先应用 "all" 默认
         if let Some(all_cfg) = self.configs.get("all") {

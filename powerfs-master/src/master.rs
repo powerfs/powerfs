@@ -3491,9 +3491,7 @@ impl MasterNode {
             let metrics_addr = format!("{}:{}", self.address.ip(), metrics_port);
             let debug_store = self.debug_config.clone();
             info!("Starting metrics + debug config server on {}", metrics_addr);
-            if let Err(e) =
-                crate::metrics::start_metrics_server(&metrics_addr, debug_store).await
-            {
+            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, debug_store).await {
                 error!("Failed to start metrics server on {}: {}", metrics_addr, e);
             }
         }

@@ -459,14 +459,24 @@ fn lookup(&mut self, parent: u64, name: &OsStr, reply: ReplyEntry) {
 
 ### 9.1 创建目录 (mkdir)
 
+> **架构更新（Filer 分片）**：mkdir 现在由 Filer 分片处理，不再走 Master。
+> 详见 [shard-routing-no-forward-principle.md](shard-routing-no-forward-principle.md) §2-§3。
+>
+> 两种方式：
+> - **单 shard 快速路径**（`target_shard == parent_shard`）：客户端发 `Mkdir` 到 parent_shard，
+>   Filer 原子完成 CreateInode + AddDirEntry
+> - **跨 shard 两阶段**（`target_shard != parent_shard`，子目录换片常态）：
+>   客户端协调 `alloc_inode_batch` + `MkdirPhaseA`（target_shard）+ `MkdirPhaseB`（parent_shard），
+>   服务端**绝不服务间转发**，非 leader 返回 REDIRECT 由客户端重定向
+
 ```
-流程:
+流程（跨 shard 两阶段）:
   1. 检查缓存中是否已存在同名条目
-  2. 分配本地 inode
-  3. 创建 CachedEntry 并插入缓存
-  4. 获取父目录租约
-  5. 构建 FilerEntry，调用 Master create_entry
-  6. 使用 Master 返回的 inode 更新本地缓存
+  2. 客户端算 target_shard = (parent_shard + 1) % shard_count
+  3. alloc_inode_batch(target_shard) → 得到 ino
+  4. Phase A: MkdirPhaseA → target_shard leader（CreateInode only）
+  5. Phase B: MkdirPhaseB → parent_shard leader（AddDirEntry only）
+  6. 使用返回的 inode 更新本地缓存
   7. 返回成功
 ```
 

@@ -424,7 +424,10 @@ impl FuseApp {
                 runtime.spawn(async move {
                     match mc.batch_unlink(batch.clone(), shard_id).await {
                         Ok(statuses) => {
-                            let failed: Vec<_> = statuses.iter().filter(|&&s| s != powerfs_net::STATUS_OK as u32).collect();
+                            let failed: Vec<_> = statuses
+                                .iter()
+                                .filter(|&&s| s != powerfs_net::STATUS_OK as u32)
+                                .collect();
                             if !failed.is_empty() {
                                 warn!(
                                     "batch_unlink: {}/{} entries failed (shard={})",

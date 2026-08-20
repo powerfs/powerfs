@@ -201,7 +201,7 @@ impl PosixMetaService for PosixMetaServiceImpl {
                     &name,
                     // mode is u32 already (from POSIX attrs u32 bits); no
                     // S_IFDIR bit needed because create_directory sets it.
-                    mode as u32,
+                    mode,
                     uid,
                     gid,
                 )
@@ -227,7 +227,7 @@ impl PosixMetaService for PosixMetaServiceImpl {
                     parent_inode,
                     &name,
                     shard_id,
-                    if mode != 0 { mode as u32 } else { 0o100644 },
+                    if mode != 0 { mode } else { 0o100644 },
                     uid,
                     gid,
                 )
