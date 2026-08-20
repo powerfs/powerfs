@@ -261,7 +261,40 @@ fn main() {
     }
 
     // 创建tokio runtime
-    let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    //
+    // NOTE: Runtime::new() defaults to worker_threads = num_cpus() (host value,
+    // can be 16/32/64 on the host). However, cgroup-pids limits or ulimit
+    // inside Docker often cap our threads at a much smaller number (~7-12).
+    // When that happens:
+    //   1. `main` thread permanently parks in runtime.block_on(FuseApp::new.await)
+    //      → this keeps one OS thread busy for the entire process lifetime.
+    //   2. FUSE callbacks (write/release/create/open/unlink...) are handled by
+    //      6 fuse_backend_rs workers running on OS threads — not our tokio pool.
+    //      Each callback uses SyncFuseClientFacade::block_on(), which spawns a
+    //      task onto the tokio runtime and waits on an mpsc channel.
+    //   3. If tokio has fewer worker threads than concurrent block_on() callers,
+    //      all workers get parked on mpsc::recv() waiting for responses, while
+    //      the async network futures (recv_loop, send_task, lockify sync tasks
+    //      that produce those responses) never get scheduled → deadlock, all
+    //      FUSE requests hang forever ("context canceled" inside tests).
+    //
+    // Fix: explicitly size the runtime. Use 8 workers (well above the 1 main
+    // thread + 6 FUSE workers simultaneous-block-on worst case, leaving head
+    // room for network tasks) + generous blocking pool budget. We also read
+    // TOKIO_WORKER_THREADS so it can be overridden per-deploy.
+    let default_workers: usize = 8;
+    let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default_workers)
+        .clamp(2, 64);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(32)
+        .enable_all()
+        .thread_name("powerfs-tokio")
+        .build()
+        .expect("Failed to create tokio runtime");
     let runtime_arc = Arc::new(runtime);
 
     let result = runtime_arc.block_on(async {

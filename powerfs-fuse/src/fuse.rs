@@ -5052,6 +5052,13 @@ impl FileSystem for PowerFsFs {
                     }
 
                     let updated_size = inline_buf.data.len() as u64;
+                    // Snap locals BEFORE dropping the RefMut. This avoids:
+                    //   RefMut still alive → nested inline_buffers.get() on same shard
+                    //   → DashMap shard RwLock writer re-enters on same thread → deadlock.
+                    let inline_dirty_snap = inline_buf.dirty;
+                    let buf_len_snap = inline_buf.data.len();
+                    drop(inline_buf); // release DashMap shard write lock
+
                     debug!(
                         "write inline: inode={} offset={} len={} buffer_len={}",
                         inode, offset, read_len, updated_size
@@ -5067,14 +5074,9 @@ impl FileSystem for PowerFsFs {
                             .peek_inode(inode)
                             .map(|e| e.content_size)
                             .unwrap_or(u64::MAX);
-                        let inline_dirty = self
-                            .inline_buffers
-                            .get(&inode)
-                            .map(|b| b.dirty)
-                            .unwrap_or(false);
                         info!(
                             "DBG-INLINE: write inline END inode={} offset={} len={} cs_after={} buf_len={} inline_dirty={}",
-                            inode, offset, read_len, cs_after, inline_buf.data.len(), inline_dirty
+                            inode, offset, read_len, cs_after, buf_len_snap, inline_dirty_snap
                         );
                     }
                     // #endregion
