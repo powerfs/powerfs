@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use log::error;
+use log::trace;
+use log::warn;
 
 use crate::client_identity::ClientIdentity;
 use crate::meta_shard_client::{
@@ -1234,6 +1236,10 @@ pub struct SyncFuseClientFacade {
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
+// #region debug-point block_on_seq (fuse-create-write-hang)
+static BLOCKON_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// #endregion
+
 /// Parameters for a single chunk write in a batch flush.
 #[derive(Clone)]
 pub struct WriteBlobRequest {
@@ -1272,26 +1278,92 @@ impl SyncFuseClientFacade {
         &self.runtime
     }
 
-    /// 同步桥接异步 future（不占用 tokio worker 线程）
+    /// 同步桥接异步 future（优先零开销 runtime.block_on，必要时退回 spawn+mpsc）
     ///
-    /// 通过 handle.spawn 将 future 提交到 tokio runtime，当前线程在
-    /// mpsc::channel 上阻塞等待结果。这样 tokio worker 可以自由调度
-    /// data_queue processor、send_task、recv_loop 等 spawn task，
-    /// 避免 block_on 占用 worker 导致的调度争用和超时。
+    /// 背景：FUSE 回调由 fuse_backend_rs 自己的 OS 线程池驱动（不是 tokio worker）。
+    /// 之前的实现通过 `handle.spawn` 把 future 推给 tokio workers，然后在 OS 线程上
+    /// mpsc 等待。当并发 block_on 数量超过 `worker_threads`（默认 8）时，所有 workers
+    /// 都会被这些一次性"桥接任务"占满，负责 `recv_loop / send_task / net futures`
+    /// 的真正任务永远调度不到 → 45 秒后 rx 超时 panic → 全局 EIO。
+    ///
+    /// 修复策略（双路径）：
+    ///   * 若当前线程不在 tokio runtime 内（FUSE 回调的常见情况）：直接使用
+    ///     `self.runtime.block_on(future)`。这会在当前 OS 线程上跑一个临时的
+    ///     tokio 事件循环，完全不占用 worker threads，从而不会导致 worker 饥饿。
+    ///   * 若当前真在 tokio worker 上下文内（嵌套调用）：退化为 spawn + mpsc 模式，
+    ///     避免 `runtime.block_on` 的"嵌套 runtimes not allowed" panic。
     ///
     /// 详见 docs/communication-optimization-plan.md §12 阶段1.5
     pub fn block_on<F: std::future::Future + Send + 'static>(&self, future: F) -> F::Output
     where
         F::Output: Send + 'static,
     {
-        let handle = self.runtime.handle().clone();
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        handle.spawn(async move {
-            let result = future.await;
-            let _ = tx.send(result);
-        });
-        rx.recv()
-            .expect("block_on: future panicked or runtime dropped")
+        // #region debug-point block_on-trace (fuse-create-write-hang)
+        let seq = BLOCKON_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lwp: i32 = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        let t0 = std::time::Instant::now();
+        trace!(
+            "DBG-BLOCKON seq={} tid={} enter",
+            seq, lwp,
+        );
+        let within_tokio = tokio::runtime::Handle::try_current().is_ok();
+        // #endregion
+
+        let recv_result: Result<F::Output, std::sync::mpsc::RecvTimeoutError>;
+        let status: &str;
+        if !within_tokio {
+            // Hot path: outside tokio context → use own OS thread to drive the
+            // runtime; does NOT consume a worker → no worker starvation possible.
+            let out = self.runtime.block_on(future);
+            recv_result = Ok(out);
+            status = "ok";
+        } else {
+            // Nested (cold) path: spawn onto workers, wait on mpsc.
+            let handle = self.runtime.handle().clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            handle.spawn(async move {
+                let result = future.await;
+                let _ = tx.send(result);
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(45)) {
+                Ok(v) => {
+                    recv_result = Ok(v);
+                    status = "ok";
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    recv_result = Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+                    status = "TIMEOUT";
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    recv_result = Err(std::sync::mpsc::RecvTimeoutError::Disconnected);
+                    status = "DISCONNECTED";
+                }
+            }
+        }
+        let elapsed = t0.elapsed().as_millis();
+
+        if elapsed > 100 || status != "ok" {
+            warn!(
+                "DBG-BLOCKON seq={} tid={} exit status={} elapsed_ms={} within_tokio={}",
+                seq, lwp, status, elapsed, within_tokio,
+            );
+        } else {
+            trace!(
+                "DBG-BLOCKON seq={} tid={} exit status={} elapsed_ms={} within_tokio={}",
+                seq, lwp, status, elapsed, within_tokio,
+            );
+        }
+
+        match recv_result {
+            Ok(v) => v,
+            Err(e) => {
+                error!(
+                    "DBG-BLOCKON seq={} tid={} FAILED {:?} elapsed_ms={} within_tokio={} — spawning task never ran or panicked (tokio workers starved / all parked on mpsc?)",
+                    seq, lwp, e, elapsed, within_tokio,
+                );
+                panic!("DBG-BLOCKON seq={} {e:?} after {elapsed}ms", seq);
+            }
+        }
     }
 
     /// 获取客户端标识（用于 lease holder 校验）
@@ -1333,7 +1405,7 @@ impl SyncFuseClientFacade {
     pub fn get_entry(&self, path: &str) -> Result<Option<ProtoEntry>, String> {
         let facade = self.facade.clone();
         let path = path.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
             let result = provider.get_entry(&path).await.map_err(pfe_to_string)?;
             Ok(result.map(|e| traits_entry_to_proto(&e)))
@@ -1347,7 +1419,7 @@ impl SyncFuseClientFacade {
     ) -> Result<Option<ProtoEntry>, String> {
         let facade = self.facade.clone();
         let name = name.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
             let result = provider
                 .get_entry_by_parent(parent_ino, &name)
@@ -1363,7 +1435,7 @@ impl SyncFuseClientFacade {
             inode
         );
         let facade = self.facade.clone();
-        let result = self.runtime.block_on(async move {
+        let result = self.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
             let result = provider
                 .get_entry_by_inode(inode)
@@ -1383,7 +1455,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let traits_entry = proto_entry_to_traits(entry);
         let client_id = client_id.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
             provider
                 .create_entry(&traits_entry, &client_id)
@@ -1402,7 +1474,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let traits_entry = proto_entry_to_traits(entry);
         let client_id = client_id.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
             provider
                 .create_entry_with_parent_ino(&traits_entry, parent_ino, &client_id)
@@ -1421,7 +1493,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let traits_entry = proto_entry_to_traits(entry);
         let client_id = client_id.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
             provider
                 .update_entry(&traits_entry, &client_id, old_size, is_truncate)
@@ -1444,7 +1516,7 @@ impl SyncFuseClientFacade {
     ) -> Result<String, String> {
         let facade = self.facade.clone();
         let client_id = client_id.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             facade
                 .acquire_lease(
                     volume_id,
@@ -1473,7 +1545,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let client_id = client_id.to_string();
         let token = token.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             facade
                 .release_lease(volume_id, inode, stripe_start, &client_id, &token)
                 .await
@@ -1539,7 +1611,7 @@ impl SyncFuseClientFacade {
     ) -> Result<(String, u64), String> {
         let facade = self.facade.clone();
         let client_id = client_id.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             facade
                 .acquire_inode_lease(inode, &client_id, duration_ms)
                 .await
@@ -1571,7 +1643,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let client_id = client_id.to_string();
         let token = token.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             facade
                 .renew_inode_lease(inode, &client_id, &token, duration_ms)
                 .await
@@ -1588,7 +1660,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let name = name.to_string();
         let client_id = client_id.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
 
             // 解析 inode
@@ -1634,7 +1706,7 @@ impl SyncFuseClientFacade {
     ) -> Result<Vec<ProtoEntry>, String> {
         let facade = self.facade.clone();
         let client_id = client_id.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeMetadataProvider::new(facade);
             let entries = provider
                 .list_entries(inode, limit, &client_id)
@@ -1658,7 +1730,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let collection = collection.to_string();
         let replication = replication.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeVolumeProvider::new(facade.clone());
             let result = provider
                 .assign_volume(&collection, &replication)
@@ -1687,7 +1759,7 @@ impl SyncFuseClientFacade {
 
         log::info!("lookup_volume: starting for volume_id={}", vid);
 
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeVolumeProvider::new(facade.clone());
             let locations_result = provider.lookup_volume(volume_id).await;
 
@@ -1748,7 +1820,7 @@ impl SyncFuseClientFacade {
     ) -> Result<(), String> {
         let _ = volume_addr;
         let facade = self.facade.clone();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
             provider
                 .write_blob(volume_id, file_key, offset, size, &data)
@@ -1772,7 +1844,7 @@ impl SyncFuseClientFacade {
         let _ = volume_addr;
         let facade = self.facade.clone();
         let lease_owned = lease_token.map(|s| s.to_string());
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
             let lease_ref = lease_owned.as_deref();
             provider
@@ -1792,7 +1864,7 @@ impl SyncFuseClientFacade {
     ) -> Result<Vec<u8>, String> {
         let _ = volume_addr;
         let facade = self.facade.clone();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
             match provider.read_blob(volume_id, file_key, offset, size).await {
                 Ok(data) => Ok(data),
@@ -1819,7 +1891,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let lease_owned = lease_token.map(|s| s.to_string());
         let timeout = self.facade.config.request_timeout;
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let futures: Vec<_> = requests
                 .into_iter()
                 .map(|req| {
@@ -1859,7 +1931,7 @@ impl SyncFuseClientFacade {
     /// Batch read multiple chunks in parallel using tokio::join_all.
     pub fn read_blob_batch(&self, requests: Vec<ReadBlobRequest>) -> Vec<Result<Vec<u8>, String>> {
         let facade = self.facade.clone();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let futures: Vec<_> = requests
                 .into_iter()
                 .map(|req| {
@@ -1879,7 +1951,7 @@ impl SyncFuseClientFacade {
 
     pub fn delete_blob(&self, volume_id: u64, file_key: u64) -> Result<(), String> {
         let facade = self.facade.clone();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
             provider
                 .delete_blob(volume_id, file_key)
@@ -1895,7 +1967,7 @@ impl SyncFuseClientFacade {
         file_key: u64,
     ) -> Result<(), String> {
         let facade = self.facade.clone();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let provider = crate::provider_adapter::FacadeStorageProvider::new(facade);
             provider
                 .delete_blob(volume_id, file_key)
@@ -1928,7 +2000,7 @@ impl SyncFuseClientFacade {
         let facade = self.facade.clone();
         let name = name.to_string();
         let target = target.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let shard_id = facade.meta_shard_client().calculate_shard_id(parent);
             let payload = {
                 let mut enc = powerfs_net::TlvEncoder::new();
@@ -1990,7 +2062,7 @@ impl SyncFuseClientFacade {
     /// 读取符号链接
     pub fn readlink(&self, inode: u64) -> Result<String, String> {
         let facade = self.facade.clone();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let shard_id = facade.meta_shard_client().calculate_shard_id(inode);
             let payload = {
                 let mut enc = powerfs_net::TlvEncoder::new();
@@ -2046,7 +2118,7 @@ impl SyncFuseClientFacade {
     pub fn link(&self, inode: u64, newparent: u64, name: &str) -> Result<u64, String> {
         let facade = self.facade.clone();
         let name = name.to_string();
-        self.runtime.block_on(async move {
+        self.block_on(async move {
             let shard_id = facade.meta_shard_client().calculate_shard_id(newparent);
             let payload = {
                 let mut enc = powerfs_net::TlvEncoder::new();
@@ -2080,7 +2152,7 @@ impl SyncFuseClientFacade {
     /// 查询集群级 StatFs (同步)
     pub fn statfs(&self) -> Result<crate::volume_client::FsStats, String> {
         let facade = self.facade.clone();
-        self.runtime.block_on(async move { facade.statfs().await })
+        self.block_on(async move { facade.statfs().await })
     }
 }
 

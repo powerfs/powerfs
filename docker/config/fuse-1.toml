@@ -17,6 +17,12 @@ replication = "000"
 threads = 8
 verbose = true
 container = true
+# Fallback when master topology has no healthy filer shards yet.
+force_mount = true
+filer_addresses = ["172.30.0.31", "172.30.0.32", "172.30.0.33"]
+volume_addresses = ["172.30.0.21", "172.30.0.22", "172.30.0.23",
+                    "172.30.0.24", "172.30.0.25", "172.30.0.26"]
+request_timeout_secs = 10
 
 [fuse.lease]
 mode = "range"

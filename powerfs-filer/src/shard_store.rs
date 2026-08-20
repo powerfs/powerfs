@@ -193,8 +193,48 @@ impl ShardStore {
             ColumnFamilyDescriptor::new(CF_PENDING_RECLAIMS, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_LEASES, make_cf_opts()),
         ];
+        let known_names: std::collections::HashSet<&'static str> = [
+            CF_INODES,
+            CF_DIR_ENTRIES,
+            CF_STATS,
+            CF_METADATA,
+            CF_ORSET_STATE,
+            CF_TOMBSTONES,
+            CF_PENDING_RECLAIMS,
+            CF_LEASES,
+        ]
+        .iter()
+        .cloned()
+        .collect();
 
-        let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
+        // Robust open: first list existing CFs on-disk, then build the final
+        // descriptor list as (existing set ∪ known set). This avoids the
+        // classic `Column families not opened` crash when a new CF was added
+        // to the code but the DB on disk carries it, or when a historical CF
+        // was persisted by an older binary that we still want to open.
+        let mut final_descriptors: Vec<ColumnFamilyDescriptor> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(existing) = DB::list_cf(&opts, db_path) {
+            for name in existing {
+                if name == "default" {
+                    continue;
+                }
+                let opts_cf = if known_names.contains(name.as_str()) {
+                    make_cf_opts()
+                } else {
+                    rocksdb::Options::default()
+                };
+                seen.insert(name.clone());
+                final_descriptors.push(ColumnFamilyDescriptor::new(name, opts_cf));
+            }
+        }
+        for desc in cf_descriptors {
+            if !seen.contains(desc.name()) {
+                final_descriptors.push(desc);
+            }
+        }
+
+        let db = DB::open_cf_descriptors(&opts, db_path, final_descriptors)
             .map_err(|e| format!("failed to open rocksdb: {}", e))?;
 
         let mut store = Self {
