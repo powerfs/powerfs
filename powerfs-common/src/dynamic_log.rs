@@ -69,15 +69,15 @@ pub const DEFAULT_FLAGS: &[&str] = &[
     "fuse_lookup_trace",     // lookup 路径（含 lease 跳过）
     "fuse_writeback_trace",  // write/release 同步路径
     // Filer 服务端
-    "filer_raft_trace",      // Raft propose/commit/apply
-    "filer_create_trace",    // handle_create 全流程
-    "filer_redirect_trace",  // leader 重定向
-    "filer_lease_trace",     // 服务端 lease 管理
+    "filer_raft_trace",     // Raft propose/commit/apply
+    "filer_create_trace",   // handle_create 全流程
+    "filer_redirect_trace", // leader 重定向
+    "filer_lease_trace",    // 服务端 lease 管理
     // Master
     "master_topology_trace", // 拓扑/路由变更
     // 通用
-    "rpc_trace",             // RPC 发送/接收/重试
-    "routing_trace",         // shard 路由计算
+    "rpc_trace",     // RPC 发送/接收/重试
+    "routing_trace", // shard 路由计算
 ];
 
 fn parse_level(s: &str) -> Result<LevelFilter, String> {
@@ -179,7 +179,10 @@ pub fn set_flag(name: &str, on: bool) {
 /// }
 /// ```
 pub fn flag(name: &str) -> bool {
-    flags().get(name).map(|v| v.load(Ordering::Relaxed)).unwrap_or(false)
+    flags()
+        .get(name)
+        .map(|v| v.load(Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 /// 列出所有已注册的开关及其当前状态。
@@ -218,21 +221,20 @@ fn install_wrapper() {
         return; // 已经安装
     }
     // 用 Debug 级别创建 env_logger（放行所有），target 过滤由 wrapper 做
-    let env_logger = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("debug"),
-    )
-    .format(|buf, record| {
-        use std::io::Write;
-        writeln!(
-            buf,
-            "[{}] [{}] [{}] {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            record.level(),
-            record.target(),
-            record.args()
-        )
-    })
-    .build();
+    let env_logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug"))
+            .format(|buf, record| {
+                use std::io::Write;
+                writeln!(
+                    buf,
+                    "[{}] [{}] [{}] {}",
+                    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                    record.level(),
+                    record.target(),
+                    record.args()
+                )
+            })
+            .build();
 
     let wrapper = TargetFilterLogger { env_logger };
     let _ = WRAPPER_LOGGER.set(wrapper);
@@ -241,8 +243,7 @@ fn install_wrapper() {
     // OnceLock 保证 wrapper 存活到进程结束，因此引用是 'static 的。
     // INSTALLED AtomicBool 保证只调一次 set_logger。
     let logger_ref: &'static TargetFilterLogger = WRAPPER_LOGGER.get().unwrap();
-    log::set_logger(logger_ref as &'static dyn log::Log)
-        .expect("set_logger failed");
+    log::set_logger(logger_ref as &'static dyn log::Log).expect("set_logger failed");
     log::set_max_level(LevelFilter::Debug);
 }
 

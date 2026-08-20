@@ -766,10 +766,7 @@ impl MetaShardManager {
             let result: Result<(), String> = if shard_ino == shard_dir {
                 // Same shard: batch both entries into one Raft message.
                 self.raft_group_manager
-                    .propose_many(
-                        shard_ino,
-                        vec![cmd_ino.serialize(), cmd_dir.serialize()],
-                    )
+                    .propose_many(shard_ino, vec![cmd_ino.serialize(), cmd_dir.serialize()])
                     .await
                     .map(|_| ())
             } else {
@@ -780,12 +777,11 @@ impl MetaShardManager {
                     .propose(shard_ino, cmd_ino.serialize())
                     .await
                 {
-                    Ok(_) => {
-                        self.raft_group_manager
-                            .propose(shard_dir, cmd_dir.serialize())
-                            .await
-                            .map(|_| ())
-                    }
+                    Ok(_) => self
+                        .raft_group_manager
+                        .propose(shard_dir, cmd_dir.serialize())
+                        .await
+                        .map(|_| ()),
                     Err(e) => Err(e),
                 }
             };
@@ -798,7 +794,8 @@ impl MetaShardManager {
                     "create async(staged): propose FAILED for inode={} parent={} name={}: {} — removing staging, client will retry",
                     inode, parent_inode, name, e
                 );
-                self.meta_cache.invalidate_staging(inode, parent_inode, name);
+                self.meta_cache
+                    .invalidate_staging(inode, parent_inode, name);
                 return Err(e);
             }
 
@@ -979,6 +976,15 @@ impl MetaShardManager {
         name: &str,
         inode: u64,
     ) -> Result<(), String> {
+        // Stage the deletion BEFORE proposing Raft so the entry becomes
+        // immediately invisible to subsequent reads (POSIX semantics on the
+        // same client). MetaCache Deleted markers are swept after Raft
+        // apply confirms RemoveDirEntry/DeleteInode; if propose fails, we
+        // fall back to ShardStore (stale Deleted markers never win over
+        // live entries on a propose failure because lookup/getattr call
+        // `get_dir_entry_inode`/`get_inode` after MetaCache misses).
+        self.meta_cache.stage_delete(parent_inode, name, inode);
+
         let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
         let shard_ino = self.shard_strategy.calculate_shard(inode);
 
@@ -987,8 +993,7 @@ impl MetaShardManager {
             parent_inode,
             name: name.to_string(),
         };
-        self.propose_meta(shard_dir, cmd_dir.serialize())
-            .await?;
+        self.propose_meta(shard_dir, cmd_dir.serialize()).await?;
 
         if !self.is_async_meta_persist() {
             self.wait_for_entry_removed(shard_dir, parent_inode, name)
@@ -1011,10 +1016,7 @@ impl MetaShardManager {
             // Hardlink: decrement nlink, keep inode alive for remaining links.
             let expected_nlink = nlink - 1;
             let cmd = ShardCommand::DecrementNlink { inode };
-            if let Err(e) = self
-                .propose_meta(shard_ino, cmd.serialize())
-                .await
-            {
+            if let Err(e) = self.propose_meta(shard_ino, cmd.serialize()).await {
                 log::warn!(
                     "DecrementNlink propose failed for inode {} on shard {}: {}. \
                      Dir entry already removed; nlink may be stale.",
@@ -1035,10 +1037,7 @@ impl MetaShardManager {
             // Last link: delete the inode record. Best-effort: if this fails,
             // GC will collect the orphan inode later.
             let cmd_ino = ShardCommand::DeleteInode { inode };
-            if let Err(e) = self
-                .propose_meta(shard_ino, cmd_ino.serialize())
-                .await
-            {
+            if let Err(e) = self.propose_meta(shard_ino, cmd_ino.serialize()).await {
                 log::warn!(
                     "DeleteInode propose failed for inode {} on shard {}: {}. \
                      Dir entry already removed; inode will be GC'd.",
@@ -1066,10 +1065,7 @@ impl MetaShardManager {
     /// (sequential `delete_file`) to 2 (one for dir entries, one for inodes).
     ///
     /// Returns per-entry `Result<(), String>`. Entry indices match input order.
-    pub async fn batch_delete_files(
-        &self,
-        entries: &[(u64, String)],
-    ) -> Vec<Result<(), String>> {
+    pub async fn batch_delete_files(&self, entries: &[(u64, String)]) -> Vec<Result<(), String>> {
         let n = entries.len();
         let mut results = vec![Ok(()); n];
 
@@ -1103,6 +1099,13 @@ impl MetaShardManager {
 
         if resolved.is_empty() {
             return results;
+        }
+
+        // Stage all deletions BEFORE the Raft propose so subsequent reads
+        // on this filer immediately return ENOENT (matches POSIX semantics
+        // for a single client thread that unlinks then stats).
+        for (_, parent_inode, inode, name) in &resolved {
+            self.meta_cache.stage_delete(*parent_inode, name, *inode);
         }
 
         // Step 2: Batch all RemoveDirEntry commands into one propose_many on
@@ -1176,11 +1179,7 @@ impl MetaShardManager {
                 })
                 .collect();
 
-            match self
-                .raft_group_manager
-                .propose_many(*shard_ino, cmds)
-                .await
-            {
+            match self.raft_group_manager.propose_many(*shard_ino, cmds).await {
                 Ok(_) => {
                     debug!(
                         "batch_delete: Phase B committed {} inode ops to shard {}",
@@ -1255,7 +1254,11 @@ impl MetaShardManager {
         let inode = self.alloc_inode_in_shard(target_shard);
         let now = chrono::Utc::now().timestamp() as u64;
         // Ensure S_IFDIR bit is set even if caller only provided perms.
-        let dir_mode = if mode & 0o170000 != 0 { mode } else { mode | 0o040000 };
+        let dir_mode = if mode & 0o170000 != 0 {
+            mode
+        } else {
+            mode | 0o040000
+        };
         let info = InodeInfo {
             inode,
             name: name.to_string(),
@@ -1500,8 +1503,7 @@ impl MetaShardManager {
                 new_name: new_name.to_string(),
             };
 
-            self.propose_meta(old_shard, cmd.serialize())
-                .await?;
+            self.propose_meta(old_shard, cmd.serialize()).await?;
 
             if !self.is_async_meta_persist() {
                 self.wait_for_entry_appeared(old_shard, new_parent_inode, new_name)
@@ -1531,8 +1533,7 @@ impl MetaShardManager {
                 name: new_name.to_string(),
                 inode,
             };
-            self.propose_meta(new_shard, add_cmd.serialize())
-                .await?;
+            self.propose_meta(new_shard, add_cmd.serialize()).await?;
             if !self.is_async_meta_persist() {
                 self.wait_for_entry_appeared(new_shard, new_parent_inode, new_name)
                     .await;
@@ -1543,8 +1544,7 @@ impl MetaShardManager {
                 parent_inode: old_parent_inode,
                 name: old_name.to_string(),
             };
-            self.propose_meta(old_shard, rem_cmd.serialize())
-                .await?;
+            self.propose_meta(old_shard, rem_cmd.serialize()).await?;
             if !self.is_async_meta_persist() {
                 self.wait_for_entry_removed(old_shard, old_parent_inode, old_name)
                     .await;
@@ -1557,10 +1557,7 @@ impl MetaShardManager {
                 new_name: new_name.to_string(),
                 new_parent_inode,
             };
-            if let Err(e) = self
-                .propose_meta(inode_shard, rename_cmd.serialize())
-                .await
-            {
+            if let Err(e) = self.propose_meta(inode_shard, rename_cmd.serialize()).await {
                 log::warn!(
                     "cross-shard rename: RenameInode proposal failed (dir entries already moved): {}",
                     e
@@ -1580,9 +1577,7 @@ impl MetaShardManager {
                     mtime: Some(now),
                     atime: Some(now),
                 };
-                let _ = self
-                    .propose_meta(p_shard, attr_cmd.serialize())
-                    .await;
+                let _ = self.propose_meta(p_shard, attr_cmd.serialize()).await;
             }
 
             Ok(())
@@ -1693,19 +1688,25 @@ impl MetaShardManager {
     }
 
     pub fn get_inode(&self, inode: u64) -> Option<InodeInfo> {
-        // P3: Check MetaCache staging first — newly created inodes may
-        // not have been Raft-applied to ShardStore yet.
-        if let Some(staging_result) = self.meta_cache.get_inode(inode) {
-            return staging_result;
+        // P3: Check MetaCache first (Staging/Dirty/Clean entries, plus Deleted
+        // marker for pending unlinks). If the entry is already there, return
+        // directly — skips a RocksDB round-trip + deserialization.
+        if let Some(cached_result) = self.meta_cache.get_inode(inode) {
+            return cached_result;
         }
 
-        // Not in staging → check ShardStore (RocksDB-backed in-memory cache)
+        // Cache miss → fetch from ShardStore and write back as Clean so the
+        // next lookup hits the fast path.
         let shard_id = self.shard_strategy.calculate_shard(inode);
 
         let stores = self.shard_stores.read().unwrap();
         let shard_store = stores.get(&shard_id)?;
 
-        shard_store.get_inode(inode)
+        let info = shard_store.get_inode(inode)?;
+        if info.delete_time == 0 {
+            self.meta_cache.cache_put_clean(info.clone());
+        }
+        Some(info)
     }
 
     /// 遍历所有 shard 的所有 inode, 收集 chunk 映射 (needle_id, volume_id).
@@ -2121,7 +2122,11 @@ impl MetaShardManager {
             atime: now,
             ctime: now,
             // Ensure S_IFREG is set even if the caller only passed permission bits
-            mode: if mode & 0o170000 != 0 { mode } else { mode | 0o100000 },
+            mode: if mode & 0o170000 != 0 {
+                mode
+            } else {
+                mode | 0o100000
+            },
             uid,
             gid,
             blocks: 0,
@@ -2216,8 +2221,7 @@ impl MetaShardManager {
             size,
             mtime: chrono::Utc::now().timestamp_millis() as u64 * 1_000_000,
         };
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
         Ok(())
     }
 
@@ -2238,8 +2242,7 @@ impl MetaShardManager {
                 new_name: new_name.to_string(),
             };
 
-            self.propose_meta(old_shard_id, cmd.serialize())
-                .await?;
+            self.propose_meta(old_shard_id, cmd.serialize()).await?;
 
             if !self.is_async_meta_persist() {
                 self.wait_for_entry_appeared(old_shard_id, new_parent_ino, new_name)
@@ -2264,6 +2267,37 @@ impl MetaShardManager {
         mtime: Option<u64>,
         atime: Option<u64>,
     ) -> Result<(), String> {
+        // MetaCache Dirty write-through: apply the caller's intended values to
+        // the cached copy BEFORE the Raft propose. Subsequent getattrs on this
+        // filer see the new mode/uid/... immediately (no stale reads between
+        // propose and apply). The Dirty flag is demoted to Clean once ShardStore
+        // apply confirms via confirm_dirty().
+        let current_for_dirty = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).and_then(|s| s.get_inode(inode))
+        };
+        let meta_cache = self.meta_cache.clone();
+        meta_cache.mark_dirty(inode, current_for_dirty, |info| {
+            if let Some(sz) = size {
+                info.size = sz;
+            }
+            if let Some(m) = mode {
+                info.mode = (m as u32) & 0o7777;
+            }
+            if let Some(u) = uid {
+                info.uid = u as u32;
+            }
+            if let Some(g) = gid {
+                info.gid = g as u32;
+            }
+            if let Some(mt) = mtime {
+                info.mtime = mt;
+            }
+            if let Some(at) = atime {
+                info.atime = at;
+            }
+        });
+
         let cmd = ShardCommand::SetAttr {
             inode,
             size,
@@ -2274,8 +2308,7 @@ impl MetaShardManager {
             atime,
         };
 
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for the command to be applied to the state
         // machine. Must check ALL changed fields (mode, uid, gid, size), not
@@ -2340,10 +2373,21 @@ impl MetaShardManager {
         shard_id: ShardId,
         size: Option<u64>,
     ) -> Result<(), String> {
+        // MetaCache Dirty write-through for size (same rationale as setattr()).
+        let current_for_dirty = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).and_then(|s| s.get_inode(inode))
+        };
+        self.meta_cache
+            .mark_dirty(inode, current_for_dirty, |info| {
+                if let Some(sz) = size {
+                    info.size = sz;
+                }
+            });
+
         let cmd = ShardCommand::SetAttrData { inode, size };
 
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for the command to be applied.
         //
@@ -2492,7 +2536,14 @@ impl MetaShardManager {
         }
         inode_info.version = timestamp;
 
+        // MetaCache Dirty write-through for setattr_meta: the CRDT merged
+        // value is what we intend; Raft apply confirms it via SetAttrMeta
+        // handler.
+        let merged_copy = inode_info.clone();
         store.update_inode(inode_info)?;
+        self.meta_cache.mark_dirty(inode, Some(merged_copy), |_| {
+            // merged_copy already reflects the final state; no further change.
+        });
 
         debug!(
             "setattr_meta CRDT merged: inode={}, mode={:?}, uid={:?}, gid={:?}, client={}, ts={}",
@@ -2523,8 +2574,7 @@ impl MetaShardManager {
             size,
         };
 
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for the command to be applied.
         // In async mode, propose_meta returns immediately; readers retry.
@@ -2566,8 +2616,7 @@ impl MetaShardManager {
             value,
         };
 
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for the command to be applied.
         // In async mode, propose_meta returns immediately; readers retry.
@@ -2607,8 +2656,7 @@ impl MetaShardManager {
             key: key.to_string(),
         };
 
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for the command to be applied.
         // In async mode, propose_meta returns immediately; readers retry.
@@ -2653,8 +2701,7 @@ impl MetaShardManager {
             replica_chunks,
         };
 
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for the command to be applied.
         // In async mode, propose_meta returns immediately. This is a
@@ -2701,8 +2748,7 @@ impl MetaShardManager {
             ec_chunks,
         };
 
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for the command to be applied.
         if !self.is_async_meta_persist() {
@@ -2893,21 +2939,25 @@ impl MetaShardManager {
         name: &str,
         shard_id: ShardId,
     ) -> Result<u64, String> {
-        // P3: Check MetaCache staging first — newly created dir entries
-        // may not have been Raft-applied to ShardStore yet.
-        if let Some(staging_result) = self.meta_cache.get_direntry(parent_inode, name) {
-            return staging_result.ok_or_else(|| "entry not found".to_string());
+        // P3: Check MetaCache first (Staging/Dirty/Clean + Deleted markers for
+        // pending unlinks). Hit skips the ShardStore dir-index lookup.
+        if let Some(cached_result) = self.meta_cache.get_direntry(parent_inode, name) {
+            return cached_result.ok_or_else(|| "entry not found".to_string());
         }
 
-        // Not in staging → check ShardStore
+        // Miss → read from ShardStore and backfill a Clean direntry so the
+        // next lookup on this (parent, name) pair is served from MetaCache.
         let stores = self.shard_stores.read().unwrap();
         let shard_store = stores
             .get(&shard_id)
             .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
 
-        shard_store
+        let child = shard_store
             .get_dir_entry_inode(parent_inode, name)
-            .ok_or_else(|| "entry not found".to_string())
+            .ok_or_else(|| "entry not found".to_string())?;
+        self.meta_cache
+            .cache_put_clean_direntry(parent_inode, name, child);
+        Ok(child)
     }
 
     pub async fn get_entry(&self, inode: u64, shard_id: ShardId) -> Result<InodeInfo, String> {
@@ -3165,8 +3215,7 @@ impl MetaShardManager {
             name: bucket.to_string(),
             inode,
         };
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for apply (increased timeout to accommodate
         // propose forwarding latency: follower → leader → commit →
@@ -3431,8 +3480,7 @@ impl MetaShardManager {
             inline_data,
             is_append,
         };
-        self.propose_meta(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         // Strict mode only: Wait for the apply to complete on this (leader)
         // node so that notify_inode_change and subsequent reads see the

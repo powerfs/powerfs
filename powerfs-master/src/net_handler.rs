@@ -205,9 +205,7 @@ impl MasterNetHandler {
         // Volume lookup reads topology state. Redirect non-leader requests
         // to ensure the client gets up-to-date volume routing from the leader.
         if !self.master.is_leader().await {
-            return self
-                .build_redirect_response(msg, "NET_LOOKUP_VOLUME")
-                .await;
+            return self.build_redirect_response(msg, "NET_LOOKUP_VOLUME").await;
         }
 
         let original_id: u64 = volume_id_str.parse().unwrap_or(0);
@@ -481,9 +479,7 @@ impl MasterNetHandler {
     ) -> Result<NetMessage, powerfs_net::NetError> {
         // If not leader, redirect client to the actual leader
         if !self.master.is_leader().await {
-            return self
-                .build_redirect_response(msg, "NET_GET_TOPOLOGY")
-                .await;
+            return self.build_redirect_response(msg, "NET_GET_TOPOLOGY").await;
         }
 
         // Leader path: fetch own leader address (self) for the response body
@@ -891,8 +887,8 @@ impl MasterNetHandler {
             config.flags.len()
         );
 
-        let body = powerfs_net::serialize::encode_get_debug_config_resp(&config)
-            .unwrap_or_default();
+        let body =
+            powerfs_net::serialize::encode_get_debug_config_resp(&config).unwrap_or_default();
         Ok(Self::build_response(msg, STATUS_OK, body, Vec::new()))
     }
 
@@ -993,11 +989,7 @@ impl MasterNetHandler {
     /// 否则客户端拿到空 leader 会无限重连或失败，形成路由黑洞。
     ///
     /// `ctx`：调用上下文名（如 "NET_ASSIGN"），用于告警定位。
-    async fn build_redirect_response(
-        &self,
-        msg: &NetMessage,
-        ctx: &str,
-    ) -> NetResult<NetMessage> {
+    async fn build_redirect_response(&self, msg: &NetMessage, ctx: &str) -> NetResult<NetMessage> {
         let leader = self.master.get_leader().await;
         if leader.is_empty() {
             warn!(
@@ -1013,10 +1005,7 @@ impl MasterNetHandler {
                 Vec::new(),
             ));
         }
-        debug!(
-            "{}: not leader, redirecting to leader at {}",
-            ctx, leader
-        );
+        debug!("{}: not leader, redirecting to leader at {}", ctx, leader);
         let mut enc = TlvEncoder::new();
         let _ = enc.add_string(FieldId::Owner, &leader);
         Ok(Self::build_response(

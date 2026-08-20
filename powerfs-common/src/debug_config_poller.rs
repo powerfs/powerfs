@@ -75,7 +75,10 @@ impl DebugConfigPoller {
                         Err(e) => {
                             warn!(
                                 "DEBUG_CONFIG_POLLER: fetch from {}:{} failed (attempt {}): {}",
-                                host, port, attempt + 1, e
+                                host,
+                                port,
+                                attempt + 1,
+                                e
                             );
                         }
                     }

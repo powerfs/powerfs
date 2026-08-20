@@ -1503,13 +1503,7 @@ impl FilerNetHandler {
             // separate setattr() follow-up propose that added one Raft round
             // per mkdir. The mode/u64 → u32 truncation is safe because POSIX
             // permission + type bits fit in u32.
-            .create_directory(
-                parent_ino,
-                &name,
-                mode as u32,
-                uid as u32,
-                gid as u32,
-            )
+            .create_directory(parent_ino, &name, mode as u32, uid as u32, gid as u32)
             .await
         {
             Ok(info) => {
@@ -1610,7 +1604,7 @@ impl FilerNetHandler {
         {
             Ok(info) => {
                 // Return full attributes (same format as handle_mkdir)
-                let dir_mode = (mode | 0o040000) as u32;
+                let dir_mode = mode | 0o040000;
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, info.inode);
                 enc.add_u32(FieldId::Mode, dir_mode);
@@ -1826,10 +1820,7 @@ impl FilerNetHandler {
 
         // Batch delete via propose_many: one Raft cycle for all RemoveDirEntry,
         // one per distinct inode shard for DeleteInode/DecrementNlink.
-        let results = self
-            .meta_shard_manager
-            .batch_delete_files(&entries)
-            .await;
+        let results = self.meta_shard_manager.batch_delete_files(&entries).await;
 
         let mut statuses: Vec<u32> = Vec::with_capacity(entries.len());
         let mut any_ok = false;
@@ -1837,10 +1828,7 @@ impl FilerNetHandler {
             match result {
                 Ok(_) => {
                     let (parent_ino, name) = &entries[i];
-                    info!(
-                        "FILER_NET_BATCH_UNLINK: deleted '{}/{}'",
-                        parent_ino, name
-                    );
+                    info!("FILER_NET_BATCH_UNLINK: deleted '{}/{}'", parent_ino, name);
                     let v = self.next_version();
                     self.notify_inode_change(*parent_ino, v);
                     statuses.push(STATUS_OK as u32);
@@ -1864,9 +1852,13 @@ impl FilerNetHandler {
             }
         }
 
-        let resp_body = powerfs_net::serialize::encode_batch_unlink_resp(&statuses)
-            .unwrap_or_default();
-        let overall_status = if any_ok { STATUS_OK } else { STATUS_ERR_NOT_FOUND };
+        let resp_body =
+            powerfs_net::serialize::encode_batch_unlink_resp(&statuses).unwrap_or_default();
+        let overall_status = if any_ok {
+            STATUS_OK
+        } else {
+            STATUS_ERR_NOT_FOUND
+        };
         Ok(Self::build_response(msg, overall_status, resp_body))
     }
 

@@ -288,8 +288,7 @@ fn main() {
         .expect("Failed to create FUSE client");
 
         // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
-        let node_id = std::env::var("HOSTNAME")
-            .unwrap_or_else(|_| "fuse-unknown".to_string());
+        let node_id = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse-unknown".to_string());
         let master_endpoints: Vec<(String, u16)> = master_addrs
             .iter()
             .map(|a| (a.clone(), master_net_port))

@@ -81,6 +81,45 @@ pub struct InodeInfo {
     pub replica_chunks: Vec<StoredFileChunk>,
 }
 
+impl InodeInfo {
+    /// Build a minimal tombstone used by MetaCache Deleted state.
+    ///
+    /// When an entry is in `Deleted` state, the caller short-circuits with
+    /// ENOENT, so the only meaningful field is `inode` (used as HashMap key).
+    pub fn tombstone(inode: u64) -> Self {
+        use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
+
+        Self {
+            inode,
+            name: String::new(),
+            parent_inode: 0,
+            file_type: FileType::File,
+            size: 0,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: Vec::new(),
+            inline_data: None,
+            extended: std::collections::HashMap::new(),
+            symlink_target: None,
+            nlink: 0,
+            version: 0,
+            delete_time: 0,
+            reliability: Reliability::default(),
+            reliability_state: ReliabilityState::default(),
+            compression_state: CompressionState::default(),
+            replica_chunks: Vec::new(),
+        }
+    }
+}
+
 /// Lightweight directory entry for readdir responses.
 /// Contains only the fields needed by readdir, avoiding expensive
 /// clones of chunks/inline_data/extended/replica_chunks from full InodeInfo.
@@ -585,9 +624,15 @@ impl ShardStore {
                 atime,
             } => {
                 self.setattr(inode, size, mode, uid, gid, mtime, atime);
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_dirty(inode);
+                }
             }
             ShardCommand::SetAttrData { inode, size } => {
                 self.setattr_data(inode, size);
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_dirty(inode);
+                }
             }
             ShardCommand::SetAttrMeta {
                 inode,
@@ -600,6 +645,9 @@ impl ShardStore {
                 timestamp: _,
             } => {
                 self.setattr_meta(inode, mode, uid, gid, mtime, atime);
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_dirty(inode);
+                }
             }
             ShardCommand::CreateSymlink {
                 parent_inode,

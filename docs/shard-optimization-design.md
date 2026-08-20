@@ -141,48 +141,61 @@
 
 ### 3.1 目录范围分片
 
+> **更新（与 [sharding-and-dot-fix-plan.md](sharding-and-dot-fix-plan.md) 方案 2 +
+> [shard-routing-no-forward-principle.md](shard-routing-no-forward-principle.md) §2 对齐）**：
+> 本节描述的"父子目录尽量同分片"的分片**目标**仍然有效，但具体算法已迭代为
+> **per-shard inode 分配器 + `calculate_shard(inode) = inode_range`** 的实现，
+> 不再使用下方伪代码中的"父目录 inode 高位"算法。下方伪代码仅作历史设计参考。
+
 **核心思想**：按目录树层级切分，父子目录尽量落在同一片
 
 ```
-目录树结构：
-/
-├── home/                ──► Shard-0 (inode: 0-1M)
-│   ├── user1/           ──► Shard-0
-│   │   ├── docs/        ──► Shard-0
-│   │   └── photos/      ──► Shard-0
-│   └── user2/           ──► Shard-0
-│       └── videos/      ──► Shard-0
-├── data/                ──► Shard-1 (inode: 1M-2M)
-│   ├── logs/            ──► Shard-1
-│   └── backup/          ──► Shard-1
-└── tmp/                 ──► Shard-2 (inode: 2M-3M)
+目录树结构（目标分布；子目录换片实现逐层分散）：
+/                         ──► Shard-0 (inode: 0-1M)
+├── home/                 ──► Shard-1 (inode: 1M-2M)   ← 子目录换片
+│   ├── user1/            ──► Shard-2 (inode: 2M-3M)   ← 再换片
+│   │   ├── docs/         ──► Shard-0
+│   │   └── photos/       ──► Shard-0
+│   └── user2/            ──► Shard-2
+├── data/                 ──► Shard-1
+│   ├── logs/             ──► Shard-2
+│   └── backup/           ──► Shard-2
+└── tmp/                  ──► Shard-1
 ```
 
-**分片键计算**：
+**当前实现**（per-shard inode 范围映射，非下方伪代码的"高位"算法）：
 
 ```rust
-// 分片键 = 目录inode前缀
-// 顶级目录inode直接决定分片
+// 分片键 = inode 所在的范围段（每 shard 1M inode）
+// 文件从 parent_shard 分配 inode → 天然同分片
+// 子目录从 pick_child_dir_shard(parent_shard) 分配 → 换片负载均衡
 fn calculate_shard(inode: u64) -> ShardId {
-    // 获取父目录inode（如果是文件）
-    let parent_inode = get_parent_inode(inode);
-    
-    // 分片键 = 父目录inode的高位部分
-    let shard_key = parent_inode >> 24; // 取高8位作为分片键
-    
-    // 根据分片键映射到分片ID
-    ShardId(shard_key % SHARD_COUNT)
+    // 每个 shard 固定 1M inode 范围：shard 0 = [0, 1M), shard 1 = [1M, 2M), ...
+    ShardId((inode / INODE_PER_SHARD) as u64)
+}
+
+// 子目录换片：round-robin 到下一个 shard
+pub fn pick_child_dir_shard(&self, parent_shard: ShardId) -> ShardId {
+    let count = self.shard_strategy.get_shard_count();
+    if count <= 1 { return parent_shard; }
+    ShardId((parent_shard.0 + 1) % count)
 }
 ```
+
+> **注意**：子目录换片后 `calculate_shard(child_inode) != calculate_shard(parent_inode)`，
+> 因此子目录创建是**跨 shard 操作**，由客户端两阶段协调（`MkdirPhaseA` + `MkdirPhaseB`），
+> 见 [shard-routing-no-forward-principle.md §2.2-§3](shard-routing-no-forward-principle.md)。
+> **绝不服务间转发。**
 
 **优势**：
 
 | 场景 | 说明 |
 |------|------|
-| **创建文件** | 同目录下的文件天然同分片 |
+| **创建文件** | 同目录下的文件天然同分片（inode 从 parent_shard 分配） |
 | **删除文件** | 同目录下的删除天然同分片 |
 | **列出目录** | 目录下所有文件同分片，一次查询完成 |
 | **重命名** | 同目录重命名单分片，跨目录重命名才需要跨分片 |
+| **创建子目录** | 跨 shard 两阶段（客户端协调，非服务间转发） |
 
 ### 3.2 分片分裂策略
 
@@ -572,16 +585,22 @@ pub async fn handle_conflict(
 
 ### 5.2 跨分片操作场景分析
 
+> **更新**：子目录创建的跨分片处理见
+> [shard-routing-no-forward-principle.md](shard-routing-no-forward-principle.md) §2-§3。
+> 服务端**绝不服务间转发**，跨分片操作由客户端协调。
+
 | 操作 | 场景 | 是否跨分片 | 处理方式 |
 |------|------|-----------|---------|
-| **创建文件** | 在目录内创建 | 否（同分片） | 直接写入 |
+| **创建文件** | 在目录内创建 | 否（同分片） | 直接写入（inode 从 parent_shard 分配） |
+| **创建子目录** | shard_count > 1 | 是（子目录换片） | 客户端两阶段：`MkdirPhaseA`(target_shard) + `MkdirPhaseB`(parent_shard) |
+| **创建子目录** | shard_count ≤ 1 | 否（同分片） | 单 shard 快速路径（原 `Mkdir`） |
 | **删除文件** | 删除目录内文件 | 否（同分片） | 直接删除 |
 | **修改文件** | 修改已有文件 | 否（同分片） | 直接更新 |
 | **列出目录** | 列出目录内容 | 否（同分片） | 一次查询 |
 | **重命名（同目录）** | 同一目录内重命名 | 否（同分片） | 直接操作 |
-| **重命名（跨目录）** | 不同目录间重命名 | 是 | 乐观2PC |
-| **移动文件（跨目录）** | 不同目录间移动 | 是 | 乐观2PC |
-| **创建硬链接** | 跨目录创建硬链接 | 是 | 乐观2PC |
+| **重命名（跨目录）** | 不同目录间重命名 | 是 | 客户端协调乐观2PC（非服务间转发） |
+| **移动文件（跨目录）** | 不同目录间移动 | 是 | 客户端协调乐观2PC |
+| **创建硬链接** | 跨目录创建硬链接 | 是 | 客户端协调乐观2PC |
 
 ---
 
@@ -645,7 +664,18 @@ pub async fn handle_conflict(
 
 ### 6.2 Filer核心组件
 
+> **设计原则更新（重要）**：下方 `MetaShardManager.route_to_remote()` 使用
+> `filer_client_pool.get_client(&shard_info.leader_addr)` 在**服务端**路由到远程 Filer ——
+> 这属于**服务间转发，已废弃**，违反 [shard-routing-no-forward-principle.md §1](shard-routing-no-forward-principle.md)
+> 的容错原则。
+>
+> **当前实现**：Filer 收到非本节点 leader 的 shard 写入请求时，**直接返回
+> `STATUS_ERR_REDIRECT` + 正确 leader 地址**，由客户端更新 `shard_router` 后直连正确 leader。
+> 服务端不再维护 `filer_client_pool` 用于转发，也不再调用 `route_to_remote`。
+> 下方代码仅作历史架构参考，**勿据此实现新功能**。
+
 ```rust
+// ⚠️ 已废弃 —— 服务间转发违反容错原则，见上方说明
 // powerfs-filer/src/meta_shard_manager.rs
 pub struct MetaShardManager {
     // Raft组管理器
@@ -654,18 +684,17 @@ pub struct MetaShardManager {
     // 本地分片存储
     shard_stores: HashMap<ShardId, Arc<ShardStore>>,
     
-    // 路由表缓存
+    // 路由表缓存（仅用于判断本节点是否是某 shard 的 leader，不再用于转发）
     route_table_cache: RouteTableCache,
     
-    // Filer客户端池（用于路由到其他Filer）
-    filer_client_pool: FilerClientPool,
+    // ❌ 已移除：filer_client_pool（服务间转发用，违反原则）
     
     // 分片统计
     shard_stats: ShardStatsManager,
 }
 
 impl MetaShardManager {
-    // 处理本地分片请求
+    // 处理本地分片请求（本节点是该 shard 的 leader 时）
     pub async fn handle_local_request(
         &self,
         shard_id: ShardId,
@@ -676,20 +705,16 @@ impl MetaShardManager {
         shard_store.handle_request(request).await
     }
     
-    // 路由到远程分片
-    pub async fn route_to_remote(
-        &self,
-        shard_id: ShardId,
-        request: MetaRequest,
-    ) -> Result<MetaResponse> {
-        let shard_info = self.route_table_cache.get_shard_info(shard_id).await?;
-        let client = self.filer_client_pool.get_client(&shard_info.leader_addr)?;
-        client.handle_meta_request(request).await
-    }
+    // ❌ 已废弃：route_to_remote —— 改为返回 STATUS_ERR_REDIRECT，由客户端重定向
+    // pub async fn route_to_remote(...) { ... } // 已删除
 }
 ```
 
 ### 6.3 Filer请求处理流程
+
+> **设计原则更新**：下方"远程分片 → FilerClientPool.route() → gRPC调用远程Filer"是
+> **服务间转发，已废弃**。当前实现中，Filer 遇到非本节点 leader 的 shard 请求时
+> **返回 `STATUS_ERR_REDIRECT`**，由客户端重定向。下方流程保留"本地分片"分支作为参考。
 
 ```
 请求入口：PUT /bucket/key
@@ -703,17 +728,22 @@ impl MetaShardManager {
    └─► 查询路由表 → ShardInfo
 
 3. 路由决策
-   ├─► 本地分片（当前Filer是Leader）
+   ├─► 本地分片（当前Filer是该 shard 的 Leader）
    │   └─► MetaShardManager.handle_local_request()
-   │       └─► RaftGroupManager.propose()
+   │       └─► RaftGroupManager.propose() / propose_ff()
    │       └─► DirectoryTree.apply()
    │       └─► 返回响应
    │
-   └─► 远程分片（其他Filer是Leader）
-       └─► FilerClientPool.route()
-           └─► gRPC调用远程Filer
-           └─► 返回响应
+   └─► 远程分片（其他Filer是该 shard 的 Leader）
+       └─► ❌ 已废弃：FilerClientPool.route() gRPC转发
+       └─► ✓ 当前实现：返回 STATUS_ERR_REDIRECT + 正确 leader 地址
+           └─► 客户端更新 shard_router 后直连正确 leader 重试
 ```
+
+> **客户端侧的等价流程**（FUSE/S3/CLI 客户端均如此）：
+> 客户端自己计算 `shard_id` 并查本地 `shard_router` 直连对应 leader；
+> 收到 REDIRECT 时更新路由表并重试。**请求第一次发送就应直连 leader**，
+> REDIRECT 只在路由表过期时作为兜底。
 
 ---
 
