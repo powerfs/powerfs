@@ -149,6 +149,13 @@ impl FilerMetaService for FilerMetaServiceImpl {
         let entry = entry.unwrap();
         let parent_path = entry.directory.clone();
         let name = entry.name.clone();
+        // P3.1: Extract mode/uid/gid from gRPC FuseAttributes for direct
+        // embedding in CreateInode. Defaults match POSIX expectations (0644
+        // regular file, uid=0 gid=0).
+        let (mode, uid, gid) = match &entry.attributes {
+            Some(attrs) => (attrs.mode, attrs.uid, attrs.gid),
+            None => (0o100644, 0, 0),
+        };
 
         let parent_inode = match self.meta_shard_manager.resolve_path(&parent_path).await {
             Ok(ino) => ino,
@@ -164,7 +171,7 @@ impl FilerMetaService for FilerMetaServiceImpl {
         let shard_id = self.inode_to_shard_id(parent_inode);
         let inode = match self
             .meta_shard_manager
-            .create_file_with_shard(parent_inode, &name, shard_id)
+            .create_file_with_shard(parent_inode, &name, shard_id, mode, uid, gid)
             .await
         {
             Ok(ino) => ino,

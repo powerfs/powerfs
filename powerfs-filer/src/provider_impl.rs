@@ -117,7 +117,7 @@ impl MetadataProvider for MetaShardManager {
             .unwrap_or(false);
 
         let inode = if is_dir {
-            self.create_directory(bucket_root_inode, &entry.name)
+            self.create_directory(bucket_root_inode, &entry.name, 0o040755, 0, 0)
                 .await
                 .map(|info| info.inode)
         } else {

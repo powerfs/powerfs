@@ -1237,6 +1237,13 @@ impl MetaShardManager {
         &self,
         parent_inode: u64,
         name: &str,
+        // P3.1: Real mode/uid/gid from the client, embedded directly in the
+        // CreateInode command. This eliminates the follow-up SetAttr propose
+        // in handle_mkdir (handle_mkdir_phase_a already had its own params so
+        // it does not need updating).
+        mode: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<InodeInfo, String> {
         // Phase 3: Allocate the directory's inode on a different shard from
         // the parent. The dir_entry goes on the parent's shard (so lookup
@@ -1247,6 +1254,8 @@ impl MetaShardManager {
         let target_shard = self.pick_child_dir_shard(parent_shard);
         let inode = self.alloc_inode_in_shard(target_shard);
         let now = chrono::Utc::now().timestamp() as u64;
+        // Ensure S_IFDIR bit is set even if caller only provided perms.
+        let dir_mode = if mode & 0o170000 != 0 { mode } else { mode | 0o040000 };
         let info = InodeInfo {
             inode,
             name: name.to_string(),
@@ -1256,9 +1265,9 @@ impl MetaShardManager {
             mtime: now,
             atime: now,
             ctime: now,
-            mode: 0o040755,
-            uid: 0,
-            gid: 0,
+            mode: dir_mode,
+            uid,
+            gid,
             blocks: 0,
             fid: None,
             volume_id: None,
@@ -1431,7 +1440,9 @@ impl MetaShardManager {
                 current_inode = ino;
             } else {
                 // Create this directory component
-                let info = self.create_directory(current_inode, part).await?;
+                let info = self
+                    .create_directory(current_inode, part, 0o040755, 0, 0)
+                    .await?;
                 current_inode = info.inode;
             }
         }
@@ -2086,6 +2097,12 @@ impl MetaShardManager {
         // `calculate_shard(parent_inode)`. Kept in the signature so FUSE
         // clients that still pass `ShardId(parent)` do not break.
         _shard_id: ShardId,
+        // P3.1: Real mode/uid/gid from the client, embedded directly into
+        // the CreateInode command so we eliminate the follow-up SetAttr
+        // propose. Eliminates one Raft round-trip per create().
+        mode: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<u64, String> {
         let t0 = std::time::Instant::now();
 
@@ -2103,9 +2120,10 @@ impl MetaShardManager {
             mtime: now,
             atime: now,
             ctime: now,
-            mode: 0o100644,
-            uid: 0,
-            gid: 0,
+            // Ensure S_IFREG is set even if the caller only passed permission bits
+            mode: if mode & 0o170000 != 0 { mode } else { mode | 0o100000 },
+            uid,
+            gid,
             blocks: 0,
             fid: None,
             volume_id: None,
@@ -2127,9 +2145,12 @@ impl MetaShardManager {
             .await?;
 
         log::info!(
-            "create_file_with_shard latency: total={}ms, inode={}",
+            "create_file_with_shard latency: total={}ms, inode={}, mode={:o}, uid={}, gid={}",
             t0.elapsed().as_millis(),
-            inode
+            inode,
+            mode,
+            uid,
+            gid
         );
         Ok(inode)
     }
