@@ -54,6 +54,7 @@ powerfs-raft = { path = "../powerfs-raft" }
 powerfs-lease = { path = "../powerfs-lease" }
 powerfs-lock-health = { path = "../powerfs-lock-health" }
 openraft = { workspace = true }
+futures = { workspace = true }
 hex = "0.4"
 sha2 = "0.10"
 rocksdb = { workspace = true }

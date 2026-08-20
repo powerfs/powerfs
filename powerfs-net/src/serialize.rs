@@ -1174,6 +1174,97 @@ pub fn decode_mkdir_req(body: &[u8]) -> Result<(u64, String, u32, u32, u32), Net
     Ok((parent_ino, name, mode, uid, gid))
 }
 
+// ============================================================================
+// Two-phase Mkdir (client-routed, no server-to-server forwarding)
+// See docs/shard-routing-no-forward-principle.md §3
+// ============================================================================
+
+/// Encode Mkdir Phase A request (CreateInode on target_shard).
+/// Filer expects: ShardId(u64) + Ino(u64) + ParentIno(u64) + Name(string)
+///                + Mode(u64) + Uid(u64) + Gid(u64)
+///
+/// The client pre-allocates `ino` via AllocInodeBatch on target_shard,
+/// then sends this request to target_shard's leader to create the inode
+/// record (directory type).
+pub fn encode_mkdir_phase_a_req(
+    shard_id: u64,
+    ino: u64,
+    parent_ino: u64,
+    name: &str,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ShardId, shard_id);
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    enc.add_u64(FieldId::Mode, mode as u64);
+    enc.add_u64(FieldId::Uid, uid as u64);
+    enc.add_u64(FieldId::Gid, gid as u64);
+    Ok(enc.into_bytes())
+}
+
+/// Decode Mkdir Phase A request (server side, on target_shard leader).
+/// Returns (shard_id, ino, parent_ino, name, mode, uid, gid)
+pub fn decode_mkdir_phase_a_req(
+    body: &[u8],
+) -> Result<(u64, u64, u64, String, u32, u32, u32), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let shard_id = dec.next_u64(FieldId::ShardId)?;
+    let ino = dec.next_u64(FieldId::Ino)?;
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    let mode = dec.next_u64(FieldId::Mode)? as u32;
+    let uid = dec.next_u64(FieldId::Uid)? as u32;
+    let gid = dec.next_u64(FieldId::Gid)? as u32;
+    Ok((shard_id, ino, parent_ino, name, mode, uid, gid))
+}
+
+/// Encode Mkdir Phase B request (AddDirEntry on parent_shard).
+/// Filer expects: ShardId(u64) + ParentIno(u64) + Name(string) + Ino(u64)
+///                + Mode(u64) + Uid(u64) + Gid(u64)
+///
+/// Sent to parent_shard's leader to add the dir entry pointing to the
+/// newly created inode (from Phase A). Also triggers parent mtime update
+/// and inode change notification.
+pub fn encode_mkdir_phase_b_req(
+    shard_id: u64,
+    parent_ino: u64,
+    name: &str,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ShardId, shard_id);
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_u64(FieldId::Mode, mode as u64);
+    enc.add_u64(FieldId::Uid, uid as u64);
+    enc.add_u64(FieldId::Gid, gid as u64);
+    Ok(enc.into_bytes())
+}
+
+/// Decode Mkdir Phase B request (server side, on parent_shard leader).
+/// Returns (shard_id, parent_ino, name, ino, mode, uid, gid)
+pub fn decode_mkdir_phase_b_req(
+    body: &[u8],
+) -> Result<(u64, u64, String, u64, u32, u32, u32), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let shard_id = dec.next_u64(FieldId::ShardId)?;
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    let ino = dec.next_u64(FieldId::Ino)?;
+    let mode = dec.next_u64(FieldId::Mode)? as u32;
+    let uid = dec.next_u64(FieldId::Uid)? as u32;
+    let gid = dec.next_u64(FieldId::Gid)? as u32;
+    Ok((shard_id, parent_ino, name, ino, mode, uid, gid))
+}
+
 /// Encode an unlink request
 /// Filer expects: ParentIno(u64) / Name(string)
 pub fn encode_unlink_req(parent_ino: u64, name: &str) -> Result<Vec<u8>, NetError> {
@@ -1191,6 +1282,62 @@ pub fn decode_unlink_req(body: &[u8]) -> Result<(u64, String), NetError> {
     Ok((parent_ino, name))
 }
 
+/// Encode a batch unlink request (client side)
+/// Format: Count(u32) + [ParentIno(u64) + Name(string)] * count
+pub fn encode_batch_unlink_req(entries: &[(u64, String)]) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u32(FieldId::Count, entries.len() as u32);
+    for (parent_ino, name) in entries {
+        let mut entry_enc = TlvEncoder::new();
+        entry_enc.add_u64(FieldId::ParentIno, *parent_ino);
+        entry_enc.add_string(FieldId::Name, name)?;
+        enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
+    }
+    Ok(enc.into_bytes())
+}
+
+/// Decode a batch unlink request (server side)
+/// Returns Vec of (parent_ino, name)
+pub fn decode_batch_unlink_req(body: &[u8]) -> Result<Vec<(u64, String)>, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let count = dec.next_u32(FieldId::Count)? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let entry_bytes = dec.next_bytes(FieldId::Entry)?;
+        let mut entry_dec = TlvDecoder::new(&entry_bytes);
+        let parent_ino = entry_dec.next_u64(FieldId::ParentIno)?;
+        let name = entry_dec.next_string(FieldId::Name)?.to_string();
+        entries.push((parent_ino, name));
+    }
+    Ok(entries)
+}
+
+/// Encode a batch unlink response: Count(u32) + [status(u32)] * count
+pub fn encode_batch_unlink_resp(statuses: &[u32]) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u32(FieldId::Count, statuses.len() as u32);
+    for status in statuses {
+        let mut entry_enc = TlvEncoder::new();
+        entry_enc.add_u32(FieldId::Mode, *status); // reuse Mode field for status code
+        enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
+    }
+    Ok(enc.into_bytes())
+}
+
+/// Decode a batch unlink response
+pub fn decode_batch_unlink_resp(body: &[u8]) -> Result<Vec<u32>, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let count = dec.next_u32(FieldId::Count)? as usize;
+    let mut statuses = Vec::with_capacity(count);
+    for _ in 0..count {
+        let entry_bytes = dec.next_bytes(FieldId::Entry)?;
+        let mut entry_dec = TlvDecoder::new(&entry_bytes);
+        let status = entry_dec.next_u32(FieldId::Mode)?;
+        statuses.push(status);
+    }
+    Ok(statuses)
+}
+
 /// Encode an rmdir request
 /// Filer expects: ParentIno(u64) / Name(string)
 pub fn encode_rmdir_req(parent_ino: u64, name: &str) -> Result<Vec<u8>, NetError> {
@@ -1206,6 +1353,81 @@ pub fn decode_rmdir_req(body: &[u8]) -> Result<(u64, String), NetError> {
     let parent_ino = dec.next_u64(FieldId::ParentIno)?;
     let name = dec.next_string(FieldId::Name)?;
     Ok((parent_ino, name))
+}
+
+// ============================================================================
+// Debug config (GetDebugConfig 0x0089)
+// 集中式调试控制：Master 存储全局 + 节点级配置，节点轮询拉取并本地应用
+// ============================================================================
+
+/// DebugConfig: 节点有效的调试配置（master 合并 "all" + 节点覆盖后返回）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DebugConfig {
+    /// 日志级别: "off"|"error"|"warn"|"info"|"debug"|"trace"，None 表示不修改
+    pub log_level: Option<String>,
+    /// Target 过滤: "powerfs_fuse::fuse" 等，None 表示不修改，空串表示清除过滤
+    pub target_filter: Option<String>,
+    /// 子系统调试开关: (name, on) 列表
+    pub flags: Vec<(String, bool)>,
+}
+
+/// Encode a GetDebugConfig request (client → master)
+/// Format: NodeId(string)
+pub fn encode_get_debug_config_req(node_id: &str) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_string(FieldId::NodeId, node_id)?;
+    Ok(enc.into_bytes())
+}
+
+/// Decode a GetDebugConfig request (master side)
+/// Returns the requesting node_id
+pub fn decode_get_debug_config_req(body: &[u8]) -> Result<String, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let node_id = dec.next_string(FieldId::NodeId)?.to_string();
+    Ok(node_id)
+}
+
+/// Encode a GetDebugConfig response (master → client)
+/// Format: LogLevel(string, optional) + TargetFilter(string, optional)
+///         + Count(u32) + [FlagName(string) + FlagOn(u8)] * Count
+pub fn encode_get_debug_config_resp(config: &DebugConfig) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    if let Some(level) = &config.log_level {
+        enc.add_string(FieldId::LogLevel, level)?;
+    }
+    if let Some(filter) = &config.target_filter {
+        enc.add_string(FieldId::TargetFilter, filter)?;
+    }
+    enc.add_u32(FieldId::Count, config.flags.len() as u32);
+    for (name, on) in &config.flags {
+        enc.add_string(FieldId::FlagName, name)?;
+        enc.add_u8(FieldId::FlagOn, if *on { 1 } else { 0 });
+    }
+    Ok(enc.into_bytes())
+}
+
+/// Decode a GetDebugConfig response (client side)
+pub fn decode_get_debug_config_resp(body: &[u8]) -> Result<DebugConfig, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let mut config = DebugConfig::default();
+
+    // LogLevel 和 TargetFilter 是可选字段
+    if dec.has_field(FieldId::LogLevel) {
+        config.log_level = Some(dec.next_string(FieldId::LogLevel)?.to_string());
+    }
+    if dec.has_field(FieldId::TargetFilter) {
+        config.target_filter = Some(dec.next_string(FieldId::TargetFilter)?.to_string());
+    }
+
+    let count = dec.next_u32(FieldId::Count)? as usize;
+    config.flags.reserve(count);
+    for _ in 0..count {
+        let name = dec.next_string(FieldId::FlagName)?.to_string();
+        let on = dec.next_u8(FieldId::FlagOn)? != 0;
+        config.flags.push((name, on));
+    }
+
+    Ok(config)
 }
 
 // ============================================================================

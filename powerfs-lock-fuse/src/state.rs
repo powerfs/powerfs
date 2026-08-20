@@ -261,6 +261,32 @@ impl ClientLeaseState {
         None
     }
 
+    // ---------- bulk operations ----------
+
+    /// Clear all cached inode and range leases without notifying the server.
+    ///
+    /// Called when a Filer leader change is detected (cache epoch mismatch):
+    /// the old leader's leases are no longer valid, and the new leader has no
+    /// record of them. Clearing locally prevents the client from trusting
+    /// stale directory leases that could bypass lookup RPCs after a leader
+    /// switch.
+    ///
+    /// Server-side leases will expire via TTL; no explicit release RPC is
+    /// needed (the old leader is likely unreachable anyway).
+    pub fn clear_all(&self) {
+        let inode_count = self.inode_leases.lock().unwrap().len();
+        let range_count = self.range_leases.lock().unwrap().len();
+        self.inode_leases.lock().unwrap().clear();
+        self.range_leases.lock().unwrap().clear();
+        if inode_count > 0 || range_count > 0 {
+            log::warn!(
+                "ClientLeaseState::clear_all: dropped {} inode leases + {} range leases (leader change)",
+                inode_count,
+                range_count
+            );
+        }
+    }
+
     // ---------- introspection (for metrics / tests) ----------
 
     /// Number of cached inode leases (including expired ones not yet

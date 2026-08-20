@@ -153,6 +153,8 @@ pub struct ShardStore {
     // Phase 3.5.3: per-inode open 计数（内存追踪，filer 重启重置为 0；
     // fuse 端重新 open 时上报，grace_period 兜底重启窗口）
     open_counts: RwLock<HashMap<u64, u32>>,
+    // P3: MetaCache 引用，Raft apply 后回调 confirm_*() 清除 staging
+    meta_cache: RwLock<Option<std::sync::Arc<crate::meta_cache::MetaCache>>>,
 }
 
 impl ShardStore {
@@ -253,11 +255,18 @@ impl ShardStore {
             root_inodes: RwLock::new(HashMap::new()),
             next_inode: std::sync::Mutex::new(inode_range.0),
             open_counts: RwLock::new(HashMap::new()),
+            meta_cache: RwLock::new(None),
         };
 
         store.load_data()?;
         store.init_next_inode();
         Ok(store)
+    }
+
+    /// P3: 注入 MetaCache 引用，Raft apply 后回调 confirm_*() 清除 staging。
+    /// 由 MetaShardManager 在创建 ShardStore 后调用。
+    pub fn set_meta_cache(&self, cache: std::sync::Arc<crate::meta_cache::MetaCache>) {
+        *self.meta_cache.write().unwrap() = Some(cache);
     }
 
     fn load_data(&mut self) -> Result<(), String> {
@@ -676,6 +685,10 @@ impl ShardStore {
                         e
                     );
                 }
+                // P3: Raft apply 完成，清除 MetaCache staging
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_create_inode(info.inode);
+                }
             }
             ShardCommand::AddDirEntry {
                 parent_inode,
@@ -691,6 +704,10 @@ impl ShardStore {
                         e
                     );
                 }
+                // P3: Raft apply 完成，清除 MetaCache staging
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_add_direntry(parent_inode, &name);
+                }
             }
             ShardCommand::DeleteInode { inode } => {
                 if let Err(e) = self.delete_inode(inode) {
@@ -700,6 +717,10 @@ impl ShardStore {
                         inode,
                         e
                     );
+                }
+                // P3: Raft apply 完成，清除 MetaCache deleted marker
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_delete_inode(inode);
                 }
             }
             ShardCommand::RemoveDirEntry { parent_inode, name } => {
@@ -711,6 +732,10 @@ impl ShardStore {
                         name,
                         e
                     );
+                }
+                // P3: Raft apply 完成，清除 MetaCache deleted marker
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_remove_direntry(parent_inode, &name);
                 }
             }
             ShardCommand::IncrementNlink { inode } => {

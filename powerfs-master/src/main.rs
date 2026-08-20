@@ -54,10 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let master_cfg = cfg.master.clone();
 
     let log_level = cfg.global.log_level.clone();
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
-        .init();
-    let _ = powerfs_common::dynamic_log::set_log_level(&log_level);
+    // 使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
+    powerfs_common::dynamic_log::init(&log_level, None);
 
     BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).log_startup();
 

@@ -9,7 +9,7 @@ use log::{debug, error, info, warn};
 use powerfs_allocator::{ShardMap, ShardState};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_BAD_REQUEST,
+    FieldId, MsgType, NetHandler, NetMessage, NetResult, RequestContext, STATUS_ERR_BAD_REQUEST,
     STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::sync::Arc;
@@ -142,20 +142,7 @@ impl MasterNetHandler {
         );
 
         if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            warn!(
-                "NET_ASSIGN: not leader; current leader is {}, returning redirect response",
-                leader
-            );
-            // Return redirect response with leader address
-            let mut enc = TlvEncoder::new();
-            let _ = enc.add_string(FieldId::Owner, &leader);
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_REDIRECT,
-                enc.into_bytes(),
-                Vec::new(),
-            ));
+            return self.build_redirect_response(msg, "NET_ASSIGN").await;
         }
 
         let result = self.master.assign_volume(&replication, &collection).await;
@@ -218,19 +205,9 @@ impl MasterNetHandler {
         // Volume lookup reads topology state. Redirect non-leader requests
         // to ensure the client gets up-to-date volume routing from the leader.
         if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            warn!(
-                "NET_LOOKUP_VOLUME: not leader; current leader is {}, returning redirect response",
-                leader
-            );
-            let mut enc = TlvEncoder::new();
-            let _ = enc.add_string(FieldId::Owner, &leader);
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_REDIRECT,
-                enc.into_bytes(),
-                Vec::new(),
-            ));
+            return self
+                .build_redirect_response(msg, "NET_LOOKUP_VOLUME")
+                .await;
         }
 
         let original_id: u64 = volume_id_str.parse().unwrap_or(0);
@@ -319,19 +296,7 @@ impl MasterNetHandler {
         // Heartbeat mutates Master topology state (add_node, volume registration).
         // Only the Raft leader should process it; followers return REDIRECT.
         if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            warn!(
-                "NET_HEARTBEAT: not leader; current leader is {}, returning redirect response",
-                leader
-            );
-            let mut enc = TlvEncoder::new();
-            let _ = enc.add_string(FieldId::Owner, &leader);
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_REDIRECT,
-                enc.into_bytes(),
-                Vec::new(),
-            ));
+            return self.build_redirect_response(msg, "NET_HEARTBEAT").await;
         }
 
         let node_id = powerfs_common::types::NodeId(node_id_str);
@@ -456,19 +421,9 @@ impl MasterNetHandler {
         // Only the leader should process this to maintain a consistent client
         // registry; followers return REDIRECT.
         if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            warn!(
-                "NET_KEEP_CONNECTED: not leader; current leader is {}, returning redirect response",
-                leader
-            );
-            let mut enc = TlvEncoder::new();
-            let _ = enc.add_string(FieldId::Owner, &leader);
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_REDIRECT,
-                enc.into_bytes(),
-                Vec::new(),
-            ));
+            return self
+                .build_redirect_response(msg, "NET_KEEP_CONNECTED")
+                .await;
         }
 
         if client_id.is_empty() {
@@ -524,20 +479,25 @@ impl MasterNetHandler {
         &self,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
-        let leader = self.master.get_leader().await;
-
         // If not leader, redirect client to the actual leader
         if !self.master.is_leader().await {
-            info!(
-                "NET_GET_TOPOLOGY: not leader, redirecting to leader at {}",
-                leader
+            return self
+                .build_redirect_response(msg, "NET_GET_TOPOLOGY")
+                .await;
+        }
+
+        // Leader path: fetch own leader address (self) for the response body
+        let leader = self.master.get_leader().await;
+        if leader.is_empty() {
+            // 自身是 leader 但 get_leader() 返回空：raft 状态异常，防御性报错
+            warn!(
+                "NET_GET_TOPOLOGY: is_leader=true but get_leader() returned empty; \
+                 raft state inconsistent, returning SERVER_ERROR"
             );
-            let mut enc = TlvEncoder::new();
-            enc.add_string(FieldId::Owner, &leader)?;
             return Ok(Self::build_response(
                 msg,
-                STATUS_ERR_REDIRECT,
-                enc.into_bytes(),
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
                 Vec::new(),
             ));
         }
@@ -725,29 +685,9 @@ impl MasterNetHandler {
         let force = dec.next_u8(FieldId::Force).unwrap_or(0) != 0;
 
         if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            if leader.is_empty() {
-                // 无 leader (选举未完成): 返回 SERVER_ERROR 让 Filer 重试,
-                // 而非返回空地址的 REDIRECT 导致 Filer 端连接失败.
-                warn!(
-                    "NET_REGISTER_FILER: not leader and no leader elected yet, filer_id={}",
-                    filer_id
-                );
-                return Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                    Vec::new(),
-                ));
-            }
-            let mut enc = TlvEncoder::new();
-            enc.add_string(FieldId::Owner, &leader)?;
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_REDIRECT,
-                enc.into_bytes(),
-                Vec::new(),
-            ));
+            return self
+                .build_redirect_response(msg, "NET_REGISTER_FILER")
+                .await;
         }
 
         // Register filer node for ListFilers discovery (replaces gRPC RegisterFiler).
@@ -917,6 +857,45 @@ impl MasterNetHandler {
         ))
     }
 
+    /// Handle GetDebugConfig request from fuse/filer/volume nodes.
+    ///
+    /// Nodes poll this every 2s to fetch their effective debug config
+    /// (merged "all" defaults + node-specific overrides). The response
+    /// carries log_level, target_filter, and subsystem flags.
+    ///
+    /// TLV request: NodeId(string)
+    /// TLV response: see `encode_get_debug_config_resp`
+    async fn handle_get_debug_config(
+        &self,
+        msg: &NetMessage,
+    ) -> powerfs_net::NetResult<NetMessage> {
+        let node_id = match powerfs_net::serialize::decode_get_debug_config_req(&msg.body) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!("MASTER_GET_DEBUG_CONFIG: decode failed: {}", e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_BAD_REQUEST,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+        };
+
+        let config = self.master.debug_config().effective_config(&node_id);
+        debug!(
+            "MASTER_GET_DEBUG_CONFIG: node='{}' level={:?} filter={:?} flags={}",
+            node_id,
+            config.log_level,
+            config.target_filter,
+            config.flags.len()
+        );
+
+        let body = powerfs_net::serialize::encode_get_debug_config_resp(&config)
+            .unwrap_or_default();
+        Ok(Self::build_response(msg, STATUS_OK, body, Vec::new()))
+    }
+
     /// Handle ListFilers request from kernel client.
     /// Returns all registered filer nodes with their powerfs-net addresses,
     /// allowing the kernel to populate its connection pool without manual
@@ -1005,6 +984,48 @@ impl MasterNetHandler {
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>, data: Vec<u8>) -> NetMessage {
         NetMessage::response(msg, status, body, data)
     }
+
+    /// 集中构造非 leader 节点的重定向响应。
+    ///
+    /// **防御性**：follower 必须能给出有效 leader 地址才能 REDIRECT；若 `get_leader()`
+    /// 返回空（选举未完成 / raft 无 leader / membership 不一致），立即返回
+    /// `STATUS_ERR_SERVER_ERROR` 让客户端重试，**绝不返回空地址的 REDIRECT**——
+    /// 否则客户端拿到空 leader 会无限重连或失败，形成路由黑洞。
+    ///
+    /// `ctx`：调用上下文名（如 "NET_ASSIGN"），用于告警定位。
+    async fn build_redirect_response(
+        &self,
+        msg: &NetMessage,
+        ctx: &str,
+    ) -> NetResult<NetMessage> {
+        let leader = self.master.get_leader().await;
+        if leader.is_empty() {
+            warn!(
+                "{}: not leader AND get_leader() returned empty — no leader elected yet or \
+                 raft membership inconsistent; returning SERVER_ERROR to force client retry \
+                 (returning empty REDIRECT would cause client routing black hole)",
+                ctx
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        debug!(
+            "{}: not leader, redirecting to leader at {}",
+            ctx, leader
+        );
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_string(FieldId::Owner, &leader);
+        Ok(Self::build_response(
+            msg,
+            STATUS_ERR_REDIRECT,
+            enc.into_bytes(),
+            Vec::new(),
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1035,6 +1056,7 @@ impl NetHandler for MasterNetHandler {
             MsgType::RegisterFiler => self.handle_register_filer(msg).await,
             MsgType::ListFilers => self.handle_list_filers(msg).await,
             MsgType::StatFs => self.handle_statfs(msg).await,
+            MsgType::GetDebugConfig => self.handle_get_debug_config(msg).await,
             MsgType::RaftMessage => self.handle_raft_message(msg).await,
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {

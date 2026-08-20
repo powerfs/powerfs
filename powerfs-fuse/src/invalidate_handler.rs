@@ -66,6 +66,13 @@ pub struct InvalidateHandler {
     /// between release's unpin and the next open's pin, causing eviction
     /// of an inode that is being opened (ENOENT in mdtest-hard).
     open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
+    /// Reference to the FUSE client's lease state (ClientLeaseState).
+    /// When an Invalidate notification arrives for a directory inode, the
+    /// corresponding directory lease is cleared to prevent the client from
+    /// trusting stale dentry cache via has_valid_dir_lease().
+    /// Uses RwLock<Option<...>> so it can be set after construction (the
+    /// lock_manager is created after the handler in PowerFsFs::new).
+    lease_state: RwLock<Option<Arc<powerfs_lock_fuse::ClientLeaseState>>>,
 }
 
 impl InvalidateHandler {
@@ -82,6 +89,7 @@ impl InvalidateHandler {
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
             fuse_fd: Arc::new(AtomicI32::new(-1)),
             open_inodes: Arc::new(RwLock::new(HashMap::new())),
+            lease_state: RwLock::new(None),
         }
     }
 
@@ -100,6 +108,7 @@ impl InvalidateHandler {
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
             fuse_fd,
             open_inodes: Arc::new(RwLock::new(HashMap::new())),
+            lease_state: RwLock::new(None),
         }
     }
 
@@ -122,7 +131,15 @@ impl InvalidateHandler {
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
             fuse_fd,
             open_inodes,
+            lease_state: RwLock::new(None),
         }
+    }
+
+    /// Set the lease state reference so the handler can clear directory
+    /// leases when an Invalidate notification arrives for a directory inode.
+    /// Called after construction once the FuseLockManager is available.
+    pub fn set_lease_state(&self, state: Arc<powerfs_lock_fuse::ClientLeaseState>) {
+        *self.lease_state.write().unwrap() = Some(state);
     }
 
     /// Set the FUSE file descriptor (called after the FUSE session is mounted)
@@ -526,6 +543,14 @@ impl NotificationHandler for InvalidateHandler {
                     // may no longer correspond to the current chunks list.
                     self.cache.invalidate_inode(inode);
                     self.chunk_cache.remove_inode_chunks(inode);
+                    // Clear any directory lease on this inode: the server
+                    // invalidated it (another client modified it), so our
+                    // Shared lease is no longer valid. Without this,
+                    // has_valid_dir_lease() would return true and cause
+                    // lookup/create to bypass RPCs, reading stale dentry cache.
+                    if let Some(lease_state) = self.lease_state.read().unwrap().as_ref() {
+                        lease_state.invalidate_inode(inode);
+                    }
                     // Also clear the inline buffer (if not dirty). The buffer
                     // may contain stale data from a previous read; without
                     // clearing it, the next open would see the buffer and skip

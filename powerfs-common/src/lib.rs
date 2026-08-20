@@ -1,6 +1,7 @@
 pub mod build_info;
 pub mod config;
 pub mod constants;
+pub mod debug_config_poller;
 pub mod dynamic_log;
 pub mod error;
 pub mod event;

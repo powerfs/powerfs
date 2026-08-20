@@ -33,7 +33,6 @@ use powerfs_raft::BasicNode;
 use powerfs_raft::FilerRequest;
 use powerfs_raft::FilerTypeConfig;
 use rocksdb::DB;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 
@@ -528,121 +527,42 @@ impl RaftGroupManagerV2 {
 
         let req = FilerRequest { payload: data };
 
-        // 1) 尝试本地 client_write
-        match group.raft.client_write(req.clone()).await {
-            Ok(resp) => return Ok(resp.log_id.index()),
+        // **Design principle: NO server-to-server forwarding.**
+        // Submit to local RaftCore. If not leader, openraft returns
+        // ForwardToLeader error. We return it immediately so the caller
+        // (net_handler) can return STATUS_ERR_REDIRECT to the client.
+        // The client updates its shard_router and resends to the correct
+        // leader. This is the容错 principle: a non-leader may be down,
+        // forwarding to it would worsen the failure.
+        //
+        // Pre-check leadership via metrics to avoid the RaftCore round-trip
+        // when we know we're not the leader. This also avoids spurious log
+        // entries that openraft may silently drop on non-leader nodes.
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        if metrics.state != ServerState::Leader {
+            return Err(format!(
+                "not_leader: shard {} requires client redirect (current state: {:?})",
+                shard_id.0, metrics.state
+            ));
+        }
+
+        match group.raft.client_write(req).await {
+            Ok(resp) => Ok(resp.log_id.index()),
             Err(e) => {
                 let err_str = format!("{}", e);
                 let is_forward = err_str.contains("has to forward request to")
-                    || err_str.contains("not the leader");
-                if !is_forward {
-                    return Err(format!(
+                    || err_str.contains("not the leader")
+                    || err_str.contains("ForwardToLeader");
+                if is_forward {
+                    Err(format!(
+                        "not_leader: shard {} requires client redirect",
+                        shard_id.0
+                    ))
+                } else {
+                    Err(format!(
                         "client_write failed for shard {}: {}",
                         shard_id.0, e
-                    ));
-                }
-                // 是 ForwardToLeader 错误，继续转发流程
-                debug!(
-                    "shard {}: local node not leader, forwarding propose: {}",
-                    shard_id.0, err_str
-                );
-            }
-        }
-
-        // 2) 本地不是 leader，通过 gRPC 转发到 leader
-        let group_id = shard_id.0.to_string();
-        let payload_bytes = serde_json::to_vec(&req)
-            .map_err(|e| format!("failed to serialize FilerRequest: {}", e))?;
-
-        let mut forward_target = self.get_shard_leader(shard_id).await;
-        let mut retries = 0;
-        loop {
-            let target_id = match &forward_target {
-                Some(addr) => {
-                    // 从 peers 表反查 node_id
-                    let peers = self.peers.read().await;
-                    peers
-                        .iter()
-                        .find(|(_, p)| &p.address == addr)
-                        .map(|(id, _)| id.to_string())
-                        .or_else(|| {
-                            // leader 可能是本节点（地址匹配 self.node_address）
-                            if addr == &self.node_address {
-                                Some(self.node_id.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                }
-                None => None,
-            };
-
-            let target_id = match target_id {
-                Some(id) => id,
-                None => {
-                    retries += 1;
-                    if retries >= 5 {
-                        return Err(format!(
-                            "shard {}: propose forward failed: no leader known after {} retries",
-                            shard_id.0, retries
-                        ));
-                    }
-                    debug!(
-                        "shard {}: no leader known, retrying ({}/5)",
-                        shard_id.0, retries
-                    );
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    forward_target = self.get_shard_leader(shard_id).await;
-                    continue;
-                }
-            };
-
-            match self
-                .network_router
-                .propose_forward(&target_id, &group_id, payload_bytes.clone())
-                .await
-            {
-                Ok((true, log_index, _, _)) => return Ok(log_index),
-                Ok((false, _, ref fwd_id, ref err)) if !fwd_id.is_empty() => {
-                    // leader 又变了，更新 target 重试
-                    debug!(
-                        "shard {}: forwarded to '{}' but should go to '{}': {}",
-                        shard_id.0, target_id, fwd_id, err
-                    );
-                    let peers = self.peers.read().await;
-                    forward_target = peers
-                        .get(&fwd_id.parse::<u64>().ok().unwrap_or(0))
-                        .map(|p| p.address.clone());
-                    drop(peers);
-                    retries += 1;
-                    if retries >= 5 {
-                        return Err(format!(
-                            "shard {}: propose forward failed after {} retries: leader kept changing",
-                            shard_id.0, retries
-                        ));
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-                Ok((false, _, _, err)) => {
-                    return Err(format!(
-                        "shard {}: propose forward to '{}' failed: {}",
-                        shard_id.0, target_id, err
-                    ));
-                }
-                Err(e) => {
-                    retries += 1;
-                    if retries >= 5 {
-                        return Err(format!(
-                            "shard {}: propose forward to '{}' failed after {} retries: {}",
-                            shard_id.0, target_id, retries, e
-                        ));
-                    }
-                    debug!(
-                        "shard {}: propose forward to '{}' failed (retry {}/5): {}",
-                        shard_id.0, target_id, retries, e
-                    );
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    forward_target = self.get_shard_leader(shard_id).await;
+                    ))
                 }
             }
         }
@@ -655,6 +575,217 @@ impl RaftGroupManagerV2 {
         } else {
             false
         }
+    }
+
+    /// Spawn a background task that watches for leadership changes on the
+    /// given shard. When the node loses leadership (Leader → non-Leader),
+    /// the provided callback `on_leadership_lost` is invoked.
+    ///
+    /// This is used by `MetaShardManager::create_shard` to clear the
+    /// `MetaCache` staging area when leadership is lost, preventing reads
+    /// from returning uncommitted data that the new leader may not have.
+    pub async fn spawn_leader_watcher<F>(&self, shard_id: ShardId, on_leadership_lost: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let group = match self.get_group(shard_id).await {
+            Some(g) => g,
+            None => return,
+        };
+
+        let mut rx = group.raft.metrics();
+        let sid = shard_id.0;
+        let callback = std::sync::Arc::new(on_leadership_lost);
+
+        tokio::spawn(async move {
+            let mut was_leader = rx.borrow_watched().state == ServerState::Leader;
+            debug!(
+                "leader_watcher: shard {} initial state: was_leader={}",
+                sid, was_leader
+            );
+            loop {
+                match rx.changed().await {
+                    Ok(_) => {
+                        let current_state = rx.borrow_watched().state;
+                        let is_leader = current_state == ServerState::Leader;
+                        if was_leader && !is_leader {
+                            warn!(
+                                "leader_watcher: shard {} LOST leadership (now {:?}) — \
+                                 clearing MetaCache staging to prevent stale reads",
+                                sid, current_state
+                            );
+                            callback();
+                        }
+                        was_leader = is_leader;
+                    }
+                    Err(_) => {
+                        // Sender dropped — Raft is shutting down
+                        debug!(
+                            "leader_watcher: shard {} metrics receiver closed (raft shutting down)",
+                            sid
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Fire-and-forget propose: submit to Raft core and return immediately.
+    ///
+    /// Uses openraft's `client_write_ff` (fire-and-forget) API, which sends
+    /// the `ClientWrite` message to RaftCore and returns without waiting for
+    /// commit or apply. This is the fastest propose path — the log entry is
+    /// appended to the leader's log and will be replicated/applied
+    /// asynchronously by the Raft background task.
+    ///
+    /// Trade-off: if the leader crashes before the entry is committed, the
+    /// data is lost. Acceptable for performance mode (default).
+    ///
+    /// **Design principle: NO server-to-server forwarding.**
+    /// If the local node is not the leader for this shard, return an error
+    /// immediately. The caller (net_handler) is responsible for returning
+    /// STATUS_ERR_REDIRECT to the client, and the client updates its
+    /// shard_router and resends to the correct leader. This is the容错
+    /// principle: a non-leader node may be down, forwarding to it would
+    /// worsen the failure. The client owns the shard→leader routing table
+    /// (synced from Master topology + updated on redirect), so the server
+    /// never needs to forward.
+    pub async fn propose_ff(&self, shard_id: ShardId, data: Vec<u8>) -> Result<(), String> {
+        let group = self
+            .get_group(shard_id)
+            .await
+            .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+
+        // **Critical: pre-check leadership before fire-and-forget.**
+        //
+        // openraft's `client_write_ff()` does NOT return ForwardToLeader when
+        // the node is not the leader — it just sends a message to RaftCore and
+        // returns Ok(()). RaftCore then silently drops the entry (no responder
+        // to notify). Without this pre-check, propose_ff on a non-leader node
+        // returns Ok but the entry is lost forever.
+        //
+        // This caused 98% data loss in testing (100 creates → only 2 visible)
+        // because requests landed on non-leader nodes.
+        //
+        // The pre-check reads metrics to detect non-leader state. There's a
+        // small TOCTOU window (leader change between check and submit), but
+        // that's acceptable for fire-and-forget ops — the entry just gets
+        // dropped by RaftCore, and the caller's retry (or client retry)
+        // recovers. The important thing is catching the common case where the
+        // node is clearly NOT the leader.
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        if metrics.state != ServerState::Leader {
+            debug!(
+                "shard {}: propose_ff pre-check: not leader (state={:?}), returning redirect error",
+                shard_id.0, metrics.state
+            );
+            return Err(format!(
+                "not_leader: shard {} requires client redirect (current state: {:?})",
+                shard_id.0, metrics.state
+            ));
+        }
+
+        let req = FilerRequest { payload: data };
+
+        // Fire-and-forget: submit to local RaftCore, return immediately.
+        // No responder (None) — caller does not wait for commit/apply.
+        match group.raft.client_write_ff(req, None).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Fatal errors only — client_write_ff does not return
+                // ForwardToLeader (that's handled by the pre-check above).
+                Err(format!(
+                    "client_write_ff failed for shard {}: {}",
+                    shard_id.0, e
+                ))
+            }
+        }
+    }
+
+    /// Batch propose: submit multiple entries to the same shard's Raft log in
+    /// a single `ClientWrite` message to RaftCore.
+    ///
+    /// This is significantly faster than calling `propose()` multiple times
+    /// because all entries share one RaftCore round-trip, one `leader_append_entries`
+    /// call, and one replication cycle (entries are batched into a single
+    /// AppendEntries RPC to followers). Two entries committed via `propose_many`
+    /// cost roughly the same latency as one `propose`.
+    ///
+    /// Each entry gets its own `ProgressResponder`, so `ForwardToLeader` is
+    /// reliably returned (unlike `propose_ff` where `None` responder silently
+    /// drops the entry on non-leader nodes).
+    ///
+    /// Returns the committed log indices for all entries, in submission order.
+    ///
+    /// **Design principle: NO server-to-server forwarding.** If the local node
+    /// is not the leader, returns an error immediately so the caller can return
+    /// `STATUS_ERR_REDIRECT` to the client.
+    pub async fn propose_many(
+        &self,
+        shard_id: ShardId,
+        data: Vec<Vec<u8>>,
+    ) -> Result<Vec<u64>, String> {
+        let group = self
+            .get_group(shard_id)
+            .await
+            .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Pre-check leadership (same rationale as propose/propose_ff).
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        if metrics.state != ServerState::Leader {
+            return Err(format!(
+                "not_leader: shard {} requires client redirect (current state: {:?})",
+                shard_id.0, metrics.state
+            ));
+        }
+
+        let payloads: Vec<FilerRequest> = data
+            .into_iter()
+            .map(|d| FilerRequest { payload: d })
+            .collect();
+
+        let mut stream = group
+            .raft
+            .client_write_many(payloads)
+            .await
+            .map_err(|e| format!("client_write_many failed for shard {}: {}", shard_id.0, e))?;
+
+        use futures::TryStreamExt;
+        let mut indices = Vec::new();
+        while let Some(write_result) = stream
+            .try_next()
+            .await
+            .map_err(|e| format!("stream fatal for shard {}: {}", shard_id.0, e))?
+        {
+            match write_result {
+                Ok(resp) => {
+                    indices.push(resp.log_id.index());
+                }
+                Err(forward_err) => {
+                    debug!(
+                        "shard {}: propose_many ForwardToLeader: {:?}",
+                        shard_id.0, forward_err
+                    );
+                    return Err(format!(
+                        "not_leader: shard {} requires client redirect",
+                        shard_id.0
+                    ));
+                }
+            }
+        }
+
+        debug!(
+            "propose_many: shard {} committed {} entries at indices {:?}",
+            shard_id.0,
+            indices.len(),
+            indices
+        );
+        Ok(indices)
     }
 
     /// 获取指定 shard 的 leader 地址。

@@ -147,6 +147,13 @@ impl ShardMap {
         entries[idx].shard_id
     }
 
+    /// Number of shards in the map (active + inactive).
+    /// Used by clients to compute `pick_child_dir_shard` without server help.
+    pub fn shard_count(&self) -> u64 {
+        let entries = self.entries.read().unwrap();
+        entries.len() as u64
+    }
+
     /// Get all Active shard IDs (available for new allocations).
     pub fn active_shards(&self) -> Vec<ShardId> {
         let entries = self.entries.read().unwrap();
