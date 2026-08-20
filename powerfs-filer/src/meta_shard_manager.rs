@@ -255,6 +255,13 @@ impl MetaShardManager {
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Accessor for the shared MetaCache — used by the filer metrics HTTP
+    /// server to expose hit/miss/dirty counters on `/metrics` and
+    /// `/admin/meta-cache-stats`. The Arc handle is cheap to clone.
+    pub fn meta_cache(&self) -> std::sync::Arc<crate::meta_cache::MetaCache> {
+        self.meta_cache.clone()
+    }
+
     /// Check if async_meta_persist is enabled.
     pub fn is_async_meta_persist(&self) -> bool {
         self.async_meta_persist
@@ -1917,7 +1924,25 @@ impl MetaShardManager {
         }
 
         // Cross-shard path: resolve each inode from its own shard.
+        //
+        // Fallback #1 (remote / offline shard): when stores.get(inode_shard)
+        // returns None (this filer doesn't own the child shard) OR
+        // get_inode_metadata returns None (e.g. inode was created by Phase A
+        // but Phase B hasn't replicated to every local follower yet, or the
+        // shard is currently on a different filer), we use the
+        // DirStatSummary cached on the parent shard via child_summaries —
+        // this is exactly the fast-path the cross-shard summary design was
+        // built for: we can still return mode/uid/gid/size/mtime back to
+        // FUSE without a round-trip to the child shard's leader. The
+        // child_shard_id still comes from calculate_shard so callers can
+        // route SetAttr / other ops correctly.
+        //
+        // Fallback #2 (no summary either): drop the entry from the returned
+        // list. The FUSE client will later re-lookup that specific name if
+        // the user calls stat(), which triggers a proper per-child getattr
+        // that routes to the correct shard (no forwarding).
         let stores = self.shard_stores.read().unwrap();
+        let parent_store = stores.get(&parent_shard);
         let mut result = Vec::with_capacity(limit + 1);
 
         for (name, inode) in pairs {
@@ -1925,22 +1950,49 @@ impl MetaShardManager {
                 break;
             }
             let inode_shard = self.shard_strategy.calculate_shard(inode);
-            if let Some(shard_store) = stores.get(&inode_shard) {
-                if let Some(meta) = shard_store.get_inode_metadata(inode) {
-                    result.push(DirEntry {
-                        inode,
-                        name,
-                        mode: meta.mode,
-                        uid: meta.uid,
-                        gid: meta.gid,
-                        size: meta.size,
-                        atime: meta.atime,
-                        mtime: meta.mtime,
-                        ctime: meta.ctime,
-                        nlink: meta.nlink,
-                    });
-                }
+            // Try local child shard store first (covers same-filer
+            // multi-shard ownership, or a follower that has applied the
+            // CreateInode locally).
+            let meta = stores
+                .get(&inode_shard)
+                .and_then(|ss| ss.get_inode_metadata(inode));
+            if let Some(meta) = meta {
+                result.push(DirEntry {
+                    inode,
+                    name,
+                    mode: meta.mode,
+                    uid: meta.uid,
+                    gid: meta.gid,
+                    size: meta.size,
+                    atime: meta.atime,
+                    mtime: meta.mtime,
+                    ctime: meta.ctime,
+                    nlink: meta.nlink,
+                });
+                continue;
             }
+            // Fallback: parent shard cached DirStatSummary (written during
+            // mkdir Phase B's UpdateChildSummary apply on this leader).
+            let summary = parent_store.and_then(|ps| ps.get_child_summary(parent_inode, &name));
+            if let Some(s) = summary {
+                result.push(DirEntry {
+                    inode,
+                    name,
+                    mode: s.mode_and_type,
+                    uid: s.uid,
+                    gid: s.gid,
+                    size: s.size,
+                    atime: s.atime,
+                    mtime: s.mtime,
+                    ctime: s.ctime,
+                    nlink: s.nlink,
+                });
+                continue;
+            }
+            // No local info available — drop from this page. Callers will
+            // trigger a per-name getattr if a user actually queries that
+            // entry (e.g. `ls -l` does a per-entry stat after readdir, so
+            // each missing attr still gets routed to the owning shard).
         }
 
         // has_more if we fetched limit+1 pairs (more entries in BTreeMap)
@@ -4302,7 +4354,26 @@ impl MetaShardManager {
     /// Phase B (`DeleteInode`) is skipped after Phase A (`RemoveDirEntry`)
     /// succeeded.
     ///
-    /// This is a best-effort sweep. We skip:
+    /// This is a best-effort sweep with multiple safety layers:
+    ///   1. **Grace age guard**: skip inodes younger than
+    ///      `MIN_ORPHAN_AGE_SECS` (default 5 min) measured from `ctime`.
+    ///      Phase A + Phase B for a healthy create finishes in << 1 s, so
+    ///      this absorbs Phase B in-flight proposals, Raft replication lag,
+    ///      and the 1-2 s window when `stores.get(parent_shard)` returns
+    ///      `None` because the parent shard is owned by another filer node
+    ///      (see guards #2 and #3).
+    ///   2. **Parent shard unknown (multi-filer)**: if this filer does not
+    ///      own the parent's shard locally we **cannot prove** the dentry
+    ///      is missing — bail out and defer the decision to the filer that
+    ///      actually owns the parent shard (its next GC pass will have the
+    ///      authoritative CF_DIRENTRIES view). Otherwise we'd falsely
+    ///      reclaim a live inode simply because the parent's shard is on a
+    ///      different box.
+    ///   3. **Parent shard known → dentry + child_summaries**: if either
+    ///      the real dentry OR the cached DirStatSummary on the parent
+    ///      shard claims this name → keep the inode. The summary is the
+    ///      authoritative hint when multi-filer makes the child's inode
+    ///      record unavailable locally (see §3.2 of metacache design).
     /// - directories with `nlink >= 2` (real directories have nlink=2+;
     ///   an orphaned directory would still have nlink=2 from creation,
     ///   so we can't distinguish from a live one — but live dirs always
@@ -4311,8 +4382,34 @@ impl MetaShardManager {
     ///
     /// Returns the count of orphan inodes removed.
     pub fn collect_orphan_inodes(&self) -> usize {
+        /// Inodes newer than this many seconds old are never GC'd as
+        /// orphans. Absorbs Phase A → Phase B Raft latency plus multi-filer
+        /// shard-migration skew. Tunable via `POWERFS_ORPHAN_MIN_AGE_SECS`.
+        const DEFAULT_MIN_AGE_SECS: u64 = 5 * 60;
+        fn min_age_secs() -> u64 {
+            std::env::var("POWERFS_ORPHAN_MIN_AGE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MIN_AGE_SECS)
+        }
+        fn now_secs() -> u64 {
+            use std::time::SystemTime;
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+        // `ctime` and `mtime` are stored as **ms** in InodeInfo (see the
+        // `atime/mtime/ctime` fields + the net protocol ms-based encoding).
+        // To compare with wall-clock seconds above, convert ctime_ms to
+        // seconds before comparing.
+        const MS_PER_SEC: u64 = 1000;
+
         let stores = self.shard_stores.read().unwrap();
         let mut removed = 0usize;
+        let age_threshold_ms = min_age_secs().saturating_mul(MS_PER_SEC);
+        let now_s = now_secs();
+        let now_ms = now_s.saturating_mul(MS_PER_SEC);
 
         for (shard_id, store) in stores.iter() {
             let inodes = store.list_all_inodes();
@@ -4325,21 +4422,37 @@ impl MetaShardManager {
                     continue;
                 }
 
-                // Look up the dir entry on the parent's shard. Use
-                // get_dir_entry_inode (not lookup) because with split-create
-                // the inode record lives on calculate_shard(inode), which may
-                // differ from the parent's shard. lookup() would fail to find
-                // the inode record locally and falsely report an orphan.
-                let parent_shard = self.shard_strategy.calculate_shard(info.parent_inode);
-                let has_dir_entry = stores
-                    .get(&parent_shard)
-                    .map(|s| {
-                        s.get_dir_entry_inode(info.parent_inode, &info.name)
-                            .is_some()
-                    })
-                    .unwrap_or(false);
+                // ---- Grace age guard (#1) ----
+                // Saturating subtraction: ctime==0 (old migrations) is treated
+                // as "definitely older than threshold" to avoid holding
+                // pre-existing garbage forever.
+                let age_ms = now_ms.saturating_sub(info.ctime);
+                if info.ctime > 0 && age_ms < age_threshold_ms {
+                    continue;
+                }
 
-                if has_dir_entry {
+                // ---- Parent ownership guard (#2) ----
+                // If this filer node doesn't own the parent shard, we have
+                // NO authoritative dentry map for it. Refuse to make the
+                // orphan call; the filer that actually owns the parent
+                // shard will re-run collect_orphan_inodes and decide.
+                let parent_shard = self.shard_strategy.calculate_shard(info.parent_inode);
+                let Some(parent_store) = stores.get(&parent_shard) else {
+                    continue;
+                };
+
+                // ---- Dentry + summary guard (#3) ----
+                // Presence in EITHER the real dentry table OR the cross-shard
+                // DirStatSummary cache is sufficient proof that some parent
+                // directory still points at this inode.
+                let has_dentry = parent_store
+                    .get_dir_entry_inode(info.parent_inode, &info.name)
+                    .is_some();
+                let has_summary = parent_store
+                    .get_child_summary(info.parent_inode, &info.name)
+                    .map(|s| s.child_inode == info.inode)
+                    .unwrap_or(false);
+                if has_dentry || has_summary {
                     continue;
                 }
 
@@ -4347,12 +4460,13 @@ impl MetaShardManager {
                 // Remove the inode record from its own shard.
                 log::info!(
                     "GC orphan: inode={} (name={:?}, parent={}) on shard {} has no dir entry \
-                     on parent shard {} — removing",
+                     on parent shard {} (age_ms={}) — removing",
                     info.inode,
                     info.name,
                     info.parent_inode,
                     shard_id.0,
-                    parent_shard.0
+                    parent_shard.0,
+                    age_ms,
                 );
                 if let Err(e) = store.delete_inode(info.inode) {
                     log::warn!(
