@@ -995,6 +995,22 @@ impl MetaShardManager {
         };
         self.propose_meta(shard_dir, cmd_dir.serialize()).await?;
 
+        // Also drop the cross-shard DirStatSummary (if any) from the parent
+        // shard. Unlink/rmdir means ls on parent must not show a stale cached
+        // summary for a name that no longer exists. Routed via the same
+        // parent_shard — still no service-to-service forwarding.
+        let cmd_summary = ShardCommand::DeleteChildSummary {
+            parent_inode,
+            name: name.to_string(),
+        };
+        if let Err(e) = self.propose_meta(shard_dir, cmd_summary.serialize()).await {
+            warn!(
+                "propose_remove_direntry: DeleteChildSummary propose failed (non-fatal) \
+                 parent={} name={}: {}",
+                parent_inode, name, e
+            );
+        }
+
         if !self.is_async_meta_persist() {
             self.wait_for_entry_removed(shard_dir, parent_inode, name)
                 .await;
@@ -1110,16 +1126,25 @@ impl MetaShardManager {
 
         // Step 2: Batch all RemoveDirEntry commands into one propose_many on
         // shard_dir. All entries share the same parent → same shard_dir.
-        let dir_cmds: Vec<Vec<u8>> = resolved
-            .iter()
-            .map(|(_, parent_inode, _, name)| {
+        // Pair each RemoveDirEntry with a DeleteChildSummary so stale
+        // cross-shard stat summaries are cleared with the dentry.
+        let mut dir_cmds: Vec<Vec<u8>> = Vec::with_capacity(resolved.len() * 2);
+        for (_, parent_inode, _, name) in &resolved {
+            dir_cmds.push(
                 ShardCommand::RemoveDirEntry {
                     parent_inode: *parent_inode,
                     name: name.clone(),
                 }
-                .serialize()
-            })
-            .collect();
+                .serialize(),
+            );
+            dir_cmds.push(
+                ShardCommand::DeleteChildSummary {
+                    parent_inode: *parent_inode,
+                    name: name.clone(),
+                }
+                .serialize(),
+            );
+        }
 
         match self
             .raft_group_manager
@@ -1128,7 +1153,8 @@ impl MetaShardManager {
         {
             Ok(_) => {
                 debug!(
-                    "batch_delete: Phase A committed {} RemoveDirEntry to shard {}",
+                    "batch_delete: Phase A committed {} RemoveDirEntry + {} DeleteChildSummary cmds to shard {}",
+                    resolved.len(),
                     resolved.len(),
                     shard_dir.0
                 );
@@ -1380,6 +1406,11 @@ impl MetaShardManager {
     /// inode created in Phase A. It does NOT create the inode record (that was
     /// Phase A on target_shard).
     ///
+    /// Along with AddDirEntry, we atomically (in Raft log order) persist a
+    /// DirStatSummary for the new child on the PARENT shard. This enables
+    /// `ls -l` on a cross-shard directory to return mode/uid/gid/size/mtime
+    /// locally without an extra RPC to the child shard (see docs/metacache.md §3.2).
+    ///
     /// Returns Ok(()) on success.
     /// See docs/shard-routing-no-forward-principle.md §3
     pub async fn create_directory_phase_b(
@@ -1387,8 +1418,12 @@ impl MetaShardManager {
         parent_inode: u64,
         name: &str,
         ino: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<(), String> {
         let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+        let child_shard = self.shard_strategy.calculate_shard(ino);
 
         // Verify shard store exists
         {
@@ -1398,10 +1433,9 @@ impl MetaShardManager {
             }
         }
 
-        // Propose ONLY AddDirEntry (inode record was Phase A on target_shard).
-        // Use propose_meta_commit (wait for Raft commit) — propose_ff would
-        // silently drop the entry if leadership changes, making the directory
-        // invisible even though Phase A succeeded.
+        // Propose AddDirEntry first — the canonical dentry is required for
+        // the lookup path even if the summary goes missing (a reader will
+        // just fall back to the child shard and backfill).
         let cmd = ShardCommand::AddDirEntry {
             parent_inode,
             name: name.to_string(),
@@ -1410,9 +1444,45 @@ impl MetaShardManager {
         self.propose_meta_commit(parent_shard, cmd.serialize())
             .await?;
 
+        // Now drop the DirStatSummary on the same parent shard leader.
+        // `version_ts` uses millisecond wall clock; we only need monotonic
+        // ordering per-child and in practice the same filer never proposes
+        // two summaries for a single mkdir in reverse order.
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let summary = crate::shard_store::DirStatSummary {
+            child_inode: ino,
+            mode_and_type: (mode & 0o7777) | 0o040000,
+            uid,
+            gid,
+            size: 0,
+            mtime: now_ms / 1000,
+            ctime: now_ms / 1000,
+            atime: now_ms / 1000,
+            nlink: 2,
+            child_shard_id: child_shard.0,
+            version_ts: now_ms,
+        };
+        let summary_cmd = ShardCommand::UpdateChildSummary {
+            parent_inode,
+            name: name.to_string(),
+            summary,
+        };
+        // Fire-and-forget commit: even if this secondary Raft fails, the
+        // dentry is already committed; reader backfill will re-populate the
+        // summary lazily on first miss.
+        if let Err(e) = self
+            .propose_meta_commit(parent_shard, summary_cmd.serialize())
+            .await
+        {
+            warn!(
+                "mkdir phase B: UpdateChildSummary parent={} name={} ino={} propose failed (non-fatal): {}",
+                parent_inode, name, ino, e
+            );
+        }
+
         debug!(
-            "mkdir phase B: inode={} parent={} name={} shard={} (AddDirEntry only)",
-            ino, parent_inode, name, parent_shard.0
+            "mkdir phase B: inode={} parent={} name={} shard={} (AddDirEntry + UpdateChildSummary child_shard={})",
+            ino, parent_inode, name, parent_shard.0, child_shard.0
         );
 
         Ok(())

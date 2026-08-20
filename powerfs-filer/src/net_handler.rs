@@ -1642,7 +1642,7 @@ impl FilerNetHandler {
     ///
     /// See docs/shard-routing-no-forward-principle.md §3
     async fn handle_mkdir_phase_b(&self, msg: &NetMessage) -> NetResult<NetMessage> {
-        let (shard_id, parent_ino, name, ino, _mode, _uid, _gid) =
+        let (shard_id, parent_ino, name, ino, mode, uid, gid) =
             match powerfs_net::serialize::decode_mkdir_phase_b_req(&msg.body) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1673,7 +1673,7 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            .create_directory_phase_b(parent_ino, &name, ino)
+            .create_directory_phase_b(parent_ino, &name, ino, mode, uid, gid)
             .await
         {
             Ok(()) => {

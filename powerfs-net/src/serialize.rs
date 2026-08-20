@@ -1208,6 +1208,7 @@ pub fn encode_mkdir_phase_a_req(
 
 /// Decode Mkdir Phase A request (server side, on target_shard leader).
 /// Returns (shard_id, ino, parent_ino, name, mode, uid, gid)
+#[allow(clippy::type_complexity)]
 pub fn decode_mkdir_phase_a_req(
     body: &[u8],
 ) -> Result<(u64, u64, u64, String, u32, u32, u32), NetError> {
@@ -1251,6 +1252,7 @@ pub fn encode_mkdir_phase_b_req(
 
 /// Decode Mkdir Phase B request (server side, on parent_shard leader).
 /// Returns (shard_id, parent_ino, name, ino, mode, uid, gid)
+#[allow(clippy::type_complexity)]
 pub fn decode_mkdir_phase_b_req(
     body: &[u8],
 ) -> Result<(u64, u64, String, u64, u32, u32, u32), NetError> {
