@@ -442,25 +442,26 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             warn!("startup lease recovery failed (non-fatal): {}", e);
         }
 
-        // P7 可观测性: start the Prometheus metrics server for the inode
-        // lease manager. Exposes `/metrics` (Prometheus text format) +
-        // `/admin/lease-stats` (JSON) so operators can monitor active
+        // P7 observability: start the Prometheus metrics server for the
+        // inode lease manager + MetaCache. Exposes `/metrics` (Prometheus
+        // text format) + `/admin/lease-stats` (JSON) +
+        // `/admin/meta-cache-stats` (JSON) so operators can monitor active
         // leases, acquire/conflict counts, the Fencer SN high-water
-        // (phase 4 §5.3), and Early Grant waiter backpressure (phase 4
-        // §5.2). Port is `filer_cfg.metrics_port`, defaulting to
-        // `grpc_port + 1` so existing configs need no change.
+        // (phase 4 §5.3), Early Grant waiter backpressure (phase 4 §5.2),
+        // and MetaCache hit/miss/dirty/staging counters. Port is
+        // `filer_cfg.metrics_port`, defaulting to `grpc_port + 1` so
+        // existing configs need no change.
         {
             let metrics_port = filer_cfg.metrics_port.unwrap_or(grpc_port + 1);
             let metrics_addr: std::net::SocketAddr =
                 format!("{}:{}", bind_ip, metrics_port).parse()?;
             let lease_mgr = net_handler.inode_lease_mgr.clone();
+            let meta_cache = meta_shard_manager.meta_cache();
             if let Err(e) =
-                powerfs_filer::metrics::start_metrics_server(metrics_addr, lease_mgr).await
+                powerfs_filer::metrics::start_metrics_server(metrics_addr, lease_mgr, meta_cache)
+                    .await
             {
-                warn!(
-                    "filer lease metrics server failed to start (non-fatal): {}",
-                    e
-                );
+                warn!("filer metrics server failed to start (non-fatal): {}", e);
             }
         }
 

@@ -551,6 +551,72 @@ impl MetaCache {
         }
         m
     }
+
+    /// Directory entry state breakdown (mirrors `state_counts` for dentries).
+    pub fn direntry_state_counts(&self) -> HashMap<CacheState, usize> {
+        let mut m = HashMap::new();
+        for de in self.direntry_table.read().unwrap().values() {
+            *m.entry(de.state).or_insert(0) += 1;
+        }
+        m
+    }
+
+    /// Consistent snapshot of all cumulative counters + current state counts.
+    ///
+    /// Used by `/metrics` scrape and the `/admin/meta-cache-stats` JSON
+    /// endpoint. We read atomics with `Relaxed` ordering because Prometheus
+    /// counters are monotonic best-effort (no cross-counter coherence
+    /// required between scrape boundaries).
+    pub fn stats(&self) -> MetaCacheStats {
+        use Ordering::Relaxed;
+        let state_counts = self.state_counts();
+        let de_counts = self.direntry_state_counts();
+        MetaCacheStats {
+            inode_hit_total: self.inode_hit_total.load(Relaxed),
+            inode_miss_total: self.inode_miss_total.load(Relaxed),
+            inode_deleted_served_total: self.inode_deleted_served_total.load(Relaxed),
+            direntry_hit_total: self.direntry_hit_total.load(Relaxed),
+            direntry_miss_total: self.direntry_miss_total.load(Relaxed),
+            direntry_deleted_served_total: self.direntry_deleted_served_total.load(Relaxed),
+            dirty_mark_total: self.dirty_mark_total.load(Relaxed),
+            dirty_confirm_total: self.dirty_confirm_total.load(Relaxed),
+            stage_delete_total: self.stage_delete_total.load(Relaxed),
+            backfill_clean_total: self.backfill_clean_total.load(Relaxed),
+            invalidate_all_total: self.invalidate_all_total.load(Relaxed),
+            inode_clean_count: *state_counts.get(&CacheState::Clean).unwrap_or(&0),
+            inode_staging_count: *state_counts.get(&CacheState::Staging).unwrap_or(&0),
+            inode_dirty_count: *state_counts.get(&CacheState::Dirty).unwrap_or(&0),
+            inode_deleted_count: *state_counts.get(&CacheState::Deleted).unwrap_or(&0),
+            direntry_clean_count: *de_counts.get(&CacheState::Clean).unwrap_or(&0),
+            direntry_staging_count: *de_counts.get(&CacheState::Staging).unwrap_or(&0),
+            direntry_deleted_count: *de_counts.get(&CacheState::Deleted).unwrap_or(&0),
+        }
+    }
+}
+
+/// Snapshot returned by [`MetaCache::stats`] — consumed by Prometheus
+/// refresh + JSON admin handler. All counts are `u64` (same width as the
+/// backing Atomics) so JSON serializers / Prometheus i64 gauges keep fit.
+#[derive(Debug, Clone)]
+pub struct MetaCacheStats {
+    pub inode_hit_total: u64,
+    pub inode_miss_total: u64,
+    pub inode_deleted_served_total: u64,
+    pub direntry_hit_total: u64,
+    pub direntry_miss_total: u64,
+    pub direntry_deleted_served_total: u64,
+    pub dirty_mark_total: u64,
+    pub dirty_confirm_total: u64,
+    pub stage_delete_total: u64,
+    pub backfill_clean_total: u64,
+    pub invalidate_all_total: u64,
+    pub inode_clean_count: usize,
+    pub inode_staging_count: usize,
+    pub inode_dirty_count: usize,
+    pub inode_deleted_count: usize,
+    pub direntry_clean_count: usize,
+    pub direntry_staging_count: usize,
+    pub direntry_deleted_count: usize,
 }
 
 // ---------- helpers ----------
