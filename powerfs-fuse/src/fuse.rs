@@ -5624,15 +5624,87 @@ impl FileSystem for PowerFsFs {
         } else {
             // entry.fid 为 None 且无 inline_buffer: 文件可能是新建的空文件,
             // inline_buffer 被 InvalidateHandler 驱逐后未重建.
-            // 创建新 inline buffer 并写入, 而非返回 EIO.
             // 这修复了 mdtest-hard 等 metadata 密集场景下的崩溃:
             // Filer 对每个新建文件发送 invalidation, 导致 inline_buffer 被驱逐,
             // 后续 write 找不到 buffer 也找不到 fid → EIO → IO500 assertion crash.
             warn!(
-                "write: inode {} has no fid and no inline_buffer, creating new inline buffer \
-                 (likely evicted by InvalidateHandler during metadata-heavy workload)",
+                "write: inode {} has no fid and no inline_buffer, inline_buffer was evicted \
+                 (likely by InvalidateHandler during metadata-heavy workload)",
                 inode
             );
+            let new_end = offset + read_len as u64;
+            if new_end > INLINE_HARD_LIMIT as u64 {
+                // BUG FIX: 当 inline_buffer 被驱逐后, 如果写入数据超过
+                // INLINE_HARD_LIMIT, 不能返回 EFBIG (这会导致 dd 大文件写入 0 字节).
+                // 直接走 Inline→Flat migrate 逻辑: 分配 volume_id/needle_id 并切换到
+                // Flat 模式. inline_buffer 为空, merged_data 就是 buf (零填充 offset 前的间隙).
+                let merged_data = {
+                    let mut data = Vec::with_capacity(new_end as usize);
+                    if offset > 0 {
+                        data.resize(offset as usize, 0);
+                    }
+                    data.extend_from_slice(&buf[..read_len]);
+                    data
+                };
+                let migrate_threshold = INLINE_HARD_LIMIT as u64;
+                info!(
+                    "write: inode {} new_end={} > INLINE_HARD_LIMIT={}, invoking migrate \
+                     (inline_buffer was evicted, data reconstructed from write buffer)",
+                    inode, new_end, INLINE_HARD_LIMIT
+                );
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let routing_shard = self.routing_shard(inode);
+                match self.client.block_on(async move {
+                    meta_client.migrate_inline_alloc(routing_shard, inode).await
+                }) {
+                    Ok((volume_id, needle_id)) => {
+                        info!(
+                            "write inline migrate (evicted): inode={} new_end={} > threshold={} → \
+                             Flat volume_id={} needle_id={:#x}",
+                            inode, new_end, migrate_threshold, volume_id, needle_id
+                        );
+                        let mtime = chrono::Utc::now().timestamp() as u64;
+                        self.chunk_cache
+                            .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
+                        self.mark_dirty(inode, 0);
+                        let fid = Fid {
+                            volume_id: VolumeId(volume_id),
+                            cookie: 0,
+                            file_key: needle_id,
+                        };
+                        let new_size = new_end;
+                        let chunks = vec![CachedFileChunk {
+                            offset: 0,
+                            size: new_size,
+                            mtime,
+                            needle_id,
+                            volume_id,
+                            crc32: 0,
+                        }];
+                        self.cache.update_fid(inode, fid);
+                        self.cache.update_chunks(inode, chunks);
+                        self.cache.update_size(inode, new_size);
+                        self.inline_buffers.remove(&inode);
+                        self.inline_max_sizes.remove(&inode);
+                        debug!(
+                            "write inline migrate (evicted) done: inode={} size={} → Flat, \
+                             subsequent writes → Volume Server",
+                            inode, new_size
+                        );
+                        self.cache.mark_dirty(inode);
+                        return Ok(read_len);
+                    }
+                    Err(e) => {
+                        error!(
+                            "write inline migrate (evicted) FAILED: inode={} new_end={} error={} — \
+                             EFBIG, inline buffer unmodified",
+                            inode, new_end, e
+                        );
+                        return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+                    }
+                }
+            }
+            // 小数据写入 (≤ 8KB): 创建新 inline buffer 并写入
             let inline_max = self
                 .inline_max_sizes
                 .get(&inode)
@@ -5650,10 +5722,6 @@ impl FileSystem for PowerFsFs {
             );
             // 重新进入 inline 写路径
             if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                let new_end = offset + read_len as u64;
-                if new_end > INLINE_HARD_LIMIT as u64 {
-                    return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
-                }
                 let buf_len = inline_buf.data.len() as u64;
                 if offset > buf_len {
                     inline_buf.data.resize(offset as usize, 0);

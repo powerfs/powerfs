@@ -2281,13 +2281,13 @@ impl MetadataClient for MetaShardClient {
                 let mut enc = TlvEncoder::new();
                 let _ = enc.add_u64(FieldId::Ino, ino);
                 if let Some(mo) = params.mode {
-                    let _ = enc.add_u32(FieldId::Mode, mo);
+                    let _ = enc.add_u64(FieldId::Mode, mo as u64);
                 }
                 if let Some(u) = params.uid {
-                    let _ = enc.add_u32(FieldId::Uid, u);
+                    let _ = enc.add_u64(FieldId::Uid, u as u64);
                 }
                 if let Some(g) = params.gid {
-                    let _ = enc.add_u32(FieldId::Gid, g);
+                    let _ = enc.add_u64(FieldId::Gid, g as u64);
                 }
                 if let Some(mt) = params.mtime {
                     let _ = enc.add_u64(FieldId::Mtime, mt);
