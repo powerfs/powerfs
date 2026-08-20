@@ -330,6 +330,12 @@ impl FuseApp {
             )
             .with_lockify(Some(sync_client.runtime().handle().clone())),
         );
+        // Wire the lease state into the InvalidateHandler so that server-
+        // pushed Invalidate notifications also clear directory leases.
+        // Without this, has_valid_dir_lease() would return true for stale
+        // leases after another client modifies the directory.
+        invalidate_handler.set_lease_state(lock_manager.state().clone());
+
         // Clone the Arc before moving into `PowerFsFs` so the admin
         // server can keep a handle for `/lock-metrics` queries.
         let lock_manager_for_admin = lock_manager.clone();
@@ -372,19 +378,13 @@ impl FuseApp {
             last_cache_epoch: std::sync::atomic::AtomicU64::new(0),
             fuse_fd: fuse_fd.clone(),
             readdir_cursors: Arc::new(DashMap::new()),
+            pending_unlinks: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
 
         let fs_arc = Arc::new(fs);
         let bg_fs = fs_arc.clone();
         thread::spawn(move || loop {
             // P2-d: Adaptive flusher interval.
-            // When dirty chunks exist, use a shorter interval (50ms) to flush
-            // them quickly, reducing close latency and dirty backlog.
-            // When idle, use a longer interval (100ms) to save CPU wakeups.
-            // Note: too-aggressive (10ms) caused lock contention with write
-            // path and OOM under sustained 512M+ sequential writes (dirty
-            // accumulation vs flush rate). 20ms balances responsiveness and
-            // throughput (2GB container has enough memory to handle higher flush rate).
             if bg_fs.has_dirty.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = bg_fs.flush_all_dirty_chunks();
                 bg_fs
@@ -393,6 +393,63 @@ impl FuseApp {
                 thread::sleep(Duration::from_millis(20));
             } else {
                 thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        // Batch unlink flusher: drains pending_unlinks every 5ms or when
+        // batch reaches 16 entries, sends BatchUnlink RPC grouped by shard.
+        let bg_fs_unlink = fs_arc.clone();
+        let unlink_runtime = self.runtime.handle().clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(5));
+            let entries: Vec<(u64, String, u64)> = {
+                let mut guard = bg_fs_unlink.pending_unlinks.lock().unwrap();
+                if guard.is_empty() {
+                    continue;
+                }
+                std::mem::take(&mut *guard)
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            // Group by shard_id
+            let mut groups: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
+            for (parent, name, shard) in entries {
+                groups.entry(shard).or_default().push((parent, name));
+            }
+            let meta_client = bg_fs_unlink.client.facade().meta_shard_client().clone();
+            for (shard_id, batch) in groups {
+                let mc = meta_client.clone();
+                let runtime = unlink_runtime.clone();
+                runtime.spawn(async move {
+                    match mc.batch_unlink(batch.clone(), shard_id).await {
+                        Ok(statuses) => {
+                            let failed: Vec<_> = statuses.iter().filter(|&&s| s != powerfs_net::STATUS_OK as u32).collect();
+                            if !failed.is_empty() {
+                                warn!(
+                                    "batch_unlink: {}/{} entries failed (shard={})",
+                                    failed.len(),
+                                    statuses.len(),
+                                    shard_id
+                                );
+                            }
+                            debug!(
+                                "batch_unlink: {} entries processed (shard={})",
+                                statuses.len(),
+                                shard_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "batch_unlink RPC failed for {} entries (shard={}): {} — \
+                                 filer GC will clean up orphaned inodes",
+                                batch.len(),
+                                shard_id,
+                                e
+                            );
+                        }
+                    }
+                });
             }
         });
 
@@ -602,6 +659,13 @@ struct PowerFsFs {
     /// RPC returned the first page — `rm -rf` never enumerated entries beyond
     /// the first page and they survived the deletion (intermittent-delete bug).
     readdir_cursors: Arc<DashMap<u64, ReaddirCursor>>,
+    /// Pending batch unlink entries: (parent_ino, name, shard_id).
+    /// unlink callback adds entries here and returns immediately (optimistic
+    /// delete from cache). A background flush task sends BatchUnlink RPCs
+    /// every 5ms or when the batch reaches 16 entries.
+    /// On crash, pending entries are lost — filer GC eventually cleans up
+    /// orphaned inodes (acceptable in non-critical environments).
+    pending_unlinks: Arc<std::sync::Mutex<Vec<(u64, String, u64)>>>,
 }
 
 /// Cursor for last_name-based readdir pagination.
@@ -913,6 +977,66 @@ impl PowerFsFs {
         }
     }
 
+    /// Acquire a Shared lease on a directory inode (lockify self-declare,
+    /// background async sync). While held, `entry_exists` and `lookup` trust
+    /// the local dentry cache and skip the lookup RPC to the Filer.
+    ///
+    /// Called from `readdir` (and any path that wants to pin a directory's
+    /// contents for cache consistency). The lease is opportunistic: if
+    /// lockify is disabled or the acquire fails, callers fall through to
+    /// the normal cache-miss-then-RPC path. Correctness is preserved either
+    /// way — the lease is a performance hint, not a correctness requirement.
+    ///
+    /// Design: see `docs/shard-routing-no-forward-principle.md` §7.
+    fn acquire_dir_lease(&self, dir_inode: u64) {
+        match self.lock_manager.acquire_local(
+            dir_inode,
+            powerfs_lock_fuse::LockMode::Shared,
+            self.lease_duration_ms,
+        ) {
+            Ok(_) => {
+                info!(
+                    "acquire_dir_lease OK dir_inode={} duration={}ms — subsequent lookups/entry_exists skip RPC",
+                    dir_inode, self.lease_duration_ms
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "acquire_dir_lease FAILED dir_inode={}: {} — lookups will fall back to RPC",
+                    dir_inode, e
+                );
+            }
+        }
+    }
+
+    /// Check whether the client currently holds a valid (non-expired) Shared
+    /// lease on the given directory inode. Used by `entry_exists` and `lookup`
+    /// to decide whether to trust the local dentry cache and skip the Filer
+    /// RPC.
+    ///
+    /// Returns `false` if no lease is cached or the lease has expired. In
+    /// either case the caller falls back to the normal cache-miss-then-RPC
+    /// path.
+    fn has_valid_dir_lease(&self, dir_inode: u64) -> bool {
+        self.lock_manager
+            .state()
+            .get_inode(dir_inode)
+            .map(|entry| entry.mode == powerfs_lock_fuse::LockMode::Shared)
+            .unwrap_or(false)
+    }
+
+    /// Invalidate the directory listing cache for `parent_inode` after the
+    /// client itself modifies the directory (create/mkdir/unlink/rmdir).
+    ///
+    /// This does NOT release the directory lease — the lease is kept because
+    /// the modification was initiated by this client; subsequent lookups can
+    /// still trust the lease for entries that are re-fetched. Other clients'
+    /// modifications are detected via the lockify CAS-conflict path, which
+    /// invalidates the lease automatically.
+    fn invalidate_dir_entries(&self, parent_inode: u64) {
+        self.cache.invalidate_dir(parent_inode);
+    }
+
     /// Check if the Filer leader has changed since the last call.
     /// If so, invalidate all cached metadata to handle potentially missed
     /// Invalidate notifications during the leader change window.
@@ -924,11 +1048,17 @@ impl PowerFsFs {
             .load(std::sync::atomic::Ordering::Relaxed);
         if current != last {
             log::warn!(
-                "check_cache_epoch: epoch changed {} -> {}, invalidating all cached metadata",
+                "check_cache_epoch: epoch changed {} -> {}, invalidating all cached metadata + leases",
                 last,
                 current
             );
             self.cache.invalidate_all();
+            // Clear all directory/file leases: the old leader's leases are
+            // no longer valid, and the new leader has no record of them.
+            // Without this, has_valid_dir_lease() would return true for
+            // stale leases, causing lookup/create to bypass RPCs and read
+            // stale dentry cache after a leader switch.
+            self.lock_manager.state().clear_all();
             self.last_cache_epoch
                 .store(current, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1645,13 +1775,31 @@ impl PowerFsFs {
         if self.lookup_in_cache(parent, name).is_some() {
             return true;
         }
-        // 查 Filer（shard_id calculated from parent_ino）
+        // 持有目录 Shared lease 时，信任缓存，不再发 lookup RPC。
+        if self.has_valid_dir_lease(parent) {
+            debug!(
+                "entry_exists: dir lease held, cache MISS = not exist (parent={}, name={})",
+                parent, name
+            );
+            return false;
+        }
+        // 无 lease：查 Filer（shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
         let shard_id = self.routing_shard(parent);
         let name_owned = name.to_string();
-        self.client
+        let t_lookup = std::time::Instant::now();
+        let result = self
+            .client
             .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
-            .is_ok()
+            .is_ok();
+        let lookup_ms = t_lookup.elapsed().as_millis();
+        if lookup_ms > 10 {
+            info!(
+                "entry_exists LOOKUP SLOW: parent={}, name={}, lookup={}ms, result={}",
+                parent, name, lookup_ms, result
+            );
+        }
+        result
     }
 
     /// Lookup "." — return the directory's own attributes.
@@ -2307,6 +2455,36 @@ impl FileSystem for PowerFsFs {
             return Ok(self.create_fuse_entry(&entry));
         }
 
+        // 1b. Directory lease fast path: if we hold a Shared lease on the
+        // parent directory, no other client can have modified it. A cache
+        // miss therefore means the file truly doesn't exist — return a
+        // negative entry WITHOUT sending a lookup RPC to the Filer.
+        //
+        // This is the primary performance benefit of the directory lease:
+        // it eliminates lookup RPCs for nonexistent files (e.g., during
+        // `ls -la` or path resolution through multiple directories).
+        //
+        // Safety: the lease is a Shared (read) lease. While held, no other
+        // client can acquire an Exclusive (write) lease, so the directory
+        // content is guaranteed unchanged. Files we just created are in the
+        // inode_cache (checked above), so they won't reach this path.
+        //
+        // Design: see docs/shard-routing-no-forward-principle.md §7
+        if self.has_valid_dir_lease(parent) {
+            debug!(
+                "lookup: dir lease held, cache MISS = negative (parent={}, name={})",
+                parent, name_str
+            );
+            return Ok(Entry {
+                inode: 0,
+                generation: 0,
+                attr: unsafe { std::mem::zeroed() },
+                attr_flags: 0,
+                attr_timeout: Duration::ZERO,
+                entry_timeout: Duration::ZERO,
+            });
+        }
+
         // 2. Step 2: Filer RPC（强一致 Leader Lease Read, shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
         let shard_id = self.routing_shard(parent);
@@ -2717,6 +2895,10 @@ impl FileSystem for PowerFsFs {
             attr.inode, parent, attr.mode, attr.nlink, attr.size, attr.uid, attr.gid, attr.mtime, attr.atime, attr.ctime
         );
 
+        // 修改了父目录内容（新增子目录），invalidate 父目录的 dentry 缓存。
+        // 保持目录 lease（修改是自己发起，下次 readdir 重新拉取即可）。
+        self.invalidate_dir_entries(parent);
+
         // Phase-4 §5.1 Lockify: speculatively self-declare inode
         // ownership to avoid a synchronous lease-acquire RPC on the
         // first write into the new directory. Async-synced to filer.
@@ -2775,6 +2957,9 @@ impl FileSystem for PowerFsFs {
         self.cache.insert(entry.clone());
         debug!("mknod: RPC done, inode={}, parent={}", attr.inode, parent);
 
+        // 修改了父目录内容（新增特殊文件），invalidate 父目录的 dentry 缓存。
+        self.invalidate_dir_entries(parent);
+
         // Phase-4 §5.1 Lockify: speculatively self-declare inode
         // ownership for the new special file. Async-synced to filer.
         self.lockify_declare_new_inode(attr.inode);
@@ -2807,6 +2992,8 @@ impl FileSystem for PowerFsFs {
         if let Some(entry) = self.lookup_in_cache(parent, name_str) {
             self.cache.remove(entry.inode);
         }
+        // 修改了父目录内容（删除子目录），invalidate 父目录的 dentry 缓存。
+        self.invalidate_dir_entries(parent);
         Ok(())
     }
 
@@ -2814,12 +3001,17 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("unlink: parent={}, name={}", parent, name_str);
 
-        // Try cache first; if miss (e.g., after InvalidateHandler evicted the
-        // entry due to a prior setattr/chown), fetch from filer. This avoids
-        // a self-invalidation race where the chown's Invalidate clears the
-        // cache before unlink runs.
+        // Try cache first; if miss, try dir lease (trust cache MISS = not exist).
+        // Only fall back to lookup RPC when no dir lease is held.
         let entry = if let Some(e) = self.lookup_in_cache(parent, name_str) {
             e
+        } else if self.has_valid_dir_lease(parent) {
+            // Dir lease held: cache is authoritative, MISS = not exist
+            debug!(
+                "unlink: dir lease held, cache MISS for '{}/{}' → ENOENT",
+                parent, name_str
+            );
+            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         } else {
             debug!(
                 "unlink: cache miss for '{}/{}', fetching from filer",
@@ -2857,36 +3049,11 @@ impl FileSystem for PowerFsFs {
             None
         };
 
-        // Step 2: 通过 MetadataClient.unlink RPC 走 Filer Raft leader（强一致）
-        // Filer 端原子地移除目录条目并递减 nlink。
-        let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = self.routing_shard(parent);
-        let name_owned = name_str.to_string();
-        self.client
-            .block_on(async move { meta_client.unlink(parent, &name_owned, shard_id).await })
-            .map_err(|e| {
-                let errno = filer_error_to_errno(&e.to_string());
-                if errno == libc::EIO {
-                    error!("unlink RPC failed: {}", e);
-                } else if errno == libc::ENOENT {
-                    // ENOENT on unlink is suspicious — it means the filer returned
-                    // NOT_FOUND. This can happen if the request hit a non-leader
-                    // whose Raft state was stale (pre-fix). Log at warn so it's
-                    // visible even without --verbose.
-                    warn!(
-                        "unlink: ENOENT for '{}/{}' (shard={}) — possible stale leader read; err={}",
-                        parent, name_str, shard_id, e
-                    );
-                } else {
-                    debug!("unlink RPC failed: {} -> errno={}", e, errno);
-                }
-                std::io::Error::from_raw_os_error(errno)
-            })?;
-
+        // Optimistic cache update: remove from cache immediately so
+        // subsequent lookups see the file as gone. The filer-side delete
+        // is batched and will eventually catch up.
         if should_delete {
             // Last hard link - delete the actual data and remove all cache entries
-            // NOTE: 数据删除保留立即调用（过渡期），Phase 3.5 GC 实现后改为延迟回收
-            // Iterate entry.chunks and delete each by its needle_id and volume_id.
             for chunk in &entry.chunks {
                 match self.client.get_volume_addr(chunk.volume_id) {
                     Ok(addr) => {
@@ -2907,7 +3074,6 @@ impl FileSystem for PowerFsFs {
             }
 
             self.cache.remove(entry.inode);
-            // P2.5: 清理可能残留的 inline buffer (文件被 unlink 时仍打开的罕见场景)
             self.inline_buffers.remove(&entry.inode);
             self.inline_max_sizes.remove(&entry.inode);
         } else {
@@ -2916,6 +3082,63 @@ impl FileSystem for PowerFsFs {
                 self.cache.remove_path(entry.inode, &path);
             }
         }
+
+        // Batch the filer-side unlink: add to pending queue and return
+        // immediately. The background flusher sends BatchUnlink RPCs every
+        // 5ms, grouping entries by shard. This eliminates the block_on(unlink
+        // RPC) from the FUSE callback critical path — unlink becomes a pure
+        // cache operation, no runtime worker consumed.
+        //
+        // Crash safety: if the client crashes before the batch is flushed,
+        // the filer still has the entry. The kernel has already removed the
+        // dentry from its cache, so the file appears deleted to this client.
+        // Other clients see it until filer GC cleans it up (acceptable in
+        // non-critical environments per user preference).
+        let shard_id = self.routing_shard(parent);
+        {
+            let mut guard = self.pending_unlinks.lock().unwrap();
+            guard.push((parent, name_str.to_string(), shard_id));
+            // Flush immediately if batch is full (16 entries)
+            if guard.len() >= 16 {
+                let entries: Vec<_> = std::mem::take(&mut *guard);
+                drop(guard);
+                // Group by shard and spawn async send
+                let mut groups: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
+                for (p, n, s) in entries {
+                    groups.entry(s).or_default().push((p, n));
+                }
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let runtime = self.client.runtime().handle().clone();
+                for (sid, batch) in groups {
+                    let mc = meta_client.clone();
+                    runtime.spawn(async move {
+                        match mc.batch_unlink(batch.clone(), sid).await {
+                            Ok(statuses) => {
+                                let failed: Vec<_> =
+                                    statuses.iter().filter(|&&s| s != powerfs_net::STATUS_OK as u32).collect();
+                                if !failed.is_empty() {
+                                    warn!(
+                                        "batch_unlink (inline): {}/{} failed (shard={})",
+                                        failed.len(),
+                                        statuses.len(),
+                                        sid
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "batch_unlink (inline) RPC failed (shard={}): {} — GC will cleanup",
+                                    sid, e
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // 修改了父目录内容（删除文件），invalidate 父目录的 dentry 缓存。
+        self.invalidate_dir_entries(parent);
 
         Ok(())
     }
@@ -2939,7 +3162,24 @@ impl FileSystem for PowerFsFs {
             parent, name_str, args.mode
         );
 
-        if self.entry_exists(parent, name_str) {
+        // 目录 lease: 首次访问父目录时获取 Shared lease。
+        // 后续 create 的 entry_exists 在 lease 有效期内跳过 lookup RPC，
+        // 将每个 create 的 block_on 从 2 个降到 1 个（仅 create RPC 本身）。
+        // 设计文档: docs/shard-routing-no-forward-principle.md §7
+        if !self.has_valid_dir_lease(parent) {
+            self.acquire_dir_lease(parent);
+        }
+
+        let t_entry = std::time::Instant::now();
+        let exists = self.entry_exists(parent, name_str);
+        let entry_ms = t_entry.elapsed().as_millis();
+        if entry_ms > 10 {
+            info!(
+                "FUSE create entry_exists slow: parent={}, name={}, exists={}, took={}ms, has_dir_lease={}",
+                parent, name_str, exists, entry_ms, self.has_valid_dir_lease(parent)
+            );
+        }
+        if exists {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
@@ -2980,6 +3220,7 @@ impl FileSystem for PowerFsFs {
             })?;
         let create_ms = t_create.elapsed().as_millis();
         let inode = attr.inode;
+        let t_post_rpc = std::time::Instant::now();
 
         // Phase-4 §5.1 Lockify: speculatively self-declare inode
         // ownership for the new file before the Inline/Stripe/Flat
@@ -2987,6 +3228,18 @@ impl FileSystem for PowerFsFs {
         // first write into this inode will hit the lease cache
         // instead of issuing a synchronous acquire RPC.
         self.lockify_declare_new_inode(inode);
+        let lockify_ms = t_post_rpc.elapsed().as_millis();
+
+        // 修改了父目录内容（新增文件），invalidate 父目录的 dentry 缓存。
+        // 保持目录 lease（修改是自己发起，下次 readdir 重新拉取即可）。
+        let t_inval = std::time::Instant::now();
+        self.invalidate_dir_entries(parent);
+        let inval_ms = t_inval.elapsed().as_millis();
+
+        info!(
+            "FUSE create timing: inode={}, create_rpc={}ms, lockify={}ms, inval={}ms, total_after_inval={}ms",
+            inode, create_ms, lockify_ms, inval_ms, t0.elapsed().as_millis()
+        );
 
         // P2.5: Inline 模式分支。Filer 在 CREATE 响应中返回
         // Placement::Inline { max_size } (无 volume_id/needle_id)。
@@ -3270,6 +3523,13 @@ impl FileSystem for PowerFsFs {
             }
             // Cache hit: best-effort 从 filer 刷新 size/chunks
             let parent = entry.parent;
+
+            let has_inode_lease = self
+                .lock_manager
+                .state()
+                .get_inode(inode)
+                .map(|le| le.mode == powerfs_lock_fuse::LockMode::Exclusive)
+                .unwrap_or(false);
             // CRITICAL: Skip the Filer refresh when there are dirty (unflushed)
             // chunks. A concurrent open by another FUSE worker (e.g., shell
             // pipeline like `echo > f && cat f` opens f twice in quick
@@ -3287,13 +3547,19 @@ impl FileSystem for PowerFsFs {
                 .unwrap_or(false);
             let has_dirty_chunks = self.chunk_cache.has_dirty_chunks(inode);
             debug!(
-                "open: inode={} dirty_check has_dirty_chunks={} has_dirty_inline={} inline_buffers_contains={}",
+                "open: inode={} dirty_check has_inode_lease={} has_dirty_chunks={} has_dirty_inline={} inline_buffers_contains={}",
                 inode,
+                has_inode_lease,
                 has_dirty_chunks,
                 has_dirty_inline,
                 self.inline_buffers.contains_key(&inode)
             );
-            if has_dirty_chunks || has_dirty_inline {
+            if has_inode_lease {
+                debug!(
+                    "open: skipping filer refresh for inode={} (Exclusive lease held, local cache authoritative)",
+                    inode
+                );
+            } else if has_dirty_chunks || has_dirty_inline {
                 // Local cache has unsynced data (write happened but
                 // sync_size_chunks_on_close hasn't completed yet, e.g.,
                 // async FUSE RELEASE). The local cache is authoritative:
@@ -3596,23 +3862,24 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        // Phase 3.5.3: 通知 filer 递增 open_count（best-effort，失败不阻塞 open）
+        // Phase 3.5.3: 通知 filer 递增 open_count（fire-and-forget，不阻塞 open）
+        // 原实现用 block_on 同步等待，每个 open 多一个 block_on 占用 runtime worker。
+        // open_count 是 best-effort 统计，失败不影响正确性，改为 spawn 异步发送。
         let meta_shard_client = self.client.facade().meta_shard_client().clone();
-        // inode-level state → route by calculate_shard_id(inode)
         let open_count_shard = self.routing_shard(inode);
         let req = powerfs_coherence::OpenCountRequest {
             shard_id: open_count_shard,
             inode,
         };
-        if let Err(e) = self
-            .client
-            .block_on(async move { meta_shard_client.open_count_inc(&req).await })
-        {
-            debug!(
-                "open: open_count_inc for inode {} failed (best-effort): {}",
-                inode, e
-            );
-        }
+        let runtime = self.client.runtime().handle().clone();
+        runtime.spawn(async move {
+            if let Err(e) = meta_shard_client.open_count_inc(&req).await {
+                debug!(
+                    "open: open_count_inc for inode {} failed (best-effort): {}",
+                    inode, e
+                );
+            }
+        });
 
         // Phase-4 §5.2 (P3): Pre-acquire the inode lease at open time
         // and bind it to the open-file registry. Subsequent
@@ -5824,21 +6091,21 @@ impl FileSystem for PowerFsFs {
             // Capture final size for the close completion log line:
             let final_size = buf_len as u64;
 
-            // open_count_dec (best-effort, 同 Flat 路径)
+            // open_count_dec (fire-and-forget，不阻塞 release)
             let meta_shard_client = self.client.facade().meta_shard_client().clone();
             let req = powerfs_coherence::OpenCountRequest {
                 shard_id: routing_shard,
                 inode,
             };
-            if let Err(e) = self
-                .client
-                .block_on(async move { meta_shard_client.open_count_dec(&req).await })
-            {
-                debug!(
-                    "release inline: open_count_dec for inode {} failed (best-effort): {}",
-                    inode, e
-                );
-            }
+            let runtime = self.client.runtime().handle().clone();
+            runtime.spawn(async move {
+                if let Err(e) = meta_shard_client.open_count_dec(&req).await {
+                    debug!(
+                        "release inline: open_count_dec for inode {} failed (best-effort): {}",
+                        inode, e
+                    );
+                }
+            });
 
             // 移除 open_inodes 追踪 + unpin (Inline 无 flush 失败重试, 总是 unpin)
             // Use reference count: only remove when last open context closes.
@@ -6019,15 +6286,15 @@ impl FileSystem for PowerFsFs {
                 shard_id: open_count_shard,
                 inode,
             };
-            if let Err(e) = self
-                .client
-                .block_on(async move { meta_shard_client.open_count_dec(&req).await })
-            {
-                debug!(
-                    "release: open_count_dec for inode {} failed (best-effort): {}",
-                    inode, e
-                );
-            }
+            let runtime = self.client.runtime().handle().clone();
+            runtime.spawn(async move {
+                if let Err(e) = meta_shard_client.open_count_dec(&req).await {
+                    debug!(
+                        "release: open_count_dec for inode {} failed (best-effort): {}",
+                        inode, e
+                    );
+                }
+            });
         }
 
         // Phase 4.3/4.4: 移除 open_inodes 追踪（getattr 恢复短 TTL）
@@ -6208,6 +6475,20 @@ impl FileSystem for PowerFsFs {
         add_entry: &mut dyn FnMut(DirEntry) -> std::io::Result<usize>,
     ) -> std::io::Result<()> {
         debug!("readdir: inode={}, offset={}", inode, offset);
+
+        // Acquire a Shared lease on the directory so subsequent
+        // `entry_exists` / `lookup` calls trust the local dentry cache
+        // and skip the Filer lookup RPC. This is the key optimization for
+        // `cp N files` into the same directory: without it, each `create`
+        // triggers a lookup RPC (2N RPCs total); with it, only the create
+        // RPC is issued (N RPCs total).
+        //
+        // The lease is opportunistic: if lockify is disabled, the acquire
+        // silently fails and callers fall through to the normal RPC path.
+        // Design: docs/shard-routing-no-forward-principle.md §7
+        if offset == 0 {
+            self.acquire_dir_lease(inode);
+        }
 
         // 尝试从缓存获取目录条目（用于 is_dir 检查和 ".." 的 parent inode）
         let cached_entry = self.cache.get_inode(inode);

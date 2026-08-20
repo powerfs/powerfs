@@ -35,10 +35,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&args.config);
 
     let log_level = cfg.global.log_level.clone();
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
-        .init();
-    let _ = powerfs_common::dynamic_log::set_log_level(&log_level);
+    // 使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
+    powerfs_common::dynamic_log::init(&log_level, None);
 
     BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).log_startup();
 
@@ -137,6 +135,22 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     let event_bind_ip = bind_ip.clone();
     let event_provider_clone = event_provider.clone();
     let data_dir_for_event = filer_cfg.data_dir.clone();
+
+    // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
+    {
+        let poller_node_id = node_id.clone();
+        let poller_masters: Vec<(String, u16)> = filer_cfg
+            .master_addresses
+            .iter()
+            .map(|a| {
+                let ip = a.split(':').next().unwrap_or(a).to_string();
+                (ip, filer_cfg.master_net_port)
+            })
+            .collect();
+        powerfs_common::debug_config_poller::DebugConfigPoller::new(poller_node_id, poller_masters)
+            .start();
+    }
+
     tokio::spawn(async move {
         let mut sys = sysinfo::System::new_all();
         loop {

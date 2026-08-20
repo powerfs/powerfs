@@ -6,6 +6,8 @@ use prometheus::{register_counter, register_gauge, Counter, Encoder, Gauge, Text
 use serde_json::json;
 use std::collections::HashMap;
 
+use crate::debug_config::{DebugConfigStore, DebugConfigUpdate};
+
 lazy_static::lazy_static! {
     pub static ref RAFT_TERM: Gauge = register_gauge!(
         "powerfs_raft_term",
@@ -48,11 +50,20 @@ lazy_static::lazy_static! {
     ).unwrap();
 }
 
-pub async fn start_metrics_server(addr: &str) -> Result<(), String> {
-    let app = Router::new().route("/metrics", get(metrics_handler)).route(
-        "/admin/log-level",
-        get(get_log_level_handler).put(set_log_level_handler),
-    );
+pub async fn start_metrics_server(addr: &str, debug_store: DebugConfigStore) -> Result<(), String> {
+    let app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route(
+            "/admin/log-level",
+            get(get_log_level_handler).put(set_log_level_handler),
+        )
+        .route(
+            "/admin/debug",
+            get(get_debug_handler)
+                .put(put_debug_handler)
+                .delete(delete_debug_handler),
+        )
+        .with_state(debug_store);
 
     let addr = addr
         .parse()
@@ -107,4 +118,52 @@ async fn set_log_level_handler(Query(params): Query<HashMap<String, String>>) ->
             Json(json!({ "error": e })),
         ),
     }
+}
+
+// ===== Centralized debug config control (PUT/GET/DELETE /admin/debug) =====
+
+use axum::extract::State;
+use axum::http::StatusCode;
+
+/// GET /admin/debug — 列出所有节点的调试配置
+async fn get_debug_handler(State(store): State<DebugConfigStore>) -> impl IntoResponse {
+    let all = store.list_all();
+    Json(json!({ "configs": all }))
+}
+
+/// PUT /admin/debug — 更新节点调试配置
+/// Body: {"node":"fuse-1","level":"debug","flag":"fuse_create_timing","on":true}
+async fn put_debug_handler(
+    State(store): State<DebugConfigStore>,
+    Json(update): Json<DebugConfigUpdate>,
+) -> impl IntoResponse {
+    if update.node.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing 'node' field" })),
+        );
+    }
+    let updated = store.apply_update(update);
+    (StatusCode::OK, Json(json!({ "updated": updated })))
+}
+
+/// DELETE /admin/debug?node=fuse-1 — 清除节点配置
+async fn delete_debug_handler(
+    State(store): State<DebugConfigStore>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let node = match params.get("node") {
+        Some(n) => n.as_str(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "missing 'node' query parameter" })),
+            )
+        }
+    };
+    let removed = store.clear(node);
+    (
+        StatusCode::OK,
+        Json(json!({ "node": node, "removed": removed })),
+    )
 }

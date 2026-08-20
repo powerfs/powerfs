@@ -19,7 +19,8 @@ use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityStat
 use powerfs_net::serialize::{decode_setattr_req, EntryInfo, TlvDecoder, TlvEncoder};
 use powerfs_net::{
     ClientType, FieldId, MsgType, NetError, NetHandler, NetMessage, NetResult, RequestContext,
-    STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    STATUS_ERR_BAD_REQUEST, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR,
+    STATUS_OK,
 };
 use std::sync::Arc;
 
@@ -575,7 +576,20 @@ impl FilerNetHandler {
 
     /// Notify subscribers that an inode's metadata has changed.
     /// This is called after successful metadata mutations.
+    ///
+    /// Async mode (default): no-op. In async mode, propose_meta returns
+    /// before Raft apply completes, so notifying subscribers would cause
+    /// them to re-fetch stale (pre-apply) data and cache it. Instead, let
+    /// the natural TTL/lookup cycle handle cache invalidation after apply
+    /// completes. This avoids useless RPC round-trips to subscribers.
     fn notify_inode_change(&self, inode: u64, version: u64) {
+        if self.meta_shard_manager.is_async_meta_persist() {
+            debug!(
+                "FILER_NET_NOTIFY: skipping in async mode: inode={}, version={}",
+                inode, version
+            );
+            return;
+        }
         if let Some(ref notifier) = self.inode_notifier {
             let notifier = notifier.clone();
             let sub_count = notifier.subscriber_count(inode);
@@ -882,7 +896,26 @@ impl FilerNetHandler {
             }
         }
 
-        match self.meta_shard_manager.lookup(parent_ino, name.as_str()) {
+        // Lookup with retry for async_meta_persist mode.
+        // In async mode, create returns before Raft apply completes.
+        // If lookup misses, retry briefly to allow apply to catch up.
+        let lookup_result = if self.meta_shard_manager.is_async_meta_persist() {
+            let mut retries = 0;
+            loop {
+                if let Some(info) = self.meta_shard_manager.lookup(parent_ino, name.as_str()) {
+                    break Some(info);
+                }
+                if retries >= 20 {
+                    break None;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                retries += 1;
+            }
+        } else {
+            self.meta_shard_manager.lookup(parent_ino, name.as_str())
+        };
+
+        match lookup_result {
             Some(info) => {
                 let entry_info = Self::inode_to_entry_info(&info);
                 info!(
@@ -941,7 +974,24 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        match self.meta_shard_manager.get_inode(ino) {
+        // GetAttr with retry for async_meta_persist mode
+        let inode_result = if self.meta_shard_manager.is_async_meta_persist() {
+            let mut retries = 0;
+            loop {
+                if let Some(info) = self.meta_shard_manager.get_inode(ino) {
+                    break Some(info);
+                }
+                if retries >= 20 {
+                    break None;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                retries += 1;
+            }
+        } else {
+            self.meta_shard_manager.get_inode(ino)
+        };
+
+        match inode_result {
             Some(info) => {
                 let entry_info = Self::inode_to_entry_info(&info);
                 let mut enc = TlvEncoder::new();
@@ -1510,6 +1560,149 @@ impl FilerNetHandler {
         }
     }
 
+    /// Handle MkdirPhaseA request: CreateInode on target_shard (Phase A of
+    /// client-routed two-phase mkdir).
+    ///
+    /// The client pre-allocated `ino` via AllocInodeBatch on target_shard,
+    /// then routes this request to target_shard's leader. We create ONLY the
+    /// inode record (no dir entry). The client will then send MkdirPhaseB to
+    /// parent_shard's leader to add the dir entry.
+    ///
+    /// If we are not the leader for target_shard, return STATUS_ERR_REDIRECT
+    /// so the client updates its shard_router and retries.
+    ///
+    /// See docs/shard-routing-no-forward-principle.md §3
+    async fn handle_mkdir_phase_a(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let (shard_id, ino, parent_ino, name, mode, uid, gid) =
+            match powerfs_net::serialize::decode_mkdir_phase_a_req(&msg.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("FILER_NET_MKDIR_PHASE_A: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
+
+        info!(
+            "FILER_NET_MKDIR_PHASE_A: shard={} ino={} parent={} name={} mode={:o}",
+            shard_id, ino, parent_ino, name, mode
+        );
+
+        let target_shard = ShardId(shard_id);
+
+        // Check leader — redirect if we are not the leader for target_shard
+        if let Err(redirect) = self.check_leader(msg, target_shard).await {
+            warn!(
+                "FILER_NET_MKDIR_PHASE_A: not leader for shard {}, redirecting",
+                target_shard.0
+            );
+            return Ok(redirect);
+        }
+
+        match self
+            .meta_shard_manager
+            .create_directory_phase_a(ino, parent_ino, &name, mode, uid, gid)
+            .await
+        {
+            Ok(info) => {
+                // Return full attributes (same format as handle_mkdir)
+                let dir_mode = (mode | 0o040000) as u32;
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::Ino, info.inode);
+                enc.add_u32(FieldId::Mode, dir_mode);
+                enc.add_u32(FieldId::Uid, uid);
+                enc.add_u32(FieldId::Gid, gid);
+                enc.add_u64(FieldId::Size, info.size);
+                enc.add_u32(FieldId::Nlink, info.nlink);
+                enc.add_u64(FieldId::Mtime, info.mtime);
+                enc.add_u64(FieldId::Atime, info.atime);
+                enc.add_u64(FieldId::Ctime, info.ctime);
+                enc.add_u8(FieldId::IsDir, 1);
+                enc.add_string(FieldId::Name, &name)?;
+                enc.add_u64(FieldId::ShardId, target_shard.0);
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_MKDIR_PHASE_A failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Handle MkdirPhaseB request: AddDirEntry on parent_shard (Phase B of
+    /// client-routed two-phase mkdir).
+    ///
+    /// The client already completed Phase A (CreateInode on target_shard) and
+    /// now routes this request to parent_shard's leader to add the dir entry
+    /// pointing to the new inode. We add ONLY the dir entry (no inode record).
+    ///
+    /// If we are not the leader for parent_shard, return STATUS_ERR_REDIRECT.
+    ///
+    /// See docs/shard-routing-no-forward-principle.md §3
+    async fn handle_mkdir_phase_b(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let (shard_id, parent_ino, name, ino, _mode, _uid, _gid) =
+            match powerfs_net::serialize::decode_mkdir_phase_b_req(&msg.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("FILER_NET_MKDIR_PHASE_B: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
+
+        info!(
+            "FILER_NET_MKDIR_PHASE_B: shard={} parent={} name={} ino={}",
+            shard_id, parent_ino, name, ino
+        );
+
+        let parent_shard = ShardId(shard_id);
+
+        // Check leader — redirect if we are not the leader for parent_shard
+        if let Err(redirect) = self.check_leader(msg, parent_shard).await {
+            warn!(
+                "FILER_NET_MKDIR_PHASE_B: not leader for shard {}, redirecting",
+                parent_shard.0
+            );
+            return Ok(redirect);
+        }
+
+        match self
+            .meta_shard_manager
+            .create_directory_phase_b(parent_ino, &name, ino)
+            .await
+        {
+            Ok(()) => {
+                // Notify inode change (parent readdir cache + new dir inode)
+                let v = self.next_version();
+                self.notify_inode_change(parent_ino, v);
+                self.notify_inode_change(ino, v);
+
+                // Phase B response: status only (Phase A already returned attrs)
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::Ino, ino);
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            Err(e) => {
+                warn!("FILER_NET_MKDIR_PHASE_B failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     /// Handle Unlink request
     async fn handle_unlink(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -1586,6 +1779,94 @@ impl FilerNetHandler {
                 Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
             }
         }
+    }
+
+    /// Handle BatchUnlink: remove multiple directory entries in one RPC.
+    /// All entries must belong to the same shard (caller ensures this).
+    /// Uses `batch_delete_files` → `propose_many` to submit all
+    /// RemoveDirEntry commands in a single Raft replication cycle,
+    /// and all DeleteInode commands in one cycle per inode shard.
+    ///
+    /// For N entries on the same shard, Raft commits = 2 (not 2N).
+    async fn handle_batch_unlink(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let entries = match powerfs_net::serialize::decode_batch_unlink_req(&msg.body) {
+            Ok(e) => e,
+            Err(err) => {
+                warn!("FILER_NET_BATCH_UNLINK: decode failed: {}", err);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_BAD_REQUEST,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        if entries.is_empty() {
+            return Ok(Self::build_response(msg, STATUS_OK, Vec::new()));
+        }
+
+        // All entries must be in the same shard (caller groups by shard).
+        let shard_id = self.shard_strategy.calculate_shard(entries[0].0);
+
+        info!(
+            "FILER_NET_BATCH_UNLINK: {} entries, shard={}",
+            entries.len(),
+            shard_id.0
+        );
+
+        // Check leader once for the whole batch.
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_BATCH_UNLINK: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
+        // Batch delete via propose_many: one Raft cycle for all RemoveDirEntry,
+        // one per distinct inode shard for DeleteInode/DecrementNlink.
+        let results = self
+            .meta_shard_manager
+            .batch_delete_files(&entries)
+            .await;
+
+        let mut statuses: Vec<u32> = Vec::with_capacity(entries.len());
+        let mut any_ok = false;
+        for (i, result) in results.iter().enumerate() {
+            match result {
+                Ok(_) => {
+                    let (parent_ino, name) = &entries[i];
+                    info!(
+                        "FILER_NET_BATCH_UNLINK: deleted '{}/{}'",
+                        parent_ino, name
+                    );
+                    let v = self.next_version();
+                    self.notify_inode_change(*parent_ino, v);
+                    statuses.push(STATUS_OK as u32);
+                    any_ok = true;
+                }
+                Err(e) => {
+                    let (parent_ino, name) = &entries[i];
+                    let status = if e.contains("not found") {
+                        STATUS_ERR_NOT_FOUND
+                    } else if e.contains("not_leader") || e.contains("redirect") {
+                        STATUS_ERR_REDIRECT
+                    } else {
+                        STATUS_ERR_SERVER_ERROR
+                    };
+                    warn!(
+                        "FILER_NET_BATCH_UNLINK: failed '{}/{}': {} -> status={}",
+                        parent_ino, name, e, status
+                    );
+                    statuses.push(status as u32);
+                }
+            }
+        }
+
+        let resp_body = powerfs_net::serialize::encode_batch_unlink_resp(&statuses)
+            .unwrap_or_default();
+        let overall_status = if any_ok { STATUS_OK } else { STATUS_ERR_NOT_FOUND };
+        Ok(Self::build_response(msg, overall_status, resp_body))
     }
 
     /// Handle Rmdir request
@@ -1902,11 +2183,12 @@ impl FilerNetHandler {
         let count = dec.next_u32(FieldId::Count).unwrap_or(0);
         let _client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
 
-        // fuse 端传 dir_ino/parent 作为 shard_id，重映射到正确的 shard
-        let shard_id = self
-            .meta_shard_manager
-            .get_shard_strategy()
-            .calculate_shard(shard_id_raw);
+        // Client sends the real shard_id (e.g. target_shard for two-phase mkdir).
+        // Do NOT re-map via calculate_shard() — that would treat the shard_id as
+        // an inode number and route to the wrong shard (e.g. shard_id=1 maps to
+        // shard 0 because inode 1 ∈ [0, 1M)). The gRPC and POSIX handlers in
+        // grpc_service.rs / posix_service.rs already use shard_id directly.
+        let shard_id = ShardId(shard_id_raw);
         if let Err(redirect) = self.check_leader(msg, shard_id).await {
             return Ok(redirect);
         }
@@ -2040,6 +2322,11 @@ impl FilerNetHandler {
                 // increasing version. This prevents the client's is_duplicate
                 // check from suppressing concurrent append notifications that
                 // would otherwise share the same second-resolution timestamp.
+                //
+                // Note: notify_inode_change is a no-op in async mode (see
+                // method doc). In async mode, the apply hasn't completed yet,
+                // so notifying would cause subscribers to re-fetch stale
+                // (pre-apply) data and cache it.
                 self.notify_inode_change(inode, self.next_version());
                 // 成功: STATUS_OK + 空 body
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
@@ -2785,6 +3072,11 @@ impl NetHandler for FilerNetHandler {
             MsgType::GetXattr => self.handle_getxattr(msg).await,
             MsgType::RemoveXattr => self.handle_remove_xattr(msg).await,
             MsgType::ListXattr => self.handle_list_xattr(msg).await,
+            // Two-phase Mkdir (client-routed, no server-to-server forwarding)
+            // See docs/shard-routing-no-forward-principle.md §3
+            MsgType::MkdirPhaseA => self.handle_mkdir_phase_a(msg).await,
+            MsgType::MkdirPhaseB => self.handle_mkdir_phase_b(msg).await,
+            MsgType::BatchUnlink => self.handle_batch_unlink(msg).await,
             // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)
             MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
             MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,

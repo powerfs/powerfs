@@ -2050,14 +2050,112 @@ impl MetadataClient for MetaShardClient {
     ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            let body =
-                serialize::encode_mkdir_req(parent_ino, &name, mode, uid, gid).map_err(map_err)?;
-            let resp = self
-                .send_coherence_msg(MsgType::Mkdir, shard_id, body)
+            // Two-phase mkdir (client-routed, no server-to-server forwarding).
+            //
+            // Fast path: if target_shard == parent_shard (shard_count <= 1 or
+            // pick_child_dir_shard returns parent_shard), use the legacy single-
+            // RPC Mkdir — the server handles both CreateInode + AddDirEntry
+            // atomically on the same shard.
+            //
+            // Slow path: if target_shard != parent_shard (子目录换片, the common
+            // case for mkdir), the client coordinates two phases:
+            //   Phase A: AllocInode + CreateInode → target_shard leader
+            //   Phase B: AddDirEntry → parent_shard leader
+            // Each phase is independently redirected on not_leader. If Phase A
+            // succeeds but Phase B fails, an orphan inode record remains on
+            // target_shard (no dir entry points to it) — cleaned by GC later.
+            //
+            // See docs/shard-routing-no-forward-principle.md §3
+            let parent_shard = shard_id;
+            let shard_count = {
+                let map = self.shard_map.lock().unwrap();
+                map.shard_count()
+            };
+            let target_shard = if shard_count <= 1 {
+                parent_shard
+            } else {
+                (parent_shard + 1) % shard_count
+            };
+
+            if target_shard == parent_shard {
+                // Fast path: single-shard mkdir (legacy Mkdir RPC).
+                // The server creates inode + dir entry atomically on parent_shard.
+                let body = serialize::encode_mkdir_req(parent_ino, &name, mode, uid, gid)
+                    .map_err(map_err)?;
+                let resp = self
+                    .send_coherence_msg(MsgType::Mkdir, parent_shard, body)
+                    .await
+                    .map_err(map_err)?;
+                let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+                return Ok(attr_from_resp(attr_resp));
+            }
+
+            // Slow path: two-phase mkdir across target_shard + parent_shard.
+            log::debug!(
+                "mkdir two-phase: parent={} name={} parent_shard={} target_shard={}",
+                parent_ino, name, parent_shard, target_shard
+            );
+
+            // Phase A: allocate inode on target_shard, then CreateInode.
+            let alloc_req = powerfs_coherence::AllocInodeBatchRequest {
+                shard_id: target_shard,
+                count: 1,
+                client_id: self.client_id.to_string(),
+            };
+            let alloc_resp = self.alloc_inode_batch(&alloc_req).await.map_err(map_err)?;
+            if !alloc_resp.success || alloc_resp.start_inode == 0 {
+                return Err(map_err("alloc_inode_batch failed for mkdir phase A"));
+            }
+            let ino = alloc_resp.start_inode;
+
+            // Phase A RPC: MkdirPhaseA → target_shard (CreateInode only)
+            let phase_a_body = serialize::encode_mkdir_phase_a_req(
+                target_shard,
+                ino,
+                parent_ino,
+                &name,
+                mode,
+                uid,
+                gid,
+            )
+            .map_err(map_err)?;
+            let phase_a_resp = self
+                .send_coherence_msg(MsgType::MkdirPhaseA, target_shard, phase_a_body)
                 .await
                 .map_err(map_err)?;
-            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
-            Ok(attr_from_resp(attr_resp))
+
+            // Decode attr from Phase A response
+            let attr_resp = serialize::decode_attr_resp(&phase_a_resp).map_err(map_err)?;
+            let attr = attr_from_resp(attr_resp);
+
+            // Phase B RPC: MkdirPhaseB → parent_shard (AddDirEntry only)
+            let phase_b_body = serialize::encode_mkdir_phase_b_req(
+                parent_shard,
+                parent_ino,
+                &name,
+                ino,
+                mode,
+                uid,
+                gid,
+            )
+            .map_err(map_err)?;
+            let _phase_b_resp = self
+                .send_coherence_msg(MsgType::MkdirPhaseB, parent_shard, phase_b_body)
+                .await
+                .map_err(map_err)?;
+
+            // Check Phase B status — if it failed, we have an orphan inode on
+            // target_shard (Phase A succeeded). Log and return error; GC will
+            // clean up the orphan inode record later.
+            // Phase B response body contains Ino; status is in the frame header
+            // which send_coherence_msg already checks (returns Err on non-OK).
+            // If we get here, Phase B succeeded.
+            log::debug!(
+                "mkdir two-phase done: ino={} parent={} name={}",
+                ino, parent_ino, name
+            );
+
+            Ok(attr)
         })
     }
 
@@ -2097,6 +2195,23 @@ impl MetadataClient for MetaShardClient {
                 .await
                 .map_err(map_err)?;
             Ok(())
+        })
+    }
+
+    fn batch_unlink(
+        &self,
+        entries: Vec<(u64, String)>,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<Vec<u32>>> + Send + '_>> {
+        Box::pin(async move {
+            let body =
+                serialize::encode_batch_unlink_req(&entries).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::BatchUnlink, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let statuses = serialize::decode_batch_unlink_resp(&resp).map_err(map_err)?;
+            Ok(statuses)
         })
     }
 

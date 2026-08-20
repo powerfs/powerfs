@@ -163,6 +163,14 @@ pub trait MetadataClient: Send + Sync {
         shard_id: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
 
+    /// batch_unlink：批量删除文件（一次 RPC + 一次 Raft propose_many）
+    /// entries: Vec of (parent_ino, name)，所有 entry 必须属于同一 shard
+    fn batch_unlink(
+        &self,
+        entries: Vec<(u64, String)>,
+        shard_id: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>>> + Send + '_>>;
+
     /// rmdir：删除空目录
     fn rmdir(
         &self,

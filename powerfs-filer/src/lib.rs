@@ -10,6 +10,7 @@ pub mod inode_notifier;
 pub mod lease_persistence;
 pub mod meta_shard_manager;
 pub mod metadata_store;
+pub mod meta_cache;
 pub mod metrics;
 pub mod net_handler;
 pub mod posix_service;

@@ -192,42 +192,9 @@ fn main() {
         process::exit(1);
     }
 
-    // 配置日志
-    let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level));
-
-    builder.format(|buf, record| {
-        writeln!(
-            buf,
-            "[{}] [{}] [{}] {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            record.level(),
-            record.target(),
-            record.args()
-        )
-    });
-
-    if let Some(log_file_path) = &log_file {
-        use std::fs::{self, File};
-        use std::path::Path;
-
-        let log_path = Path::new(log_file_path);
-        if let Some(parent) = log_path.parent() {
-            fs::create_dir_all(parent).unwrap_or_else(|e| {
-                eprintln!("Failed to create log directory: {}", e);
-            });
-        }
-
-        let file = File::create(log_file_path).unwrap_or_else(|e| {
-            eprintln!("Failed to create log file: {}", e);
-            std::process::exit(1);
-        });
-
-        builder.target(env_logger::Target::Pipe(Box::new(file)));
-        info!("Logging to file: {}", log_file_path);
-    }
-
-    builder.init();
+    // 配置日志：使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
+    // master 通过 GetDebugConfig 下发配置，fuse 每 2s 轮询并本地应用
+    powerfs_common::dynamic_log::init(&log_level, None);
 
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
@@ -319,6 +286,16 @@ fn main() {
         )
         .await
         .expect("Failed to create FUSE client");
+
+        // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
+        let node_id = std::env::var("HOSTNAME")
+            .unwrap_or_else(|_| "fuse-unknown".to_string());
+        let master_endpoints: Vec<(String, u16)> = master_addrs
+            .iter()
+            .map(|a| (a.clone(), master_net_port))
+            .collect();
+        powerfs_common::debug_config_poller::DebugConfigPoller::new(node_id, master_endpoints)
+            .start();
 
         info!("Mounting PowerFS at: {}", mount_point);
 

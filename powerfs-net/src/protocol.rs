@@ -584,6 +584,27 @@ pub enum MsgType {
     /// Response: XattrKeys (repeated string, NUL-separated) or empty.
     ListXattr = 0x003b,
 
+    /// Mkdir Phase A: CreateInode on target_shard (client-routed two-phase mkdir).
+    /// Request: ShardId(target) + Ino + ParentIno + Name + Mode + Uid + Gid
+    /// Response: Ino + Mode + Uid + Gid + Size + Nlink + Mtime + Atime + Ctime + IsDir + Name + ShardId
+    /// See docs/shard-routing-no-forward-principle.md §3
+    MkdirPhaseA = 0x003c,
+
+    /// Mkdir Phase B: AddDirEntry on parent_shard (client-routed two-phase mkdir).
+    /// Request: ShardId(parent) + ParentIno + Name + Ino + Mode + Uid + Gid
+    /// Response: status only (Phase A already returned the full attr)
+    /// See docs/shard-routing-no-forward-principle.md §3
+    MkdirPhaseB = 0x003d,
+
+    /// Batch unlink: remove multiple directory entries in one RPC + one Raft
+    /// propose_many. Client batches consecutive unlink calls and flushes
+    /// periodically or when the batch is full.
+    ///
+    /// Request: ShardId(parent) + count(u32) + [(ParentIno + NameLen + Name)] * count
+    /// Response: status + per-entry status codes
+    /// See docs/shard-routing-no-forward-principle.md §8
+    BatchUnlink = 0x003e,
+
     // Status
     StatFs = 0x0040,
 
@@ -645,6 +666,17 @@ pub enum MsgType {
     /// Request TLV: Ino + ClientId + LeaseToken. Response: STATUS only.
     RevokeInodeLeaseAck = 0x0088,
 
+    /// Get debug configuration from master (centralized debug control).
+    ///
+    /// Request TLV: NodeId(string) — requesting node's identifier (e.g. "fuse-1")
+    /// Response TLV: LogLevel(string) + TargetFilter(string) + FlagCount(u32)
+    ///               + [FlagName(string) + FlagOn(u8)] * FlagCount
+    ///
+    /// Master merges "all" defaults with node-specific overrides and returns
+    /// the effective config. Nodes poll every 2s and apply locally via
+    /// `powerfs_common::dynamic_log`.
+    GetDebugConfig = 0x0089,
+
     // Raft inter-node operations
     /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
     /// to the peer that leads the target shard group.
@@ -683,6 +715,9 @@ impl MsgType {
             0x0039 => Some(Self::GetXattr),
             0x003a => Some(Self::RemoveXattr),
             0x003b => Some(Self::ListXattr),
+            0x003c => Some(Self::MkdirPhaseA),
+            0x003d => Some(Self::MkdirPhaseB),
+            0x003e => Some(Self::BatchUnlink),
             0x0040 => Some(Self::StatFs),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
@@ -714,6 +749,7 @@ impl MsgType {
             0x0086 => Some(Self::ReleaseInodeLease),
             0x0087 => Some(Self::RenewInodeLease),
             0x0088 => Some(Self::RevokeInodeLeaseAck),
+            0x0089 => Some(Self::GetDebugConfig),
             0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
@@ -1027,6 +1063,22 @@ pub enum FieldId {
     /// overwriting. Used by FUSE release to support cross-client concurrent
     /// appends to inline files without lost updates.
     IsAppend = 0xBE,
+
+    // ===== Debug control fields (0xBF-0xC3) =====
+    // 用于 GetDebugConfig 请求/响应的 TLV 编码
+    /// Node identifier (string). GetDebugConfig 请求中标识调用方节点
+    /// (如 "fuse-1", "filer-2", "all")。Master 据此合并 "all" 默认 + 节点覆盖。
+    NodeId = 0xBF,
+    /// Log level (string, "off"|"error"|"warn"|"info"|"debug"|"trace").
+    /// GetDebugConfig 响应中携带有效日志级别。
+    LogLevel = 0xC0,
+    /// Target filter (string, 如 "powerfs_fuse::fuse")。
+    /// GetDebugConfig 响应中携带有效 target 过滤器，空串表示无过滤。
+    TargetFilter = 0xC1,
+    /// Flag name (string). GetDebugConfig 响应中每个开关的名称。
+    FlagName = 0xC2,
+    /// Flag enabled (u8, 0/1). GetDebugConfig 响应中每个开关的状态。
+    FlagOn = 0xC3,
 }
 
 impl FieldId {
@@ -1132,6 +1184,11 @@ impl FieldId {
             0xBC => Some(Self::XattrKeys),
             0xBD => Some(Self::ShardMapEntries),
             0xBE => Some(Self::IsAppend),
+            0xBF => Some(Self::NodeId),
+            0xC0 => Some(Self::LogLevel),
+            0xC1 => Some(Self::TargetFilter),
+            0xC2 => Some(Self::FlagName),
+            0xC3 => Some(Self::FlagOn),
             _ => None,
         }
     }
@@ -1375,6 +1432,13 @@ pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
         // GetXattr (0x0039) - body < 4KB (xattr value)
         0x0039 => Some((4 * 1024, 0)),
 
+        // MkdirPhaseA (0x003c) - body < 4KB (attr response, same as Mkdir)
+        0x003c => Some((4 * 1024, 0)),
+        // MkdirPhaseB (0x003d) - body < 256B (status only)
+        0x003d => Some((256, 0)),
+        // BatchUnlink (0x003e) - body < 64KB (up to ~256 entries × 256B each)
+        0x003e => Some((64 * 1024, 0)),
+
         // ReadNeedle (0x0063) - data ≤ 2MB, body < 256KB
         0x0063 => Some((256 * 1024, 2 * 1024 * 1024)),
 
@@ -1496,6 +1560,8 @@ fn required_fields_for(msg_type: u16) -> &'static [FieldId] {
         0x0013 => &[FieldId::Ino, FieldId::Mode],
         // Mkdir 响应：必须含 Ino + Mode + IsDir
         0x0014 => &[FieldId::Ino, FieldId::Mode, FieldId::IsDir],
+        // MkdirPhaseA 响应（CreateInode）：必须含 Ino + Mode + IsDir
+        0x003c => &[FieldId::Ino, FieldId::Mode, FieldId::IsDir],
         // Symlink 响应：必须含 Ino + Mode + SymlinkTarget
         0x0019 => &[FieldId::Ino, FieldId::Mode, FieldId::SymlinkTarget],
         // Readlink 响应：必须含 SymlinkTarget
