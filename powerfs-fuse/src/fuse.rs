@@ -3582,6 +3582,34 @@ impl FileSystem for PowerFsFs {
                     "open: skipping filer refresh for inode={} (has dirty/unsynced chunks or inline buffer)",
                     inode
                 );
+            } else if entry.state != EntryState::Stale && !entry.chunks.is_empty() {
+                // P4: Trust cache hit on non-Stale entries with known chunks.
+                //
+                // Rationale: every Filer-driven metadata change (other
+                // clients writing, resize, truncate, chmod, unlink, rename,
+                // setattr) is pushed to this FUSE client via the
+                // coherence Invalidate notification, which transitions the
+                // entry to Stale and/or evicts it (see invalidate.rs /
+                // InvalidateHandler).  Therefore if state is *not* Stale,
+                // no other client has modified this file since the last
+                // time our cache was refreshed/inserted.  Skipping the
+                // refresh RPC avoids a round-trip on every open of a
+                // recently-touched file (common for shell pipelines and
+                // re-opens by the same process).
+                //
+                // Guard: require non-empty chunks. The Filer returns empty
+                // chunks for newly-created files before the first
+                // sync_size_chunks_on_close has run; in that window we
+                // can't tell if another client raced and appended, so we
+                // still refresh. Entries where the local cache has chunks
+                // AND state != Stale are authoritative.
+                debug!(
+                    "open: skipping filer refresh for inode={} \
+                     (P4 cache trust: state={:?}, chunks={}, no invalidation received)",
+                    inode,
+                    entry.state,
+                    entry.chunks.len()
+                );
             } else if let Ok(Some((filer_entry, _))) = self.client.get_entry_by_inode(inode) {
                 let fresh = self.entry_to_cached(parent, &filer_entry);
                 // Data has been synced: the Filer is authoritative. Update
