@@ -59,7 +59,9 @@ fn test_shard_creation_and_file_operations() {
 
         meta_shard_manager.register_root_inode("test-bucket", 1);
 
-        let result = meta_shard_manager.create_directory(1, "test-dir").await;
+        let result = meta_shard_manager
+            .create_directory(1, "test-dir", 0o040755, 0, 0)
+            .await;
         assert!(result.is_ok(), "Failed to create directory: {:?}", result);
 
         let dir_info = result.unwrap();
@@ -175,13 +177,13 @@ fn test_path_resolution() {
         meta_shard_manager.register_root_inode("my-bucket", 1);
 
         meta_shard_manager
-            .create_directory(1, "level1")
+            .create_directory(1, "level1", 0o040755, 0, 0)
             .await
             .unwrap();
         let level1_info = meta_shard_manager.lookup(1, "level1").unwrap();
 
         meta_shard_manager
-            .create_directory(level1_info.inode, "level2")
+            .create_directory(level1_info.inode, "level2", 0o040755, 0, 0)
             .await
             .unwrap();
         let level2_info = meta_shard_manager
