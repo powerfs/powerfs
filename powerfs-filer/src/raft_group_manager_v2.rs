@@ -292,6 +292,35 @@ pub enum ShardCommand {
     LeaseSaveEpoch {
         epoch: u64,
     },
+
+    // ----- P4 cross-shard DirStatSummary on parent shard -----
+    //
+    // Persist (or overwrite) a lightweight DirStatSummary for a single
+    // directory child on the *parent's* shard. The update is always
+    // client-routed directly to `calculate_shard(parent_inode)` — there
+    // is NEVER a filer → filer forward (see
+    // docs/shard-routing-no-forward-principle.md §3). The
+    // `summary.version_ts` guard drops out-of-order old updates.
+    //
+    // Typical producers:
+    //   * MkdirPhaseB on parent_shard — first write of the child summary
+    //     after AddDirEntry succeeds.
+    //   * SetAttr handlers on the child shard — they re-issue a second
+    //     client-routed UpdateChildSummary to the parent shard leader.
+    //   * Unlink/rmdir/Rename on parent_shard — issue DeleteChildSummary
+    //     to keep the cache consistent with the removed dir entry.
+    UpdateChildSummary {
+        parent_inode: u64,
+        name: String,
+        summary: crate::shard_store::DirStatSummary,
+    },
+    /// Drop a DirStatSummary from the parent shard when the child entry
+    /// is removed or renamed-away. Idempotent: deleting a missing key is a
+    /// no-op. Routed via `calculate_shard(parent_inode)`.
+    DeleteChildSummary {
+        parent_inode: u64,
+        name: String,
+    },
 }
 
 impl ShardCommand {

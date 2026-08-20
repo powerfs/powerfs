@@ -126,6 +126,26 @@ pub struct MetaCache {
 
     /// Directory entry cache by (parent_inode, name).
     direntry_table: RwLock<HashMap<DirEntryKey, CachedDirEntry>>,
+
+    // ----- Prometheus-friendly cumulative counters -----
+    //
+    // Mirroring the lease-manager pattern (`powerfs-filer/src/metrics.rs`):
+    // these atomics store absolute totals; the metrics endpoint reads them
+    // via `stats()` and sets `IntGauge`s that a Prometheus scraper then
+    // treats as counters (because monotonic). Using Atomics here keeps
+    // MetaCache lock-free on the hot path; the read-only snapshots never
+    // contend with `mark_dirty`/`stage_delete` writers.
+    pub(crate) inode_hit_total: AtomicU64,
+    pub(crate) inode_miss_total: AtomicU64,
+    pub(crate) inode_deleted_served_total: AtomicU64,
+    pub(crate) direntry_hit_total: AtomicU64,
+    pub(crate) direntry_miss_total: AtomicU64,
+    pub(crate) direntry_deleted_served_total: AtomicU64,
+    pub(crate) dirty_mark_total: AtomicU64,
+    pub(crate) dirty_confirm_total: AtomicU64,
+    pub(crate) stage_delete_total: AtomicU64,
+    pub(crate) backfill_clean_total: AtomicU64,
+    pub(crate) invalidate_all_total: AtomicU64,
 }
 
 impl Default for MetaCache {
@@ -139,6 +159,17 @@ impl MetaCache {
         Self {
             inode_table: RwLock::new(HashMap::new()),
             direntry_table: RwLock::new(HashMap::new()),
+            inode_hit_total: AtomicU64::new(0),
+            inode_miss_total: AtomicU64::new(0),
+            inode_deleted_served_total: AtomicU64::new(0),
+            direntry_hit_total: AtomicU64::new(0),
+            direntry_miss_total: AtomicU64::new(0),
+            direntry_deleted_served_total: AtomicU64::new(0),
+            dirty_mark_total: AtomicU64::new(0),
+            dirty_confirm_total: AtomicU64::new(0),
+            stage_delete_total: AtomicU64::new(0),
+            backfill_clean_total: AtomicU64::new(0),
+            invalidate_all_total: AtomicU64::new(0),
         }
     }
 
@@ -180,11 +211,12 @@ impl MetaCache {
         F: FnMut(&mut InodeInfo),
     {
         let mut tbl = self.inode_table.write().unwrap();
-        match tbl.get_mut(&inode) {
+        let did_mark = match tbl.get_mut(&inode) {
             Some(existing) => {
                 updater(&mut existing.info);
                 existing.state = CacheState::Dirty;
                 existing.touch();
+                true
             }
             None => {
                 if let Some(mut info) = fallback_current {
@@ -192,8 +224,14 @@ impl MetaCache {
                     let ci = CachedInode::new(info, CacheState::Dirty);
                     ci.touch();
                     tbl.insert(inode, ci);
+                    true
+                } else {
+                    false
                 }
             }
+        };
+        if did_mark {
+            self.dirty_mark_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -204,6 +242,7 @@ impl MetaCache {
     /// After this call, reads return ENOENT. The marker is cleared on apply
     /// or by `invalidate_all` on leader change.
     pub fn stage_delete(&self, parent_inode: u64, name: &str, inode: u64) {
+        self.stage_delete_total.fetch_add(1, Ordering::Relaxed);
         // 1. inode table → state = Deleted
         {
             let mut tbl = self.inode_table.write().unwrap();
@@ -244,11 +283,24 @@ impl MetaCache {
     ///   call `cache_put_clean()` on a hit to populate.
     pub fn get_inode(&self, inode: u64) -> Option<Option<InodeInfo>> {
         let tbl = self.inode_table.read().unwrap();
-        let ci = tbl.get(&inode)?;
+        let ci = match tbl.get(&inode) {
+            Some(ci) => ci,
+            None => {
+                self.inode_miss_total.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
         ci.touch();
         match ci.state {
-            CacheState::Deleted => Some(None),
-            _ => Some(Some(ci.info.clone())),
+            CacheState::Deleted => {
+                self.inode_deleted_served_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(None)
+            }
+            _ => {
+                self.inode_hit_total.fetch_add(1, Ordering::Relaxed);
+                Some(Some(ci.info.clone()))
+            }
         }
     }
 
@@ -258,9 +310,6 @@ impl MetaCache {
     pub fn cache_put_clean(&self, info: InodeInfo) {
         let ino = info.inode;
         let mut tbl = self.inode_table.write().unwrap();
-        // Do NOT clobber Staging / Dirty / Deleted entries — those are the
-        // authoritative "intended state". Only populate on miss or on a
-        // stale Clean copy.
         let needs_insert = match tbl.get(&ino) {
             None => true,
             Some(existing) => existing.state == CacheState::Clean,
@@ -268,6 +317,7 @@ impl MetaCache {
         if needs_insert {
             let ci = CachedInode::new(info, CacheState::Clean);
             tbl.insert(ino, ci);
+            self.backfill_clean_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -277,11 +327,24 @@ impl MetaCache {
     pub fn get_direntry(&self, parent_inode: u64, name: &str) -> Option<Option<u64>> {
         let key = (parent_inode, name.to_string());
         let tbl = self.direntry_table.read().unwrap();
-        let de = tbl.get(&key)?;
+        let de = match tbl.get(&key) {
+            Some(de) => de,
+            None => {
+                self.direntry_miss_total.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
         de.touch();
         match de.state {
-            CacheState::Deleted => Some(None),
-            _ => Some(Some(de.child_inode)),
+            CacheState::Deleted => {
+                self.direntry_deleted_served_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(None)
+            }
+            _ => {
+                self.direntry_hit_total.fetch_add(1, Ordering::Relaxed);
+                Some(Some(de.child_inode))
+            }
         }
     }
 
@@ -296,6 +359,7 @@ impl MetaCache {
         if needs_insert {
             let de = CachedDirEntry::new(child_inode, CacheState::Clean);
             tbl.insert(key, de);
+            self.backfill_clean_total.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -330,6 +394,8 @@ impl MetaCache {
         if let Some(ci) = tbl.get_mut(&inode) {
             if ci.state == CacheState::Dirty {
                 ci.state = CacheState::Clean;
+                drop(tbl);
+                self.dirty_confirm_total.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -385,6 +451,7 @@ impl MetaCache {
     /// the previous leader broadcast before losing leadership. The client
     /// retries on the new leader and the cache repopulates from ShardStore.
     pub fn invalidate_all(&self) {
+        self.invalidate_all_total.fetch_add(1, Ordering::Relaxed);
         let (inode_count, de_count) = {
             let it = self.inode_table.read().unwrap();
             let dt = self.direntry_table.read().unwrap();

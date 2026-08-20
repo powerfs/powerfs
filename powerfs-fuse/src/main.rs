@@ -1,7 +1,6 @@
 use clap::Parser;
 use log::{error, info, warn};
 use std::ffi::CString;
-use std::io::Write;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -170,7 +169,7 @@ fn main() {
     let verbose = args.verbose || fuse_cfg.verbose;
     let container = args.container || fuse_cfg.container;
     let log_level = if verbose { "debug" } else { "info" };
-    let log_file = args.log_file.clone().or(fuse_cfg.log_file);
+    let _log_file = args.log_file.clone().or(fuse_cfg.log_file);
 
     // 验证配置完整性
     if master_addrs.is_empty() {
@@ -194,7 +193,7 @@ fn main() {
 
     // 配置日志：使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
     // master 通过 GetDebugConfig 下发配置，fuse 每 2s 轮询并本地应用
-    powerfs_common::dynamic_log::init(&log_level, None);
+    powerfs_common::dynamic_log::init(log_level, None);
 
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
