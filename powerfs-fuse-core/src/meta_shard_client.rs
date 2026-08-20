@@ -2332,11 +2332,70 @@ impl MetadataClient for MetaShardClient {
             let entries = serialize::decode_readdir_resp(&resp).map_err(map_err)?;
             let result = entries
                 .into_iter()
-                .map(|e| MetadataDirEntry {
-                    inode: e.ino,
-                    name: e.name,
-                    file_type: file_type_from_mode(e.mode),
-                    offset: e.offset,
+                .map(|e| {
+                    let file_type = file_type_from_mode(e.mode);
+                    // The Filer readdir response always carries mode/uid/...
+                    // now; the struct defaults to 0 for every numeric field,
+                    // so if we got an all-zero payload (e.g. legacy filer
+                    // that didn't emit uid/gid/size) constructing the attrs
+                    // with 0s would overwrite any real cached value with
+                    // nonsense. Guard by requiring at least a non-zero mode.
+                    let has_attrs = e.mode != 0
+                        && (e.uid != 0
+                            || e.gid != 0
+                            || e.size != 0
+                            || e.mtime != 0
+                            || e.nlink != 0
+                            || e.child_shard_id != 0
+                            || file_type == libc::DT_DIR/* dirs size=0 is fine */);
+                    let attrs = if has_attrs {
+                        use powerfs_layout::reliability::Reliability;
+                        let child_shard = if e.child_shard_id != 0 {
+                            Some(e.child_shard_id)
+                        } else {
+                            None
+                        };
+                        Some(MetadataAttr {
+                            inode: e.ino,
+                            mode: e.mode,
+                            uid: e.uid,
+                            gid: e.gid,
+                            size: e.size,
+                            mtime: e.mtime,
+                            atime: e.atime,
+                            // Filer ctime is ms-based; MetadataAttr stores
+                            // signed seconds (i64). Saturate at i64::MAX ms
+                            // to avoid wrap-around for far-future values.
+                            ctime: if e.ctime <= i64::MAX as u64 {
+                                e.ctime as i64
+                            } else {
+                                i64::MAX
+                            },
+                            nlink: e.nlink,
+                            rdev: 0,
+                            file_type,
+                            symlink_target: None,
+                            volume_id: None,
+                            file_key: None,
+                            placement: None,
+                            reliability: Reliability::SingleReplica,
+                            inline_data: None,
+                            inline_max_size: None,
+                            chunks: Vec::new(),
+                            replica_chunks: Vec::new(),
+                            shard_id: child_shard,
+                        })
+                    } else {
+                        None
+                    };
+                    MetadataDirEntry {
+                        inode: e.ino,
+                        name: e.name,
+                        file_type,
+                        offset: e.offset,
+                        attrs,
+                        child_shard_id: e.child_shard_id,
+                    }
                 })
                 .collect();
             Ok(result)

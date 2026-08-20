@@ -6698,7 +6698,7 @@ impl FileSystem for PowerFsFs {
             // to a name near the end of the BTreeMap, so the next readdir
             // RPC returned 0 entries — silently dropping ~500/600 entries
             // and causing rm -rf to leave most files behind.
-            match add_entry(DirEntry {
+            let added = match add_entry(DirEntry {
                 ino: child.inode,
                 offset: idx,
                 type_,
@@ -6710,11 +6710,100 @@ impl FileSystem for PowerFsFs {
                     // the cursor resumes correctly on the next readdir call.
                     break;
                 }
-                Ok(_) => {
+                Ok(n) => {
                     last_returned = Some(child);
+                    Some(n)
                 }
                 Err(_) => {
                     break;
+                }
+            };
+
+            // === READDIR-DRIVEN ATTR CACHING ===
+            // If the Filer's readdir response piggybacked stat fields on the
+            // entry (mode/uid/gid/size/mtime/nlink + child_shard_id), seed
+            // the client cache with them as a Stale hint. This avoids an
+            // extra per-entry getattr RPC for a subsequent `ls -l`, which
+            // otherwise would be O(N) cross-shard RPCs when the directory
+            // contains children homed on different shards (UpdateChildSummary
+            // in §3.2 of the MetaCache design populates exactly these fields
+            // on the parent shard leader's readdir path).
+            //
+            // Rules:
+            //   * inserted state = EntryState::Stale — these attrs are a
+            //     "cached value of last resort", not the result of a fresh
+            //     per-entry lookup RPC. If the user ever does a real stat()
+            //     or the TTL expires, we fall back to a full getattr RPC and
+            //     the entry moves to Clean / Dirty normally. In particular,
+            //     NEVER overwrite an existing cache entry that's in the
+            //     Clean, Dirty, or Flushing lifecycle state (those carry
+            //     authoritative local data that readdir's indirect payload
+            //     must not regress).
+            //   * skip `..` / `.` (they're never MetadataDirEntry items).
+            //   * cross-shard child_shard_id is stored as `shard_id: Some()`,
+            //     so `routing_shard()` uses the Filer-provided value instead
+            //     of re-hashing inode (avoids shard_count drift skew).
+            if added.is_some() {
+                if let Some(attr) = child.attrs.as_ref() {
+                    if self.cache.get_inode(child.inode).is_none() {
+                        use std::time::Instant;
+                        let is_dir = child.file_type == libc::DT_DIR;
+                        let is_symlink = child.file_type == libc::DT_LNK;
+                        let symlink_target = if is_symlink {
+                            attr.symlink_target.clone()
+                        } else {
+                            None
+                        };
+                        // Units: readdir response encodes atime/mtime/ctime in
+                        // milliseconds, matching the same convention the rest
+                        // of attr_from_resp uses for MetadataAttr → CachedEntry.
+                        let ms_to_i64 = |ms: u64| -> i64 {
+                            if ms <= i64::MAX as u64 {
+                                ms as i64
+                            } else {
+                                i64::MAX
+                            }
+                        };
+                        let cached = CachedEntry {
+                            inode: child.inode,
+                            parent: inode,
+                            name: child.name.clone(),
+                            is_dir,
+                            is_symlink,
+                            symlink_target,
+                            nlink: attr.nlink.max(1),
+                            fid: None,
+                            size: attr.size,
+                            // Strip SUID/SGID/sticky + file-type bits → perm
+                            // by masking with 0o7777, mirroring what
+                            // entry_to_cached does with the raw mode field.
+                            mode: attr.mode & 0o7777,
+                            uid: attr.uid,
+                            gid: attr.gid,
+                            atime: ms_to_i64(attr.atime),
+                            mtime: ms_to_i64(attr.mtime),
+                            ctime: attr.ctime, // already signed ms in MetadataAttr
+                            xattrs: HashMap::new(),
+                            chunks: Vec::new(),
+                            hard_link_id: String::new(),
+                            hard_link_counter: 0,
+                            content_size: attr.size,
+                            disk_size: attr.size,
+                            generation: 0,
+                            placement: attr.placement.clone(),
+                            reliability: attr.reliability.clone(),
+                            replica_chunks: Vec::new(),
+                            shard_id: if child.child_shard_id != 0 {
+                                Some(child.child_shard_id)
+                            } else {
+                                attr.shard_id
+                            },
+                            cached_at: Instant::now(),
+                            state: EntryState::Stale,
+                            hold: HoldState::Unpinned,
+                        };
+                        self.cache.insert(cached);
+                    }
                 }
             }
         }

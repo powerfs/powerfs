@@ -89,6 +89,17 @@ pub struct MetadataDirEntry {
     pub name: String,
     pub file_type: u8,
     pub offset: u64,
+    /// Optional per-entry stat attributes carried by the Filer's readdir
+    /// response. If populated, callers (the FUSE `readdir` implementation)
+    /// can seed the client-side attr cache so a subsequent `ls -l` avoids
+    /// one per-entry getattr RPC — especially valuable for cross-shard
+    /// subdirectories where the parent shard already serves a lightweight
+    /// DirStatSummary (§3.2 of the MetaCache design).
+    pub attrs: Option<MetadataAttr>,
+    /// The shard that owns this child inode (when non-zero). Populated by
+    /// the Filer during readdir using the same shard-strategy used for
+    /// authoritative routing. Clients can route SetAttr/getattr directly.
+    pub child_shard_id: u64,
 }
 
 /// setattr 操作参数（仅更新提供的字段，None 表示不修改）

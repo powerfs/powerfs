@@ -1079,6 +1079,16 @@ pub struct DirEntry {
     pub name: String,
     pub mode: u32,
     pub offset: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub nlink: u32,
+    /// Set to the owning shard_id as computed by the Filer that produced
+    /// this entry. 0 = "unset" (older filer, cross-shard info not available).
+    pub child_shard_id: u64,
 }
 
 /// Encode a readdir response
@@ -1092,6 +1102,16 @@ pub fn encode_readdir_resp(entries: &[DirEntry]) -> Result<Vec<u8>, NetError> {
         entry_enc.add_string(FieldId::Name, &entry.name)?;
         entry_enc.add_u32(FieldId::Mode, entry.mode);
         entry_enc.add_u64(FieldId::Offset, entry.offset);
+        entry_enc.add_u32(FieldId::Uid, entry.uid);
+        entry_enc.add_u32(FieldId::Gid, entry.gid);
+        entry_enc.add_u64(FieldId::Size, entry.size);
+        entry_enc.add_u64(FieldId::Atime, entry.atime);
+        entry_enc.add_u64(FieldId::Mtime, entry.mtime);
+        entry_enc.add_u64(FieldId::Ctime, entry.ctime);
+        entry_enc.add_u32(FieldId::Nlink, entry.nlink);
+        if entry.child_shard_id != 0 {
+            entry_enc.add_u64(FieldId::ShardId, entry.child_shard_id);
+        }
         enc.add_nested(FieldId::Entry, &entry_enc.into_bytes())?;
     }
 
@@ -1115,6 +1135,14 @@ pub fn decode_readdir_resp(body: &[u8]) -> Result<Vec<DirEntry>, NetError> {
                     name: String::new(),
                     mode: 0,
                     offset: 0,
+                    uid: 0,
+                    gid: 0,
+                    size: 0,
+                    atime: 0,
+                    mtime: 0,
+                    ctime: 0,
+                    nlink: 0,
+                    child_shard_id: 0,
                 };
 
                 while let Some((ef, el)) = entry_dec.next_field() {
@@ -1123,6 +1151,14 @@ pub fn decode_readdir_resp(body: &[u8]) -> Result<Vec<DirEntry>, NetError> {
                         FieldId::Name => entry.name = entry_dec.read_string(el)?.to_string(),
                         FieldId::Mode => entry.mode = entry_dec.read_u32(el)?,
                         FieldId::Offset => entry.offset = entry_dec.read_u64(el)?,
+                        FieldId::Uid => entry.uid = entry_dec.read_u32(el)?,
+                        FieldId::Gid => entry.gid = entry_dec.read_u32(el)?,
+                        FieldId::Size => entry.size = entry_dec.read_u64(el)?,
+                        FieldId::Atime => entry.atime = entry_dec.read_u64(el)?,
+                        FieldId::Mtime => entry.mtime = entry_dec.read_u64(el)?,
+                        FieldId::Ctime => entry.ctime = entry_dec.read_u64(el)?,
+                        FieldId::Nlink => entry.nlink = entry_dec.read_u32(el)?,
+                        FieldId::ShardId => entry.child_shard_id = entry_dec.read_u64(el)?,
                         _ => entry_dec.skip(el)?,
                     }
                 }

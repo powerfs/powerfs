@@ -170,6 +170,101 @@ fuse1 "rmdir '$d6'" >/dev/null
 post=$(fuse1 "test -e '$d6' && echo EXISTS || echo GONE" | tr -d '\r')
 [[ "$post" == "GONE" ]] && pass "T6.3 rmdir → ENOENT" || fail "T6.3 dir exists after rmdir"
 
+# ----------------------------------------------------------------
+# T7: MetaCache Prometheus/admin counters are non-zero after the
+#     workload above (T1..T6 exercised getattr, chmod, unlink, rmdir,
+#     mkdir). This confirms meta_cache.rs counter instrumentation plus
+#     the /admin/meta-cache-stats HTTP endpoint wired through
+#     metrics.rs are both working.
+# ----------------------------------------------------------------
+echo "-- T7 MetaCache admin counter endpoint"
+# The metrics HTTP server listens on grpc_port+1 = 8890 inside each
+# filer container. Counters are per-filer local (a shard leader
+# increments dirty_mark_total / stage_delete_total for shards it owns;
+# followers see mostly invalidations). We therefore query all three
+# filers and SUM the results per counter. All filer containers carry
+# `curl`; we reach filer-N:8890 by hostname via the compose network
+# (queried from inside any one container, e.g. filer-1).
+fetch_filer_stats() {
+    local host="$1"
+    docker exec filer-1 bash -c \
+        "curl -fsS --max-time 3 http://$host:8890/admin/meta-cache-stats 2>/dev/null | grep -m1 '^{'" \
+        2>/dev/null | tr -d '\r'
+}
+json_raw_1=$(fetch_filer_stats filer-1)
+json_raw_2=$(fetch_filer_stats filer-2)
+json_raw_3=$(fetch_filer_stats filer-3)
+if [[ -z "$json_raw_1" && -z "$json_raw_2" && -z "$json_raw_3" ]]; then
+    echo "  [SKIP] T7: cannot reach any filer :8890/admin/meta-cache-stats endpoint"
+else
+    # Aggregate helper: given a key, sum values across all 3 parsed JSONs.
+    # grep-based parser — JSON is a single-line flat object, no nested
+    # counters (nested `.state` counts are not aggregated here).
+    extract_num_from() {
+        # $1 = key, $2 = json blob (possibly empty). Prints number or "0".
+        local k="$1"; local blob="$2"
+        if [[ -z "$blob" ]]; then echo 0; return; fi
+        local n
+        n=$(echo "$blob" | grep -oE "\"$k\":[[:space:]]*[0-9]+" | grep -oE "[0-9]+\$")
+        echo "${n:-0}"
+    }
+    sum_counter() {
+        local k="$1"
+        local a b c
+        a=$(extract_num_from "$k" "$json_raw_1")
+        b=$(extract_num_from "$k" "$json_raw_2")
+        c=$(extract_num_from "$k" "$json_raw_3")
+        echo $((a + b + c))
+    }
+    ih=$(sum_counter inode_hit_total)
+    im=$(sum_counter inode_miss_total)
+    dm=$(sum_counter dirty_mark_total)
+    sc=$(sum_counter stage_delete_total)
+    bc=$(sum_counter backfill_clean_total)
+    dc=$(sum_counter inode_deleted_served_total)
+    ic=$(sum_counter invalidate_all_total)
+    echo "  FILER MC STATS (sum over filer-1..3):"
+    echo "    ihit=$ih imiss=$im dirty=$dm del=$sc backfill=$bc del_served=$dc invall=$ic"
+    echo "    per-filer payloads for triage:"
+    echo "      F1: $(echo "$json_raw_1" | tr -d '\n' | head -c 250)"
+    echo "      F2: $(echo "$json_raw_2" | tr -d '\n' | head -c 250)"
+    echo "      F3: $(echo "$json_raw_3" | tr -d '\n' | head -c 250)"
+    # T1 (chmod ×2) + T6 (chmod dir ×1) → ≥3 SetAttr mark_dirty events.
+    if [[ "$dm" -ge 3 ]]; then
+        pass "T7.1 dirty_mark_total=$dm >= 3 (chmod SetAttr count reflected in admin endpoint)"
+    else
+        fail "T7.1 dirty_mark_total='$dm', expected >=3"
+    fi
+    # T1 f1, T2 f2, T3 f3, T4 d4, T6 d6 → ≥3 Clean backfills on first
+    # per-inode ShardStore read miss. (Some paths may hit warmed-up
+    # leader-local caches; we use a lenient threshold.)
+    if [[ "$bc" -ge 3 ]]; then
+        pass "T7.2 backfill_clean_total=$bc >= 3 (ShardStore → MetaCache Clean seeding worked)"
+    else
+        fail "T7.2 backfill_clean_total='$bc', expected >=3"
+    fi
+    # T3 unlink + T4 rmdir → ≥2 stage_delete events across the cluster.
+    if [[ "$sc" -ge 2 ]]; then
+        pass "T7.3 stage_delete_total=$sc >= 2 (unlink/rmdir staging counter non-zero)"
+    else
+        fail "T7.3 stage_delete_total='$sc', expected >=2"
+    fi
+    # ihit accumulates reads routed through the local MetaCache after the
+    # first backfill — 10 is a low floor just to prove hits occur.
+    if [[ "$ih" -ge 10 ]]; then
+        pass "T7.4 inode_hit_total=$ih >= 10 (read path hits MetaCache)"
+    else
+        fail "T7.4 inode_hit_total='$ih', expected >=10"
+    fi
+    # imiss reflects per-inode first ShardStore lookup — should be >= 3
+    # across T1..T6's new inodes (files f1/f2/f3, dirs d4/d6 at minimum).
+    if [[ "$im" -ge 3 ]]; then
+        pass "T7.5 inode_miss_total=$im >= 3 (initial ShardStore misses present)"
+    else
+        fail "T7.5 inode_miss_total='$im', expected >=3"
+    fi
+fi
+
 echo
 echo "=========================="
 echo " Result: $PASS passed, $FAIL failed"
