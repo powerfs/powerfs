@@ -1301,3 +1301,387 @@ fn now_ms() -> u64 {
 // Re-export so callers (meta_shard_manager) don't have to import state types
 // from this file individually.
 pub use CacheState as MetaCacheState;
+
+// ========================================================================
+// Phase 3 Lease Recall tests
+// ========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inode_lease_manager::InodeLeaseManager;
+    use crate::shard_store::InodeInfo;
+    use std::sync::Arc;
+
+    /// Build a MetaCache with a tiny memory limit so tests can trigger
+    /// trim_pass without inserting thousands of entries.
+    ///
+    /// Each cached inode is charged at least 512 bytes (see
+    /// `estimate_inode_bytes` → `.max(512)`), so a 2 KiB limit overflows
+    /// after ~4 entries.
+    fn make_mc_with_limit(limit_bytes: usize) -> MetaCache {
+        let mut mc = MetaCache::new();
+        mc.trim.memory_limit_bytes = limit_bytes;
+        mc
+    }
+
+    /// Insert a minimal Clean inode into the cache at the given inode number.
+    fn insert_clean(mc: &MetaCache, inode: u64) {
+        mc.cache_put_clean(InodeInfo::tombstone(inode));
+    }
+
+    // ---- T1: trim_pass evicts refcount==0 first, collects pinned as recall ----
+
+    #[test]
+    fn test_trim_evicts_zero_refcount_and_collects_recall_candidates() {
+        // 5 pinned (refcount > 0) + 5 evictable (refcount == 0) = 10 entries
+        // Each ~512 B → ~5120 B total.  Limit 2048, high 0.8*2048=1638,
+        // low 0.6*2048=1228.  After evicting all 5 evictable entries
+        // (freeing 2560 B → usage=2560), still > high (1638) → collect
+        // the 5 pinned as recall_candidates.
+        let mc = make_mc_with_limit(2048);
+
+        // Insert 5 evictable + 5 pinned inodes
+        let evictable: Vec<u64> = (100..105).collect();
+        let pinned: Vec<u64> = (200..205).collect();
+        for &ino in evictable.iter().chain(pinned.iter()) {
+            insert_clean(&mc, ino);
+        }
+        // Bump refcount on pinned inodes (simulates active lease)
+        for &ino in &pinned {
+            mc.incr_refcount(ino);
+        }
+
+        let usage_before = mc.trim.current_usage_bytes.load(Ordering::Relaxed);
+        assert!(
+            usage_before > mc.trim.high_bytes(),
+            "usage {} should exceed high_bytes {}",
+            usage_before,
+            mc.trim.high_bytes()
+        );
+
+        let result = mc.trim_pass();
+
+        // All 5 evictable entries should have been evicted
+        assert_eq!(result.evicted, 5, "should evict all 5 refcount==0 entries");
+
+        // The 5 pinned entries should be recall_candidates
+        assert_eq!(
+            result.recall_candidates.len(),
+            5,
+            "should collect 5 recall candidates"
+        );
+        for &ino in &pinned {
+            assert!(
+                result.recall_candidates.contains(&ino),
+                "pinned inode {} should be in recall_candidates",
+                ino
+            );
+        }
+
+        // Pinned inodes should still be in the cache
+        for &ino in &pinned {
+            assert!(
+                mc.get_inode(ino).is_some(),
+                "pinned inode {} should still be cached",
+                ino
+            );
+        }
+        // Evicted inodes should be gone
+        for &ino in &evictable {
+            assert!(
+                mc.get_inode(ino).is_none(),
+                "evictable inode {} should have been evicted",
+                ino
+            );
+        }
+    }
+
+    // ---- T2: recall_cooldown skips recently recalled inodes ----
+
+    #[test]
+    fn test_recall_cooldown_skips_recently_recalled() {
+        let mc = make_mc_with_limit(1024);
+
+        // Insert 3 pinned inodes (3 * 512 = 1536 > high=819)
+        let pinned: Vec<u64> = (300..303).collect();
+        for &ino in &pinned {
+            insert_clean(&mc, ino);
+            mc.incr_refcount(ino);
+        }
+
+        // First trim_pass: should collect all 3 as recall_candidates
+        let r1 = mc.trim_pass();
+        assert_eq!(r1.recall_candidates.len(), 3, "first pass collects all 3");
+
+        // Mark them as recalled (simulates GC pushing Invalidate)
+        for &ino in &r1.recall_candidates {
+            mc.mark_recalled(ino);
+        }
+
+        let cooldown_skips_before = mc.trim.recall_cooldown_skips.load(Ordering::Relaxed);
+
+        // Second trim_pass immediately: should skip all 3 (in cooldown)
+        let r2 = mc.trim_pass();
+        assert_eq!(
+            r2.recall_candidates.len(),
+            0,
+            "second pass should skip all (in cooldown)"
+        );
+
+        let cooldown_skips_after = mc.trim.recall_cooldown_skips.load(Ordering::Relaxed);
+        assert_eq!(
+            cooldown_skips_after - cooldown_skips_before,
+            3,
+            "should record 3 cooldown skips"
+        );
+    }
+
+    // ---- T3: releasing lease (decr_refcount) enables eviction ----
+
+    #[test]
+    fn test_decr_refcount_enables_eviction() {
+        let mc = make_mc_with_limit(1024);
+
+        // Insert 3 pinned inodes
+        let pinned: Vec<u64> = (400..403).collect();
+        for &ino in &pinned {
+            insert_clean(&mc, ino);
+            mc.incr_refcount(ino);
+        }
+
+        // trim_pass: all 3 are recall_candidates, none evicted
+        let r1 = mc.trim_pass();
+        assert_eq!(r1.evicted, 0, "nothing evicted while pinned");
+        assert_eq!(r1.recall_candidates.len(), 3, "all 3 are recall candidates");
+
+        // Simulate client releasing lease on inode 400
+        mc.decr_refcount(400);
+
+        // Next trim_pass: inode 400 should now be evictable
+        let r2 = mc.trim_pass();
+        assert!(
+            r2.evicted >= 1,
+            "inode 400 should be evicted after refcount drop (got {})",
+            r2.evicted
+        );
+        assert!(
+            mc.get_inode(400).is_none(),
+            "inode 400 should have been evicted"
+        );
+        // Remaining 2 should still be cached
+        assert!(mc.get_inode(401).is_some(), "inode 401 still pinned");
+        assert!(mc.get_inode(402).is_some(), "inode 402 still pinned");
+    }
+
+    // ---- T4: sweep_leaked_refcounts fixes stale refcounts ----
+
+    #[test]
+    fn test_sweep_leaked_refcounts() {
+        let mut mc = make_mc_with_limit(4096); // large enough that trim won't fire
+
+        // Insert 2 inodes with leaked refcounts (refcount > 0 but no active lease)
+        insert_clean(&mc, 500);
+        insert_clean(&mc, 501);
+        mc.incr_refcount(500);
+        mc.incr_refcount(501);
+
+        let leaks_before = mc.trim.refcount_leak_fixes.load(Ordering::Relaxed);
+
+        // sweep: predicate says NO active lease for both → reset to 0
+        mc.sweep_leaked_refcounts(|_inode| false);
+
+        let leaks_after = mc.trim.refcount_leak_fixes.load(Ordering::Relaxed);
+        assert_eq!(
+            leaks_after - leaks_before,
+            2,
+            "should fix 2 leaked refcounts"
+        );
+
+        // Now with refcount == 0, trim should be able to evict them
+        // (if memory were over high watermark)
+        mc.trim.memory_limit_bytes = 512; // shrink to force trim
+        let r = mc.trim_pass();
+        assert!(r.evicted >= 2, "both should be evicted after leak fix");
+    }
+
+    // ---- T5: batch_limit caps recall_candidates at 64 ----
+
+    #[test]
+    fn test_recall_batch_limit_64() {
+        let mc = make_mc_with_limit(1024);
+
+        // Insert 100 pinned inodes (far exceeding batch_limit=64)
+        for ino in 600..700u64 {
+            insert_clean(&mc, ino);
+            mc.incr_refcount(ino);
+        }
+
+        let r = mc.trim_pass();
+        assert!(
+            r.recall_candidates.len() <= 64,
+            "recall_candidates should be capped at 64, got {}",
+            r.recall_candidates.len()
+        );
+        assert!(
+            !r.recall_candidates.is_empty(),
+            "should collect at least some recall candidates"
+        );
+    }
+
+    // ---- T6: no recall when under high watermark ----
+
+    #[test]
+    fn test_no_recall_under_high_watermark() {
+        let mc = make_mc_with_limit(4096); // high = 3276
+
+        // Insert 2 pinned inodes (2 * 512 = 1024 < 3276)
+        for ino in 700..702u64 {
+            insert_clean(&mc, ino);
+            mc.incr_refcount(ino);
+        }
+
+        let r = mc.trim_pass();
+        assert_eq!(r.evicted, 0, "nothing to evict (under high watermark)");
+        assert_eq!(
+            r.recall_candidates.len(),
+            0,
+            "no recall candidates (under high watermark)"
+        );
+    }
+
+    // ---- T7: full integration with InodeLeaseManager ----
+
+    #[test]
+    fn test_lease_manager_recall_integration() {
+        // limit=512 → high=409, low=307.  3 inodes × 512 B = 1536 > 409.
+        // After release, all 3 have refcount=0; trim evicts until ≤ 307:
+        // 1536→1024→512→0, all 3 evicted.
+        let mc = Arc::new(make_mc_with_limit(512));
+        let lease_mgr = InodeLeaseManager::new().with_meta_cache(mc.clone());
+
+        let client_id = "test-client-1";
+        let inodes: Vec<u64> = (800..803).collect();
+
+        // 1) Insert Clean inodes into cache
+        for &ino in &inodes {
+            insert_clean(&mc, ino);
+        }
+
+        // 2) Acquire leases → refcount should bump
+        let mut tokens = Vec::new();
+        for &ino in &inodes {
+            let res = lease_mgr.acquire(ino, client_id, 60_000).unwrap();
+            tokens.push((ino, res.token));
+        }
+
+        // Verify refcount > 0 on all leased inodes
+        for &ino in &inodes {
+            let tbl = mc.inode_table.read().unwrap();
+            let rc = tbl.get(&ino).map(|c| c.refcount.load(Ordering::Relaxed));
+            assert_eq!(
+                rc,
+                Some(1),
+                "inode {} refcount should be 1 after acquire",
+                ino
+            );
+        }
+
+        // 3) trim_pass → should collect recall_candidates
+        let r1 = mc.trim_pass();
+        assert_eq!(r1.evicted, 0, "nothing evicted (all pinned by leases)");
+        assert_eq!(
+            r1.recall_candidates.len(),
+            3,
+            "all 3 leased inodes should be recall candidates"
+        );
+
+        // 4) Verify get_holder returns the correct client for each recall candidate
+        for &ino in &r1.recall_candidates {
+            let holder = lease_mgr.get_holder(ino);
+            assert_eq!(
+                holder.as_deref(),
+                Some(client_id),
+                "get_holder should return the lease holder for inode {}",
+                ino
+            );
+        }
+
+        // 5) Mark recalled (simulates GC pushing Invalidate)
+        for &ino in &r1.recall_candidates {
+            mc.mark_recalled(ino);
+        }
+
+        // 6) Simulate client releasing leases after receiving Invalidate
+        for (ino, token) in &tokens {
+            lease_mgr.release(*ino, client_id, token).unwrap();
+        }
+
+        // Verify refcount == 0 after release
+        for &ino in &inodes {
+            let tbl = mc.inode_table.read().unwrap();
+            let rc = tbl.get(&ino).map(|c| c.refcount.load(Ordering::Relaxed));
+            assert_eq!(
+                rc,
+                Some(0),
+                "inode {} refcount should be 0 after release",
+                ino
+            );
+        }
+
+        // 7) Wait for cooldown to expire (5s), then trim_pass should evict
+        std::thread::sleep(std::time::Duration::from_millis(5_100));
+
+        let r2 = mc.trim_pass();
+        assert!(
+            r2.evicted >= 3,
+            "all 3 inodes should be evicted after lease release + cooldown (got {})",
+            r2.evicted
+        );
+        for &ino in &inodes {
+            assert!(
+                mc.get_inode(ino).is_none(),
+                "inode {} should have been evicted",
+                ino
+            );
+        }
+
+        // 8) Verify metrics
+        let stats = mc.stats();
+        assert!(
+            stats.recall_total >= 3,
+            "recall_total should be >= 3 (got {})",
+            stats.recall_total
+        );
+    }
+
+    // ---- T8: sweep_leaked_refcounts with active lease is NOT reset ----
+
+    #[test]
+    fn test_sweep_leaked_refcounts_preserves_active_lease() {
+        let mc = Arc::new(make_mc_with_limit(4096));
+        let lease_mgr = InodeLeaseManager::new().with_meta_cache(mc.clone());
+
+        insert_clean(&mc, 900);
+        // Acquire a real lease → refcount bumps to 1
+        lease_mgr.acquire(900, "active-client", 60_000).unwrap();
+
+        let leaks_before = mc.trim.refcount_leak_fixes.load(Ordering::Relaxed);
+
+        // sweep: predicate delegates to lease_mgr.get_holder which returns
+        // Some("active-client") → lease IS active → refcount preserved
+        mc.sweep_leaked_refcounts(|ino| lease_mgr.get_holder(ino).is_some());
+
+        let leaks_after = mc.trim.refcount_leak_fixes.load(Ordering::Relaxed);
+        assert_eq!(
+            leaks_after - leaks_before,
+            0,
+            "should NOT fix refcount when lease is active"
+        );
+
+        // Verify refcount still 1
+        let tbl = mc.inode_table.read().unwrap();
+        let rc = tbl.get(&900).map(|c| c.refcount.load(Ordering::Relaxed));
+        assert_eq!(rc, Some(1), "refcount should still be 1");
+    }
+}
