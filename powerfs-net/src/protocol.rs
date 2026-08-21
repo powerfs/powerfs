@@ -1145,6 +1145,15 @@ pub enum FieldId {
     /// When non-zero, the client may trust the dentry (positive or negative)
     /// for this duration without sending further lookup RPCs.
     DentryLeaseTtl = 0xCA,
+    // ===== Filer node discovery fields (0xCB-0xCC) =====
+    /// Filer HTTP (S3) server port (u64). Reported in RegisterFiler TLV so
+    /// the Master can proxy `/admin/shards` to the correct listener (the
+    /// S3 router also serves the shard introspection endpoints).
+    FilerHttpPort = 0xCB,
+    /// Filer metrics HTTP server port (u64). Reported in RegisterFiler TLV
+    /// so the Master can proxy `/admin/meta-cache-stats` and
+    /// `/admin/lease-stats` when serving the new `GetFilerStats` gRPC.
+    FilerMetricsPort = 0xCC,
 }
 
 impl FieldId {
@@ -1262,6 +1271,8 @@ impl FieldId {
             0xC8 => Some(Self::HasUpgrade),
             0xC9 => Some(Self::DirVersion),
             0xCA => Some(Self::DentryLeaseTtl),
+            0xCB => Some(Self::FilerHttpPort),
+            0xCC => Some(Self::FilerMetricsPort),
             _ => None,
         }
     }

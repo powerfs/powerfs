@@ -1,16 +1,20 @@
 use super::kv_cache_service::KvCacheServiceImpl;
-use super::master::{AddNodeParams, FuseClientInfo, MasterNode, UpdateNodeVolumesParams};
+use super::master::{
+    AddNodeParams, FilerNodeInfo, FuseClientInfo, MasterNode, UpdateNodeVolumesParams,
+};
 use super::metrics::{ASSIGN_REQUEST_COUNT, LOOKUP_REQUEST_COUNT, REQUEST_COUNT};
 use super::proto::powerfs::*;
 use super::proto::*;
 use futures::Stream;
-use log::{info, warn};
+use log::{error, info, warn};
 use powerfs_allocator::config::{MigrationPolicy, RebalancePolicy};
 use powerfs_allocator::management::{ManagementApi, RebalanceAction};
 use powerfs_allocator::{MigrationState, MigrationTaskStatus, MigrationType};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
 use powerfs_core::kv_cache::KVCacheEngine;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1424,6 +1428,8 @@ impl MasterService for MasterGrpcServer {
                 is_healthy: f.is_healthy,
                 leader_count: f.leader_count,
                 total_shards: f.total_shards,
+                net_port: f.net_port,
+                metrics_port: f.metrics_port,
             })
             .collect();
 
@@ -1459,6 +1465,7 @@ impl MasterService for MasterGrpcServer {
             grpc_port: req.grpc_port,
             http_port: req.http_port,
             net_port: req.net_port,
+            metrics_port: req.metrics_port,
             is_healthy: true,
             leader_count: 0,
             total_shards: req.shard_count,
@@ -1474,6 +1481,54 @@ impl MasterService for MasterGrpcServer {
 
         Ok(Response::new(RegisterFilerResponse {
             success: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn get_filer_stats(
+        &self,
+        request: Request<FilerStatsRequest>,
+    ) -> Result<Response<FilerStatsResponse>, Status> {
+        let req = request.into_inner();
+
+        if !self.master.is_leader().await {
+            let leader = self.master.get_leader_grpc_addr().await;
+            return Err(Status::failed_precondition(format!(
+                "not leader; current leader is {}",
+                leader
+            )));
+        }
+
+        let filers: Vec<crate::master::FilerNodeInfo> = self
+            .master
+            .list_filers()
+            .into_iter()
+            .filter(|f| req.node_id.is_empty() || f.node_id == req.node_id)
+            .collect();
+
+        let mut futs = Vec::with_capacity(filers.len());
+        for f in filers {
+            futs.push(tokio::task::spawn_blocking(move || {
+                fetch_filer_stats_sync(f)
+            }));
+        }
+        let results = futures::future::join_all(futs).await;
+
+        let mut stats = Vec::with_capacity(results.len());
+        for r in results {
+            match r {
+                Ok(s) => stats.push(s),
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "spawn_blocking for GetFilerStats failed: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        Ok(Response::new(FilerStatsResponse {
+            stats,
             error: String::new(),
         }))
     }
@@ -2082,5 +2137,129 @@ fn migration_task_to_proto(task: MigrationTaskStatus) -> MigrationTaskInfo {
         bytes_migrated: task.bytes_migrated,
         bytes_total: task.bytes_total,
         pause_reason: task.pause_reason.unwrap_or_default(),
+    }
+}
+
+fn http_get_sync(addr: &str, path: &str) -> std::result::Result<String, String> {
+    let socket_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("invalid addr '{}': {}", addr, e))?
+        .next()
+        .ok_or_else(|| format!("no address resolved for '{}'", addr))?;
+
+    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5))
+        .map_err(|e| format!("connect {} failed: {}", addr, e))?;
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| format!("set_read_timeout: {}", e))?;
+
+    let request = format!(
+        "GET {} HTTP/1.0\r\nHost: powerfs-master\r\nConnection: close\r\n\r\n",
+        path
+    );
+
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("write request: {}", e))?;
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|e| format!("read response: {}", e))?;
+
+    let response_str = String::from_utf8_lossy(&response);
+    let body_start = response_str
+        .find("\r\n\r\n")
+        .ok_or_else(|| "malformed HTTP response".to_string())?;
+
+    let status_line = response_str.lines().next().unwrap_or("");
+    let status_ok = status_line.split_whitespace().nth(1) == Some("200");
+
+    let body = response_str[body_start + 4..].to_string();
+
+    if status_ok {
+        Ok(body)
+    } else {
+        Err(format!("HTTP status: {}", status_line))
+    }
+}
+
+fn fetch_filer_stats_sync(filer: FilerNodeInfo) -> FilerNodeStats {
+    // FilerNodeInfo.address is currently "ip:net_port" (used for filer<->volume TLV).
+    // Strip the port and use the IP with service-specific ports carried at
+    // registration time.
+    let ip_only = filer
+        .address
+        .split(':')
+        .next()
+        .unwrap_or(&filer.address)
+        .to_string();
+
+    let mut fetch_error_parts: Vec<String> = Vec::new();
+
+    let meta_cache_stats_json = if filer.metrics_port != 0 {
+        let addr = format!("{}:{}", ip_only, filer.metrics_port);
+        match http_get_sync(&addr, "/admin/meta-cache-stats") {
+            Ok(s) => s,
+            Err(e) => {
+                fetch_error_parts.push(format!("/admin/meta-cache-stats: {}", e));
+                error!(
+                    "GetFilerStats: /admin/meta-cache-stats failed for {} addr={}: {}",
+                    filer.node_id, addr, e
+                );
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let lease_stats_json = if filer.metrics_port != 0 {
+        let addr = format!("{}:{}", ip_only, filer.metrics_port);
+        match http_get_sync(&addr, "/admin/lease-stats") {
+            Ok(s) => s,
+            Err(e) => {
+                fetch_error_parts.push(format!("/admin/lease-stats: {}", e));
+                error!(
+                    "GetFilerStats: /admin/lease-stats failed for {} addr={}: {}",
+                    filer.node_id, addr, e
+                );
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let shards_json = if filer.http_port != 0 {
+        let addr = format!("{}:{}", ip_only, filer.http_port);
+        match http_get_sync(&addr, "/admin/shards") {
+            Ok(s) => s,
+            Err(e) => {
+                fetch_error_parts.push(format!("/admin/shards: {}", e));
+                error!(
+                    "GetFilerStats: /admin/shards failed for {} addr={}: {}",
+                    filer.node_id, addr, e
+                );
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    FilerNodeStats {
+        node_id: filer.node_id,
+        address: filer.address,
+        is_healthy: filer.is_healthy,
+        leader_count: filer.leader_count as u32,
+        total_shards: filer.total_shards as u32,
+        http_port: filer.http_port,
+        metrics_port: filer.metrics_port,
+        meta_cache_stats_json,
+        lease_stats_json,
+        shards_json,
+        fetch_error: fetch_error_parts.join("; "),
     }
 }

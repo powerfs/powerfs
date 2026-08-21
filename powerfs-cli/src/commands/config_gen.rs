@@ -66,6 +66,7 @@ struct PortsConfig {
     filer: Option<u16>,
     filer_grpc: Option<u16>,
     filer_net: Option<u16>,
+    filer_metrics: Option<u16>,
     s3: Option<u16>,
     monitor: Option<u16>,
 }
@@ -121,6 +122,7 @@ impl Defaults {
     const FILER_PORT: u16 = 8888;
     const FILER_GRPC_PORT: u16 = 8889;
     const FILER_NET_PORT: u16 = 9334;
+    const FILER_METRICS_PORT: u16 = 8900;
     const S3_PORT: u16 = 9000;
     const MONITOR_PORT: u16 = 8081;
     const MAX_VOLUME_SIZE: u64 = 107_374_182_400; // 100 GB
@@ -151,6 +153,7 @@ struct ResolvedConfig {
     filer_port: u16,
     filer_grpc_port: u16,
     filer_net_port: u16,
+    filer_metrics_port: u16,
     s3_port: u16,
     monitor_port: u16,
     s3_access_key: String,
@@ -231,6 +234,8 @@ pub struct ConfigGenArgs {
     pub filer_grpc_port: Option<u16>,
     #[arg(long)]
     pub filer_net_port: Option<u16>,
+    #[arg(long)]
+    pub filer_metrics_port: Option<u16>,
     #[arg(long)]
     pub s3_port: Option<u16>,
     #[arg(long)]
@@ -378,6 +383,11 @@ fn resolve(args: &ConfigGenArgs) -> Result<ResolvedConfig, String> {
             ports.filer_net,
             Defaults::FILER_NET_PORT,
         ),
+        filer_metrics_port: opt_u16(
+            args.filer_metrics_port,
+            ports.filer_metrics,
+            Defaults::FILER_METRICS_PORT,
+        ),
         s3_port: opt_u16(args.s3_port, ports.s3, Defaults::S3_PORT),
         monitor_port: opt_u16(args.monitor_port, ports.monitor, Defaults::MONITOR_PORT),
         s3_access_key: opt_str(&args.s3_access_key, s3.access_key, Defaults::S3_ACCESS_KEY),
@@ -515,6 +525,7 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
         ("filer_port", cfg.filer_port),
         ("filer_grpc_port", cfg.filer_grpc_port),
         ("filer_net_port", cfg.filer_net_port),
+        ("filer_metrics_port", cfg.filer_metrics_port),
         ("s3_port", cfg.s3_port),
         ("monitor_port", cfg.monitor_port),
     ];
@@ -578,6 +589,35 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
             "filer_port ({}) and filer_net_port ({}) must differ",
             cfg.filer_port, cfg.filer_net_port
         ));
+    }
+    // 4-way filer port uniqueness — no port-addition derivation.
+    for &(na, nb) in &[
+        ("filer_port", "filer_grpc_port"),
+        ("filer_port", "filer_metrics_port"),
+        ("filer_grpc_port", "filer_net_port"),
+        ("filer_grpc_port", "filer_metrics_port"),
+        ("filer_net_port", "filer_metrics_port"),
+    ] {
+        let (a, b) = match (na, nb) {
+            ("filer_port", "filer_grpc_port") => (cfg.filer_port, cfg.filer_grpc_port),
+            ("filer_port", "filer_metrics_port") => (cfg.filer_port, cfg.filer_metrics_port),
+            ("filer_grpc_port", "filer_net_port") => (cfg.filer_grpc_port, cfg.filer_net_port),
+            ("filer_grpc_port", "filer_metrics_port") => {
+                (cfg.filer_grpc_port, cfg.filer_metrics_port)
+            }
+            ("filer_net_port", "filer_metrics_port") => {
+                (cfg.filer_net_port, cfg.filer_metrics_port)
+            }
+            _ => unreachable!(),
+        };
+        if a == b {
+            return Err(format!(
+                "{} ({}) and {} ({}) must differ — all 4 filer ports \
+                 (port/grpc_port/net_port/metrics_port) explicitly \
+                 configured; no port-addition derivation allowed.",
+                na, a, nb, b
+            ));
+        }
     }
 
     Ok(())
@@ -753,7 +793,7 @@ fn build_config(
             gc_grace_period_secs: None,
             inline_max_size: None,
             force_register: false,
-            metrics_port: None,
+            metrics_port: cfg.filer_metrics_port,
         },
         s3: S3Config {
             port: cfg.s3_port,

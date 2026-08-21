@@ -1,121 +1,132 @@
-//! `powerfs-cli filer-stats` — query Filer admin statistics.
+//! `powerfs-cli filer-stats` — query Filer statistics via MasterService gRPC.
 //!
-//! Connects to a Filer's HTTP admin server and displays:
-//! - MetaCache stats (hit/miss/dirty/recall metrics)
-//! - Lease stats (active leases, holders, revokes)
-//! - Shard distribution (shard IDs, leaders, entry counts)
+//! The CLI **never** connects directly to Filer nodes.  Instead, the Master
+//! holds a cached view of every registered Filer (identity, heartbeat,
+//! shard counts, and admin endpoint ports) and proxies each Filer's HTTP
+//! introspection endpoints (`/admin/meta-cache-stats`, `/admin/lease-stats`,
+//! `/admin/shards`) on behalf of the CLI.  The aggregated responses are
+//! returned to the CLI via the `GetFilerStats` gRPC call.
 //!
-//! # Usage
-//!
-//! ```sh
-//! powerfs-cli filer-stats                          # default localhost:8888
-//! powerfs-cli filer-stats --addr filer-1:8888
-//! powerfs-cli filer-stats --addr filer-1:8888 --meta-cache
-//! powerfs-cli filer-stats --addr filer-1:8888 --lease
-//! powerfs-cli filer-stats --addr filer-1:8888 --shards
-//! powerfs-cli filer-stats --json
-//! ```
+//! The old `--addr` argument (which targeted a single Filer's HTTP admin
+//! port at a hard-coded "grpc_port + 1" derived address) is removed to
+//! enforce the "CLI only talks to the Master" and "no port arithmetic"
+//! design rules.  If only one Filer is of interest, use `--node-id` to
+//! filter.
 
 use clap::Args;
-use powerfs_common::error::{PowerFsError, Result};
 
-use crate::http;
+use crate::client::MasterClient;
+use powerfs_common::error::PowerFsError;
+use powerfs_master::proto::powerfs::FilerStatsRequest;
+use powerfs_master::proto::FilerNodeStats;
 
 #[derive(Args, Debug)]
 pub struct FilerStatsArgs {
-    /// Filer admin server address (host:port).
-    /// Default is the metrics server port (grpc_port + 1).
-    /// Use port 8888 for /admin/status and /admin/shards (S3 HTTP server).
-    #[arg(long, default_value = "localhost:8890", global = true)]
-    addr: String,
-
-    /// Show only MetaCache stats.
+    /// Only return stats for the given filer node id (e.g. "filer-1").
+    /// When omitted, all registered filers are returned.
     #[arg(long)]
-    meta_cache: bool,
+    node_id: Option<String>,
 
-    /// Show only Lease stats.
-    #[arg(long)]
-    lease: bool,
-
-    /// Show only Shard distribution.
-    #[arg(long)]
-    shards: bool,
-
-    /// Output raw JSON.
+    /// Output raw, per-filer JSON payloads with minimal decoration (useful
+    /// for scripting / piping to jq).  The top-level wrapper is still
+    /// human-readable to preserve context; the three raw JSON blobs
+    /// (`meta_cache_stats_json`, `lease_stats_json`, `shards_json`) coming
+    /// back from each filer's admin endpoints are emitted verbatim.
     #[arg(long)]
     json: bool,
 }
 
-pub async fn filer_stats(_master: &str, args: FilerStatsArgs) -> super::CommandResult {
-    let show_all = !args.meta_cache && !args.lease && !args.shards;
+/// Fetch Filer statistics from the Master via the `GetFilerStats` gRPC
+/// call and display them.  Never opens a direct connection to a Filer.
+pub async fn filer_stats(mut client: MasterClient, args: FilerStatsArgs) -> super::CommandResult {
+    let mut svc = client
+        .service()
+        .await
+        .map_err(|e| PowerFsError::Internal(format!("Failed to connect: {}", e)))?;
 
-    if args.meta_cache || show_all {
-        fetch_and_print(
-            &args.addr,
-            "/admin/meta-cache-stats",
-            "MetaCache Statistics",
-            args.json,
-        )?;
-    }
-    if args.lease || show_all {
-        fetch_and_print(
-            &args.addr,
-            "/admin/lease-stats",
-            "Lease Statistics",
-            args.json,
-        )?;
-    }
-    if args.shards || show_all {
-        fetch_and_print(&args.addr, "/admin/shards", "Shard Distribution", args.json)?;
-    }
-    Ok(())
-}
+    let req = FilerStatsRequest {
+        node_id: args.node_id.clone().unwrap_or_default(),
+    };
 
-fn fetch_and_print(addr: &str, path: &str, title: &str, json: bool) -> Result<()> {
-    let body = http::http_get(addr, path)?;
+    let resp = svc
+        .get_filer_stats(tonic::Request::new(req))
+        .await
+        .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?
+        .into_inner();
 
-    if json {
-        println!("{}", body);
+    if !resp.error.is_empty() {
+        return Err(PowerFsError::Internal(format!(
+            "GetFilerStats returned error: {}",
+            resp.error
+        )));
+    }
+
+    if resp.stats.is_empty() {
+        match args.node_id {
+            Some(id) => println!("No filers matched node_id={}", id),
+            None => println!("No filers are currently registered with the Master"),
+        }
         return Ok(());
     }
 
-    let v: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| PowerFsError::Internal(format!("parse JSON: {}", e)))?;
+    if args.json {
+        for (i, s) in resp.stats.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            print_stats_debug(s);
+        }
+        return Ok(());
+    }
 
-    println!("═══════════════════════════════════════════════════════════");
-    println!("  {}  ({})", title, addr);
-    println!("═══════════════════════════════════════════════════════════");
-
-    print_json_flat(&v, 0);
-    println!();
+    display_formatted(&resp.stats);
     Ok(())
 }
 
-/// Recursively print JSON as flat key=value lines (2-space indent per level).
-fn print_json_flat(v: &serde_json::Value, indent: usize) {
-    let pad = "  ".repeat(indent);
-    match v {
-        serde_json::Value::Object(map) => {
-            for (k, val) in map.iter() {
-                match val {
-                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        println!("{}{}:", pad, k);
-                        print_json_flat(val, indent + 1);
-                    }
-                    _ => {
-                        println!("{}{:<30} {}", pad, format!("{}:", k), val);
-                    }
-                }
-            }
+fn print_stats_debug(s: &FilerNodeStats) {
+    println!("FilerNodeStats {{");
+    println!("  node_id: {:?}", s.node_id);
+    println!("  address: {:?}", s.address);
+    println!("  is_healthy: {}", s.is_healthy);
+    println!("  leader_count: {}", s.leader_count);
+    println!("  total_shards: {}", s.total_shards);
+    println!("  meta_cache_stats_json:");
+    println!("{}", s.meta_cache_stats_json);
+    println!("  lease_stats_json:");
+    println!("{}", s.lease_stats_json);
+    println!("  shards_json:");
+    println!("{}", s.shards_json);
+    println!("}}");
+}
+
+fn display_formatted(stats: &[FilerNodeStats]) {
+    for s in stats {
+        println!(
+            "=== Filer: {} (addr={}, healthy={}) ===",
+            s.node_id, s.address, s.is_healthy
+        );
+        println!(
+            "  shards: total={}, leader={}",
+            s.total_shards, s.leader_count
+        );
+        if !s.meta_cache_stats_json.is_empty() {
+            println!("--- meta-cache-stats ---");
+            println!("{}", s.meta_cache_stats_json);
+        } else {
+            println!("--- meta-cache-stats --- (not reported: metrics_port=0 or endpoint down)");
         }
-        serde_json::Value::Array(arr) => {
-            for (i, item) in arr.iter().enumerate() {
-                println!("{}[{}]:", pad, i);
-                print_json_flat(item, indent + 1);
-            }
+        if !s.lease_stats_json.is_empty() {
+            println!("--- lease-stats ---");
+            println!("{}", s.lease_stats_json);
+        } else {
+            println!("--- lease-stats --- (not reported: metrics_port=0 or endpoint down)");
         }
-        _ => {
-            println!("{}{}", pad, v);
+        if !s.shards_json.is_empty() {
+            println!("--- shards ---");
+            println!("{}", s.shards_json);
+        } else {
+            println!("--- shards --- (not reported: http_port=0 or endpoint down)");
         }
+        println!();
     }
 }

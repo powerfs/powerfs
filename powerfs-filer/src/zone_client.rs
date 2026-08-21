@@ -21,6 +21,14 @@ pub struct FilerNodeRegistration {
     pub advertise_addr: String,
     /// powerfs-net 端口
     pub net_port: u32,
+    /// S3 HTTP server port (hosts /admin/status, /admin/shards and S3 data).
+    /// Reported to Master so it can proxy shard-introspection endpoints
+    /// through `GetFilerStats`.
+    pub http_port: u32,
+    /// Metrics HTTP server port (hosts /metrics, /admin/meta-cache-stats,
+    /// /admin/lease-stats). Reported to Master so it can proxy the
+    /// observability endpoints through `GetFilerStats`.
+    pub metrics_port: u32,
     /// 该 filer 持有的 shard 数量
     pub shard_count: u64,
     /// 该 filer 持有的 shard id 列表
@@ -70,6 +78,8 @@ pub async fn register_filer(
         let _ = enc.add_string(FieldId::Owner, &reg.filer_id);
         let _ = enc.add_string(FieldId::FilerAddress, &reg.advertise_addr);
         let _ = enc.add_u64(FieldId::Blksize, reg.net_port as u64);
+        let _ = enc.add_u64(FieldId::FilerHttpPort, reg.http_port as u64);
+        let _ = enc.add_u64(FieldId::FilerMetricsPort, reg.metrics_port as u64);
         let _ = enc.add_u64(FieldId::Limit, reg.shard_count);
         if !shard_ids_blob.is_empty() {
             let _ = enc.add_bytes(FieldId::ShardIdList, &shard_ids_blob);
