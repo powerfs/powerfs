@@ -21,7 +21,7 @@ PASS=0
 FAIL=0
 FAILED_TESTS=()
 
-CONTAINER="fuse-test"
+CONTAINER="fuse-1-test"
 TEST_DIR="/mnt/fuse/l2_persist_test"
 
 log()  { echo "[$(date '+%H:%M:%S')] $1"; }

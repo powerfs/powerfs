@@ -2,23 +2,23 @@
 # =============================================================================
 # PowerFS FUSE 文件系统全面功能测试
 #
-# 按照 docs/fuse-test-plan.md 方案执行 T1-T9 功能测试
-# 在 fuse-test 容器内运行：docker exec fuse-test /tmp/fuse_full_test.sh
+# 按照 docs/fuse-1-test-plan.md 方案执行 T1-T9 功能测试
+# 在 fuse-1-test 容器内运行：docker exec fuse-1-test /tmp/fuse_full_test.sh
 #
 # T1-T8: 基础功能（文件CRUD/目录/权限/边界/并发/压力）
 # T9:    内核源码 E2E（打包/解包/编译/删除）— 需要内核 tarball
 #
 # 用法：
-#   docker cp scripts/tests/fuse/run_fuse_full_test.sh fuse-test:/tmp/
-#   docker exec fuse-test /tmp/fuse_full_test.sh
+#   docker cp scripts/tests/fuse/run_fuse_full_test.sh fuse-1-test:/tmp/
+#   docker exec fuse-1-test /tmp/fuse_full_test.sh
 #
 # T9 内核 E2E 用法（需要 tarball + 编译工具）：
-#   docker cp linux-6.17.0.orig.tar.gz fuse-test:/tmp/
+#   docker cp linux-6.17.0.orig.tar.gz fuse-1-test:/tmp/
 #   docker exec -e KERNEL_TARBALL=/tmp/linux-6.17.0.orig.tar.gz \
-#     fuse-test /tmp/fuse_full_test.sh
+#     fuse-1-test /tmp/fuse_full_test.sh
 #
 # 快速测试（跳过 T9）：
-#   docker exec -e SKIP_KERNEL_E2E=1 fuse-test /tmp/fuse_full_test.sh
+#   docker exec -e SKIP_KERNEL_E2E=1 fuse-1-test /tmp/fuse_full_test.sh
 # =============================================================================
 
 set -u

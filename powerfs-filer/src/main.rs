@@ -370,11 +370,16 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         FilerMetaServiceImpl::new(meta_shard_manager.clone(), shard_strategy.clone());
 
     let grpc_addr: std::net::SocketAddr = grpc_address.parse()?;
-    info!("Starting gRPC meta service on {}", grpc_address);
+    info!(
+        "Starting shared gRPC server (RaftService + FilerMetaService) on {}",
+        grpc_address
+    );
 
     use powerfs_filer::powerfs::filer_meta_service_server::FilerMetaServiceServer;
+    let raft_service = raft_group_manager.raft_service();
     tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
+            .add_service(raft_service)
             .add_service(FilerMetaServiceServer::new(grpc_service))
             .serve(grpc_addr)
             .await

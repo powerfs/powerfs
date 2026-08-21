@@ -1869,7 +1869,10 @@ impl MetaShardClient {
         enc.add_u64(powerfs_net::FieldId::Ino, inode);
         enc.add_string(powerfs_net::FieldId::ClientId, client_id)
             .map_err(|e| format!("encode ClientId: {:?}", e))?;
-        enc.add_u8(powerfs_net::FieldId::IsWriteOpen, if is_write_open { 1 } else { 0 });
+        enc.add_u8(
+            powerfs_net::FieldId::IsWriteOpen,
+            if is_write_open { 1 } else { 0 },
+        );
 
         let resp = self
             .send_coherence_msg(MsgType::CapOpenGrant, shard_id, enc.into_bytes())
@@ -1879,11 +1882,15 @@ impl MetaShardClient {
         // (Status is in the response header, not the TLV body — if
         // send_coherence_msg returned Ok, status is STATUS_OK.)
         let mut dec = powerfs_net::serialize::TlvDecoder::new(&resp);
-        let token = dec.next_string(powerfs_net::FieldId::LeaseToken).unwrap_or_default();
+        let token = dec
+            .next_string(powerfs_net::FieldId::LeaseToken)
+            .unwrap_or_default();
         let caps_bits = dec.next_u8(powerfs_net::FieldId::CapSet).unwrap_or(0);
         let epoch = dec.next_u64(powerfs_net::FieldId::CapEpoch).unwrap_or(0);
         let sn = dec.next_u64(powerfs_net::FieldId::CapSn).unwrap_or(0);
-        let duration_ms = dec.next_u64(powerfs_net::FieldId::LeaseDuration).unwrap_or(0);
+        let duration_ms = dec
+            .next_u64(powerfs_net::FieldId::LeaseDuration)
+            .unwrap_or(0);
 
         log::debug!(
             "cap_open_grant: inode={} client={} write={} → token={} caps={:#b} epoch={} sn={} duration_ms={}",
@@ -2059,6 +2066,8 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
         shard_id: resp.shard_id,
+        dir_version: 0,
+        dentry_lease_ttl_ms: 0,
     }
 }
 
@@ -2099,6 +2108,32 @@ fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> Met
     // P4: 解析 FieldId::ReplicaChunks (副本 chunk 列表, 读路径 failover 使用).
     // 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节).
     attr.replica_chunks = parse_replica_chunks_from_body(body);
+
+    // Dentry lease: parse DirVersion and DentryLeaseTtl from the response body.
+    // These are added by the Filer in lookup responses to support per-dentry
+    // lease caching (three-layer check like Ceph).
+    {
+        use powerfs_net::serialize::TlvDecoder;
+        let mut dec = TlvDecoder::new(body);
+        while let Some((fid, len)) = dec.next_field() {
+            match fid {
+                powerfs_net::FieldId::DirVersion => {
+                    if let Ok(v) = dec.read_u64(len) {
+                        attr.dir_version = v;
+                    }
+                }
+                powerfs_net::FieldId::DentryLeaseTtl => {
+                    if let Ok(v) = dec.read_u64(len) {
+                        attr.dentry_lease_ttl_ms = v;
+                    }
+                }
+                _ => {
+                    // Skip unknown/other fields
+                    let _ = dec.skip(len);
+                }
+            }
+        }
+    }
 
     // Symlink: extract target from inline_data. The Filer encodes the symlink
     // target as InlineData in the FileLayout (see encode_chunks_fields). Without
@@ -2533,6 +2568,8 @@ impl MetadataClient for MetaShardClient {
                             chunks: Vec::new(),
                             replica_chunks: Vec::new(),
                             shard_id: child_shard,
+                            dir_version: 0,
+                            dentry_lease_ttl_ms: 0,
                         })
                     } else {
                         None

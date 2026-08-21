@@ -641,6 +641,17 @@ impl NotificationHandler for InvalidateHandler {
                     // may no longer correspond to the current chunks list.
                     self.cache.invalidate_inode(inode);
                     self.chunk_cache.remove_inode_chunks(inode);
+
+                    // Dentry lease invalidation: when a directory's content
+                    // changes (create/mkdir/unlink/rmdir on a child), the
+                    // Filer sends an Invalidate for the parent inode. Clear
+                    // all per-dentry leases for this parent's children and
+                    // mark the dir listing as incomplete (clear I_COMPLETE),
+                    // so subsequent lookups re-query the Filer instead of
+                    // trusting stale negative dentries.
+                    self.cache.invalidate_dentry_leases(inode);
+                    self.cache.invalidate_dir(inode);
+
                     // Clear any directory lease on this inode: the server
                     // invalidated it (another client modified it), so our
                     // Shared lease is no longer valid. Without this,
@@ -720,9 +731,9 @@ impl NotificationHandler for InvalidateHandler {
                 // Update the cap state (embedded in CachedEntry::cap) and
                 // determine the action: dirty recalled bits move to
                 // flushing_caps so the caller knows to flush before ACKing.
-                let action = self.cache.with_cap_mut(inode, |cap| {
-                    process_recall(cap, retained, epoch)
-                });
+                let action = self
+                    .cache
+                    .with_cap_mut(inode, |cap| process_recall(cap, retained, epoch));
 
                 let handler_guard = self.cap_handler.read().unwrap();
                 if let Some(handler) = handler_guard.as_ref() {
@@ -848,6 +859,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         }
     }
 

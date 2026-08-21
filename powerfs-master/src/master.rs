@@ -275,7 +275,7 @@ impl MasterNode {
         cluster_config: Option<ClusterConfig>,
         raft_path: &str,
         raft_id: u64,
-        peers: Vec<String>,
+        raft_peers: Vec<String>,
         net_port: u16,
     ) -> Result<Self> {
         let addr: SocketAddr = bind_address.parse()?;
@@ -284,14 +284,12 @@ impl MasterNode {
         let config = cluster_config.unwrap_or_default();
         let raft_config = RaftConfig::default();
 
-        let peer_list: Vec<Peer> = peers
+        // raft_peers 配置中的地址格式为 ip:raft_port（RaftService gRPC 地址）。
+        // net_address 从 peer IP + 本节点 net_port 派生，用于 powerfs-net 通信。
+        let peer_list: Vec<Peer> = raft_peers
             .into_iter()
             .enumerate()
             .map(|(i, addr)| {
-                // Derive the powerfs-net address (ip:net_port) from the peer's
-                // gRPC address (ip:port) by replacing the port with this node's
-                // `net_port`. All master nodes in the cluster share the same
-                // `net_port`, so this yields the correct TLV endpoint.
                 let peer_ip = addr.split(':').next().unwrap_or(&addr);
                 let net_address = format!("{}:{}", peer_ip, net_port);
                 Peer {

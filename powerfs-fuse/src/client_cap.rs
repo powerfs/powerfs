@@ -147,7 +147,9 @@ impl ClientCap {
 
     /// Issued caps minus dirty and flushing (clean issued bits).
     pub fn issued_non_dirty(&self) -> CapSet {
-        self.issued.remove(self.dirty_caps).remove(self.flushing_caps)
+        self.issued
+            .remove(self.dirty_caps)
+            .remove(self.flushing_caps)
     }
 
     /// True if this cap currently allows local write caching.
@@ -225,11 +227,7 @@ pub enum RecallAction {
 /// - `cap`: the mutable cap record (from `CachedEntry::cap`).
 /// - `retained_caps`: caps the client is allowed to keep after recall.
 /// - `new_epoch`: the new fencing epoch from the server.
-pub fn process_recall(
-    cap: &mut ClientCap,
-    retained_caps: CapSet,
-    new_epoch: u64,
-) -> RecallAction {
+pub fn process_recall(cap: &mut ClientCap, retained_caps: CapSet, new_epoch: u64) -> RecallAction {
     let recalled = cap.apply_recall(retained_caps, new_epoch);
     if cap.flushing_caps.is_empty() {
         // No dirty data being flushed — ACK immediately.
@@ -245,7 +243,9 @@ pub fn process_recall(
             "process_recall: recalled={:?} retained={:?} — FlushThenAck(flushing={:?})",
             recalled, retained_caps, flushing
         );
-        RecallAction::FlushThenAck { flushing_caps: flushing }
+        RecallAction::FlushThenAck {
+            flushing_caps: flushing,
+        }
     }
 }
 
@@ -271,12 +271,14 @@ impl CapWaiters {
     }
 
     /// Register a waiter for cap changes on an inode.
-    pub fn wait_for_cap(
-        &self,
-        inode: u64,
-    ) -> tokio::sync::oneshot::Receiver<CapSet> {
+    pub fn wait_for_cap(&self, inode: u64) -> tokio::sync::oneshot::Receiver<CapSet> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.waiters.lock().unwrap().entry(inode).or_default().push_back(tx);
+        self.waiters
+            .lock()
+            .unwrap()
+            .entry(inode)
+            .or_default()
+            .push_back(tx);
         rx
     }
 

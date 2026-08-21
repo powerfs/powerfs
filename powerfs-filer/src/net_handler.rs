@@ -1133,9 +1133,20 @@ impl FilerNetHandler {
         match lookup_result {
             Some(info) => {
                 let entry_info = Self::inode_to_entry_info(&info);
+                // Fetch parent directory's version (shared_gen) for dentry lease.
+                // Clients use this to detect stale dentries after lease expiry.
+                let dir_version = self
+                    .meta_shard_manager
+                    .get_inode(parent_ino)
+                    .map(|p| p.version)
+                    .unwrap_or(0);
+                // Dentry lease TTL: 30 seconds. The client may trust this
+                // dentry (positive or negative) for this duration.
+                const DENTRY_LEASE_TTL_MS: u64 = 30_000;
+
                 info!(
-                    "FILER_NET_LOOKUP: returning ino={}, mode={:o}, is_dir={}, name={}, size={}, chunks={}",
-                    entry_info.ino, entry_info.mode, entry_info.is_dir, entry_info.name, entry_info.size, info.chunks.len()
+                    "FILER_NET_LOOKUP: returning ino={}, mode={:o}, is_dir={}, name={}, size={}, chunks={}, dir_version={}, lease_ttl={}ms",
+                    entry_info.ino, entry_info.mode, entry_info.is_dir, entry_info.name, entry_info.size, info.chunks.len(), dir_version, DENTRY_LEASE_TTL_MS
                 );
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, entry_info.ino);
@@ -1153,6 +1164,9 @@ impl FilerNetHandler {
                     FieldId::ShardId,
                     self.shard_strategy.calculate_shard(info.inode).0,
                 );
+                // Dentry lease: dir_version + TTL
+                enc.add_u64(FieldId::DirVersion, dir_version);
+                enc.add_u64(FieldId::DentryLeaseTtl, DENTRY_LEASE_TTL_MS);
 
                 // 完整 chunks 列表 + 兼容旧单 chunk 字段
                 Self::encode_chunks_fields(&mut enc, &info)?;
@@ -1160,6 +1174,16 @@ impl FilerNetHandler {
                 Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             None => {
+                // Lookup NOT FOUND: still return dir_version + lease TTL so
+                // the client can cache the NEGATIVE dentry (file doesn't exist)
+                // for the lease duration, avoiding repeated lookup RPCs.
+                let dir_version = self
+                    .meta_shard_manager
+                    .get_inode(parent_ino)
+                    .map(|p| p.version)
+                    .unwrap_or(0);
+                const DENTRY_LEASE_TTL_MS: u64 = 30_000;
+
                 // 调试: LOOKUP 失败时打印 directory_entries 中的 key 用于对比
                 let shard_id = self.shard_strategy.calculate_shard(parent_ino);
                 let entries = self.meta_shard_manager.list_directory(parent_ino);
@@ -1168,10 +1192,17 @@ impl FilerNetHandler {
                     .map(|e| format!("'{}'(len={})", e.name, e.name.len()))
                     .collect();
                 warn!(
-                    "FILER_NET_LOOKUP: NOT FOUND parent_ino={}, name='{}'(len={}), shard={}, dir_entries=[{}]",
-                    parent_ino, name, name.len(), shard_id.0, entry_names.join(", ")
+                    "FILER_NET_LOOKUP: NOT FOUND parent_ino={}, name='{}'(len={}), shard={}, dir_version={}, dir_entries=[{}]",
+                    parent_ino, name, name.len(), shard_id.0, dir_version, entry_names.join(", ")
                 );
-                Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::DirVersion, dir_version);
+                enc.add_u64(FieldId::DentryLeaseTtl, DENTRY_LEASE_TTL_MS);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_NOT_FOUND,
+                    enc.into_bytes(),
+                ))
             }
         }
     }

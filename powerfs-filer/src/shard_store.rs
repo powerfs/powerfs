@@ -2225,6 +2225,11 @@ impl ShardStore {
             dir.insert(name.to_string(), inode);
         }
 
+        // Bump parent directory's version (shared_gen equivalent).
+        // This invalidates cached dentry leases on all clients: when a client
+        // next checks dentry_shared_gen_valid(), the mismatch forces an RPC.
+        self.bump_dir_version(parent_inode);
+
         Ok(())
     }
 
@@ -2244,7 +2249,35 @@ impl ShardStore {
             dir.remove(name);
         }
 
+        // Bump parent directory's version (shared_gen equivalent).
+        self.bump_dir_version(parent_inode);
+
         Ok(())
+    }
+
+    /// Increment a directory's version counter (shared_gen).
+    ///
+    /// Called from add_dir_entry / remove_dir_entry to signal that the
+    /// directory's content changed. Clients compare their cached
+    /// `dir_shared_gen` against this version to detect stale dentries.
+    ///
+    /// If the parent inode lives on a different shard (cross-shard dir
+    /// entry), this is a no-op on this shard — the parent's own shard
+    /// will bump its version when it processes the AddDirEntry command.
+    fn bump_dir_version(&self, parent_inode: u64) {
+        let mut inodes = self.inodes.write().unwrap();
+        if let Some(info) = inodes.get_mut(&parent_inode) {
+            info.version = info.version.wrapping_add(1);
+            // Persist to RocksDB
+            if let Ok(data) = serde_json::to_vec(info) {
+                let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
+                let inode_key = parent_inode.to_be_bytes();
+                let _ = self.db.put_cf(cf_inodes, inode_key, &data);
+            }
+        }
+        // If parent_inode is not in this shard's inodes map (cross-shard),
+        // the version bump happens on the parent's own shard. This is fine —
+        // each shard only tracks its own inodes' versions.
     }
 
     pub fn delete_inode(&self, inode: u64) -> Result<(), String> {

@@ -15,10 +15,9 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use openraft::async_runtime::WatchReceiver;
 use openraft::Raft;
 use openraft::ServerState;
@@ -360,11 +359,15 @@ pub struct RaftGroupManagerV2 {
 }
 
 impl RaftGroupManagerV2 {
-    /// 创建多组管理器并启动共享 gRPC 服务。
+    /// 创建多组管理器（不启动 gRPC server — 由调用者统一启动）。
     ///
     /// - `node_id`：本节点 ID（u64，内部转 String 用于 openraft NodeId）。
-    /// - `node_address`：gRPC 监听地址（如 `"127.0.0.1:8889"`）。
+    /// - `node_address`：gRPC 监听地址（如 `"172.30.0.31:8889"`），用于
+    ///   openraft 集群成员发现，不在此方法内 bind。
     /// - `storage_path`：Raft 数据根目录。
+    ///
+    /// gRPC server 的启动由 main.rs 统一负责，将 RaftService 和
+    /// FilerMetaService 合并到同一个 tonic Server 上，避免端口冲突。
     pub async fn new(
         node_id: u64,
         node_address: String,
@@ -372,26 +375,6 @@ impl RaftGroupManagerV2 {
     ) -> Result<Arc<Self>, String> {
         let router = Arc::new(MultiRaftRouter::<FilerTypeConfig>::new());
         let network_router = MultiGroupRouter::new();
-
-        // 启动共享 gRPC 服务（所有 shard 共用一个端口）
-        let socket_addr: SocketAddr = node_address
-            .parse()
-            .map_err(|e| format!("invalid address '{}': {}", node_address, e))?;
-
-        let service = MultiRaftServiceImpl::new(router.clone());
-        tokio::spawn(async move {
-            info!(
-                "MultiRaftService gRPC server listening on {} (filer node {})",
-                socket_addr, node_id
-            );
-            if let Err(e) = tonic::transport::Server::builder()
-                .add_service(RaftServiceServer::new(service))
-                .serve(socket_addr)
-                .await
-            {
-                error!("MultiRaftService gRPC server error: {}", e);
-            }
-        });
 
         // 注册自身地址到 network_router（用于出站连接路由）
         network_router
@@ -407,6 +390,11 @@ impl RaftGroupManagerV2 {
             storage_path,
             peers: RwLock::new(HashMap::new()),
         }))
+    }
+
+    /// 返回 Raft gRPC service，供调用者合并到共享 gRPC server。
+    pub fn raft_service(&self) -> RaftServiceServer<MultiRaftServiceImpl<FilerTypeConfig>> {
+        RaftServiceServer::new(MultiRaftServiceImpl::new(self.router.clone()))
     }
 
     /// 获取本节点 gRPC 地址。

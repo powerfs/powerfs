@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 从配置文件获取所有必需值 - 无硬编码默认值
     let port = master_cfg.port;
+    let raft_port = master_cfg.raft_port;
     let net_port = master_cfg.net_port;
     let dir = master_cfg.dir;
 
@@ -75,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peers = if !args.peer.is_empty() {
         args.peer
     } else {
-        master_cfg.peers
+        master_cfg.raft_peers
     };
 
     let ip = args.ip.unwrap_or_else(|| {
@@ -101,16 +102,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         });
 
+    // Raft inter-node gRPC address: advertise_ip:raft_port
+    // (advertise_addr is ip:port for MasterService; raft_port is separate)
+    let advertise_ip = advertise_addr.split(':').next().unwrap_or(&advertise_addr);
+    let raft_address = format!("{}:{}", advertise_ip, raft_port);
+
     info!("Starting PowerFS Master Node");
     info!("  Bind Address: {}", bind_address);
-    info!("  Raft Address: {}", advertise_addr);
+    info!("  Raft Address: {}", raft_address);
+    info!("  Master Port: {}", port);
+    info!("  Raft Port: {}", raft_port);
     info!("  Net Port: {}", net_port);
     info!("  Raft ID: {}", raft_id);
     info!("  Data Dir: {}", dir);
 
     let master = MasterNode::new(
         &bind_address,
-        &advertise_addr,
+        &raft_address,
         None::<ClusterConfig>,
         &raft_dir,
         raft_id,

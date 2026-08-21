@@ -3,7 +3,7 @@
 # PowerFS L2 POSIX 兼容性测试 (L2.13-L2.19)
 #
 # 测试标准 Unix 工具在 PowerFS FUSE 文件系统上的兼容性
-# 在 fuse-test 容器内运行：docker exec fuse-test /tmp/run_l2_posix_test.sh
+# 在 fuse-1-test 容器内运行：docker exec fuse-1-test /tmp/run_l2_posix_test.sh
 #
 # 测试项:
 #   L2.13: ls 递归

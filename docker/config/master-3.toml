@@ -7,12 +7,13 @@ redis_url = "redis://172.30.0.50:6379"
 
 [master]
 port = 9333
+raft_port = 9335
 net_port = 9334
 dir = "/data/master"
 ip = "0.0.0.0"
 advertise_addr = "172.30.0.13:9333"
 raft_id = 3
-peers = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+raft_peers = ["172.30.0.11:9335", "172.30.0.12:9335", "172.30.0.13:9335"]
 
 [volume]
 grpc_port = 8080

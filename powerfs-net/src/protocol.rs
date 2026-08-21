@@ -1134,6 +1134,17 @@ pub enum FieldId {
     /// writer was upgraded to EXCLUSIVE_WRITE, followed by upgrade fields
     /// (LeaseToken + CapSet + CapEpoch + CapSn). 0 = no upgrade.
     HasUpgrade = 0xC8,
+
+    // ===== Dentry lease fields (0xC9-0xCA) — per-dentry lease model =====
+    /// Directory version / shared_gen (u64). Returned in lookup and readdir
+    /// responses so clients can track when a directory's content changes.
+    /// Clients compare their cached dentry's `dir_shared_gen` against this
+    /// value to detect stale dentries after their per-dentry lease expires.
+    DirVersion = 0xC9,
+    /// Dentry lease TTL in milliseconds (u64). Returned in lookup responses.
+    /// When non-zero, the client may trust the dentry (positive or negative)
+    /// for this duration without sending further lookup RPCs.
+    DentryLeaseTtl = 0xCA,
 }
 
 impl FieldId {
@@ -1249,6 +1260,8 @@ impl FieldId {
             0xC6 => Some(Self::IsWriteOpen),
             0xC7 => Some(Self::CapSn),
             0xC8 => Some(Self::HasUpgrade),
+            0xC9 => Some(Self::DirVersion),
+            0xCA => Some(Self::DentryLeaseTtl),
             _ => None,
         }
     }
