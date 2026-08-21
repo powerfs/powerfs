@@ -587,6 +587,13 @@ impl MetadataCache {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(e) = cache.get_mut(&inode) {
             e.cap = Some(cap);
+            // The server's cap grant affirms that our cached metadata is
+            // current. Refresh cached_at and clear any TTL-induced Stale
+            // state so subsequent get_inode calls bypass the TTL safety net.
+            e.cached_at = Instant::now();
+            if e.state == EntryState::Stale {
+                e.try_transition(EntryState::Clean);
+            }
         } else {
             log::warn!(
                 "MetadataCache::grant_cap: inode={} not in cache — cap grant dropped",
@@ -2764,6 +2771,292 @@ impl ChunkCache {
 impl Default for ChunkCache {
     fn default() -> Self {
         Self::with_defaults()
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn test_cap_grant_take_and_get() {
+        let cache = MetadataCache::new();
+        let inode = 100u64;
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "cap_test.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 0,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            shard_id: None,
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+            cap: None,
+        });
+
+        // No cap initially.
+        assert!(cache.get_cap(inode).is_none());
+        assert!(!cache.can_cache_writes(inode));
+        assert!(!cache.can_cache_reads(inode));
+
+        // Grant EXCLUSIVE cap (write open).
+        let cap = crate::client_cap::ClientCap::new(
+            1,
+            "tok-1".into(),
+            crate::client_cap::CapSet::EXCLUSIVE,
+            1,
+            true,
+            100,
+        );
+        cache.grant_cap(inode, cap);
+
+        // Cap is now present.
+        let got = cache.get_cap(inode).unwrap();
+        assert!(got.can_cache_writes());
+        assert!(got.can_cache_reads());
+        assert!(got.can_modify_meta());
+        assert!(cache.can_cache_writes(inode));
+        assert!(cache.can_cache_reads(inode));
+
+        // Take cap (release).
+        let taken = cache.take_cap(inode).unwrap();
+        assert_eq!(taken.token, "tok-1");
+        assert!(cache.get_cap(inode).is_none());
+        assert!(!cache.can_cache_writes(inode));
+    }
+
+    #[test]
+    fn test_cap_mark_dirty_and_flushed() {
+        let cache = MetadataCache::new();
+        let inode = 200u64;
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "dirty_test.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 0,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            shard_id: None,
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+            cap: None,
+        });
+
+        let cap = crate::client_cap::ClientCap::new(
+            2,
+            "tok-2".into(),
+            crate::client_cap::CapSet::EXCLUSIVE,
+            1,
+            true,
+            200,
+        );
+        cache.grant_cap(inode, cap);
+
+        // Write path: mark_dirty_cap_w.
+        cache.mark_dirty_cap_w(inode);
+        let got = cache.get_cap(inode).unwrap();
+        assert!(got.dirty_caps.contains(crate::client_cap::CapSet::CAP_W));
+        // Entry state should be Dirty.
+        let entry = cache.get_inode(inode).unwrap();
+        assert_eq!(entry.state, EntryState::Dirty);
+
+        // Flush: mark_cap_flushed clears flushing_caps (after recall
+        // moves dirty→flushing).
+        cache.mark_cap_flushed(inode);
+        let got = cache.get_cap(inode).unwrap();
+        assert!(got.flushing_caps.is_empty());
+    }
+
+    #[test]
+    fn test_cap_get_inode_ttl_bypass_with_cap_r() {
+        let cache = MetadataCache::new();
+        let inode = 300u64;
+        let now = chrono::Utc::now().timestamp();
+        // Insert with an old cached_at to simulate TTL expiry.
+        let old_instant = Instant::now()
+            - std::time::Duration::from_secs(300);
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "ttl_test.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 42,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 42,
+            disk_size: 0,
+            generation: 0,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            shard_id: None,
+            cached_at: old_instant,
+            state: EntryState::default(),
+            hold: HoldState::default(),
+            cap: None,
+        });
+
+        // Without cap: TTL expired → get_inode returns None.
+        assert!(cache.get_inode(inode).is_none());
+
+        // Grant CAP_R cap.
+        let cap = crate::client_cap::ClientCap::new(
+            3,
+            "tok-3".into(),
+            crate::client_cap::CapSet::CAP_R,
+            1,
+            false,
+            300,
+        );
+        cache.grant_cap(inode, cap);
+
+        // With CAP_R: TTL bypassed → get_inode returns Some.
+        let entry = cache.get_inode(inode).unwrap();
+        assert_eq!(entry.size, 42);
+    }
+
+    #[test]
+    fn test_cap_grant_on_nonexistent_inode_drops() {
+        let cache = MetadataCache::new();
+        let cap = crate::client_cap::ClientCap::new(
+            4,
+            "tok-4".into(),
+            crate::client_cap::CapSet::EXCLUSIVE,
+            1,
+            true,
+            400,
+        );
+        // Grant on an inode not in cache — should not panic.
+        cache.grant_cap(999, cap);
+        assert!(cache.get_cap(999).is_none());
+    }
+
+    #[test]
+    fn test_cap_with_cap_mut_recall_flow() {
+        let cache = MetadataCache::new();
+        let inode = 500u64;
+        let now = chrono::Utc::now().timestamp();
+        cache.insert(CachedEntry {
+            inode,
+            parent: 1,
+            name: "recall_test.txt".to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 0,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            shard_id: None,
+            cached_at: Instant::now(),
+            state: EntryState::default(),
+            hold: HoldState::default(),
+            cap: None,
+        });
+
+        let cap = crate::client_cap::ClientCap::new(
+            5,
+            "tok-5".into(),
+            crate::client_cap::CapSet::EXCLUSIVE,
+            1,
+            true,
+            500,
+        );
+        cache.grant_cap(inode, cap);
+
+        // Simulate write (mark dirty) then recall.
+        cache.mark_dirty_cap_w(inode);
+
+        let action = cache.with_cap_mut(inode, |cap| {
+            crate::client_cap::process_recall(
+                cap,
+                crate::client_cap::CapSet::CAP_R,
+                2,
+            )
+        });
+        assert!(action.is_some());
+        match action.unwrap() {
+            crate::client_cap::RecallAction::FlushThenAck { flushing_caps } => {
+                assert!(flushing_caps.contains(crate::client_cap::CapSet::CAP_W));
+            }
+            _ => panic!("expected FlushThenAck"),
+        }
+
+        // After recall, CAP_W is gone, CAP_R retained.
+        let got = cache.get_cap(inode).unwrap();
+        assert!(!got.can_cache_writes());
+        assert!(got.can_cache_reads());
     }
 }
 

@@ -1862,7 +1862,7 @@ impl MetaShardClient {
         inode: u64,
         client_id: &str,
         is_write_open: bool,
-    ) -> Result<(String, u8, u64, u64), String> {
+    ) -> Result<(String, u8, u64, u64, u64), String> {
         let shard_id = self.calculate_shard_id(inode);
 
         let mut enc = serialize::TlvEncoder::new();
@@ -1875,7 +1875,7 @@ impl MetaShardClient {
             .send_coherence_msg(MsgType::CapOpenGrant, shard_id, enc.into_bytes())
             .await?;
 
-        // Parse response: LeaseToken + CapSet + LeaseEpoch + SN
+        // Parse response: LeaseToken + CapSet + LeaseEpoch + SN + LeaseDuration
         // (Status is in the response header, not the TLV body — if
         // send_coherence_msg returned Ok, status is STATUS_OK.)
         let mut dec = powerfs_net::serialize::TlvDecoder::new(&resp);
@@ -1883,19 +1883,21 @@ impl MetaShardClient {
         let caps_bits = dec.next_u8(powerfs_net::FieldId::CapSet).unwrap_or(0);
         let epoch = dec.next_u64(powerfs_net::FieldId::CapEpoch).unwrap_or(0);
         let sn = dec.next_u64(powerfs_net::FieldId::CapSn).unwrap_or(0);
+        let duration_ms = dec.next_u64(powerfs_net::FieldId::LeaseDuration).unwrap_or(0);
 
         log::debug!(
-            "cap_open_grant: inode={} client={} write={} → token={} caps={:#b} epoch={} sn={}",
+            "cap_open_grant: inode={} client={} write={} → token={} caps={:#b} epoch={} sn={} duration_ms={}",
             inode,
             client_id,
             is_write_open,
             token,
             caps_bits,
             epoch,
-            sn
+            sn,
+            duration_ms
         );
 
-        Ok((token, caps_bits, epoch, sn))
+        Ok((token, caps_bits, epoch, sn, duration_ms))
     }
 
     /// §13 Cap model: send a `CapRecallAck` to the Filer, confirming that

@@ -66,11 +66,11 @@ pub enum CacheState {
 /// - Dirty   → what we proposed via SetAttr (visible immediately)
 /// - Clean   → what RocksDB confirmed on apply or on last read
 ///
-/// # Ceph alignment: client_caps
+/// #  alignment: client_caps
 ///
-/// `client_caps` mirrors Ceph's `CInode::client_caps` — an in-memory map
+/// `client_caps` mirrors 's `CInode::client_caps` — an in-memory map
 /// from `client_id` to the cap this Filer leader has granted to that
-/// client for this inode. Like Ceph:
+/// client for this inode. Like :
 /// - The map is **ephemeral** — it is NOT serialized to RocksDB. Only
 ///   `info` (the `InodeInfo`) is persisted; cap state is leader-local
 ///   runtime state that is rebuilt from scratch on leader failover (all
@@ -79,7 +79,7 @@ pub enum CacheState {
 ///   what caps; the `CapManager::inodes` HashMap is a fast-path index
 ///   for the cap state machine but defers to this map for persistence
 ///   boundaries.
-/// - `loner_cap` mirrors Ceph's `CInode::loner_cap` — the single client
+/// - `loner_cap` mirrors 's `CInode::loner_cap` — the single client
 ///   granted exclusive caps, used as a fast-path check for "no conflict"
 ///   without scanning the whole map.
 pub struct CachedInode {
@@ -100,7 +100,7 @@ pub struct CachedInode {
     /// Create raft version; for Staging/Dirty this is 0.
     pub raft_version: AtomicU64,
 
-    /// Per-client caps granted for this inode (Ceph: `client_caps`).
+    /// Per-client caps granted for this inode  `client_caps`).
     ///
     /// Keyed by `client_id`. Each entry records the `cap_id`, the cap
     /// bits currently issued, and the epoch at grant time. This map is
@@ -112,7 +112,7 @@ pub struct CachedInode {
     pub(crate) client_caps: Mutex<HashMap<String, InodeCapRecord>>,
 
     /// The single client currently holding exclusive caps, if any
-    /// (Ceph: `loner_cap`). `-1` (encoded as `None`) means no loner.
+    ///  `loner_cap`). `-1` (encoded as `None`) means no loner.
     /// Used as a fast-path: if a new open comes in and `loner_cap` is
     /// `None` or matches the opener, no conflict scan is needed.
     pub(crate) loner_cap: Mutex<Option<String>>,
@@ -127,9 +127,9 @@ pub struct CachedInode {
 /// in `CapHolder` under `CapManager`.
 #[derive(Clone, Debug)]
 pub(crate) struct InodeCapRecord {
-    /// Global monotonic cap id (Ceph: `cap_id`).
+    /// Global monotonic cap id  `cap_id`).
     pub cap_id: u64,
-    /// Currently issued caps (Ceph: `_issued`).
+    /// Currently issued caps  `_issued`).
     pub caps: CapSet,
     /// Epoch at grant time — used for fencing stale clients.
     pub epoch: u64,
@@ -155,7 +155,7 @@ impl CachedInode {
         self.last_access_ms.store(now_ms(), Ordering::Relaxed);
     }
 
-    /// Attach a cap record for `client_id` (Ceph: `CInode::add_client_cap`).
+    /// Attach a cap record for `client_id`  `CInode::add_client_cap`).
     /// Called by `CapManager::open_grant` via `MetaCache::cap_attach` to
     /// mirror the grant into the inode-embedded `client_caps` map.
     pub(crate) fn add_client_cap(
@@ -172,7 +172,7 @@ impl CachedInode {
             client_id.to_string(),
             InodeCapRecord { cap_id, caps, epoch, is_writer },
         );
-        // First cap → ref the inode (Ceph: `get(PIN_CAPS)`). We don't
+        // First cap → ref the inode  `get(PIN_CAPS)`). We don't
         // need an explicit PIN since MetaCache's `refcount` is already
         // bumped by `CapManager::open_grant` via `incr_refcount`.
         if was_empty && is_writer && caps.is_exclusive() {
@@ -180,7 +180,7 @@ impl CachedInode {
         }
     }
 
-    /// Remove a client's cap record (Ceph: `CInode::remove_client_cap`).
+    /// Remove a client's cap record  `CInode::remove_client_cap`).
     /// Called by `CapManager::release_cap` / `close_session` /
     /// `drain_expired_recalls` via `MetaCache::cap_detach`.
     pub(crate) fn remove_client_cap(&self, client_id: &str) {
@@ -201,7 +201,7 @@ impl CachedInode {
     }
 
     /// Snapshot of `(client_id, caps)` pairs — used for diagnostics
-    /// and leader-handoff recall (Ceph: `CInode::export_client_caps`).
+    /// and leader-handoff recall  `CInode::export_client_caps`).
     pub(crate) fn snapshot_client_caps(
         &self,
     ) -> Vec<(String, CapSet, u64 /* epoch */)> {
@@ -1225,7 +1225,7 @@ impl MetaCache {
         self.trim.recall_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Attach a cap record to a cached inode (Ceph: `CInode::add_client_cap`).
+    /// Attach a cap record to a cached inode  `CInode::add_client_cap`).
     ///
     /// Called by `CapManager::open_grant` to mirror a cap grant into the
     /// inode-embedded `client_caps` map. If the inode is not currently
@@ -1239,14 +1239,16 @@ impl MetaCache {
         client_id: &str,
         cap_id: u64,
         caps: CapSet,
+        epoch: u64,
+        is_writer: bool,
     ) {
         let tbl = self.inode_table.read().unwrap();
         if let Some(ci) = tbl.get(&inode) {
-            ci.add_client_cap(client_id, cap_id, caps, 0, /*is_writer=*/ false);
+            ci.add_client_cap(client_id, cap_id, caps, epoch, is_writer);
         }
     }
 
-    /// Detach a client's cap from a cached inode (Ceph:
+    /// Detach a client's cap from a cached inode 
     /// `CInode::remove_client_cap`).
     ///
     /// Called by `CapManager::release_cap` / `close_session` /

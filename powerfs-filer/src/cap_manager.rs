@@ -330,7 +330,7 @@ impl CapHolder {
         self.last_seq = seq;
     }
 
-    /// Mirror of Ceph `Capability::revoking()`: bits issued but not pending.
+    /// Bits issued but not pending (being revoked).
     pub fn revoking(&self) -> CapSet {
         self.caps.remove(self.pending)
     }
@@ -347,51 +347,45 @@ impl CapSetExt for CapSet {
     }
 }
 
-/// Per-client session state — the PowerFS analogue of Ceph's `Session`
-/// class (`ceph/src/mds/SessionMap.h`).
+/// Per-client session state.
 ///
-/// Ceph's `Session` holds an `xlist<Capability*> caps` — a doubly-linked
-/// list threaded through every `Capability` the session owns, via the
-/// `item_session_caps` xlist item. This gives O(1) cap insertion/removal
-/// and O(1) iteration when a session closes (bulk cap cleanup).
+/// Holds a reverse index of every cap the session owns, giving O(1)
+/// cap insertion/removal and O(1) iteration when a session closes
+/// (bulk cap cleanup).
 ///
-/// PowerFS doesn't have intrusive xlists; we use a `HashSet<(inode,
-/// cap_id)>` as the reverse index. The cap records themselves live in
-/// `CachedInode::client_caps` (mirroring `CInode::client_caps`), so this
-/// set is purely an index — it doesn't own the `CapHolder` objects.
+/// The cap records themselves live in `CachedInode::client_caps`, so
+/// this set is purely an index — it doesn't own the `CapHolder` objects.
 ///
-/// # Ceph alignment notes
+/// # Field overview
 ///
-/// | Ceph `Session` field         | PowerFS `ClientSession` field  |
-/// |------------------------------|--------------------------------|
-/// | `xlist<Capability*> caps`    | `caps: HashSet<(u64, u64)>`    |
-/// | `last_cap_renew`             | `last_cap_renew_ms`            |
-/// | `recall_caps` (DecayCounter) | `recall_caps_total` (AtomicU64)|
-/// | `release_caps`               | `release_caps_total`           |
-/// | `recall_limit`               | `recall_limit`                 |
-/// | `state` (STATE_CLOSED/OPEN)  | `state` (SessionState)         |
-/// | `connection`                 | (managed by net layer)         |
+/// | Field              | Meaning                                                |
+/// |--------------------|--------------------------------------------------------|
+/// | `caps`             | `HashSet<(inode, cap_id)>` reverse index               |
+/// | `last_cap_renew_ms`| Monotonic ms of last cap renewal                       |
+/// | `recall_caps_total`| Cumulative caps recalled from this session             |
+/// | `release_caps_total`| Cumulative caps released by this session              |
+/// | `recall_limit`     | Max outstanding recalls per session (flood control)    |
+/// | `state`            | SessionState (Closed/Opening/Active/Closing/Killing)   |
 #[derive(Debug, Default)]
 pub struct ClientSession {
     /// Reverse index: `(inode, cap_id)` for every cap this client holds.
-    /// Mirrors Ceph's `xlist<Capability*> caps`. Used for O(1) cleanup
-    /// on session close — iterate this set and remove each cap from its
-    /// inode's `client_caps` map.
+    /// Used for O(1) cleanup on session close — iterate this set and
+    /// remove each cap from its inode's `client_caps` map.
     pub caps: std::sync::Mutex<std::collections::HashSet<(u64, u64)>>,
-    /// Monotonic ms of last cap renewal (Ceph: `last_cap_renew`).
+    /// Monotonic ms of last cap renewal.
     pub last_cap_renew_ms: std::sync::atomic::AtomicU64,
-    /// Cumulative caps recalled from this session (Ceph: `recall_caps`).
+    /// Cumulative caps recalled from this session.
     pub recall_caps_total: std::sync::atomic::AtomicU64,
-    /// Cumulative caps released by this session (Ceph: `release_caps`).
+    /// Cumulative caps released by this session.
     pub release_caps_total: std::sync::atomic::AtomicU64,
-    /// Current recall limit (Ceph: `recall_limit`). Server caps the
-    /// number of outstanding recalls per session to avoid flooding.
+    /// Current recall limit. Server caps the number of outstanding
+    /// recalls per session to avoid flooding.
     pub recall_limit: std::sync::atomic::AtomicU32,
-    /// Session state (Ceph: `state`).
+    /// Session state.
     pub state: std::sync::Mutex<SessionState>,
 }
 
-/// Session state mirroring Ceph `Session::state_t`.
+/// Session state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SessionState {
     #[default]
@@ -403,19 +397,18 @@ pub enum SessionState {
 }
 
 impl ClientSession {
-    /// Record a new cap grant (Ceph: `Capability::item_session_caps`
-    /// pushed to back of `Session::caps`).
+    /// Record a new cap grant in the reverse index.
     pub fn add_cap(&self, inode: u64, cap_id: u64) {
         self.caps.lock().unwrap().insert((inode, cap_id));
     }
 
-    /// Remove a cap (Ceph: `cap_item.remove_myself()`).
+    /// Remove a cap from the reverse index.
     pub fn remove_cap(&self, inode: u64, cap_id: u64) {
         self.caps.lock().unwrap().remove(&(inode, cap_id));
     }
 
     /// Snapshot of `(inode, cap_id)` pairs — used on session close to
-    /// drive bulk cap cleanup (Ceph: `Session::~Session` walks `caps`).
+    /// drive bulk cap cleanup.
     pub fn snapshot_caps(&self) -> Vec<(u64, u64)> {
         self.caps.lock().unwrap().iter().copied().collect()
     }
@@ -609,25 +602,22 @@ impl RecallTimeoutPenalty for NoopRecallPenalty {
 pub struct CapManager {
     /// Per-inode state. Lazily created on first `open_grant`.
     ///
-    /// **Ceph alignment**: Ceph embeds cap state directly in `CInode::
-    /// client_caps` (a `mempool_cap_map client -> Capability`). PowerFS
-    /// mirrors this by also writing caps into `CachedInode::client_caps`
-    /// via the optional `meta_cache` handle; this `inodes` map remains
-    /// the fast-path authority for the cap state machine and is kept in
-    /// sync with the inode-embedded copy. The inode-embedded copy is the
+    /// Cap state is also mirrored into `CachedInode::client_caps` via
+    /// the optional `meta_cache` handle; this `inodes` map remains the
+    /// fast-path authority for the cap state machine and is kept in sync
+    /// with the inode-embedded copy. The inode-embedded copy is the
     /// "source of truth" for serialization (only `InodeInfo` is
-    /// serialized — cap state is ephemeral, matching Ceph's behaviour
-    /// where `CInode::client_caps` is not persisted to the backing store).
+    /// serialized — cap state is ephemeral).
     inodes: Arc<Mutex<HashMap<u64, CapInodeState>>>,
-    /// Per-client reverse index (Ceph: `SessionMap` keyed by `client_t`).
+    /// Per-client reverse index.
     ///
-    /// Mirrors Ceph's `Session::caps` xlist: each `ClientSession` holds
-    /// the set of `(inode, cap_id)` pairs the client owns, enabling O(1)
-    /// cleanup on session close — we iterate the set and remove each cap
-    /// from its inode's holder list, instead of scanning all inodes.
+    /// Each `ClientSession` holds the set of `(inode, cap_id)` pairs the
+    /// client owns, enabling O(1) cleanup on session close — we iterate
+    /// the set and remove each cap from its inode's holder list, instead
+    /// of scanning all inodes.
     sessions: Arc<Mutex<HashMap<String, Arc<ClientSession>>>>,
-    /// Global cap_id allocator (Ceph: `MDCache::last_cap_id`). Monotonic
-    /// across the Filer's lifetime; assigned to every new `CapHolder`.
+    /// Global cap_id allocator. Monotonic across the Filer's lifetime;
+    /// assigned to every new `CapHolder`.
     cap_id_alloc: Arc<AtomicU64>,
     /// SN allocator (§5.2 / §13.6.1) — leader-local, optimistic.
     sn: Arc<SnAllocator>,
@@ -670,8 +660,7 @@ impl CapManager {
         }
     }
 
-    /// Get-or-create the `ClientSession` for `client_id` (Ceph:
-    /// `SessionMap::get_or_existing`).
+    /// Get-or-create the `ClientSession` for `client_id`.
     pub fn session_for(&self, client_id: &str) -> Arc<ClientSession> {
         let mut sessions = self.sessions.lock().unwrap();
         sessions
@@ -680,9 +669,7 @@ impl CapManager {
             .clone()
     }
 
-    /// Drop a client session and bulk-clean all its caps (Ceph:
-    /// `SessionMap::mark_session_dead` + `CInode::remove_client_cap`
-    /// for each cap in `Session::caps`).
+    /// Drop a client session and bulk-clean all its caps.
     ///
     /// Returns the list of `(inode, cap_id)` pairs that were removed,
     /// so the caller (net layer) can push any required recall/upgrade
@@ -703,8 +690,7 @@ impl CapManager {
         let mut inodes = self.inodes.lock().unwrap();
         for &(inode, cap_id) in &removed {
             if let Some(state) = inodes.get_mut(&inode) {
-                // Remove the holder matching this cap_id (Ceph:
-                // `CInode::remove_client_cap`).
+                // Remove the holder matching this cap_id.
                 let token_to_remove: Option<String> = state
                     .holders
                     .iter()
@@ -981,17 +967,16 @@ impl CapManager {
         state.holders.push(holder);
 
         // Register the cap in the client's session reverse index
-        // (Ceph: `Session::caps.push_back(&cap->item_session_caps)`).
+        // for O(1) cleanup on client disconnect.
         self.session_for(client_id).add_cap(inode, cap_id);
 
-        // Mirror the cap into the inode-embedded `client_caps` map
-        // (Ceph: `CInode::client_caps[client] = Capability`). The
-        // inode-embedded copy is the authoritative in-memory state for
-        // serialization; the `inodes` map above is the fast-path index
-        // for the cap state machine.
+        // Mirror the cap into the inode-embedded `client_caps` map.
+        // The inode-embedded copy is the authoritative in-memory state
+        // for serialization; the `inodes` map above is the fast-path
+        // index for the cap state machine.
         if let Some(mc) = &self.meta_cache {
             mc.incr_refcount(inode);
-            mc.cap_attach(inode, client_id, cap_id, granted_caps);
+            mc.cap_attach(inode, client_id, cap_id, granted_caps, epoch, is_write_open);
         }
 
         log::debug!(
@@ -1108,8 +1093,7 @@ impl CapManager {
             ));
         }
 
-        // Remove from the client session reverse index (Ceph:
-        // `cap->item_session_caps.remove_myself()`).
+        // Remove from the client session reverse index.
         let cap_id = removed.cap_id;
         if let Some(sess) = self.sessions.lock().unwrap().get(client_id) {
             sess.remove_cap(inode, cap_id);
@@ -1117,8 +1101,7 @@ impl CapManager {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
-        // Decr MetaCache refcount and detach the inode-embedded cap
-        // (Ceph: `CInode::remove_client_cap`).
+        // Decr MetaCache refcount and detach the inode-embedded cap.
         if let Some(mc) = &self.meta_cache {
             mc.decr_refcount(inode);
             mc.cap_detach(inode, client_id);
@@ -1199,8 +1182,7 @@ impl CapManager {
                 if let Some(h) = state.remove_holder(&token_to_reclaim) {
                     reclaimed.push((*inode, h.client_id.clone()));
                     self.penalty.on_recall_ack_timeout(&h.client_id);
-                    // Clean up session reverse index (Ceph:
-                    // `cap->item_session_caps.remove_myself()`).
+                    // Clean up session reverse index.
                     if let Some(sess) =
                         self.sessions.lock().unwrap().get(&h.client_id)
                     {

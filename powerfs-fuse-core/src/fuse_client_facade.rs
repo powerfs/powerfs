@@ -875,7 +875,7 @@ impl FuseClientFacade {
         inode: u64,
         client_id: &str,
         is_write_open: bool,
-    ) -> Result<(String, u8, u64, u64), String> {
+    ) -> Result<(String, u8, u64, u64, u64), String> {
         self.meta_shard_client
             .cap_open_grant(inode, client_id, is_write_open)
             .await
