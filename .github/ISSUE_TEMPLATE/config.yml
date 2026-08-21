@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Questions & Q&A
+    url: https://github.com/powerfs/powerfs/discussions/categories/q-a
+    about: Please ask usage questions in Discussions (Q&A category), not GitHub Issues. Issues are for bug reports only.
+  - name: 💡 Feature Requests
+    url: https://github.com/powerfs/powerfs/discussions/categories/feature-requests
+    about: Suggest new features or enhancements in Discussions (Feature Requests category).
+  - name: 📝 General Discussion
+    url: https://github.com/powerfs/powerfs/discussions/categories/general
+    about: General discussion, project direction, and community conversations.

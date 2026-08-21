@@ -1,0 +1,113 @@
+name: 🐛 Bug Report
+description: Report a bug or unexpected behavior in PowerFS
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report!
+
+        **Not sure if it's a bug?** Please ask in [Discussions (Q&A)](https://github.com/powerfs/powerfs/discussions/categories/q-a) first.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction Steps
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Start cluster with config '...'
+        2. Run command '...'
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happened. Include error messages, logs, or stack traces.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Master
+        - Volume
+        - Filer
+        - FUSE Client
+        - Kernel Module (powerfs.ko)
+        - S3 Gateway
+        - CLI
+        - Monitor / Dashboard
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: PowerFS Version
+      description: Git commit hash or release tag.
+      placeholder: "e.g., master@a1b2c3d or v1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Linux Kernel Version
+      placeholder: "e.g., 6.17.0"
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / Distribution
+      placeholder: "e.g., Ubuntu 22.04, CentOS 8"
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Relevant TOML config or mount options (redact sensitive info).
+      render: toml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: |
+        Paste relevant log output (Master/Filer/Volume/FUSE logs, dmesg, etc.).
+        Use `\`\`\`log` code blocks for formatting.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing Issues and Discussions to avoid duplicates.
+          required: true
+        - label: I am using the latest master branch (not a stale build).
+          required: true
+        - label: This is a bug report, not a usage question (questions go to Discussions).
+          required: true

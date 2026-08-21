@@ -1043,13 +1043,31 @@ Based on the issues above, the following guidelines MUST be followed:
 
 ---
 
-## 🤝 Community & Contribution
+## 🤝 Community
+
+| Channel | Description |
+|---------|-------------|
+| 💬 **Discussions (Q&A)** | [Ask usage questions, get help, mark accepted answers](https://github.com/powerfs/powerfs/discussions/categories/q-a) |
+| 💡 **Feature Requests** | [Suggest new features or enhancements](https://github.com/powerfs/powerfs/discussions/categories/feature-requests) |
+| 📝 **General Discussion** | [Project direction, architecture, community chat](https://github.com/powerfs/powerfs/discussions/categories/general) |
+| 🔧 **Development** | [Rust/kernel source, PR-related discussions](https://github.com/powerfs/powerfs/discussions/categories/development) |
+| 📢 **Announcements** | [Releases, important notifications (admin-only)](https://github.com/powerfs/powerfs/discussions/categories/announcements) |
+| 🐛 **Bug Reports** | [File a bug report via GitHub Issues](https://github.com/powerfs/powerfs/issues/new/choose) |
+
+### Guidelines
+
+- **Issues** are for bug reports only. Usage questions go to **Discussions (Q&A)**.
+- Please prefer **English** for posts. Chinese is welcome in sub-topics.
+- Be respectful and follow our [Code of Conduct](.github/CODE_OF_CONDUCT.md).
+- When asking in Q&A, mark the best reply as **Accepted Answer** to help others.
+
+### Contributing
 
 PowerFS is open-source under Apache 2.0 license. We are committed to building the **next-generation unified storage infrastructure for HPC + AI converged computing**.
 
 Welcome Star, Fork, PR and Issue to help us evolve!
 
-**GitHub**: https://github.com/FudanPPI/powerfs
+**GitHub**: https://github.com/powerfs/powerfs
 
 ---
 
