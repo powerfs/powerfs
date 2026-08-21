@@ -3,14 +3,15 @@ use log::info;
 
 mod client;
 mod commands;
+mod http;
 mod kv_client;
 mod volume_client;
 
 use commands::{
     AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, FsckArgs, FuseStatsArgs, GrowArgs,
-    HeartbeatArgs, KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs, StatusArgs, VolumeListArgs,
-    WriteArgs,
+    CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, DebugArgs, FilerStatsArgs, FsckArgs,
+    FuseStatsArgs, GrowArgs, HeartbeatArgs, KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs,
+    StatusArgs, TopologyArgs, VolumeListArgs, WriteArgs,
 };
 
 /// `powerfs-cli config` subcommands.
@@ -98,6 +99,15 @@ enum Commands {
     /// Query FUSE client request statistics and in-flight requests (stuck detection)
     FuseStats(FuseStatsArgs),
 
+    /// Dynamic log level and debug flag control (via Master admin API)
+    Debug(DebugArgs),
+
+    /// View cluster topology (shard count, nodes, health) from Monitor
+    Topology(TopologyArgs),
+
+    /// Query Filer admin statistics (MetaCache, Lease, Shards)
+    FilerStats(FilerStatsArgs),
+
     /// Configuration file management (generate per-node configs from topology)
     Config {
         #[command(subcommand)]
@@ -163,6 +173,9 @@ async fn main() {
         Commands::Conflicts(command) => commands::conflicts(client, command).await,
         Commands::Fsck(args) => commands::fsck(client, args).await,
         Commands::FuseStats(args) => commands::fuse_stats(&cli.master, args),
+        Commands::Debug(args) => commands::debug(&cli.master, args).await,
+        Commands::Topology(args) => commands::topology(&cli.master, args).await,
+        Commands::FilerStats(args) => commands::filer_stats(&cli.master, args).await,
         Commands::Config { .. } => unreachable!("handled above"),
         Commands::Manage(args) => commands::manage(client, args).await,
     };
