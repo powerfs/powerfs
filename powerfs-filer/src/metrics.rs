@@ -373,6 +373,23 @@ mod tests {
         let _ = mc.get_direntry(100, "foo"); // hit
         let _ = mc.get_inode(9999); // miss (returns None)
 
+        // 1) Verify MetaCache's own atomic counters first (no global race).
+        let s = mc.stats();
+        assert!(
+            s.backfill_clean_total >= 2,
+            "two backfills (inode + direntry), got={}",
+            s.backfill_clean_total
+        );
+        assert_eq!(s.inode_hit_total, 1, "one inode hit");
+        assert_eq!(s.direntry_hit_total, 1, "one direntry hit");
+        assert_eq!(s.inode_miss_total, 1, "one inode miss");
+
+        // 2) Verify refresh_prometheus at least moves the gauges to >= the
+        //    snapshot we expect. Note: IntGauges live in the default
+        //    prometheus registry and are shared across parallel tests, so
+        //    we assert with lower bounds (equality would race with other
+        //    tests concurrently calling refresh_prometheus on the same
+        //    statics).
         let state = Arc::new(MetricsAppState {
             lease_mgr,
             meta_cache: mc,
@@ -380,11 +397,20 @@ mod tests {
         refresh_prometheus(&state);
 
         assert!(
-            MC_BACKFILL_CLEAN_TOTAL.get() >= 2,
-            "two backfills (inode + direntry)"
+            MC_BACKFILL_CLEAN_TOTAL.get() >= s.backfill_clean_total as i64,
+            "prometheus backfill gauge reflects snapshot"
         );
-        assert_eq!(MC_INODE_HIT_TOTAL.get(), 1, "one inode hit");
-        assert_eq!(MC_DIRENTRY_HIT_TOTAL.get(), 1, "one direntry hit");
-        assert_eq!(MC_INODE_MISS_TOTAL.get(), 1, "one inode miss");
+        assert!(
+            MC_INODE_HIT_TOTAL.get() >= s.inode_hit_total as i64,
+            "prometheus inode_hit gauge reflects snapshot"
+        );
+        assert!(
+            MC_DIRENTRY_HIT_TOTAL.get() >= s.direntry_hit_total as i64,
+            "prometheus direntry_hit gauge reflects snapshot"
+        );
+        assert!(
+            MC_INODE_MISS_TOTAL.get() >= s.inode_miss_total as i64,
+            "prometheus inode_miss gauge reflects snapshot"
+        );
     }
 }

@@ -1646,14 +1646,14 @@ mod tests {
 
     #[test]
     fn per_chunk_preserves_order() {
-        let chunks: Vec<ChunkRef> = (0..50)
+        let chunks: Vec<ChunkRef> = (0u64..50)
             .map(|i| ChunkRef {
                 offset: i * 4096,
                 size: 4096,
-                needle_id: 1000 + i as u64,
-                volume_id: 10 + (i % 4) as u64,
+                needle_id: 1000 + i,
+                volume_id: 10 + (i % 4),
                 crc32: i as u32,
-                mtime: 1700000000 + i as u64,
+                mtime: 1700000000 + i,
             })
             .collect();
         let layout = FileLayout {

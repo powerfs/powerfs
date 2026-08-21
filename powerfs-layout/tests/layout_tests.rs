@@ -172,9 +172,10 @@ fn auto_promote_all_thresholds() {
 
 #[test]
 fn auto_promote_widestripe_when_enabled() {
-    let mut policy = PlacementPolicy::default();
-    policy.allow_auto_widestripe = true;
-
+    let policy = PlacementPolicy {
+        allow_auto_widestripe: true,
+        ..PlacementPolicy::default()
+    };
     let p = auto_promote(200 * 1024 * 1024 * 1024, &policy);
     assert!(matches!(p, Placement::WideStripe { .. }));
 }
@@ -398,7 +399,7 @@ fn locate_stripe_continuous_offset() {
         // vol_offset = (i / stripe_count) * stripe_size
         let expected_vol_offset = (i / 4) * 1024;
         assert_eq!(
-            vol_offset, expected_vol_offset as u64,
+            vol_offset, expected_vol_offset,
             "offset {} vol_offset mismatch",
             offset
         );
