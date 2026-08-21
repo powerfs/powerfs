@@ -1239,6 +1239,38 @@ impl MetaShardClient {
                         };
 
                         if let Some(new_addr) = new_leader {
+                            // Self-redirect guard: Learner nodes may return
+                            // their own address during Raft elections because
+                            // the shard leadership hasn't converged yet.
+                            // Repeatedly retrying against the same non-leader
+                            // exhausts the 10 attempt budget in ~50ms and
+                            // surfaces a user-visible EIO even though the
+                            // election completes in 1-3s.
+                            //
+                            // On self-redirect:
+                            //   * DO NOT update shard_router (this addr is
+                            //     known not to be the leader).
+                            //   * DOUBLE the backoff window to give the
+                            //     election time to settle.
+                            //   * rely on rotation (next loop iteration
+                            //     auto-advances the rotation index via the
+                            //     attempt counter) to try another Filer.
+                            if new_addr == target_addr {
+                                let base = 5u64 << (attempt - 1).min(3);
+                                let delay_ms = base * 2;
+                                log::warn!(
+                                    "send_coherence_msg: shard={} SELF-redirect to {} \
+                                     (Learner election in progress, attempt {}/{}); \
+                                     x2 backoff={}ms, rotating next filer",
+                                    shard_id,
+                                    new_addr,
+                                    attempt,
+                                    MAX_ATTEMPTS,
+                                    delay_ms
+                                );
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
                             log::info!(
                                 "send_coherence_msg: shard={} redirect {} -> {} (attempt {}/{})",
                                 shard_id,
@@ -2785,6 +2817,28 @@ pub(crate) async fn process_request_internal(
                     };
 
                     if let Some(new_addr) = new_leader {
+                        // Self-redirect guard: Learner nodes may return
+                        // their own address during Raft elections (see
+                        // send_coherence_msg for full rationale). Do not
+                        // poison shard_router with a known-bad address;
+                        // double the backoff and rotate to the next
+                        // candidate via the attempt counter.
+                        if new_addr == target_addr {
+                            let base = 5u64 << (attempt - 1).min(3);
+                            let delay_ms = base * 2;
+                            log::warn!(
+                                "process_request_internal: shard={} SELF-redirect to {} \
+                                 (Learner election in progress, attempt {}/{}); \
+                                 x2 backoff={}ms, rotating next filer",
+                                shard_id,
+                                new_addr,
+                                attempt,
+                                MAX_ATTEMPTS,
+                                delay_ms
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
                         log::info!(
                             "process_request_internal: shard={} redirect from {} -> {}, updating route and retrying (attempt {}/{})",
                             shard_id, target_addr, new_addr, attempt, MAX_ATTEMPTS
