@@ -1849,6 +1849,121 @@ impl MetaShardClient {
         *self.state.lock().unwrap() = MetaShardClientState::Closed;
         log::info!("MetaShardClient: Closed");
     }
+
+    /// §13 Cap model: send a `CapOpenGrant` request to the Filer. The
+    /// server grants caps based on the open mode (read-only → CAP_R,
+    /// read-write → CAP_R+W+X or degraded). Returns the granted token,
+    /// cap bits, epoch, and SN.
+    ///
+    /// Request TLV: Ino + ClientId + IsWriteOpen(u8).
+    /// Response TLV: Status + LeaseToken + CapSet(u8) + LeaseEpoch(u64) + SN(u64).
+    pub async fn cap_open_grant(
+        &self,
+        inode: u64,
+        client_id: &str,
+        is_write_open: bool,
+    ) -> Result<(String, u8, u64, u64), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_u8(powerfs_net::FieldId::IsWriteOpen, if is_write_open { 1 } else { 0 });
+
+        let resp = self
+            .send_coherence_msg(MsgType::CapOpenGrant, shard_id, enc.into_bytes())
+            .await?;
+
+        // Parse response: LeaseToken + CapSet + LeaseEpoch + SN
+        // (Status is in the response header, not the TLV body — if
+        // send_coherence_msg returned Ok, status is STATUS_OK.)
+        let mut dec = powerfs_net::serialize::TlvDecoder::new(&resp);
+        let token = dec.next_string(powerfs_net::FieldId::LeaseToken).unwrap_or_default();
+        let caps_bits = dec.next_u8(powerfs_net::FieldId::CapSet).unwrap_or(0);
+        let epoch = dec.next_u64(powerfs_net::FieldId::CapEpoch).unwrap_or(0);
+        let sn = dec.next_u64(powerfs_net::FieldId::CapSn).unwrap_or(0);
+
+        log::debug!(
+            "cap_open_grant: inode={} client={} write={} → token={} caps={:#b} epoch={} sn={}",
+            inode,
+            client_id,
+            is_write_open,
+            token,
+            caps_bits,
+            epoch,
+            sn
+        );
+
+        Ok((token, caps_bits, epoch, sn))
+    }
+
+    /// §13 Cap model: send a `CapRecallAck` to the Filer, confirming that
+    /// the client has flushed dirty data (if any) and released the recalled
+    /// caps. The Filer uses this to complete the recall and grant caps to
+    /// the waiting client.
+    ///
+    /// Request TLV: Ino + ClientId + LeaseToken.
+    pub async fn cap_recall_ack(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_string(powerfs_net::FieldId::LeaseToken, token)
+            .map_err(|e| format!("encode LeaseToken: {:?}", e))?;
+
+        self.send_coherence_msg(MsgType::CapRecallAck, shard_id, enc.into_bytes())
+            .await?;
+
+        log::debug!(
+            "cap_recall_ack: inode={} client={} token={}",
+            inode,
+            client_id,
+            token
+        );
+
+        Ok(())
+    }
+
+    /// §13 Cap model: send a `CapRelease` to the Filer on close(). The
+    /// Filer uses this to detect upgrade opportunities (if a surviving
+    /// writer can be promoted back to EXCLUSIVE_WRITE).
+    ///
+    /// Request TLV: Ino + ClientId + LeaseToken.
+    pub async fn cap_release(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_string(powerfs_net::FieldId::LeaseToken, token)
+            .map_err(|e| format!("encode LeaseToken: {:?}", e))?;
+
+        self.send_coherence_msg(MsgType::CapRelease, shard_id, enc.into_bytes())
+            .await?;
+
+        log::debug!(
+            "cap_release: inode={} client={} token={}",
+            inode,
+            client_id,
+            token
+        );
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

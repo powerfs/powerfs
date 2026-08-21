@@ -13,6 +13,7 @@ use powerfs_net::serialize::TlvDecoder;
 use powerfs_net::{FieldId, MsgType, NetMessage, NotificationHandler};
 
 use crate::cache::{ChunkCache, MetadataCache};
+use crate::client_cap::{process_recall, CapSet, RecallAction};
 use crate::fuse::InlineBuffer;
 
 /// Phase 3 Lease Recall: async lease releaser for the notification handler.
@@ -30,6 +31,46 @@ pub trait LeaseReleaser: Send + Sync {
     /// client's `ClientLeaseState`. Best-effort: failures are logged
     /// and the lease will eventually expire on the server side.
     fn release(&self, inode: u64, token: String);
+}
+
+/// Cap model handler — called from the sync `handle_notification` to
+/// process `CapRecallNotify` and `CapUpgradeNotify` messages from the
+/// Filer (§13 Capability model).
+///
+/// The implementation is expected to:
+/// - For `CapRecallNotify` with dirty CAP_W: flush dirty chunks + sync
+///   metadata, then send `CapRecallAck`.
+/// - For `CapRecallNotify` without dirty data: send `CapRecallAck`
+///   immediately.
+/// - For `CapUpgradeNotify`: update the local cap and resume local caching.
+///
+/// The actual flush logic (drain_dirty_for_inode + write_blob_batch +
+/// sync_size_chunks) lives in `PowerFsFs`, injected via the `CapFlusher`
+/// trait. This keeps the handler thin and testable while avoiding
+/// duplicating the complex flush path.
+pub trait CapFlusher: Send + Sync {
+    /// Flush all dirty chunks for `inode` to the Volume Server, then sync
+    /// metadata (size + chunks) to the Filer via Raft. Returns `Ok(())`
+    /// if the flush succeeded, `Err` otherwise.
+    ///
+    /// Called by `CapHandler::flush_and_ack` before sending `CapRecallAck`.
+    /// The `lease_token` is the cap token — passed to the Volume Server
+    /// write RPCs so they carry the correct fencing epoch.
+    fn flush_and_sync(&self, inode: u64, lease_token: &str) -> std::io::Result<()>;
+}
+
+/// Cap model handler — delegates recall ACK to the Filer via
+/// `FuseClientFacade::cap_recall_ack`. Flush is performed by the
+/// injected `CapFlusher` (implemented by `PowerFsFs`).
+pub trait CapHandler: Send + Sync {
+    /// Flush dirty data for `inode` (chunks + metadata) and send
+    /// `CapRecallAck` to the Filer. Called when a `CapRecallNotify`
+    /// arrives and `RecallAction::FlushThenAck` is returned.
+    fn flush_and_ack(&self, inode: u64, token: String, epoch: u64);
+
+    /// Send `CapRecallAck` without flushing (no dirty data). Called
+    /// when `RecallAction::ImmediateAck` is returned.
+    fn immediate_ack(&self, inode: u64, token: String, epoch: u64);
 }
 
 /// Handler for server-pushed Invalidate notifications
@@ -95,6 +136,14 @@ pub struct InvalidateHandler {
     /// ReleaseInodeLease RPC so the server decrements our refcount,
     /// allowing MetaCache trim_pass to evict the entry.
     lease_releaser: RwLock<Option<Arc<dyn LeaseReleaser>>>,
+    /// §13 Cap model: async cap handler. Called when `CapRecallNotify`
+    /// or `CapUpgradeNotify` arrives to flush+ACK or upgrade the cap.
+    /// Set after construction once the FUSE client's flusher is ready.
+    ///
+    /// Note: cap state lives in `CachedEntry::cap` (via `MetadataCache`
+    /// methods). No separate cap store — the cache is the single
+    /// source of truth.
+    cap_handler: RwLock<Option<Arc<dyn CapHandler>>>,
 }
 
 impl InvalidateHandler {
@@ -113,6 +162,7 @@ impl InvalidateHandler {
             open_inodes: Arc::new(RwLock::new(HashMap::new())),
             lease_state: RwLock::new(None),
             lease_releaser: RwLock::new(None),
+            cap_handler: RwLock::new(None),
         }
     }
 
@@ -133,6 +183,7 @@ impl InvalidateHandler {
             open_inodes: Arc::new(RwLock::new(HashMap::new())),
             lease_state: RwLock::new(None),
             lease_releaser: RwLock::new(None),
+            cap_handler: RwLock::new(None),
         }
     }
 
@@ -157,6 +208,7 @@ impl InvalidateHandler {
             open_inodes,
             lease_state: RwLock::new(None),
             lease_releaser: RwLock::new(None),
+            cap_handler: RwLock::new(None),
         }
     }
 
@@ -174,6 +226,18 @@ impl InvalidateHandler {
     /// are available.
     pub fn set_lease_releaser(&self, releaser: Arc<dyn LeaseReleaser>) {
         *self.lease_releaser.write().unwrap() = Some(releaser);
+    }
+
+    /// §13 Cap model: set the async cap handler. Called after
+    /// construction once the FUSE client's flusher + RPC client are
+    /// ready. The handler is invoked when `CapRecallNotify` or
+    /// `CapUpgradeNotify` arrives.
+    ///
+    /// Cap state is no longer stored separately — it lives in
+    /// `CachedEntry::cap` (via `MetadataCache`). This handler only
+    /// provides the flush+ACK side-effect.
+    pub fn set_cap_handler(&self, handler: Arc<dyn CapHandler>) {
+        *self.cap_handler.write().unwrap() = Some(handler);
     }
 
     /// Set the FUSE file descriptor (called after the FUSE session is mounted)
@@ -631,6 +695,102 @@ impl NotificationHandler for InvalidateHandler {
                 // notifications for the same version are suppressed.
                 self.mark_processed(inode, version);
             }
+            MsgType::CapRecallNotify => {
+                // §13 Cap model: server recalls caps from this client.
+                // Notification TLV: Ino + LeaseToken + CapSet(recall) +
+                // CapSet(retained) + CapEpoch
+                let mut dec = TlvDecoder::new(&msg.body);
+                let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+                let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+                let _recall_bits = dec.next_u8(FieldId::CapSet).unwrap_or(0);
+                let retained_bits = dec.next_u8(FieldId::CapSet).unwrap_or(0);
+                let epoch = dec.next_u64(FieldId::CapEpoch).unwrap_or(0);
+                let retained = CapSet(retained_bits);
+
+                if inode == 0 {
+                    warn!("InvalidateHandler: CapRecallNotify with inode=0, ignoring");
+                    return;
+                }
+
+                debug!(
+                    "InvalidateHandler: CapRecallNotify inode={} retained={:?} epoch={}",
+                    inode, retained, epoch
+                );
+
+                // Update the cap state (embedded in CachedEntry::cap) and
+                // determine the action: dirty recalled bits move to
+                // flushing_caps so the caller knows to flush before ACKing.
+                let action = self.cache.with_cap_mut(inode, |cap| {
+                    process_recall(cap, retained, epoch)
+                });
+
+                let handler_guard = self.cap_handler.read().unwrap();
+                if let Some(handler) = handler_guard.as_ref() {
+                    match action {
+                        Some(RecallAction::ImmediateAck) => {
+                            // Shared cap, no dirty data — ACK immediately.
+                            handler.immediate_ack(inode, token, epoch);
+                        }
+                        Some(RecallAction::FlushThenAck { flushing_caps: _ }) => {
+                            // Exclusive cap with dirty data — flush then ACK.
+                            handler.flush_and_ack(inode, token, epoch);
+                        }
+                        None => {
+                            // No local cap record (cap not granted or inode
+                            // evicted). ACK immediately so the server doesn't
+                            // time out waiting for us — we have nothing to flush.
+                            warn!(
+                                "InvalidateHandler: CapRecallNotify for inode={} but no local cap — sending immediate ACK",
+                                inode
+                            );
+                            handler.immediate_ack(inode, token, epoch);
+                        }
+                    }
+                } else {
+                    warn!(
+                        "InvalidateHandler: CapRecallNotify for inode={} but no cap_handler registered — recall will time out on server",
+                        inode
+                    );
+                }
+            }
+            MsgType::CapUpgradeNotify => {
+                // §13 Cap model: server upgrades us back to EXCLUSIVE_WRITE.
+                // Notification TLV: Ino + LeaseToken + CapSet(granted) +
+                // CapEpoch + SN
+                let mut dec = TlvDecoder::new(&msg.body);
+                let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+                let _token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+                let granted_bits = dec.next_u8(FieldId::CapSet).unwrap_or(0);
+                let epoch = dec.next_u64(FieldId::CapEpoch).unwrap_or(0);
+                let sn = dec.next_u64(FieldId::CapSn).unwrap_or(0);
+                let granted = CapSet(granted_bits);
+
+                if inode == 0 {
+                    warn!("InvalidateHandler: CapUpgradeNotify with inode=0, ignoring");
+                    return;
+                }
+
+                debug!(
+                    "InvalidateHandler: CapUpgradeNotify inode={} granted={:?} epoch={} sn={}",
+                    inode, granted, epoch, sn
+                );
+
+                // Apply the upgrade to the cap embedded in CachedEntry.
+                let upgraded = self.cache.with_cap_mut(inode, |cap| {
+                    cap.apply_upgrade(granted, epoch, sn);
+                });
+                if upgraded.is_some() {
+                    debug!(
+                        "InvalidateHandler: cap upgraded for inode={} — local caching resumed",
+                        inode
+                    );
+                } else {
+                    warn!(
+                        "InvalidateHandler: CapUpgradeNotify for inode={} but no local cap (evicted or not granted)",
+                        inode
+                    );
+                }
+            }
             other => {
                 debug!(
                     "InvalidateHandler: ignoring non-Invalidate notification type={:?}",
@@ -687,6 +847,7 @@ mod tests {
             cached_at: std::time::Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         }
     }
 

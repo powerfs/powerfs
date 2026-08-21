@@ -111,6 +111,20 @@ pub struct CachedEntry {
     pub state: EntryState,
     /// Hold state (open/lease reference count). Orthogonal to `state`.
     pub hold: HoldState,
+    /// §13 Cap model: per-inode cap record.
+    ///
+    /// Embedded directly in the cache entry. When `Some`, this client
+    /// holds a capability grant from the Filer leader for this inode;
+    /// the `issued` bits determine whether local cache reads/writes
+    /// are authoritative (CAP_R/CAP_W) and whether setattr is allowed
+    /// (CAP_X).
+    ///
+    /// `dirty_caps` records which cap bits have unsynced local state
+    /// (write data, setattr metadata) — checked by `process_recall` to
+    /// decide between ImmediateAck and FlushThenAck on server recall.
+    ///
+    /// Cleared on `release()` (last close) via `take_cap`.
+    pub cap: Option<crate::client_cap::ClientCap>,
 }
 
 impl CachedEntry {
@@ -293,6 +307,7 @@ impl MetadataCache {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
         cache
     }
@@ -344,6 +359,24 @@ impl MetadataCache {
         // 3. Pinned (open file with lease): TTL bypassed to prevent cache
         //    miss during slow writes that exceed metadata_ttl.
         if entry.hold.is_pinned() {
+            return Some(entry);
+        }
+
+        // 3.5. §13 Cap model: if the entry has a cap with CAP_R, the
+        //      local cache is authoritative. The server has granted this
+        //      client permission to cache reads, so TTL must not expire
+        //      the entry. This is what makes cap-protected reads skip
+        //      the Filer refresh RPC.
+        //
+        //      Note: Dirty/Flushing already returned in step 2; this
+        //      handles the Clean+Cap case (e.g., a read-only open with
+        //      CAP_R but no local modifications).
+        if entry
+            .cap
+            .as_ref()
+            .map(|c| c.can_cache_reads())
+            .unwrap_or(false)
+        {
             return Some(entry);
         }
 
@@ -474,6 +507,37 @@ impl MetadataCache {
         }
     }
 
+    /// §13 Cap model: mark inode Dirty AND mark CAP_W on the cap.
+    ///
+    /// Called by the **write path** after buffering data locally. The
+    /// CAP_W dirty bit is what `process_recall` checks to decide
+    /// FlushThenAck vs ImmediateAck on server recall — without this,
+    /// a recall would ACK immediately and lose dirty data.
+    pub fn mark_dirty_cap_w(&self, inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            e.try_transition(EntryState::Dirty);
+            if let Some(cap) = e.cap.as_mut() {
+                cap.mark_dirty(crate::client_cap::CapSet::CAP_W);
+            }
+        }
+    }
+
+    /// §13 Cap model: mark inode Dirty AND mark CAP_X on the cap.
+    ///
+    /// Called by the **setattr path** after applying local metadata
+    /// changes (size/mode/uid/gid). The CAP_X dirty bit ensures
+    /// `process_recall` flushes metadata before ACKing a recall.
+    pub fn mark_dirty_cap_x(&self, inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            e.try_transition(EntryState::Dirty);
+            if let Some(cap) = e.cap.as_mut() {
+                cap.mark_dirty(crate::client_cap::CapSet::CAP_X);
+            }
+        }
+    }
+
     /// Mark an inode as Flushing (currently syncing to Filer/Volume).
     /// Called by flusher before starting RPC.
     pub fn mark_flushing(&self, inode: u64) {
@@ -504,6 +568,116 @@ impl MetadataCache {
         if let Some(e) = cache.get_mut(&inode) {
             e.try_transition(EntryState::Stale);
         }
+    }
+
+    // ========================================================================
+    // §13 Cap model: cap operations on CachedEntry::cap
+    //
+    // All methods are synchronous (no RPC) — they just mutate the
+    // in-cache record.
+    // ========================================================================
+
+    /// Grant (or replace) the cap on an inode.
+    /// Called from the `CapOpenGrant` response path or `CapUpgradeNotify`.
+    ///
+    /// If the inode is not in the cache, the grant is silently dropped —
+    /// the caller (open path) is expected to have populated the cache
+    /// before issuing CapOpenGrant.
+    pub fn grant_cap(&self, inode: u64, cap: crate::client_cap::ClientCap) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            e.cap = Some(cap);
+        } else {
+            log::warn!(
+                "MetadataCache::grant_cap: inode={} not in cache — cap grant dropped",
+                inode
+            );
+        }
+    }
+
+    /// Take (remove) the cap from an inode.
+    /// Returns the removed cap so the caller can use its `token` for the
+    /// `CapRelease` RPC. Called on `release()` (last close).
+    pub fn take_cap(&self, inode: u64) -> Option<crate::client_cap::ClientCap> {
+        let mut cache = self.inode_cache.write().unwrap();
+        cache.get_mut(&inode).and_then(|e| e.cap.take())
+    }
+
+    /// Get a snapshot of the cap for an inode.
+    /// Returns `None` if the inode has no cap or is not in cache.
+    pub fn get_cap(&self, inode: u64) -> Option<crate::client_cap::ClientCap> {
+        let cache = self.inode_cache.read().unwrap();
+        cache.peek(&inode).and_then(|e| e.cap.clone())
+    }
+
+    /// Mutate the cap for an inode under a closure. Returns `None`
+    /// if the inode has no cap (not in cache, or cap not granted yet).
+    ///
+    /// This is the primary entry point for:
+    /// - `mark_cap_dirty(inode, CAP_W|CAP_X)` — write/setattr paths
+    /// - `apply_recall` / `apply_upgrade` — recall/upgrade notifications
+    /// - `mark_flushed` — after successful flush
+    pub fn with_cap_mut<R>(
+        &self,
+        inode: u64,
+        f: impl FnOnce(&mut crate::client_cap::ClientCap) -> R,
+    ) -> Option<R> {
+        let mut cache = self.inode_cache.write().unwrap();
+        cache.get_mut(&inode).and_then(|e| e.cap.as_mut().map(f))
+    }
+
+    /// Mark cap bits dirty.
+    /// Called by write (CAP_W) and setattr (CAP_X) paths to record
+    /// unsynced local state. The `process_recall` function checks
+    /// `dirty_caps` to decide between ImmediateAck and FlushThenAck.
+    ///
+    /// No-op if the inode has no cap (e.g., read-only open or cap not
+    /// yet granted — in those cases the write/setattr would have already
+    /// failed earlier via `can_cache_writes` / `can_modify_meta` checks).
+    pub fn mark_cap_dirty(&self, inode: u64, bits: crate::client_cap::CapSet) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            if let Some(cap) = e.cap.as_mut() {
+                cap.mark_dirty(bits);
+            }
+        }
+    }
+
+    /// Mark the cap as flushed — clear `flushing_caps`.
+    /// Called by `CapFlusher::flush_and_sync` after a successful flush,
+    /// and by `release()` after syncing dirty data.
+    pub fn mark_cap_flushed(&self, inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(e) = cache.get_mut(&inode) {
+            if let Some(cap) = e.cap.as_mut() {
+                cap.mark_flushed();
+            }
+        }
+    }
+
+    /// True if the inode has a cap with CAP_R (read cache permission).
+    /// Used by the read path to decide whether local cache is authoritative.
+    pub fn can_cache_reads(&self, inode: u64) -> bool {
+        self.get_cap(inode)
+            .map(|c| c.can_cache_reads())
+            .unwrap_or(false)
+    }
+
+    /// True if the inode has a cap with CAP_W (write cache permission).
+    /// Used by the write path to decide whether local buffering is allowed.
+    pub fn can_cache_writes(&self, inode: u64) -> bool {
+        self.get_cap(inode)
+            .map(|c| c.can_cache_writes())
+            .unwrap_or(false)
+    }
+
+    /// True if the inode has a cap with CAP_X (metadata modify permission).
+    /// Used by the setattr path to decide whether local metadata updates
+    /// are allowed without an immediate RPC.
+    pub fn can_modify_meta(&self, inode: u64) -> bool {
+        self.get_cap(inode)
+            .map(|c| c.can_modify_meta())
+            .unwrap_or(false)
     }
 
     /// Get path by walking up parent chain
@@ -1578,6 +1752,7 @@ impl MetadataCache {
                 cached_at: Instant::now(),
                 state: EntryState::default(),
                 hold: HoldState::default(),
+                cap: None,
             },
         );
         drop(cache);
@@ -1723,6 +1898,7 @@ mod tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         let entry = cache.get_inode(inode).unwrap();
@@ -1767,6 +1943,7 @@ mod tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         assert!(cache.get_inode(inode).is_some());
@@ -1811,6 +1988,7 @@ mod tests {
                 cached_at: Instant::now(),
                 state: EntryState::default(),
                 hold: HoldState::default(),
+                cap: None,
             });
         }
 
@@ -1853,6 +2031,7 @@ mod tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         cache.update_size(inode, 1024);
@@ -1895,6 +2074,7 @@ mod tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         cache.rename(1, "old.txt", 1, "new.txt").unwrap();
@@ -1940,6 +2120,7 @@ mod tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         assert_eq!(cache.get_nlink(inode), 1);
@@ -1986,6 +2167,7 @@ mod tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         cache.set_symlink_target(inode, "/target/path".to_string());
@@ -2034,6 +2216,7 @@ mod tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         // Fresh entry should be returned
@@ -2085,6 +2268,7 @@ mod tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         // Wait some time (but less than TTL)
@@ -2774,6 +2958,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         // No generation tracking -> not stale
@@ -2828,6 +3013,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         cache.update_path_generation("/clear_test.txt", 5);
@@ -2885,6 +3071,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         // New → Dirty (write path)
@@ -2947,6 +3134,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         // Write → Dirty → Flushing (flusher starts)
@@ -3004,6 +3192,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         });
 
         // Initially not pinned
@@ -3071,6 +3260,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         };
 
         cache.insert(make_entry(pinned_ino));
@@ -3131,6 +3321,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         };
 
         // Insert 3 entries (fills cache: root=1, ino=2, ino=3, ino=4 → cap=3 means 3 entries after root)
@@ -3198,6 +3389,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         };
 
         let ino = cache.allocate_inode();
@@ -3256,6 +3448,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
         };
 
         let ino = cache.allocate_inode();
@@ -3309,6 +3502,7 @@ mod chunk_cache_tests {
             cached_at: Instant::now(),
             state: EntryState::New,
             hold: HoldState::default(),
+            cap: None,
         };
 
         assert!(

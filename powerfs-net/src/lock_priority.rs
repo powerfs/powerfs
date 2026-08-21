@@ -86,13 +86,18 @@ impl LockPriority {
     /// `is_lock_channel()` 过滤); 若误入, 保守归为 P2 (普通优先级).
     pub fn for_msg_type(mt: MsgType) -> Self {
         match mt {
-            MsgType::RevokeInodeLeaseAck => LockPriority::RevokeAck,
-            MsgType::ReleaseInodeLease | MsgType::ReleaseLease => LockPriority::Release,
-            MsgType::AcquireInodeLease | MsgType::AcquireLease | MsgType::AcquireLeaseBatch => {
-                LockPriority::Acquire
+            MsgType::RevokeInodeLeaseAck | MsgType::CapRecallAck => LockPriority::RevokeAck,
+            MsgType::ReleaseInodeLease | MsgType::ReleaseLease | MsgType::CapRelease => {
+                LockPriority::Release
             }
+            MsgType::AcquireInodeLease
+            | MsgType::AcquireLease
+            | MsgType::AcquireLeaseBatch
+            | MsgType::CapOpenGrant => LockPriority::Acquire,
             // 其余 lock 通道消息 (Renew* / LeaseStatus / RangeLease /
-            // Invalidate) 以及任何误入的非 lock 消息 → 后台优先级.
+            // Invalidate / CapRecallNotify / CapUpgradeNotify — server-push
+            // notifications, not client-initiated) 以及任何误入的非 lock
+            // 消息 → 后台优先级.
             _ => LockPriority::Routine,
         }
     }

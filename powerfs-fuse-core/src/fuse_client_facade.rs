@@ -582,19 +582,29 @@ impl FuseClientFacade {
             config.client_identity.client_id,
             conn_pool.clone(),
         );
-        // 每个 filer 地址已是 host:port 格式（master 下发的 advertise_addr）；
-        // 兜底场景需要 host + filer_port 拼接。
-        let filer_endpoints: Vec<String> = if !topology_filer_endpoints.is_empty() {
-            topology_filer_endpoints
-        } else if !config.filer_addrs.is_empty() {
+        // 构建 filer 地址列表：优先使用 master 拓扑下发的地址，但始终合并
+        // 配置中的 filer_addrs 作为 fallback。这样即使 master 拓扑只返回部分
+        // filer（如新节点尚未注册），rotation 列表仍有足够候选供 self-redirect
+        // 和网络错误时轮转。
+        let config_filer_endpoints: Vec<String> = if !config.filer_addrs.is_empty() {
             config
                 .filer_addrs
                 .iter()
                 .map(|h| format!("{}:{}", h, config.filer_port))
                 .collect()
-        } else {
+        } else if !config.filer_addr.is_empty() {
             vec![format!("{}:{}", config.filer_addr, config.filer_port)]
+        } else {
+            Vec::new()
         };
+        // 合并拓扑地址和配置地址（去重保序，拓扑地址优先）
+        let mut seen = std::collections::HashSet::new();
+        let filer_endpoints: Vec<String> = topology_filer_endpoints
+            .iter()
+            .chain(config_filer_endpoints.iter())
+            .filter(|a| !a.is_empty() && seen.insert(a.to_string()))
+            .cloned()
+            .collect();
         meta_shard_client.set_filer_addresses(filer_endpoints);
         meta_shard_client.init();
         let meta_shard_client = Arc::new(meta_shard_client);
@@ -856,6 +866,47 @@ impl FuseClientFacade {
         // Auto-invalidate cache
         self.invalidate_inode_lease(inode);
         Ok(())
+    }
+
+    /// §13 Cap model: send a `CapOpenGrant` request to the Filer. Returns
+    /// `(token, caps_bits, epoch, sn)`. Delegates to MetaShardClient.
+    pub async fn cap_open_grant(
+        &self,
+        inode: u64,
+        client_id: &str,
+        is_write_open: bool,
+    ) -> Result<(String, u8, u64, u64), String> {
+        self.meta_shard_client
+            .cap_open_grant(inode, client_id, is_write_open)
+            .await
+    }
+
+    /// §13 Cap model: send a `CapRecallAck` to the Filer. Called by the
+    /// client's `CapHandler` after flushing dirty data (if any) in response
+    /// to a `CapRecallNotify`. Delegates to MetaShardClient.
+    pub async fn cap_recall_ack(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        self.meta_shard_client
+            .cap_recall_ack(inode, client_id, token)
+            .await
+    }
+
+    /// §13 Cap model: send a `CapRelease` to the Filer on close(). The
+    /// Filer uses this to detect upgrade opportunities. Delegates to
+    /// MetaShardClient.
+    pub async fn cap_release(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        self.meta_shard_client
+            .cap_release(inode, client_id, token)
+            .await
     }
 
     /// 续租 inode metadata lease (方案 A)。委托给 MetaShardClient → Filer。
