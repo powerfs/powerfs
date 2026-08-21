@@ -21,8 +21,9 @@ redis_url = "redis://127.0.0.1:6379"
 
 [master]
 port = 9333                  # HTTP/gRPC 端口 (必填)
-raft_port = 9335             # Raft gRPC 端口 (必填，必须与 port 和 net_port 不同)
-net_port = 9334              # powerfs-net TLV 端口 (必填，必须与 port 不同)
+raft_port = 9335             # Raft gRPC 端口 (必填，必须与 port/net_port/metrics_port 都不同)
+metrics_port = 9300          # Metrics/Admin HTTP 端口 (必填; 4个master端口必须都显式配置且唯一, 禁止用端口加减推导)
+net_port = 9334              # powerfs-net TLV 端口 (必填)
 dir = "/data/master"         # 数据目录 (必填)
 raft_id = 1                  # 当前节点在 Raft 集群中的唯一 ID
 ip = "0.0.0.0"               # 监听地址

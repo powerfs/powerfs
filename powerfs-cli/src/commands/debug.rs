@@ -18,18 +18,73 @@
 
 use clap::{Args, Subcommand};
 
+use crate::client::MasterClient;
 use crate::http;
 use powerfs_common::error::{PowerFsError, Result};
 
 #[derive(Args, Debug)]
 pub struct DebugArgs {
     /// Master metrics/admin server address (host:port).
-    /// Uses the metrics port (default 9300), NOT the gRPC port (9333).
-    #[arg(long, default_value = "localhost:9335", global = true)]
-    admin: String,
+    /// If not provided, queries Master via GetMasterStatus to obtain the metrics_port.
+    #[arg(long, global = true)]
+    admin: Option<String>,
 
     #[command(subcommand)]
     command: DebugSubcommand,
+}
+
+/// Resolve admin address: use explicit --admin, or query Master's GetMasterStatus for leader's metrics_port.
+async fn resolve_admin_addr(mut client: MasterClient) -> Result<String> {
+    // Extract master IP from client address (format: "host:grpc_port")
+    let master_addr = client.address.clone();
+    let (master_ip, _) = master_addr.split_once(':').ok_or_else(|| {
+        PowerFsError::Internal(format!(
+            "invalid master address format (expected host:port): {}",
+            master_addr
+        ))
+    })?;
+
+    let mut service = client
+        .service()
+        .await
+        .map_err(|e| PowerFsError::Internal(format!("Failed to connect to master: {}", e)))?;
+
+    let resp = service
+        .get_master_status(tonic::Request::new(
+            powerfs_master::proto::MasterStatusRequest {},
+        ))
+        .await
+        .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?;
+
+    let status = resp.into_inner();
+    let leader_id = &status.leader_id;
+
+    // Find the leader node and use its metrics_port
+    let metrics_port = if !leader_id.is_empty() {
+        status
+            .nodes
+            .iter()
+            .find(|n| &n.node_id == leader_id)
+            .map(|n| n.metrics_port)
+    } else {
+        // If no leader_id set, fall back to first node that reports metrics_port
+        status.nodes.first().map(|n| n.metrics_port)
+    };
+
+    let metrics_port = metrics_port.ok_or_else(|| {
+        PowerFsError::Internal(
+            "GetMasterStatus returned no leader with metrics_port; cannot resolve admin address"
+                .into(),
+        )
+    })?;
+
+    if metrics_port == 0 {
+        return Err(PowerFsError::Internal(
+            "Master reports metrics_port=0; please check master configuration".into(),
+        ));
+    }
+
+    Ok(format!("{}:{}", master_ip, metrics_port))
 }
 
 #[derive(Subcommand, Debug)]
@@ -83,10 +138,15 @@ enum DebugSubcommand {
     },
 }
 
-pub async fn debug(_master: &str, args: DebugArgs) -> super::CommandResult {
+pub async fn debug(client: MasterClient, args: DebugArgs) -> super::CommandResult {
+    let admin = match args.admin {
+        Some(addr) => addr,
+        None => resolve_admin_addr(client).await?,
+    };
+
     match args.command {
         DebugSubcommand::Get => {
-            let body = http::http_get(&args.admin, "/admin/debug")?;
+            let body = http::http_get(&admin, "/admin/debug")?;
             print_config_list(&body)?;
         }
         DebugSubcommand::Level { level, node } => {
@@ -96,7 +156,7 @@ pub async fn debug(_master: &str, args: DebugArgs) -> super::CommandResult {
                     "node": node,
                     "level": lvl,
                 });
-                let resp = http::http_put(&args.admin, "/admin/debug", &req.to_string())?;
+                let resp = http::http_put(&admin, "/admin/debug", &req.to_string())?;
                 println!("Set log level '{}' for node '{}'", lvl, node);
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
                     if let Some(updated) = v.get("updated") {
@@ -105,7 +165,7 @@ pub async fn debug(_master: &str, args: DebugArgs) -> super::CommandResult {
                 }
             } else {
                 // Show current master log level (local to master process)
-                let body = http::http_get(&args.admin, "/admin/log-level")?;
+                let body = http::http_get(&admin, "/admin/log-level")?;
                 let v: serde_json::Value = serde_json::from_str(&body)
                     .map_err(|e| PowerFsError::Internal(format!("parse JSON: {}", e)))?;
                 println!(
@@ -132,7 +192,7 @@ pub async fn debug(_master: &str, args: DebugArgs) -> super::CommandResult {
                 "flag": name,
                 "on": val,
             });
-            http::http_put(&args.admin, "/admin/debug", &req.to_string())?;
+            http::http_put(&admin, "/admin/debug", &req.to_string())?;
             println!("Flag '{}' = {} for node '{}'", name, val, node);
         }
         DebugSubcommand::Target { filter, node } => {
@@ -140,7 +200,7 @@ pub async fn debug(_master: &str, args: DebugArgs) -> super::CommandResult {
                 "node": node,
                 "target_filter": filter,
             });
-            http::http_put(&args.admin, "/admin/debug", &req.to_string())?;
+            http::http_put(&admin, "/admin/debug", &req.to_string())?;
             println!(
                 "Target filter '{}' set for node '{}'",
                 if filter.is_empty() {
@@ -153,7 +213,7 @@ pub async fn debug(_master: &str, args: DebugArgs) -> super::CommandResult {
         }
         DebugSubcommand::Clear { node } => {
             let path = format!("/admin/debug?node={}", node);
-            let resp = http::http_delete(&args.admin, &path)?;
+            let resp = http::http_delete(&admin, &path)?;
             println!("Cleared debug config for node '{}'", node);
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
                 if let Some(removed) = v.get("removed") {

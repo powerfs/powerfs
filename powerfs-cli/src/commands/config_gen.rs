@@ -59,6 +59,7 @@ struct PortsConfig {
     master: Option<u16>,
     master_raft: Option<u16>,
     master_net: Option<u16>,
+    master_metrics: Option<u16>,
     volume_grpc: Option<u16>,
     volume_http: Option<u16>,
     volume_net: Option<u16>,
@@ -113,6 +114,7 @@ impl Defaults {
     const MASTER_PORT: u16 = 9333;
     const MASTER_RAFT_PORT: u16 = 9335;
     const MASTER_NET_PORT: u16 = 9334;
+    const MASTER_METRICS_PORT: u16 = 9300;
     const VOLUME_GRPC_PORT: u16 = 8080;
     const VOLUME_HTTP_PORT: u16 = 8091;
     const VOLUME_NET_PORT: u16 = 8901;
@@ -142,6 +144,7 @@ struct ResolvedConfig {
     master_port: u16,
     master_raft_port: u16,
     master_net_port: u16,
+    master_metrics_port: u16,
     volume_grpc_port: u16,
     volume_http_port: u16,
     volume_net_port: u16,
@@ -214,6 +217,8 @@ pub struct ConfigGenArgs {
     pub master_raft_port: Option<u16>,
     #[arg(long)]
     pub master_net_port: Option<u16>,
+    #[arg(long)]
+    pub master_metrics_port: Option<u16>,
     #[arg(long)]
     pub volume_grpc_port: Option<u16>,
     #[arg(long)]
@@ -341,6 +346,11 @@ fn resolve(args: &ConfigGenArgs) -> Result<ResolvedConfig, String> {
             args.master_net_port,
             ports.master_net,
             Defaults::MASTER_NET_PORT,
+        ),
+        master_metrics_port: opt_u16(
+            args.master_metrics_port,
+            ports.master_metrics,
+            Defaults::MASTER_METRICS_PORT,
         ),
         volume_grpc_port: opt_u16(
             args.volume_grpc_port,
@@ -498,6 +508,7 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
         ("master_port", cfg.master_port),
         ("master_raft_port", cfg.master_raft_port),
         ("master_net_port", cfg.master_net_port),
+        ("master_metrics_port", cfg.master_metrics_port),
         ("volume_grpc_port", cfg.volume_grpc_port),
         ("volume_http_port", cfg.volume_http_port),
         ("volume_net_port", cfg.volume_net_port),
@@ -532,6 +543,29 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
             "master_raft_port ({}) and master_net_port ({}) must differ",
             cfg.master_raft_port, cfg.master_net_port
         ));
+    }
+    // 4-way master port uniqueness — no derivation by port addition/subtraction allowed
+    for &(na, nb) in &[
+        ("master_port", "master_metrics_port"),
+        ("master_raft_port", "master_metrics_port"),
+        ("master_net_port", "master_metrics_port"),
+    ] {
+        let (a, b) = match (na, nb) {
+            ("master_port", "master_metrics_port") => (cfg.master_port, cfg.master_metrics_port),
+            ("master_raft_port", "master_metrics_port") => {
+                (cfg.master_raft_port, cfg.master_metrics_port)
+            }
+            ("master_net_port", "master_metrics_port") => {
+                (cfg.master_net_port, cfg.master_metrics_port)
+            }
+            _ => unreachable!(),
+        };
+        if a == b {
+            return Err(format!(
+                "{} ({}) and {} ({}) must differ — all 4 master ports explicitly configured, no port-addition derivation allowed",
+                na, a, nb, b
+            ));
+        }
     }
     if cfg.volume_http_port == cfg.volume_net_port {
         return Err(format!(
@@ -678,6 +712,7 @@ fn build_config(
         master: MasterConfig {
             port: cfg.master_port,
             raft_port: cfg.master_raft_port,
+            metrics_port: cfg.master_metrics_port,
             net_port: cfg.master_net_port,
             dir: format!("{}/master", cfg.data_dir),
             raft_dir: None,

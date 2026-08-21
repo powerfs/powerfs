@@ -173,7 +173,7 @@ async fn main() {
         Commands::Conflicts(command) => commands::conflicts(client, command).await,
         Commands::Fsck(args) => commands::fsck(client, args).await,
         Commands::FuseStats(args) => commands::fuse_stats(&cli.master, args),
-        Commands::Debug(args) => commands::debug(&cli.master, args).await,
+        Commands::Debug(args) => commands::debug(client, args).await,
         Commands::Topology(args) => commands::topology(&cli.master, args).await,
         Commands::FilerStats(args) => commands::filer_stats(&cli.master, args).await,
         Commands::Config { .. } => unreachable!("handled above"),

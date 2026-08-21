@@ -8,7 +8,8 @@ redis_url = "redis://172.30.0.50:6379"
 
 [master]
 port = 9333                    # HTTP/gRPC端口
-raft_port = 9335               # Raft gRPC端口 (必须与port和net_port不同)
+raft_port = 9335               # Raft gRPC端口 (必须与port和net_port和metrics_port不同)
+metrics_port = 9300            # Metrics/Admin HTTP端口 (必须与其他三个master端口都不同, 无加减推导)
 net_port = 9334                # powerfs-net端口 (必须与port不同)
 dir = "/data/master"
 ip = "0.0.0.0"

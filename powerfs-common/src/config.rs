@@ -49,6 +49,9 @@ pub struct MasterConfig {
     /// Raft gRPC端口 - 必须配置，必须与port不同
     /// RaftService (Vote/AppendEntries/Snapshot) 监听此端口
     pub raft_port: u16,
+    /// Metrics/Admin HTTP 端口 - 必须配置，必须与 port/raft_port/net_port 都不同
+    /// /metrics, /admin/log-level, /admin/debug 都监听此端口
+    pub metrics_port: u16,
     /// 数据目录 - 必须配置
     pub dir: String,
     pub raft_dir: Option<String>,

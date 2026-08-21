@@ -8,6 +8,7 @@ redis_url = "redis://172.30.0.50:6379"
 [master]
 port = 9333
 raft_port = 9335
+metrics_port = 9300
 net_port = 9334
 dir = "/data/master"
 ip = "0.0.0.0"

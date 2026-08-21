@@ -1206,6 +1206,7 @@ impl MasterService for MasterGrpcServer {
             mem_usage: 0.0,
             disk_usage: 0.0,
             uptime: 0,
+            metrics_port: self.master.metrics_port() as u32,
         };
 
         Ok(Response::new(MasterStatusResponse {

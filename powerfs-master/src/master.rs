@@ -40,6 +40,7 @@ pub struct MasterNode {
     id: NodeId,
     address: SocketAddr,
     net_port: u16,
+    metrics_port: u16,
     topology: RwLock<Topology>,
     volumes: RwLock<HashMap<VolumeId, VolumeInfo>>,
     volume_routes: RwLock<HashMap<u64, VolumeRoute>>,
@@ -269,6 +270,7 @@ pub struct VolumeLocationUpdate {
 }
 
 impl MasterNode {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         bind_address: &str,
         raft_address: &str,
@@ -277,6 +279,7 @@ impl MasterNode {
         raft_id: u64,
         raft_peers: Vec<String>,
         net_port: u16,
+        metrics_port: u16,
     ) -> Result<Self> {
         let addr: SocketAddr = bind_address.parse()?;
 
@@ -400,6 +403,7 @@ impl MasterNode {
             id: node_id.clone(),
             address: addr,
             net_port,
+            metrics_port,
             topology: RwLock::new(Topology::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_routes: RwLock::new(HashMap::new()),
@@ -634,6 +638,10 @@ impl MasterNode {
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn metrics_port(&self) -> u16 {
+        self.metrics_port
     }
 
     pub async fn is_leader(&self) -> bool {
@@ -3482,10 +3490,10 @@ impl MasterNode {
         }
 
         // Start HTTP metrics + debug config server.
-        // Port = net_port + 1 (e.g. net_port=9334 → metrics=9335).
+        // Port 从配置文件的 metrics_port 字段显式读取，不做任何端口加减推导。
         // Exposes /metrics, /admin/log-level, /admin/debug.
         {
-            let metrics_port = if net_port > 0 { net_port + 1 } else { 9335 };
+            let metrics_port = self.metrics_port;
             let metrics_addr = format!("{}:{}", self.address.ip(), metrics_port);
             let debug_store = self.debug_config.clone();
             info!("Starting metrics + debug config server on {}", metrics_addr);
@@ -3513,6 +3521,7 @@ impl Clone for MasterNode {
             id: self.id.clone(),
             address: self.address,
             net_port: self.net_port,
+            metrics_port: self.metrics_port,
             topology: RwLock::new(self.topology.read().unwrap().clone()),
             volumes: RwLock::new(self.volumes.read().unwrap().clone()),
             volume_routes: RwLock::new(self.volume_routes.read().unwrap().clone()),
