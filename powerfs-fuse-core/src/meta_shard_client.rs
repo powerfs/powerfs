@@ -1239,6 +1239,38 @@ impl MetaShardClient {
                         };
 
                         if let Some(new_addr) = new_leader {
+                            // Self-redirect guard: Learner nodes may return
+                            // their own address during Raft elections because
+                            // the shard leadership hasn't converged yet.
+                            // Repeatedly retrying against the same non-leader
+                            // exhausts the 10 attempt budget in ~50ms and
+                            // surfaces a user-visible EIO even though the
+                            // election completes in 1-3s.
+                            //
+                            // On self-redirect:
+                            //   * DO NOT update shard_router (this addr is
+                            //     known not to be the leader).
+                            //   * DOUBLE the backoff window to give the
+                            //     election time to settle.
+                            //   * rely on rotation (next loop iteration
+                            //     auto-advances the rotation index via the
+                            //     attempt counter) to try another Filer.
+                            if new_addr == target_addr {
+                                let base = 5u64 << (attempt - 1).min(3);
+                                let delay_ms = base * 2;
+                                log::warn!(
+                                    "send_coherence_msg: shard={} SELF-redirect to {} \
+                                     (Learner election in progress, attempt {}/{}); \
+                                     x2 backoff={}ms, rotating next filer",
+                                    shard_id,
+                                    new_addr,
+                                    attempt,
+                                    MAX_ATTEMPTS,
+                                    delay_ms
+                                );
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
                             log::info!(
                                 "send_coherence_msg: shard={} redirect {} -> {} (attempt {}/{})",
                                 shard_id,
@@ -1817,6 +1849,130 @@ impl MetaShardClient {
         *self.state.lock().unwrap() = MetaShardClientState::Closed;
         log::info!("MetaShardClient: Closed");
     }
+
+    /// §13 Cap model: send a `CapOpenGrant` request to the Filer. The
+    /// server grants caps based on the open mode (read-only → CAP_R,
+    /// read-write → CAP_R+W+X or degraded). Returns the granted token,
+    /// cap bits, epoch, and SN.
+    ///
+    /// Request TLV: Ino + ClientId + IsWriteOpen(u8).
+    /// Response TLV: Status + LeaseToken + CapSet(u8) + LeaseEpoch(u64) + SN(u64).
+    pub async fn cap_open_grant(
+        &self,
+        inode: u64,
+        client_id: &str,
+        is_write_open: bool,
+    ) -> Result<(String, u8, u64, u64, u64), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_u8(
+            powerfs_net::FieldId::IsWriteOpen,
+            if is_write_open { 1 } else { 0 },
+        );
+
+        let resp = self
+            .send_coherence_msg(MsgType::CapOpenGrant, shard_id, enc.into_bytes())
+            .await?;
+
+        // Parse response: LeaseToken + CapSet + LeaseEpoch + SN + LeaseDuration
+        // (Status is in the response header, not the TLV body — if
+        // send_coherence_msg returned Ok, status is STATUS_OK.)
+        let mut dec = powerfs_net::serialize::TlvDecoder::new(&resp);
+        let token = dec
+            .next_string(powerfs_net::FieldId::LeaseToken)
+            .unwrap_or_default();
+        let caps_bits = dec.next_u8(powerfs_net::FieldId::CapSet).unwrap_or(0);
+        let epoch = dec.next_u64(powerfs_net::FieldId::CapEpoch).unwrap_or(0);
+        let sn = dec.next_u64(powerfs_net::FieldId::CapSn).unwrap_or(0);
+        let duration_ms = dec
+            .next_u64(powerfs_net::FieldId::LeaseDuration)
+            .unwrap_or(0);
+
+        log::debug!(
+            "cap_open_grant: inode={} client={} write={} → token={} caps={:#b} epoch={} sn={} duration_ms={}",
+            inode,
+            client_id,
+            is_write_open,
+            token,
+            caps_bits,
+            epoch,
+            sn,
+            duration_ms
+        );
+
+        Ok((token, caps_bits, epoch, sn, duration_ms))
+    }
+
+    /// §13 Cap model: send a `CapRecallAck` to the Filer, confirming that
+    /// the client has flushed dirty data (if any) and released the recalled
+    /// caps. The Filer uses this to complete the recall and grant caps to
+    /// the waiting client.
+    ///
+    /// Request TLV: Ino + ClientId + LeaseToken.
+    pub async fn cap_recall_ack(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_string(powerfs_net::FieldId::LeaseToken, token)
+            .map_err(|e| format!("encode LeaseToken: {:?}", e))?;
+
+        self.send_coherence_msg(MsgType::CapRecallAck, shard_id, enc.into_bytes())
+            .await?;
+
+        log::debug!(
+            "cap_recall_ack: inode={} client={} token={}",
+            inode,
+            client_id,
+            token
+        );
+
+        Ok(())
+    }
+
+    /// §13 Cap model: send a `CapRelease` to the Filer on close(). The
+    /// Filer uses this to detect upgrade opportunities (if a surviving
+    /// writer can be promoted back to EXCLUSIVE_WRITE).
+    ///
+    /// Request TLV: Ino + ClientId + LeaseToken.
+    pub async fn cap_release(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_string(powerfs_net::FieldId::LeaseToken, token)
+            .map_err(|e| format!("encode LeaseToken: {:?}", e))?;
+
+        self.send_coherence_msg(MsgType::CapRelease, shard_id, enc.into_bytes())
+            .await?;
+
+        log::debug!(
+            "cap_release: inode={} client={} token={}",
+            inode,
+            client_id,
+            token
+        );
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1910,6 +2066,8 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         reliability: powerfs_layout::reliability::Reliability::default(),
         replica_chunks: Vec::new(),
         shard_id: resp.shard_id,
+        dir_version: 0,
+        dentry_lease_ttl_ms: 0,
     }
 }
 
@@ -1950,6 +2108,32 @@ fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> Met
     // P4: 解析 FieldId::ReplicaChunks (副本 chunk 列表, 读路径 failover 使用).
     // 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节).
     attr.replica_chunks = parse_replica_chunks_from_body(body);
+
+    // Dentry lease: parse DirVersion and DentryLeaseTtl from the response body.
+    // These are added by the Filer in lookup responses to support per-dentry
+    // lease caching (three-layer check like Ceph).
+    {
+        use powerfs_net::serialize::TlvDecoder;
+        let mut dec = TlvDecoder::new(body);
+        while let Some((fid, len)) = dec.next_field() {
+            match fid {
+                powerfs_net::FieldId::DirVersion => {
+                    if let Ok(v) = dec.read_u64(len) {
+                        attr.dir_version = v;
+                    }
+                }
+                powerfs_net::FieldId::DentryLeaseTtl => {
+                    if let Ok(v) = dec.read_u64(len) {
+                        attr.dentry_lease_ttl_ms = v;
+                    }
+                }
+                _ => {
+                    // Skip unknown/other fields
+                    let _ = dec.skip(len);
+                }
+            }
+        }
+    }
 
     // Symlink: extract target from inline_data. The Filer encodes the symlink
     // target as InlineData in the FileLayout (see encode_chunks_fields). Without
@@ -2050,14 +2234,117 @@ impl MetadataClient for MetaShardClient {
     ) -> Pin<Box<dyn Future<Output = FsResult<MetadataAttr>> + Send + '_>> {
         let name = name.to_string();
         Box::pin(async move {
-            let body =
-                serialize::encode_mkdir_req(parent_ino, &name, mode, uid, gid).map_err(map_err)?;
-            let resp = self
-                .send_coherence_msg(MsgType::Mkdir, shard_id, body)
+            // Two-phase mkdir (client-routed, no server-to-server forwarding).
+            //
+            // Fast path: if target_shard == parent_shard (shard_count <= 1 or
+            // pick_child_dir_shard returns parent_shard), use the legacy single-
+            // RPC Mkdir — the server handles both CreateInode + AddDirEntry
+            // atomically on the same shard.
+            //
+            // Slow path: if target_shard != parent_shard (子目录换片, the common
+            // case for mkdir), the client coordinates two phases:
+            //   Phase A: AllocInode + CreateInode → target_shard leader
+            //   Phase B: AddDirEntry → parent_shard leader
+            // Each phase is independently redirected on not_leader. If Phase A
+            // succeeds but Phase B fails, an orphan inode record remains on
+            // target_shard (no dir entry points to it) — cleaned by GC later.
+            //
+            // See docs/shard-routing-no-forward-principle.md §3
+            let parent_shard = shard_id;
+            let shard_count = {
+                let map = self.shard_map.lock().unwrap();
+                map.shard_count()
+            };
+            let target_shard = if shard_count <= 1 {
+                parent_shard
+            } else {
+                (parent_shard + 1) % shard_count
+            };
+
+            if target_shard == parent_shard {
+                // Fast path: single-shard mkdir (legacy Mkdir RPC).
+                // The server creates inode + dir entry atomically on parent_shard.
+                let body = serialize::encode_mkdir_req(parent_ino, &name, mode, uid, gid)
+                    .map_err(map_err)?;
+                let resp = self
+                    .send_coherence_msg(MsgType::Mkdir, parent_shard, body)
+                    .await
+                    .map_err(map_err)?;
+                let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+                return Ok(attr_from_resp(attr_resp));
+            }
+
+            // Slow path: two-phase mkdir across target_shard + parent_shard.
+            log::debug!(
+                "mkdir two-phase: parent={} name={} parent_shard={} target_shard={}",
+                parent_ino,
+                name,
+                parent_shard,
+                target_shard
+            );
+
+            // Phase A: allocate inode on target_shard, then CreateInode.
+            let alloc_req = powerfs_coherence::AllocInodeBatchRequest {
+                shard_id: target_shard,
+                count: 1,
+                client_id: self.client_id.to_string(),
+            };
+            let alloc_resp = self.alloc_inode_batch(&alloc_req).await.map_err(map_err)?;
+            if !alloc_resp.success || alloc_resp.start_inode == 0 {
+                return Err(map_err("alloc_inode_batch failed for mkdir phase A"));
+            }
+            let ino = alloc_resp.start_inode;
+
+            // Phase A RPC: MkdirPhaseA → target_shard (CreateInode only)
+            let phase_a_body = serialize::encode_mkdir_phase_a_req(
+                target_shard,
+                ino,
+                parent_ino,
+                &name,
+                mode,
+                uid,
+                gid,
+            )
+            .map_err(map_err)?;
+            let phase_a_resp = self
+                .send_coherence_msg(MsgType::MkdirPhaseA, target_shard, phase_a_body)
                 .await
                 .map_err(map_err)?;
-            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
-            Ok(attr_from_resp(attr_resp))
+
+            // Decode attr from Phase A response
+            let attr_resp = serialize::decode_attr_resp(&phase_a_resp).map_err(map_err)?;
+            let attr = attr_from_resp(attr_resp);
+
+            // Phase B RPC: MkdirPhaseB → parent_shard (AddDirEntry only)
+            let phase_b_body = serialize::encode_mkdir_phase_b_req(
+                parent_shard,
+                parent_ino,
+                &name,
+                ino,
+                mode,
+                uid,
+                gid,
+            )
+            .map_err(map_err)?;
+            let _phase_b_resp = self
+                .send_coherence_msg(MsgType::MkdirPhaseB, parent_shard, phase_b_body)
+                .await
+                .map_err(map_err)?;
+
+            // Check Phase B status — if it failed, we have an orphan inode on
+            // target_shard (Phase A succeeded). Log and return error; GC will
+            // clean up the orphan inode record later.
+            // Phase B response body contains Ino; status is in the frame header
+            // which send_coherence_msg already checks (returns Err on non-OK).
+            // If we get here, Phase B succeeded.
+            log::debug!(
+                "mkdir two-phase done: ino={} parent={} name={}",
+                ino,
+                parent_ino,
+                name
+            );
+
+            Ok(attr)
         })
     }
 
@@ -2097,6 +2384,22 @@ impl MetadataClient for MetaShardClient {
                 .await
                 .map_err(map_err)?;
             Ok(())
+        })
+    }
+
+    fn batch_unlink(
+        &self,
+        entries: Vec<(u64, String)>,
+        shard_id: u64,
+    ) -> Pin<Box<dyn Future<Output = FsResult<Vec<u32>>> + Send + '_>> {
+        Box::pin(async move {
+            let body = serialize::encode_batch_unlink_req(&entries).map_err(map_err)?;
+            let resp = self
+                .send_coherence_msg(MsgType::BatchUnlink, shard_id, body)
+                .await
+                .map_err(map_err)?;
+            let statuses = serialize::decode_batch_unlink_resp(&resp).map_err(map_err)?;
+            Ok(statuses)
         })
     }
 
@@ -2213,11 +2516,72 @@ impl MetadataClient for MetaShardClient {
             let entries = serialize::decode_readdir_resp(&resp).map_err(map_err)?;
             let result = entries
                 .into_iter()
-                .map(|e| MetadataDirEntry {
-                    inode: e.ino,
-                    name: e.name,
-                    file_type: file_type_from_mode(e.mode),
-                    offset: e.offset,
+                .map(|e| {
+                    let file_type = file_type_from_mode(e.mode);
+                    // The Filer readdir response always carries mode/uid/...
+                    // now; the struct defaults to 0 for every numeric field,
+                    // so if we got an all-zero payload (e.g. legacy filer
+                    // that didn't emit uid/gid/size) constructing the attrs
+                    // with 0s would overwrite any real cached value with
+                    // nonsense. Guard by requiring at least a non-zero mode.
+                    let has_attrs = e.mode != 0
+                        && (e.uid != 0
+                            || e.gid != 0
+                            || e.size != 0
+                            || e.mtime != 0
+                            || e.nlink != 0
+                            || e.child_shard_id != 0
+                            || file_type == libc::DT_DIR/* dirs size=0 is fine */);
+                    let attrs = if has_attrs {
+                        use powerfs_layout::reliability::Reliability;
+                        let child_shard = if e.child_shard_id != 0 {
+                            Some(e.child_shard_id)
+                        } else {
+                            None
+                        };
+                        Some(MetadataAttr {
+                            inode: e.ino,
+                            mode: e.mode,
+                            uid: e.uid,
+                            gid: e.gid,
+                            size: e.size,
+                            mtime: e.mtime,
+                            atime: e.atime,
+                            // Filer ctime is ms-based; MetadataAttr stores
+                            // signed seconds (i64). Saturate at i64::MAX ms
+                            // to avoid wrap-around for far-future values.
+                            ctime: if e.ctime <= i64::MAX as u64 {
+                                e.ctime as i64
+                            } else {
+                                i64::MAX
+                            },
+                            nlink: e.nlink,
+                            rdev: 0,
+                            file_type,
+                            symlink_target: None,
+                            volume_id: None,
+                            file_key: None,
+                            placement: None,
+                            reliability: Reliability::SingleReplica,
+                            inline_data: None,
+                            inline_max_size: None,
+                            chunks: Vec::new(),
+                            replica_chunks: Vec::new(),
+                            shard_id: child_shard,
+                            dir_version: 0,
+                            dentry_lease_ttl_ms: 0,
+                        })
+                    } else {
+                        None
+                    };
+                    MetadataDirEntry {
+                        inode: e.ino,
+                        name: e.name,
+                        file_type,
+                        offset: e.offset,
+                        attrs,
+                        child_shard_id: e.child_shard_id,
+                    }
                 })
                 .collect();
             Ok(result)
@@ -2281,13 +2645,13 @@ impl MetadataClient for MetaShardClient {
                 let mut enc = TlvEncoder::new();
                 let _ = enc.add_u64(FieldId::Ino, ino);
                 if let Some(mo) = params.mode {
-                    let _ = enc.add_u32(FieldId::Mode, mo);
+                    let _ = enc.add_u64(FieldId::Mode, mo as u64);
                 }
                 if let Some(u) = params.uid {
-                    let _ = enc.add_u32(FieldId::Uid, u);
+                    let _ = enc.add_u64(FieldId::Uid, u as u64);
                 }
                 if let Some(g) = params.gid {
-                    let _ = enc.add_u32(FieldId::Gid, g);
+                    let _ = enc.add_u64(FieldId::Gid, g as u64);
                 }
                 if let Some(mt) = params.mtime {
                     let _ = enc.add_u64(FieldId::Mtime, mt);
@@ -2607,6 +2971,28 @@ pub(crate) async fn process_request_internal(
                     };
 
                     if let Some(new_addr) = new_leader {
+                        // Self-redirect guard: Learner nodes may return
+                        // their own address during Raft elections (see
+                        // send_coherence_msg for full rationale). Do not
+                        // poison shard_router with a known-bad address;
+                        // double the backoff and rotate to the next
+                        // candidate via the attempt counter.
+                        if new_addr == target_addr {
+                            let base = 5u64 << (attempt - 1).min(3);
+                            let delay_ms = base * 2;
+                            log::warn!(
+                                "process_request_internal: shard={} SELF-redirect to {} \
+                                 (Learner election in progress, attempt {}/{}); \
+                                 x2 backoff={}ms, rotating next filer",
+                                shard_id,
+                                new_addr,
+                                attempt,
+                                MAX_ATTEMPTS,
+                                delay_ms
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
                         log::info!(
                             "process_request_internal: shard={} redirect from {} -> {}, updating route and retrying (attempt {}/{})",
                             shard_id, target_addr, new_addr, attempt, MAX_ATTEMPTS

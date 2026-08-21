@@ -20,18 +20,24 @@ use parking_lot::RwLock;
 
 use crate::flow_policy::{AdmissionDecision, FlowCtx, FlowPolicy};
 
-/// 通道类型 (与协议 CHANNEL_DATA / CHANNEL_META 对应)
+/// 通道类型 (与协议 CHANNEL_DATA / CHANNEL_META / CHANNEL_LOCK 对应)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Channel {
     Data,
     Meta,
+    /// Logical lock channel (§8.4 方案 A). Lock messages physically ride
+    /// data/meta connections but are stats-grouped under `Lock` for the
+    /// flow controller. Used when `MsgType::is_lock_channel()` routes a
+    /// frame to the dedicated lock worker pool.
+    Lock,
 }
 
 impl Channel {
-    /// 从协议层 channel 字节 (CHANNEL_DATA=0, CHANNEL_META=1) 转换
+    /// 从协议层 channel 字节 (CHANNEL_DATA=0, CHANNEL_META=1, CHANNEL_LOCK=2) 转换
     pub fn from_u8(v: u8) -> Self {
         match v {
             crate::protocol::CHANNEL_META => Channel::Meta,
+            crate::protocol::CHANNEL_LOCK => Channel::Lock,
             _ => Channel::Data,
         }
     }
@@ -117,6 +123,7 @@ impl ConnStats {
             channel: match self.channel {
                 Channel::Data => "data",
                 Channel::Meta => "meta",
+                Channel::Lock => "lock",
             },
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             bytes_recv: self.bytes_recv.load(Ordering::Relaxed),
@@ -673,6 +680,23 @@ mod tests {
         assert_eq!(snap.active_reqs, 3);
         assert_eq!(snap.channel, "data");
         assert!(!snap.slow);
+    }
+
+    // ----- §8.4 CHANNEL_LOCK channel mapping -----
+
+    #[test]
+    fn test_channel_from_u8_maps_all_three() {
+        assert_eq!(Channel::from_u8(0), Channel::Data);
+        assert_eq!(Channel::from_u8(1), Channel::Meta);
+        assert_eq!(Channel::from_u8(2), Channel::Lock);
+        // Unknown values default to Data (defensive).
+        assert_eq!(Channel::from_u8(255), Channel::Data);
+    }
+
+    #[test]
+    fn test_lock_channel_snapshot_label() {
+        let s = ConnStats::new(7, "peer".into(), Channel::Lock);
+        assert_eq!(s.snapshot().channel, "lock");
     }
 
     #[test]

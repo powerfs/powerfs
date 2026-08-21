@@ -1,0 +1,16 @@
+[package]
+name = "powerfs-lock"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Unified lock manager interface layer for PowerFS (client-form agnostic traits and types)"
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[lib]
+name = "powerfs_lock"
+path = "src/lib.rs"

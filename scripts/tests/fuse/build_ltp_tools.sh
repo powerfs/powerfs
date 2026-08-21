@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build xfstests-dev/ltp tools inside the fuse-test container
+# Build xfstests-dev/ltp tools inside the fuse-1-test container
 # Usage: bash build_ltp_tools.sh
 #
 # xfstests-dev is cloned from upstream since kernel/ is maintained in a
@@ -18,20 +18,20 @@ if [ ! -d "$LTP_SRC/ltp" ]; then
 fi
 
 # Install build dependencies
-docker exec fuse-test bash -c '
+docker exec fuse-1-test bash -c '
 apt-get update -qq && apt-get install -y -qq gcc make libaio-dev xfslibs-dev linux-libc-dev 2>&1 | tail -3
 '
 
 # Copy source files into container
-docker exec fuse-test mkdir -p /tmp/ltp-build
-docker cp "$LTP_SRC/ltp/." fuse-test:/tmp/ltp-build/
-docker cp "$LTP_SRC/src/global.h" fuse-test:/tmp/ltp-build/
-docker cp "$LTP_SRC/src/statx.h" fuse-test:/tmp/ltp-build/
-docker cp "$LTP_SRC/include/." fuse-test:/tmp/ltp-build/
-docker cp "$LTP_SRC/lib/." fuse-test:/tmp/ltp-build/
+docker exec fuse-1-test mkdir -p /tmp/ltp-build
+docker cp "$LTP_SRC/ltp/." fuse-1-test:/tmp/ltp-build/
+docker cp "$LTP_SRC/src/global.h" fuse-1-test:/tmp/ltp-build/
+docker cp "$LTP_SRC/src/statx.h" fuse-1-test:/tmp/ltp-build/
+docker cp "$LTP_SRC/include/." fuse-1-test:/tmp/ltp-build/
+docker cp "$LTP_SRC/lib/." fuse-1-test:/tmp/ltp-build/
 
 # Create config.h
-docker exec fuse-test bash -c 'cat > /tmp/ltp-build/config.h << "INNEREOF"
+docker exec fuse-1-test bash -c 'cat > /tmp/ltp-build/config.h << "INNEREOF"
 #ifndef CONFIG_H
 #define CONFIG_H
 #define _GNU_SOURCE 1
@@ -78,10 +78,10 @@ INNEREOF
 '
 
 # Patch fsx.c to skip check_trunc_hack (PowerFS doesn't support large inline truncation)
-docker exec fuse-test bash -c 'sed -i "s/check_trunc_hack();//" /tmp/ltp-build/fsx.c'
+docker exec fuse-1-test bash -c 'sed -i "s/check_trunc_hack();//" /tmp/ltp-build/fsx.c'
 
 # Compile tools
-docker exec fuse-test bash -c '
+docker exec fuse-1-test bash -c '
 cd /tmp/ltp-build
 CFLAGS="-g -O2 -D_GNU_SOURCE -DXFS -DFALLOCATE -DHAVE_COPY_FILE_RANGE -DAIO -DHAVE_RENAMEAT2 -DDEBUG -I. -Wno-unused-result -Wno-implicit-function-declaration"
 LDFLAGS="-laio -lpthread"
@@ -103,7 +103,7 @@ gcc $CFLAGS -o aio-stress aio-stress.c $LDFLAGS
 '
 
 # Install tools
-docker exec fuse-test bash -c "
+docker exec fuse-1-test bash -c "
 mkdir -p $LTP_INSTALL/testcases/bin
 cp /tmp/ltp-build/{fsstress,fsx,doio,iogen,aio-stress,rwtest.sh} $LTP_INSTALL/
 chmod +x $LTP_INSTALL/*

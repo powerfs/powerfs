@@ -35,10 +35,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&args.config);
 
     let log_level = cfg.global.log_level.clone();
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
-        .init();
-    let _ = powerfs_common::dynamic_log::set_log_level(&log_level);
+    // 使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
+    powerfs_common::dynamic_log::init(&log_level, None);
 
     BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).log_startup();
 
@@ -137,6 +135,22 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     let event_bind_ip = bind_ip.clone();
     let event_provider_clone = event_provider.clone();
     let data_dir_for_event = filer_cfg.data_dir.clone();
+
+    // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
+    {
+        let poller_node_id = node_id.clone();
+        let poller_masters: Vec<(String, u16)> = filer_cfg
+            .master_addresses
+            .iter()
+            .map(|a| {
+                let ip = a.split(':').next().unwrap_or(a).to_string();
+                (ip, filer_cfg.master_net_port)
+            })
+            .collect();
+        powerfs_common::debug_config_poller::DebugConfigPoller::new(poller_node_id, poller_masters)
+            .start();
+    }
+
     tokio::spawn(async move {
         let mut sys = sysinfo::System::new_all();
         loop {
@@ -356,11 +370,16 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         FilerMetaServiceImpl::new(meta_shard_manager.clone(), shard_strategy.clone());
 
     let grpc_addr: std::net::SocketAddr = grpc_address.parse()?;
-    info!("Starting gRPC meta service on {}", grpc_address);
+    info!(
+        "Starting shared gRPC server (RaftService + FilerMetaService) on {}",
+        grpc_address
+    );
 
     use powerfs_filer::powerfs::filer_meta_service_server::FilerMetaServiceServer;
+    let raft_service = raft_group_manager.raft_service();
     tokio::spawn(async move {
         if let Err(e) = tonic::transport::Server::builder()
+            .add_service(raft_service)
             .add_service(FilerMetaServiceServer::new(grpc_service))
             .serve(grpc_addr)
             .await
@@ -380,12 +399,115 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             net_manager.clone(),
         ));
 
-        let net_handler = Arc::new(FilerNetHandler::with_notifier(
-            meta_shard_manager.clone(),
-            shard_strategy.clone(),
-            net_port,
-            inode_notifier,
-        ));
+        let net_handler = {
+            // Phase 5 §5.3: wire Raft-backed lease persistence so
+            // active leases survive a Filer leader switch (closes the
+            // "leader switch loses leases" correctness hole). The
+            // backend routes LeasePut/Delete/SaveEpoch through the
+            // filer's openraft state machine; `CF_LEASES` on shard 0
+            // is the durable store. If shard 0 isn't available here
+            // (single-node boot before Raft initialization), we fall
+            // back to the in-memory lease manager — the cluster still
+            // runs, just with the old "leader switch loses leases"
+            // behavior, matching pre-phase-5 semantics.
+            let base = FilerNetHandler::with_notifier(
+                meta_shard_manager.clone(),
+                shard_strategy.clone(),
+                net_port,
+                inode_notifier,
+            );
+            // §8.2/§8.3.1: shared client-health store for the three-layer
+            // defense (scoring → throttle → quarantine/blacklist). Wired
+            // into the lease manager's force-reclaim penalty hook so an
+            // unresponsive holder (no RevokeAck within 2s) gets penalized;
+            // repeated violations escalate to quarantine then blacklist.
+            let client_health =
+                Arc::new(powerfs_lock_health::ClientHealth::new(Default::default()));
+            let base = base.with_client_health(client_health);
+            if let Some(shard0_store) = meta_shard_manager.try_get_shard_store(ShardId(0)) {
+                let persistence = powerfs_filer::RaftLeasePersistence::new(
+                    raft_group_manager.clone(),
+                    shard0_store,
+                    ShardId(0),
+                );
+                base.with_lease_persistence(persistence)
+            } else {
+                base
+            }
+        };
+        let net_handler = Arc::new(net_handler);
+
+        // Phase 3 Lease Recall: wire the InodeNotifier + InodeLeaseManager
+        // into the MetaShardManager so the GC loop can push Invalidate
+        // notifications to lease holders when MetaCache memory pressure
+        // exceeds the high watermark. Both components are owned by the
+        // net_handler; we clone the Arcs before moving net_handler into
+        // the server.
+        if let Some(notifier) = &net_handler.inode_notifier {
+            meta_shard_manager
+                .set_recall_components(notifier.clone(), net_handler.inode_lease_mgr.clone());
+        }
+
+        // Phase 5 §5.3: recover any leases persisted to CF_LEASES on a
+        // previous run / previous leader. Best-effort — failures log
+        // a warning and leave the in-memory store empty, matching the
+        // pre-persistence behavior. This is the no-leader-change
+        // recovery path; the leader-takeover hook below catches the
+        // case where this node is elected leader later.
+        if let Err(e) = net_handler.recover_leases_from_persistence() {
+            warn!("startup lease recovery failed (non-fatal): {}", e);
+        }
+
+        // P7 observability: start the Prometheus metrics server for the
+        // inode lease manager + MetaCache. Exposes `/metrics` (Prometheus
+        // text format) + `/admin/lease-stats` (JSON) +
+        // `/admin/meta-cache-stats` (JSON) so operators can monitor active
+        // leases, acquire/conflict counts, the Fencer SN high-water
+        // (phase 4 §5.3), Early Grant waiter backpressure (phase 4 §5.2),
+        // and MetaCache hit/miss/dirty/staging counters.
+        //
+        // The port MUST be explicitly provided via `filer.metrics_port`
+        // (no `grpc_port + 1` derivation — see design rule: all service
+        // ports declared statically in config.toml and unique).
+        {
+            let metrics_port = filer_cfg.metrics_port;
+            let metrics_addr: std::net::SocketAddr =
+                format!("{}:{}", bind_ip, metrics_port).parse()?;
+            let lease_mgr = net_handler.inode_lease_mgr.clone();
+            let meta_cache = meta_shard_manager.meta_cache();
+            if let Err(e) =
+                powerfs_filer::metrics::start_metrics_server(metrics_addr, lease_mgr, meta_cache)
+                    .await
+            {
+                warn!("filer metrics server failed to start (non-fatal): {}", e);
+            }
+        }
+
+        // §8.3.1: background force-reclaim sweep. Every 500ms, checks
+        // for pending Early Revokes whose 2-second RevokeAck timeout
+        // elapsed and force-reclaims the stuck holder's lease + grants
+        // the next queued waiter + penalizes the holder's health score.
+        // Bounds waiter stall under an unresponsive / crashed holder so
+        // a stuck client can't block contended inodes indefinitely.
+        {
+            let sweep_handler = Arc::clone(&net_handler);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                // The first tick fires immediately on `tick` creation
+                // (no pending revokes at startup) — skip it.
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let reclaimed = sweep_handler.force_reclaim_expired_revokes();
+                    if reclaimed > 0 {
+                        info!(
+                            "§8.3.1 force-reclaim sweep: reclaimed {} lease(s)",
+                            reclaimed
+                        );
+                    }
+                }
+            });
+        }
 
         // P2.5: 启用 Inline 小文件优化 (config.inline_max_size, 默认 0 = 禁用).
         // 启用后 handle_create 对新文件返回 Placement::Inline, 数据直接存 Filer
@@ -413,6 +535,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let shard_count = filer_cfg.shard_count as u64;
             let force_register = filer_cfg.force_register;
             let net_port_for_reg = net_port;
+            // S3 HTTP port (filer_cfg.port). The S3 server also serves the
+            // /admin/shards endpoint, so the Master needs this port to
+            // proxy shard-introspection in GetFilerStats.
+            let http_port_for_reg = filer_cfg.port;
+            // Filer Metrics HTTP port (explicitly configured — no derivation).
+            let metrics_port_for_reg = filer_cfg.metrics_port;
             // Filer 的可到达地址 (供 kernel 通过 ListFilers 发现本 Filer)
             let advertise_addr_for_reg = format!("{}:{}", advertise_ip, net_port);
 
@@ -424,6 +552,8 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     filer_id: filer_id.clone(),
                     advertise_addr: advertise_addr_for_reg.clone(),
                     net_port: net_port_for_reg as u32,
+                    http_port: http_port_for_reg as u32,
+                    metrics_port: metrics_port_for_reg as u32,
                     shard_count,
                     shard_ids,
                     force: force_register,

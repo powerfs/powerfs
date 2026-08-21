@@ -42,6 +42,12 @@ pub struct ServerConfig {
     pub num_workers: usize,
     /// WorkQueue 容量 (有界, 防止积压)
     pub work_queue_capacity: usize,
+    /// 锁消息独立 worker 线程池大小 (§8.4/§8.6, 默认 4). 与 IO worker
+    /// 池解耦, 防止大 write 阻塞 IO 线程池时锁消息也跟着卡. 设为 0
+    /// 则禁用独立锁队列, 锁消息回落到共享 WorkQueue.
+    pub num_lock_workers: usize,
+    /// 锁消息独立接收队列容量 (有界). 默认 1024 (锁消息量远小于 IO).
+    pub lock_queue_capacity: usize,
 }
 
 impl Default for ServerConfig {
@@ -51,6 +57,8 @@ impl Default for ServerConfig {
             num_io_loops: cpus,
             num_workers: cpus * 2,
             work_queue_capacity: 4096,
+            num_lock_workers: 4,
+            lock_queue_capacity: 1024,
         }
     }
 }
@@ -262,18 +270,41 @@ impl PowerFsNetServer {
     // Server lifecycle
     // ========================================================================
 
+    /// 创建锁消息独立接收队列 (§8.4 + §8.5 优先级分层).
+    /// `num_lock_workers == 0` 时返回 `(None, None)` 表示禁用独立锁队列,
+    /// 锁消息回落到共享 WorkQueue. 否则返回一个 §8.5 优先级队列
+    /// (`LockPriorityProducer` / `LockPriorityConsumer`)——内部是
+    /// `BinaryHeap` 而非 FIFO mpsc, 让 `RevokeAck` (P0) / `Release` (P1)
+    /// 压过 `Acquire` (P2) / `Renew` (P3) 先出队, 压缩 waiter stall.
+    fn setup_lock_queue(
+        &self,
+    ) -> (
+        Option<crate::lock_priority::LockPriorityProducer>,
+        Option<crate::lock_priority::LockPriorityConsumer>,
+    ) {
+        if self.config.num_lock_workers == 0 {
+            return (None, None);
+        }
+        let (tx, rx) = crate::lock_priority::channel(self.config.lock_queue_capacity);
+        (Some(tx), Some(rx))
+    }
+
     /// Start serving (runs until stopped)
     pub async fn serve(&self) -> NetResult<()> {
         info!("Starting to accept connections...");
 
-        // 1. 创建 WorkQueue
+        // 1. 创建 WorkQueue + 锁消息独立队列 (§8.4)
         let (work_tx, work_rx) = mpsc::channel::<Work>(self.config.work_queue_capacity);
+        let (lock_tx, lock_rx) = self.setup_lock_queue();
 
-        // 2. 启动 IoLoop 池 (N 个)
-        let io_loops = self.spawn_io_loops(work_tx.clone());
+        // 2. 启动 IoLoop 池 (N 个, 携带锁队列发送端)
+        let io_loops = self.spawn_io_loops(work_tx.clone(), lock_tx);
 
-        // 3. 启动 Worker 池 (Semaphore 限并发)
+        // 3. 启动 Worker 池 (IO) + 锁 worker 池 (§8.6 独立线程池)
         self.spawn_worker_pool(work_rx);
+        if let Some(lock_rx) = lock_rx {
+            self.spawn_lock_worker_pool(lock_rx);
+        }
 
         // 4. Acceptor 循环
         self.acceptor_loop(io_loops).await
@@ -284,8 +315,12 @@ impl PowerFsNetServer {
         info!("Starting to accept connections (graceful shutdown enabled)...");
 
         let (work_tx, work_rx) = mpsc::channel::<Work>(self.config.work_queue_capacity);
-        let io_loops = self.spawn_io_loops(work_tx);
+        let (lock_tx, lock_rx) = self.setup_lock_queue();
+        let io_loops = self.spawn_io_loops(work_tx, lock_tx);
         self.spawn_worker_pool(work_rx);
+        if let Some(lock_rx) = lock_rx {
+            self.spawn_lock_worker_pool(lock_rx);
+        }
 
         // Acceptor loop with shutdown check
         loop {
@@ -365,13 +400,22 @@ impl PowerFsNetServer {
     // ========================================================================
 
     /// 启动 N 个 IoLoop, 返回 IoLoop 引用列表
-    fn spawn_io_loops(&self, work_tx: mpsc::Sender<Work>) -> Vec<Arc<IoLoop>> {
+    ///
+    /// `lock_work_tx` 为 `Some` 时, IoLoop 会把 `MsgType::is_lock_channel()`
+    /// 的帧路由到独立锁队列 (§8.4 方案 A + §8.5 优先级分层); 为 `None`
+    /// 时所有帧走共享 WorkQueue (向后兼容).
+    fn spawn_io_loops(
+        &self,
+        work_tx: mpsc::Sender<Work>,
+        lock_work_tx: Option<crate::lock_priority::LockPriorityProducer>,
+    ) -> Vec<Arc<IoLoop>> {
         let n = self.config.num_io_loops;
         let mut loops = Vec::with_capacity(n);
         for i in 0..n {
-            let io_loop = Arc::new(IoLoop::new(
+            let io_loop = Arc::new(IoLoop::with_lock(
                 i,
                 work_tx.clone(),
+                lock_work_tx.clone(),
                 self.registry.clone(),
                 self.handler.clone(),
                 self.manager.clone(),
@@ -379,20 +423,82 @@ impl PowerFsNetServer {
             ));
             loops.push(io_loop);
         }
-        info!("Started {} IO Loops", n);
+        if lock_work_tx.is_some() {
+            info!(
+                "Started {} IO Loops (lock channel: dedicated queue enabled)",
+                n
+            );
+        } else {
+            info!(
+                "Started {} IO Loops (lock channel: fallback to shared queue)",
+                n
+            );
+        }
         loops
     }
 
     /// 启动 Worker 池: 单 dispatcher task, Semaphore 限制并发
     fn spawn_worker_pool(&self, work_rx: mpsc::Receiver<Work>) {
+        self.spawn_worker_pool_named("Worker", work_rx, self.config.num_workers);
+    }
+
+    /// 启动锁消息独立 Worker 线程池 (§8.4/§8.6 + §8.5 优先级出队).
+    /// 与 IO worker 池解耦, 线程池大小可配置 (`num_lock_workers`,
+    /// 默认 4). 锁消息处理绝不调用阻塞操作 (如刷盘), 保持快速.
+    ///
+    /// §8.5: 出队走 `LockPriorityConsumer::recv()` (优先级堆), 让
+    /// `RevokeAck` (P0) / `Release` (P1) 压过 `Acquire` (P2) / `Renew` (P3).
+    fn spawn_lock_worker_pool(&self, work_rx: crate::lock_priority::LockPriorityConsumer) {
         let handler = self.handler.clone();
         let manager = self.manager.clone();
         let flow_ctrl = self.flow_ctrl.clone();
-        let num_workers = self.config.num_workers;
+        let num_workers = self.config.num_lock_workers;
         let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
 
         tokio::spawn(async move {
-            info!("Started Worker pool (max_concurrent={})", num_workers);
+            info!(
+                "Started Lock-Worker pool (max_concurrent={}, priority queue)",
+                num_workers
+            );
+            loop {
+                let work = work_rx.recv().await;
+                let Some(work) = work else {
+                    break;
+                };
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        error!("Lock-Worker pool: semaphore closed: {:?}", e);
+                        break;
+                    }
+                };
+                let handler = handler.clone();
+                let manager = manager.clone();
+                let flow_ctrl = flow_ctrl.clone();
+                tokio::spawn(async move {
+                    let worker = Worker::new(0, handler, manager, flow_ctrl);
+                    worker.process_work(work).await;
+                    drop(permit);
+                });
+            }
+            info!("Lock-Worker pool stopped (priority queue closed)");
+        });
+    }
+
+    /// Shared dispatcher implementation used by the IO and lock worker pools.
+    fn spawn_worker_pool_named(
+        &self,
+        label: &'static str,
+        work_rx: mpsc::Receiver<Work>,
+        num_workers: usize,
+    ) {
+        let handler = self.handler.clone();
+        let manager = self.manager.clone();
+        let flow_ctrl = self.flow_ctrl.clone();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(num_workers));
+
+        tokio::spawn(async move {
+            info!("Started {} pool (max_concurrent={})", label, num_workers);
             let mut work_rx = work_rx;
 
             while let Some(work) = work_rx.recv().await {
@@ -400,7 +506,7 @@ impl PowerFsNetServer {
                 let permit = match semaphore.clone().acquire_owned().await {
                     Ok(permit) => permit,
                     Err(e) => {
-                        error!("Worker pool: semaphore closed: {:?}", e);
+                        error!("{} pool: semaphore closed: {:?}", label, e);
                         break;
                     }
                 };
@@ -416,7 +522,7 @@ impl PowerFsNetServer {
                 });
             }
 
-            info!("Worker pool stopped (WorkQueue closed)");
+            info!("{} pool stopped (WorkQueue closed)", label);
         });
     }
 

@@ -444,6 +444,7 @@ impl EcThreadPool {
         EcThreadPool { tx }
     }
 
+    #[allow(clippy::result_unit_err)]
     pub async fn encode(&self, data: Vec<u8>, config: EcConfig) -> Result<Vec<Vec<u8>>, ()> {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -460,6 +461,7 @@ impl EcThreadPool {
         response_rx.await.map_err(|_| ())?
     }
 
+    #[allow(clippy::result_unit_err)]
     pub async fn decode(&self, shards: Vec<Vec<u8>>, config: EcConfig) -> Result<Vec<u8>, ()> {
         let (response_tx, response_rx) = oneshot::channel();
 

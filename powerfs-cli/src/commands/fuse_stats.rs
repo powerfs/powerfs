@@ -1,234 +1,293 @@
-//! `powerfs-cli fuse-stats` — query FUSE client request statistics.
+//! `powerfs-cli fuse-stats` — query FUSE client statistics via MasterService gRPC.
 //!
-//! Connects to the FUSE admin/debug HTTP server (started when `admin_port > 0`
-//! in the FUSE config) and displays:
-//! - Global counters (submitted/completed/errors/in-flight)
-//! - Per-`MsgType` breakdown (count, errors, latency min/max/avg)
-//! - In-flight requests sorted by age (oldest first — most likely stuck)
+//! The CLI **never** connects directly to FUSE clients (clients must not
+//! expose listening endpoints).  Instead, FUSE/kernel clients report their
+//! identity, heartbeat, and runtime counters to the Master through the
+//! periodic TLV `KeepConnected` heartbeat.  This command fetches the
+//! aggregated view via `GetFuseClients` on the master (`-m`).
+//!
+//! Displays per-client identity, dirty-state, heartbeat age, and the
+//! internal `ClientStats` counters reported through the heartbeat.  The
+//! old `--addr` argument (which targeted a FUSE admin HTTP port) is
+//! removed to enforce the "CLI only talks to the Master" design rule.
 //!
 //! # Usage
 //!
 //! ```sh
-//! powerfs-cli fuse-stats                          # default localhost:9999
-//! powerfs-cli fuse-stats --addr 172.30.0.10:9999  # query remote FUSE
-//! powerfs-cli fuse-stats --json                   # raw JSON output
+//! powerfs-cli -m localhost:9333 fuse-stats           # all registered clients
+//! powerfs-cli -m localhost:9333 fuse-stats --json    # raw JSON output
 //! ```
-
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
 
 use clap::Args;
 
-use powerfs_common::error::{PowerFsError, Result};
+use crate::client::MasterClient;
+use powerfs_common::error::PowerFsError;
+use powerfs_master::proto::powerfs::{ClientStats, FuseClientsRequest};
+use powerfs_master::proto::FuseClientInfo;
 
 #[derive(Args, Debug)]
 pub struct FuseStatsArgs {
-    /// FUSE admin server address (host:port).
-    #[arg(long, default_value = "localhost:9999")]
-    addr: String,
-
     /// Output raw JSON (for scripting / piping to jq).
     #[arg(long)]
     json: bool,
 }
 
-pub fn fuse_stats(_master: &str, args: FuseStatsArgs) -> Result<()> {
-    let json = fetch_stats(&args.addr)?;
+/// Fetch all registered FUSE clients from the Master (via gRPC) and
+/// display their statistics.  Never opens a direct connection to FUSE.
+pub async fn fuse_stats(mut client: MasterClient, args: FuseStatsArgs) -> super::CommandResult {
+    let mut svc = client
+        .service()
+        .await
+        .map_err(|e| PowerFsError::Internal(format!("Failed to connect: {}", e)))?;
 
-    if args.json {
-        println!("{}", json);
-        return Ok(());
-    }
+    let resp = svc
+        .get_fuse_clients(tonic::Request::new(FuseClientsRequest {}))
+        .await
+        .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?
+        .into_inner();
 
-    display_formatted(&json, &args.addr)
-}
-
-/// Fetch /stats from the FUSE admin server via raw TCP.
-fn fetch_stats(addr: &str) -> Result<String> {
-    // Resolve hostname (e.g. "localhost") to SocketAddr before connect_timeout.
-    let socket_addr = addr
-        .to_socket_addrs()
-        .map_err(|e| PowerFsError::Internal(format!("invalid addr '{}': {}", addr, e)))?
-        .next()
-        .ok_or_else(|| PowerFsError::Internal(format!("no address resolved for '{}'", addr)))?;
-
-    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(5))
-        .map_err(|e| PowerFsError::Internal(format!("connect {} failed: {}", addr, e)))?;
-
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| PowerFsError::Internal(format!("set_read_timeout: {}", e)))?;
-
-    let request = "GET /stats HTTP/1.0\r\nHost: fuse-stats\r\nConnection: close\r\n\r\n";
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| PowerFsError::Internal(format!("write request: {}", e)))?;
-
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|e| PowerFsError::Internal(format!("read response: {}", e)))?;
-
-    // Parse HTTP response: skip headers, return body
-    let response_str = String::from_utf8_lossy(&response);
-    let body_start = response_str.find("\r\n\r\n").ok_or_else(|| {
-        PowerFsError::Internal("malformed HTTP response (no header/body separator)".into())
-    })?;
-    let body = &response_str[body_start + 4..];
-
-    // Check HTTP status
-    let status_line = response_str.lines().next().unwrap_or("");
-    if !status_line.contains("200") {
+    if !resp.error.is_empty() {
         return Err(PowerFsError::Internal(format!(
-            "admin server returned: {}",
-            status_line
+            "GetFuseClients returned error: {}",
+            resp.error
         )));
     }
 
-    Ok(body.trim().to_string())
-}
-
-/// Display formatted stats output.
-fn display_formatted(json_str: &str, addr: &str) -> Result<()> {
-    let v: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| PowerFsError::Internal(format!("parse JSON: {}", e)))?;
-
-    println!("═══════════════════════════════════════════════════════════════");
-    println!("  PowerFS FUSE Request Statistics  ({})", addr);
-    println!("═══════════════════════════════════════════════════════════════");
-
-    // Global summary
-    let total_submitted = v
-        .get("total_submitted")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    let total_completed = v
-        .get("total_completed")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    let total_errors = v.get("total_errors").and_then(|x| x.as_u64()).unwrap_or(0);
-    let in_flight = v
-        .get("in_flight_count")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
-    let uptime = v.get("uptime_secs").and_then(|x| x.as_u64()).unwrap_or(0);
-
-    println!("\n┌─ Global ────────────────────────────────────────────────────");
-    println!("│ Submitted:  {:>10}", total_submitted);
-    println!("│ Completed:  {:>10}", total_completed);
-    println!("│ Errors:     {:>10}", total_errors);
-    println!("│ In-flight:  {:>10}", in_flight);
-    println!("│ Uptime:     {:>9}", format_duration(uptime));
-
-    if total_submitted > 0 {
-        let err_rate = (total_errors as f64 / total_submitted as f64) * 100.0;
-        println!("│ Error rate: {:>9.2}%", err_rate);
-    }
-    println!("└──────────────────────────────────────────────────────────────");
-
-    // Per-msg_type stats
-    if let Some(per_msg) = v.get("per_msg_type").and_then(|x| x.as_object()) {
-        if !per_msg.is_empty() {
-            println!("\n┌─ Per Request Type ──────────────────────────────────────────");
-            println!(
-                "│ {:<18} {:>8} {:>8} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8}",
-                "Type", "Submit", "Done", "Err", "T/O", "QFull", "Min_us", "Max_us", "Avg_us"
-            );
-            println!("│ {}", "-".repeat(86));
-
-            // Sort by submitted descending
-            let mut entries: Vec<_> = per_msg.iter().collect();
-            entries.sort_by(|a, b| {
-                let a_sub = a.1.get("submitted").and_then(|x| x.as_u64()).unwrap_or(0);
-                let b_sub = b.1.get("submitted").and_then(|x| x.as_u64()).unwrap_or(0);
-                b_sub.cmp(&a_sub)
-            });
-
-            for (name, stats) in entries {
-                let submitted = stats.get("submitted").and_then(|x| x.as_u64()).unwrap_or(0);
-                if submitted == 0 {
-                    continue;
-                }
-                let completed = stats.get("completed").and_then(|x| x.as_u64()).unwrap_or(0);
-                let errors = stats.get("errors").and_then(|x| x.as_u64()).unwrap_or(0);
-                let timeouts = stats.get("timeouts").and_then(|x| x.as_u64()).unwrap_or(0);
-                let queue_fulls = stats
-                    .get("queue_fulls")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
-                let min_us = stats.get("min_us").and_then(|x| x.as_u64()).unwrap_or(0);
-                let max_us = stats.get("max_us").and_then(|x| x.as_u64()).unwrap_or(0);
-                let total_us = stats.get("total_us").and_then(|x| x.as_u64()).unwrap_or(0);
-                let avg_us = total_us.checked_div(completed).unwrap_or(0);
-
-                println!(
-                    "│ {:<18} {:>8} {:>8} {:>6} {:>6} {:>6} {:>8} {:>8} {:>8}",
-                    name,
-                    submitted,
-                    completed,
-                    errors,
-                    timeouts,
-                    queue_fulls,
-                    min_us,
-                    max_us,
-                    avg_us
-                );
+    if args.json {
+        // NOTE: prost-generated types don't derive serde::Serialize by
+        // default.  For scripting purposes the debug representation is
+        // unambiguous enough; if a strict JSON schema is needed in the
+        // future, this can be built explicitly from the fields.
+        for (i, c) in resp.clients.iter().enumerate() {
+            if i > 0 {
+                println!();
             }
-            println!("└──────────────────────────────────────────────────────────────");
+            print_client_debug(c);
         }
+        return Ok(());
     }
 
-    // In-flight requests (stuck detection)
-    if let Some(in_flight_arr) = v.get("in_flight").and_then(|x| x.as_array()) {
-        if !in_flight_arr.is_empty() {
-            println!("\n┌─ In-Flight Requests (sorted by age, oldest first) ─────────");
-            println!(
-                "│ {:<3} {:<18} {:>10} {:>10}",
-                "#", "Type", "Shard", "Age_ms"
-            );
-            println!("│ {}", "-".repeat(50));
-
-            for (i, req) in in_flight_arr.iter().enumerate() {
-                let msg_type_name = req
-                    .get("msg_type_name")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("?");
-                let shard_id = req.get("shard_id").and_then(|x| x.as_u64()).unwrap_or(0);
-                let age_ms = req.get("age_ms").and_then(|x| x.as_u64()).unwrap_or(0);
-
-                // Flag requests older than 1 second as potentially stuck
-                let marker = if age_ms > 5000 {
-                    " !!! STUCK"
-                } else if age_ms > 1000 {
-                    " ! slow"
-                } else {
-                    ""
-                };
-
-                println!(
-                    "│ {:<3} {:<18} {:>10} {:>10}{}",
-                    i + 1,
-                    msg_type_name,
-                    shard_id,
-                    age_ms,
-                    marker
-                );
-            }
-            println!("└──────────────────────────────────────────────────────────────");
-        }
-    }
-
-    println!();
+    display_formatted(&resp.clients);
     Ok(())
 }
 
-fn format_duration(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}s", secs)
-    } else if secs < 3600 {
-        format!("{}m{}s", secs / 60, secs % 60)
+fn print_client_debug(c: &FuseClientInfo) {
+    println!("FuseClientInfo {{");
+    println!("  client_id: {:?}", c.client_id);
+    println!("  client_type: {:?}", c.client_type);
+    println!("  mount_point: {:?}", c.mount_point);
+    println!("  collection: {:?}", c.collection);
+    println!("  replication: {:?}", c.replication);
+    println!("  host: {:?}", c.host);
+    println!("  pid: {}", c.pid);
+    println!("  connected_at: {}", c.connected_at);
+    println!("  last_heartbeat: {}", c.last_heartbeat);
+    println!("  dirty_chunks: {}", c.dirty_chunks);
+    println!("  dirty_bytes: {}", c.dirty_bytes);
+    if let Some(s) = &c.stats {
+        println!("  stats: ClientStats {{");
+        println!("    data_queue_depth: {}", s.data_queue_depth);
+        println!("    lease_queue_depth: {}", s.lease_queue_depth);
+        println!("    admin_queue_depth: {}", s.admin_queue_depth);
+        println!("    data_processed_total: {}", s.data_processed_total);
+        println!("    lease_processed_total: {}", s.lease_processed_total);
+        println!("    admin_processed_total: {}", s.admin_processed_total);
+        println!("    read_latency_p50_us: {}", s.read_latency_p50_us);
+        println!("    read_latency_p99_us: {}", s.read_latency_p99_us);
+        println!("    write_latency_p50_us: {}", s.write_latency_p50_us);
+        println!("    write_latency_p99_us: {}", s.write_latency_p99_us);
+        println!("    active_leases: {}", s.active_leases);
+        println!("    lease_renewals_total: {}", s.lease_renewals_total);
+        println!("    lease_expired_total: {}", s.lease_expired_total);
+        println!("  }}");
+    }
+    println!("}}");
+}
+
+fn display_formatted(clients: &[FuseClientInfo]) {
+    println!("════════════════════════════════════════════════════════════════════════");
+    println!(
+        "  PowerFS FUSE Clients (via MasterService gRPC)  —  {} registered",
+        clients.len()
+    );
+    println!("════════════════════════════════════════════════════════════════════════");
+
+    if clients.is_empty() {
+        println!("  (no FUSE clients registered on this master)");
+        println!();
+        return;
+    }
+
+    // Per-client identity & dirty state
+    println!("\n┌─ Identity & Dirty State ──────────────────────────────────────────────");
+    println!(
+        "│ {:<28} {:<6} {:<16} {:<10} {:<12} {:>10} {:>14}",
+        "ClientId", "Type", "Mount", "Coll", "Host", "DirtyC", "DirtyBytes"
+    );
+    println!("│ {}", "─".repeat(102));
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for c in clients {
+        let mount = truncate(&c.mount_point, 16);
+        let coll = truncate(&c.collection, 10);
+        let host = truncate(&c.host, 12);
+        let cid = truncate(&c.client_id, 28);
+        println!(
+            "│ {:<28} {:<6} {:<16} {:<10} {:<12} {:>10} {:>14}",
+            cid,
+            c.client_type,
+            mount,
+            coll,
+            host,
+            c.dirty_chunks,
+            format_bytes(c.dirty_bytes)
+        );
+    }
+    println!("└───────────────────────────────────────────────────────────────────────");
+
+    // Heartbeat / timing
+    println!("\n┌─ Heartbeat / Timing ──────────────────────────────────────────────────");
+    println!(
+        "│ {:<28} {:>7} {:>14} {:>14}",
+        "ClientId", "PID", "Connected(s)", "HB-age(s)"
+    );
+    println!("│ {}", "─".repeat(72));
+    for c in clients {
+        let cid = truncate(&c.client_id, 28);
+        let connected = if c.connected_at > 0 && now_secs >= c.connected_at {
+            now_secs - c.connected_at
+        } else {
+            0
+        };
+        let hb_age = if c.last_heartbeat > 0 && now_secs >= c.last_heartbeat {
+            now_secs - c.last_heartbeat
+        } else {
+            0
+        };
+        println!(
+            "│ {:<28} {:>7} {:>14} {:>14}",
+            cid, c.pid, connected, hb_age
+        );
+    }
+    println!("└───────────────────────────────────────────────────────────────────────");
+
+    // ClientStats counters
+    println!("\n┌─ Runtime Counters (ClientStats via heartbeat) ────────────────────────");
+    println!(
+        "│ {:<28} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}",
+        "ClientId", "DataQ", "LeaseQ", "AdminQ", "DataDone", "LeaseDone", "CoalDirty"
+    );
+    println!("│ {}", "─".repeat(90));
+    for c in clients {
+        let cid = truncate(&c.client_id, 28);
+        let s = c.stats.as_ref().unwrap_or(&EMPTY_STATS);
+        let coalescer = format_bytes(s.coalescer_dirty_bytes);
+        println!(
+            "│ {:<28} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}",
+            cid,
+            s.data_queue_depth,
+            s.lease_queue_depth,
+            s.admin_queue_depth,
+            shorten(s.data_processed_total),
+            shorten(s.lease_processed_total),
+            coalescer,
+        );
+    }
+    println!("└───────────────────────────────────────────────────────────────────────");
+
+    // Latencies & lease counters
+    println!("\n┌─ Latency Pctiles (µs) & Lease State ──────────────────────────────────");
+    println!(
+        "│ {:<28} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}",
+        "ClientId", "RdP50", "RdP99", "WrP50", "WrP99", "ActLeases", "LeaseRenew", "LeaseExp"
+    );
+    println!("│ {}", "─".repeat(96));
+    for c in clients {
+        let cid = truncate(&c.client_id, 28);
+        let s = c.stats.as_ref().unwrap_or(&EMPTY_STATS);
+        println!(
+            "│ {:<28} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10} {:>10}",
+            cid,
+            s.read_latency_p50_us,
+            s.read_latency_p99_us,
+            s.write_latency_p50_us,
+            s.write_latency_p99_us,
+            s.active_leases,
+            shorten(s.lease_renewals_total),
+            shorten(s.lease_expired_total),
+        );
+    }
+    println!("└───────────────────────────────────────────────────────────────────────");
+    println!();
+}
+
+const EMPTY_STATS: ClientStats = ClientStats {
+    data_queue_depth: 0,
+    lease_queue_depth: 0,
+    admin_queue_depth: 0,
+    data_processed_total: 0,
+    lease_processed_total: 0,
+    admin_processed_total: 0,
+    cb_closed_count: 0,
+    cb_open_count: 0,
+    cb_half_open_count: 0,
+    cb_trip_total: 0,
+    coalescer_dirty_bytes: 0,
+    coalescer_dirty_entries: 0,
+    coalescer_writes_in_total: 0,
+    coalescer_flushes_out_total: 0,
+    pool_active_connections: 0,
+    pool_reconnect_total: 0,
+    pool_ping_failures: 0,
+    read_latency_p50_us: 0,
+    read_latency_p99_us: 0,
+    write_latency_p50_us: 0,
+    write_latency_p99_us: 0,
+    active_leases: 0,
+    lease_renewals_total: 0,
+    lease_expired_total: 0,
+};
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
     } else {
-        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+fn format_bytes(b: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    const TB: u64 = 1024 * GB;
+    if b >= TB {
+        format!("{:.1} TB", b as f64 / TB as f64)
+    } else if b >= GB {
+        format!("{:.1} GB", b as f64 / GB as f64)
+    } else if b >= MB {
+        format!("{:.1} MB", b as f64 / MB as f64)
+    } else if b >= KB {
+        format!("{:.1} KB", b as f64 / KB as f64)
+    } else {
+        format!("{} B", b)
+    }
+}
+
+fn shorten(v: u64) -> String {
+    if v >= 1_000_000_000 {
+        format!("{}G", v / 1_000_000_000)
+    } else if v >= 1_000_000 {
+        format!("{}M", v / 1_000_000)
+    } else if v >= 1_000 {
+        format!("{}K", v / 1_000)
+    } else {
+        v.to_string()
     }
 }

@@ -25,6 +25,7 @@ pub mod flow_admin;
 pub mod flow_control;
 pub mod flow_policy;
 pub mod io_loop;
+pub mod lock_priority;
 pub mod middleware;
 pub mod protocol;
 pub mod request_context;

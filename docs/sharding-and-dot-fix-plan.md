@@ -61,20 +61,26 @@ let end = start.saturating_add(inode_per_shard); // 所有 shard 统一
 
 ### 方案 2：文件随父目录、目录选新 shard（解决路由策略）
 
+> **更新（与 [shard-routing-no-forward-principle.md](shard-routing-no-forward-principle.md) 对齐）**：
+> 子目录创建已从"服务端单函数 `create_directory`"重构为**客户端协调的两阶段提交**。
+> 服务端**绝不服务间转发**；非 leader 时返回 `STATUS_ERR_REDIRECT`，客户端更新路由后重试。
+> 本节代码片段保留为分片策略说明（`pick_child_dir_shard` 仍用于选目标 shard），
+> 实际的跨 shard 提交流程见下方"子目录创建的两种方式"。
+
 **核心思路**：
 - **文件**（含 symlink、S3 对象）：inode 分配在父目录所在 shard，保证
   `calculate_shard(inode) == calculate_shard(parent_inode)`，readdir 时
   可从同一 shard 获取目录项和 inode 记录，避免跨 shard 查询。
 - **目录**：inode 分配在不同 shard，将目录树分散到各 shard 实现负载均衡。
 
-**实现**：
+**分片策略实现**：
 
 ```rust
 // create_file / create_symlink / create_s3_object
 let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
 let inode = self.alloc_inode_in_shard(parent_shard);
 
-// create_directory
+// create_directory（仅计算 target_shard，实际提交由客户端两阶段协调，见下表）
 let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
 let target_shard = self.pick_child_dir_shard(parent_shard);
 let inode = self.alloc_inode_in_shard(target_shard);
@@ -91,6 +97,24 @@ pub fn pick_child_dir_shard(&self, parent_shard: ShardId) -> ShardId {
 > 实际上**目录**会跳到新 shard，目录树深度增长时逐层分散到不同 shard；
 > 只有**文件**留在父目录的 shard，这是为了 readdir 局部性，且文件数量
 > 远大于目录，集中在父目录 shard 不会导致目录树本身倾斜。
+
+#### 子目录创建的两种方式
+
+子目录创建根据 `target_shard` 是否等于 `parent_shard` 分为两种方式（详见
+[shard-routing-no-forward-principle.md §2.2-§3](shard-routing-no-forward-principle.md)）：
+
+| 方式 | 触发条件 | 通信次数 | 实现 |
+|------|---------|---------|------|
+| **单 shard 快速路径** | `target_shard == parent_shard`（shard_count ≤ 1） | 1 次 RPC | 客户端发 `Mkdir`(0x0014) 到 parent_shard，服务端 `handle_mkdir` 原子完成 `CreateInode` + `AddDirEntry` |
+| **跨 shard 两阶段** | `target_shard != parent_shard`（shard_count > 1，常态） | 3 次 RPC | 客户端协调 `alloc_inode_batch`(target_shard) → `MkdirPhaseA`(0x003c, target_shard, CreateInode) → `MkdirPhaseB`(0x003d, parent_shard, AddDirEntry) |
+
+**关键**：两个 Phase 由**客户端分别路由**到各自 shard 的 leader，各自独立重定向。
+服务端只处理发到本节点的单 shard 请求，**绝不转发**。Phase A 成功而 Phase B 失败时
+产生孤儿 inode（target_shard 有 record 但无 dir entry 指向），由后台 GC 清理——
+这比服务间转发的故障风险可接受得多。
+
+**原 `create_directory` 服务端函数已废弃**：子目录 create 不再在服务端单函数内跨 shard 调用，
+改由客户端两阶段协调。文件 create 仍走 `propose_create_inode_and_direntry`（单 shard）。
 
 ### 方案 3：`stat .` / `stat ..` 拦截（解决 ENOENT）
 
@@ -123,8 +147,13 @@ fn lookup(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> std::io::R
 
 ### 方案 4：跨 shard rename 两阶段提交
 
-**核心思路**：跨 shard rename 分解为三条独立的 Raft 提案，分别路由到
-各自 shard 的 leader（由 `RaftGroup::handle_propose` 转发）。
+> **设计原则更新**：此处的"由 `RaftGroup::handle_propose` 转发"已**废弃**。
+> 详见 [shard-routing-no-forward-principle.md](shard-routing-no-forward-principle.md)。
+> 所有跨 shard 操作改为**客户端协调的两阶段提交**，服务端绝不经 `propose_forward` 转发。
+> 非 leader 时返回 `STATUS_ERR_REDIRECT`，客户端更新 `shard_router` 后直连正确 leader。
+
+**核心思路**：跨 shard rename 分解为多条独立的 Raft 提案，由**客户端分别路由**到
+各自 shard 的 leader（非 leader 返回 REDIRECT，客户端重定向后重试）。
 
 **实现** ([meta_shard_manager.rs](file:///home/portion/powerfs/powerfs-filer/src/meta_shard_manager.rs))：
 

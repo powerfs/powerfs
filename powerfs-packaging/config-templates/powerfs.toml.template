@@ -21,12 +21,14 @@ redis_url = "redis://127.0.0.1:6379"
 
 [master]
 port = 9333                  # HTTP/gRPC 端口 (必填)
-net_port = 9334              # powerfs-net TLV 端口 (必填，必须与 port 不同)
+raft_port = 9335             # Raft gRPC 端口 (必填，必须与 port/net_port/metrics_port 都不同)
+metrics_port = 9300          # Metrics/Admin HTTP 端口 (必填; 4个master端口必须都显式配置且唯一, 禁止用端口加减推导)
+net_port = 9334              # powerfs-net TLV 端口 (必填)
 dir = "/data/master"         # 数据目录 (必填)
 raft_id = 1                  # 当前节点在 Raft 集群中的唯一 ID
 ip = "0.0.0.0"               # 监听地址
 advertise_addr = "10.0.0.11:9333"  # 对外可达地址 (必填，不能为 0.0.0.0)
-peers = ["10.0.0.11:9333", "10.0.0.12:9333", "10.0.0.13:9333"]
+raft_peers = ["10.0.0.11:9335", "10.0.0.12:9335", "10.0.0.13:9335"]
 
 [volume]
 grpc_port = 8080             # gRPC 端口 (必填)
@@ -43,6 +45,7 @@ advertise_addr = "10.0.0.21"     # 对外可达地址 (必填)
 [filer]
 port = 8888                  # HTTP 端口 (必填)
 grpc_port = 8889             # gRPC 端口 (必填)
+metrics_port = 8900             # Metrics HTTP端口 (必填; 显式配置, 禁止端口加减推导)
 net_port = 9334              # powerfs-net TLV 端口 (必填)
 master_addresses = ["10.0.0.11:9333", "10.0.0.12:9333", "10.0.0.13:9333"]
 master_net_port = 9334       # Master 的 powerfs-net 端口 (必填, 用于 Zone 注册)

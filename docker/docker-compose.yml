@@ -52,6 +52,7 @@ services:
     volumes:
       - master-1-data:/data
       - ./config/master-1.toml:/app/config/master.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
       - "9333:9333"
     environment:
@@ -82,6 +83,7 @@ services:
     volumes:
       - master-2-data:/data
       - ./config/master-2.toml:/app/config/master.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
       - "9336:9333"
     environment:
@@ -112,6 +114,7 @@ services:
     volumes:
       - master-3-data:/data
       - ./config/master-3.toml:/app/config/master.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
       - "9337:9333"
     environment:
@@ -142,6 +145,7 @@ services:
     volumes:
       - volume-1-data:/data
       - ./config/volume-1.toml:/app/config/volume.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8080:8080"    # gRPC端口
       - "8091:8091"    # HTTP管理端口
@@ -172,6 +176,7 @@ services:
     volumes:
       - volume-2-data:/data
       - ./config/volume-2.toml:/app/config/volume.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8081:8080"    # gRPC端口
       - "8092:8092"    # HTTP管理端口
@@ -202,6 +207,7 @@ services:
     volumes:
       - volume-3-data:/data
       - ./config/volume-3.toml:/app/config/volume.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8082:8080"    # gRPC端口
       - "8093:8093"    # HTTP管理端口
@@ -233,6 +239,7 @@ services:
     volumes:
       - volume-4-data:/data
       - ./config/volume-4.toml:/app/config/volume.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8085:8080"    # gRPC端口
       - "8094:8094"    # HTTP管理端口
@@ -263,6 +270,7 @@ services:
     volumes:
       - volume-5-data:/data
       - ./config/volume-5.toml:/app/config/volume.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8086:8080"    # gRPC端口
       - "8095:8095"    # HTTP管理端口
@@ -293,6 +301,7 @@ services:
     volumes:
       - volume-6-data:/data
       - ./config/volume-6.toml:/app/config/volume.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8087:8080"    # gRPC端口
       - "8096:8096"    # HTTP管理端口
@@ -323,6 +332,7 @@ services:
     volumes:
       - filer-1-data:/data/filer
       - ./config/filer-1.toml:/app/config/filer.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     ports:
       - "8888:8888"    # HTTP端口
       - "8889:8889"    # gRPC端口
@@ -358,6 +368,7 @@ services:
     volumes:
       - filer-2-data:/data/filer
       - ./config/filer-2.toml:/app/config/filer.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     ports:
       - "8898:8888"    # HTTP端口
       - "8899:8889"    # gRPC端口
@@ -393,6 +404,7 @@ services:
     volumes:
       - filer-3-data:/data/filer
       - ./config/filer-3.toml:/app/config/filer.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     ports:
       - "8908:8888"    # HTTP端口
       - "8909:8889"    # gRPC端口
@@ -431,6 +443,7 @@ services:
     volumes:
       - s3-data:/data
       - ./config/s3.toml:/app/config/s3.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-s3:/app/powerfs-s3:ro
     ports:
       - "9000:9000"
     command: >
@@ -456,6 +469,7 @@ services:
         ipv4_address: 172.30.0.30
     volumes:
       - ./config/monitor.toml:/app/config/monitor.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-monitor:/app/powerfs-monitor:ro
     ports:
       - "8083:8081"
     command: >
@@ -517,6 +531,7 @@ services:
     volumes:
       - /tmp/powerfs/fuse1:/mnt/powerfs
       - ./config/fuse-1.toml:/app/config/fuse.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-fuse:/app/powerfs-fuse:ro
     command: >
       /app/powerfs-fuse
       --config /app/config/fuse.toml
@@ -555,6 +570,7 @@ services:
     volumes:
       - /tmp/powerfs/fuse2:/mnt/powerfs
       - ./config/fuse-2.toml:/app/config/fuse.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-fuse:/app/powerfs-fuse:ro
     command: >
       /app/powerfs-fuse
       --config /app/config/fuse.toml

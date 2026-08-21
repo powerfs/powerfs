@@ -2,9 +2,9 @@
 # =============================================================================
 # PowerFS L3 性能测试 — fio 基准测试
 #
-# 在 fuse-test 容器内运行：
-#   docker cp scripts/tests/fuse/run_l3_perf_test.sh fuse-test:/tmp/
-#   docker exec fuse-test /tmp/run_l3_perf_test.sh
+# 在 fuse-1-test 容器内运行：
+#   docker cp scripts/tests/fuse/run_l3_perf_test.sh fuse-1-test:/tmp/
+#   docker exec fuse-1-test /tmp/run_l3_perf_test.sh
 #
 # 测试项 (按 fs-test-plan.md):
 #   L3.01 顺序写   bs=1M, rw=write,  size=64M

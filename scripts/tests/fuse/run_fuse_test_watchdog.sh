@@ -14,8 +14,8 @@
 #   5. Auto-kill hung processes and continue to next test
 #
 # Usage:
-#   docker cp scripts/tests/fuse/run_fuse_test_watchdog.sh fuse-test:/tmp/
-#   docker exec fuse-test /tmp/run_fuse_test_watchdog.sh
+#   docker cp scripts/tests/fuse/run_fuse_test_watchdog.sh fuse-1-test:/tmp/
+#   docker exec fuse-1-test /tmp/run_fuse_test_watchdog.sh
 #
 # Environment variables:
 #   TEST_TIMEOUT    - per-test timeout in seconds (default: 15)

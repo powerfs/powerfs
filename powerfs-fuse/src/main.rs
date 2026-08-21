@@ -1,7 +1,6 @@
 use clap::Parser;
 use log::{error, info, warn};
 use std::ffi::CString;
-use std::io::Write;
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -164,13 +163,19 @@ fn main() {
     info!("Request timeout: {}s", request_timeout_secs);
     let admin_port = fuse_cfg.admin_port;
     if admin_port > 0 {
-        info!("Admin/debug server port: {}", admin_port);
+        info!(
+            "Legacy fuse.admin_port={} present in config, but the FUSE \
+             client no longer binds any HTTP endpoint. Stats are collected \
+             via the Master KeepConnected heartbeat; use \
+             `powerfs-cli -m <master> fuse-stats`.",
+            admin_port
+        );
     }
 
     let verbose = args.verbose || fuse_cfg.verbose;
     let container = args.container || fuse_cfg.container;
     let log_level = if verbose { "debug" } else { "info" };
-    let log_file = args.log_file.clone().or(fuse_cfg.log_file);
+    let _log_file = args.log_file.clone().or(fuse_cfg.log_file);
 
     // 验证配置完整性
     if master_addrs.is_empty() {
@@ -192,42 +197,9 @@ fn main() {
         process::exit(1);
     }
 
-    // 配置日志
-    let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level));
-
-    builder.format(|buf, record| {
-        writeln!(
-            buf,
-            "[{}] [{}] [{}] {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            record.level(),
-            record.target(),
-            record.args()
-        )
-    });
-
-    if let Some(log_file_path) = &log_file {
-        use std::fs::{self, File};
-        use std::path::Path;
-
-        let log_path = Path::new(log_file_path);
-        if let Some(parent) = log_path.parent() {
-            fs::create_dir_all(parent).unwrap_or_else(|e| {
-                eprintln!("Failed to create log directory: {}", e);
-            });
-        }
-
-        let file = File::create(log_file_path).unwrap_or_else(|e| {
-            eprintln!("Failed to create log file: {}", e);
-            std::process::exit(1);
-        });
-
-        builder.target(env_logger::Target::Pipe(Box::new(file)));
-        info!("Logging to file: {}", log_file_path);
-    }
-
-    builder.init();
+    // 配置日志：使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
+    // master 通过 GetDebugConfig 下发配置，fuse 每 2s 轮询并本地应用
+    powerfs_common::dynamic_log::init(log_level, None);
 
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
@@ -261,7 +233,40 @@ fn main() {
     }
 
     // 创建tokio runtime
-    let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    //
+    // NOTE: Runtime::new() defaults to worker_threads = num_cpus() (host value,
+    // can be 16/32/64 on the host). However, cgroup-pids limits or ulimit
+    // inside Docker often cap our threads at a much smaller number (~7-12).
+    // When that happens:
+    //   1. `main` thread permanently parks in runtime.block_on(FuseApp::new.await)
+    //      → this keeps one OS thread busy for the entire process lifetime.
+    //   2. FUSE callbacks (write/release/create/open/unlink...) are handled by
+    //      6 fuse_backend_rs workers running on OS threads — not our tokio pool.
+    //      Each callback uses SyncFuseClientFacade::block_on(), which spawns a
+    //      task onto the tokio runtime and waits on an mpsc channel.
+    //   3. If tokio has fewer worker threads than concurrent block_on() callers,
+    //      all workers get parked on mpsc::recv() waiting for responses, while
+    //      the async network futures (recv_loop, send_task, lockify sync tasks
+    //      that produce those responses) never get scheduled → deadlock, all
+    //      FUSE requests hang forever ("context canceled" inside tests).
+    //
+    // Fix: explicitly size the runtime. Use 8 workers (well above the 1 main
+    // thread + 6 FUSE workers simultaneous-block-on worst case, leaving head
+    // room for network tasks) + generous blocking pool budget. We also read
+    // TOKIO_WORKER_THREADS so it can be overridden per-deploy.
+    let default_workers: usize = 8;
+    let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default_workers)
+        .clamp(2, 64);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(32)
+        .enable_all()
+        .thread_name("powerfs-tokio")
+        .build()
+        .expect("Failed to create tokio runtime");
     let runtime_arc = Arc::new(runtime);
 
     let result = runtime_arc.block_on(async {
@@ -286,6 +291,15 @@ fn main() {
         )
         .await
         .expect("Failed to create FUSE client");
+
+        // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
+        let node_id = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse-unknown".to_string());
+        let master_endpoints: Vec<(String, u16)> = master_addrs
+            .iter()
+            .map(|a| (a.clone(), master_net_port))
+            .collect();
+        powerfs_common::debug_config_poller::DebugConfigPoller::new(node_id, master_endpoints)
+            .start();
 
         info!("Mounting PowerFS at: {}", mount_point);
 

@@ -158,6 +158,46 @@ pub struct MetaShardManager {
     delta_logs: RwLock<HashMap<ShardId, Arc<DeltaLog>>>,
     // CRDT: Per-shard per-directory OR-Set state
     orset_states: RwLock<HashMap<(ShardId, u64), ServerDirORSet>>,
+    /// Async metadata persistence flag (default: true).
+    ///
+    /// When true (default, performance mode): create/mkdir/rename stage
+    /// to MetaCache and `propose_ff` to Raft (fire-and-forget). The entry
+    /// is immediately visible via MetaCache. Only dirty (setattr) and
+    /// deleted (unlink) entries use synchronous `propose` (wait for
+    /// quorum commit). This trades a small window of inconsistency (if
+    /// leader crashes before apply) for ~80x IOPS improvement on
+    /// small-file create.
+    ///
+    /// When false (strict mode): wait for Raft apply before returning,
+    /// guaranteeing the metadata is visible on the authoritative shard
+    /// before the client proceeds. Use this for苛刻环境 requiring强一致.
+    ///
+    /// Toggle via:
+    /// - Config: `async_meta_persist = true|false` in [filer] section
+    /// - Env: `POWERFS_ASYNC_META_PERSIST=0` to disable
+    async_meta_persist: std::sync::atomic::AtomicBool,
+
+    /// Staging cache for newly created metadata entries.
+    ///
+    /// When async_meta_persist is true, `create_inode()` stages the new
+    /// inode + dir entry here BEFORE `propose_ff`, making them immediately
+    /// visible to reads. Once Raft applies the entry to ShardStore, the
+    /// staging copy is swept.
+    ///
+    /// On leader change (cache epoch mismatch), `invalidate_all()` clears
+    /// all staging entries — the client retries on the new leader.
+    meta_cache: std::sync::Arc<crate::meta_cache::MetaCache>,
+    /// Phase 3 Lease Recall: optional reference to the InodeNotifier
+    /// for pushing Invalidate notifications to lease holders when the
+    /// GC loop's trim_pass identifies recall_candidates. Set via
+    /// `set_recall_components` after both the notifier and lease
+    /// manager are constructed in main.rs.
+    inode_notifier: std::sync::RwLock<Option<std::sync::Arc<crate::inode_notifier::InodeNotifier>>>,
+    /// Phase 3 Lease Recall: optional reference to the InodeLeaseManager
+    /// for querying lease holders (`get_holder`) and running
+    /// `sweep_leaked_refcounts` in the GC loop.
+    lease_mgr:
+        std::sync::RwLock<Option<std::sync::Arc<crate::inode_lease_manager::InodeLeaseManager>>>,
 }
 
 /// Per-shard inode allocator.
@@ -195,6 +235,12 @@ impl MetaShardManager {
         // the shard's inode range, with a per-node offset to avoid collisions.
         let shard_count = shard_strategy.get_shard_count();
         let allocators = Self::build_shard_allocators(&shard_strategy, shard_count, node_id);
+        // Async meta persist: default true (performance mode).
+        // Set POWERFS_ASYNC_META_PERSIST=0 to force strict mode.
+        let async_default = match std::env::var("POWERFS_ASYNC_META_PERSIST") {
+            Ok(v) => v != "0" && v.to_lowercase() != "false" && v != "off",
+            Err(_) => true,
+        };
         Self {
             raft_group_manager,
             shard_stores: RwLock::new(HashMap::new()),
@@ -208,6 +254,93 @@ impl MetaShardManager {
             shard_vclocks: RwLock::new(HashMap::new()),
             delta_logs: RwLock::new(HashMap::new()),
             orset_states: RwLock::new(HashMap::new()),
+            async_meta_persist: std::sync::atomic::AtomicBool::new(async_default),
+            meta_cache: std::sync::Arc::new(crate::meta_cache::MetaCache::new()),
+            inode_notifier: std::sync::RwLock::new(None),
+            lease_mgr: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Set async_meta_persist mode at runtime.
+    /// true = performance mode (default), false = strict mode.
+    pub fn set_async_meta_persist(&self, enabled: bool) {
+        self.async_meta_persist
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Accessor for the shared MetaCache — used by the filer metrics HTTP
+    /// server to expose hit/miss/dirty counters on `/metrics` and
+    /// `/admin/meta-cache-stats`. The Arc handle is cheap to clone.
+    pub fn meta_cache(&self) -> std::sync::Arc<crate::meta_cache::MetaCache> {
+        self.meta_cache.clone()
+    }
+
+    /// Phase 3 Lease Recall: wire the InodeNotifier and InodeLeaseManager
+    /// into the MetaShardManager so the GC loop can (1) look up lease
+    /// holders for recall candidates, (2) push Invalidate notifications
+    /// to them, and (3) periodically sweep leaked refcounts.
+    ///
+    /// Called from main.rs after both the FilerNetHandler (which owns
+    /// the lease manager) and the InodeNotifier are constructed.
+    pub fn set_recall_components(
+        &self,
+        notifier: std::sync::Arc<crate::inode_notifier::InodeNotifier>,
+        lease_mgr: std::sync::Arc<crate::inode_lease_manager::InodeLeaseManager>,
+    ) {
+        *self.inode_notifier.write().unwrap() = Some(notifier);
+        *self.lease_mgr.write().unwrap() = Some(lease_mgr);
+    }
+
+    /// Check if async_meta_persist is enabled.
+    pub fn is_async_meta_persist(&self) -> bool {
+        self.async_meta_persist
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Unified propose method: auto-selects fire-and-forget or synchronous
+    /// based on `async_meta_persist` flag.
+    ///
+    /// - Async mode (default): `propose_ff` — submit to RaftCore, return
+    ///   immediately without waiting for commit/apply. ~10x faster.
+    /// - Strict mode: `propose` — wait for quorum commit.
+    ///
+    /// Like `propose_meta` but always uses `propose` (wait for Raft quorum
+    /// commit), regardless of async_meta_persist setting. Use for CRITICAL
+    /// metadata operations where the entry MUST be in the committed log:
+    /// CreateInode, AddDirEntry. Non-critical ops (UpdateInodeSizeChunks,
+    /// setattr, etc.) can use `propose_meta` which may use propose_ff.
+    ///
+    /// Does NOT wait for apply — apply happens asynchronously (~1-5ms after
+    /// commit). The lookup retry in net_handler handles the brief gap.
+    async fn propose_meta_commit(&self, shard_id: ShardId, data: Vec<u8>) -> Result<(), String> {
+        self.raft_group_manager
+            .propose(shard_id, data)
+            .await
+            .map(|_| ())
+    }
+
+    /// Submit a metadata operation respecting the async_meta_persist setting.
+    ///
+    /// - Async mode (default): `propose_ff` — fire-and-forget, returns
+    ///   immediately after submitting to RaftCore. No waiting for commit or
+    ///   apply. Fastest path (~0ms). CRITICAL: if the node is not the leader
+    ///   or lease expired, the entry is silently dropped (None responder).
+    ///   Only use for non-critical ops where a dropped entry is recoverable
+    ///   (e.g., UpdateInodeSizeChunks — client can retry the write).
+    ///
+    /// - Strict mode: `propose` — wait for quorum commit.
+    ///
+    /// All metadata operations (create/unlink/rename/setattr/update_file)
+    /// should use this method instead of calling `raft_group_manager.propose`
+    /// directly, to respect the async_meta_persist setting.
+    async fn propose_meta(&self, shard_id: ShardId, data: Vec<u8>) -> Result<(), String> {
+        if self.is_async_meta_persist() {
+            self.raft_group_manager.propose_ff(shard_id, data).await
+        } else {
+            self.raft_group_manager
+                .propose(shard_id, data)
+                .await
+                .map(|_| ())
         }
     }
 
@@ -381,6 +514,9 @@ impl MetaShardManager {
                 .map_err(|e| format!("failed to create shard store: {}", e))?,
         );
 
+        // P3: 注入 MetaCache 引用，Raft apply 后回调 confirm_*() 清除 staging
+        shard_store.set_meta_cache(self.meta_cache.clone());
+
         {
             let mut stores = self.shard_stores.write().unwrap();
             stores.insert(shard_id, shard_store.clone());
@@ -417,30 +553,83 @@ impl MetaShardManager {
         });
 
         // apply 循环：接收 applied log index → 从 Raft 状态机读取 payload → 反序列化为 ShardCommand → 应用到 ShardStore
+        //
+        // CRITICAL: RocksStateMachine::apply() processes a BATCH of entries in
+        // one call, but only notifies the LAST index via apply_notifier
+        // (try_send). If we only process the notified index, we SKIP all
+        // intermediate entries (e.g., CreateInode at N, AddDirEntry at N+1,
+        // but only N+1 is notified → CreateInode.apply_command never called →
+        // "inode not found" on subsequent UpdateInodeSizeChunks apply).
+        //
+        // Fix: track last_applied_index and process ALL entries from
+        // last_applied+1 to the notified index. This ensures no entry is
+        // skipped even when apply() batches multiple entries.
         let mgr = self.raft_group_manager.clone();
         tokio::spawn(async move {
+            let mut last_applied: u64 = 0;
             while let Some(index) = apply_rx.recv().await {
-                match mgr.read_applied_entry(shard_id, index).await {
-                    Ok(Some(payload)) => match ShardCommand::deserialize(&payload) {
-                        Ok(cmd) => shard_store.apply_command(cmd),
-                        Err(e) => error!(
-                            "shard {}: failed to deserialize ShardCommand at index {}: {}",
-                            shard_id.0, index, e
-                        ),
-                    },
-                    Ok(None) => {
-                        warn!(
-                            "shard {}: no applied entry at index {} (may be Blank/Membership)",
-                            shard_id.0, index
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "shard {}: failed to read applied entry at index {}: {}",
-                            shard_id.0, index, e
-                        );
+                if index <= last_applied {
+                    // Already processed (duplicate notification or out-of-order)
+                    continue;
+                }
+                let start = if last_applied == 0 || index - last_applied > 100 {
+                    // First notification or large gap (e.g., after restart with
+                    // thousands of pre-existing entries): only process the
+                    // notified index. Old entries were already applied before
+                    // the shard store was created (loaded from RocksDB snapshot).
+                    index
+                } else {
+                    last_applied + 1
+                };
+                for idx in start..=index {
+                    match mgr.read_applied_entry(shard_id, idx).await {
+                        Ok(Some(payload)) => match ShardCommand::deserialize(&payload) {
+                            Ok(cmd) => shard_store.apply_command(cmd),
+                            Err(e) => error!(
+                                "shard {}: failed to deserialize ShardCommand at index {}: {}",
+                                shard_id.0, idx, e
+                            ),
+                        },
+                        Ok(None) => {
+                            // Blank/Membership entries have no payload —
+                            // this is normal, not an error.
+                            debug!(
+                                "shard {}: no applied entry at index {} (Blank/Membership)",
+                                shard_id.0, idx
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                "shard {}: failed to read applied entry at index {}: {}",
+                                shard_id.0, idx, e
+                            );
+                        }
                     }
                 }
+                last_applied = index;
+            }
+        });
+
+        // P3: Leader change watcher — clear MetaCache staging on leadership loss.
+        // When the node loses leadership for this shard, pending staging entries
+        // may not have been committed by the new leader. Clear them to prevent
+        // reads from returning uncommitted data.
+        let meta_cache_for_watcher = self.meta_cache.clone();
+        self.raft_group_manager
+            .spawn_leader_watcher(shard_id, move || {
+                meta_cache_for_watcher.invalidate_all();
+            })
+            .await;
+
+        // P3: Periodic sweep of expired deletion markers (every 60s, TTL 5min).
+        // Prevents unbounded growth of deleted_inodes/deleted_direntries maps
+        // if Raft apply is delayed or a node is isolated.
+        let meta_cache_for_sweep = self.meta_cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                meta_cache_for_sweep.sweep_expired_deletions(std::time::Duration::from_secs(300));
             }
         });
 
@@ -535,26 +724,157 @@ impl MetaShardManager {
             }
         }
 
-        // Phase A: inode record on its own hash-derived shard.
+        // PERF: async_meta_persist mode (default: true)
+        //
+        // When async mode is enabled (default, performance mode):
+        //   CreateInode + AddDirEntry use `propose` (waits for Raft quorum
+        //   commit, ~10ms each) but do NOT wait for apply. This is CRITICAL:
+        //   `propose_ff` (fire-and-forget) with None responder silently drops
+        //   the entry if the node loses leadership or lease expires between
+        //   check_leader and RaftCore processing. A dropped CreateInode means
+        //   the inode never exists, but subsequent UpdateInodeSizeChunks
+        //   (which may succeed on a different leader term) will fail with
+        //   "inode not found" → EIO to the client.
+        //
+        //   By using `propose` (with responder) for CreateInode + AddDirEntry:
+        //   - The entry is guaranteed to be in the committed Raft log
+        //   - If not leader, `propose` returns ForwardToLeader error →
+        //     caller returns STATUS_ERR_REDIRECT → client redirects
+        //   - Apply happens asynchronously (~1-5ms after commit)
+        //   - Lookup retry (20ms in net_handler) handles apply delay
+        //
+        //   UpdateInodeSizeChunks and other non-critical ops still use
+        //   `propose_ff` for maximum throughput. If dropped, the file exists
+        //   but with stale data — client can retry.
+        //
+        // When async mode is disabled (strict mode, POWERFS_ASYNC_META_PERSIST=0):
+        //   Uses `propose` (waits for quorum commit) + apply polling.
+        //   Guarantees the metadata is fully committed and applied before
+        //   returning. Use for苛刻环境 requiring强一致.
+        if self.is_async_meta_persist() {
+            // P3: Async mode with MetaCache staging (方案B).
+            //
+            // Stage the new inode + dir entry in MetaCache BEFORE proposing
+            // to Raft. This makes them immediately visible to reads
+            // (get_inode / lookup_entry check MetaCache first), eliminating
+            // the "file not found" window between create and Raft apply.
+            //
+            // Then use `propose` (wait for quorum COMMIT, NOT apply) for
+            // CreateInode + AddDirEntry. This is critical for correctness:
+            //
+            // - `propose` (wait commit): guarantees data is replicated to
+            //   majority of followers. If leader crashes after commit,
+            //   new leader replays the Raft log → data survives.
+            //   ~10ms latency, acceptable.
+            //
+            // - `propose_ff` (fire-and-forget, NOT waiting commit):
+            //   DANGEROUS for CreateInode/AddDirEntry. If leader crashes
+            //   before commit, the entry is lost. Client received "success"
+            //   but data doesn't exist → "fake success" → "inode not found"
+            //   on subsequent access. This was the root cause of the
+            //   "UpdateInodeSizeChunks failed for inode not found" bug.
+            //
+            // The staging cache bridges the commit→apply gap:
+            //   1. stage_create() → immediately visible to reads
+            //   2. propose() → wait commit (~10ms), data replicated
+            //   3. return success → client reads from staging
+            //   4. (background) Raft apply → ShardStore has data
+            //   5. confirm_create() → staging cleared, ShardStore serves reads
+            //
+            // dirty (setattr) and deleted (unlink) also use `propose`
+            // (synchronous commit) — see their respective methods.
+
+            self.meta_cache
+                .stage_create(info.clone(), parent_inode, name);
+
+            let cmd_ino = ShardCommand::CreateInode {
+                info: Box::new(info),
+            };
+            let cmd_dir = ShardCommand::AddDirEntry {
+                parent_inode,
+                name: name.to_string(),
+                inode,
+            };
+
+            // Use propose (wait commit) for both commands. On error
+            // (e.g., lost leadership), remove staging and return error
+            // so client redirects to new leader.
+            let result: Result<(), String> = if shard_ino == shard_dir {
+                // Same shard: batch both entries into one Raft message.
+                self.raft_group_manager
+                    .propose_many(shard_ino, vec![cmd_ino.serialize(), cmd_dir.serialize()])
+                    .await
+                    .map(|_| ())
+            } else {
+                // Cross-shard: different Raft groups, cannot batch.
+                // Sequential propose: first CreateInode, then AddDirEntry.
+                match self
+                    .raft_group_manager
+                    .propose(shard_ino, cmd_ino.serialize())
+                    .await
+                {
+                    Ok(_) => self
+                        .raft_group_manager
+                        .propose(shard_dir, cmd_dir.serialize())
+                        .await
+                        .map(|_| ()),
+                    Err(e) => Err(e),
+                }
+            };
+
+            if let Err(e) = result {
+                // Propose failed (lost leadership, network error, etc.)
+                // Remove staging entries — they are NOT committed.
+                // Client will receive error and redirect to new leader.
+                warn!(
+                    "create async(staged): propose FAILED for inode={} parent={} name={}: {} — removing staging, client will retry",
+                    inode, parent_inode, name, e
+                );
+                self.meta_cache
+                    .invalidate_staging(inode, parent_inode, name);
+                return Err(e);
+            }
+
+            info!(
+                "create async(staged): inode={} parent={} name={} staged + committed to shard(s) {}{} (apply pending)",
+                inode, parent_inode, name, shard_ino.0,
+                if shard_ino != shard_dir { format!("+{}", shard_dir.0) } else { String::new() }
+            );
+            return Ok(());
+        }
+
+        // Strict mode: synchronous propose (waits for quorum commit) + apply wait
+        //
+        // Optimization: when shard_ino == shard_dir, use `propose_many` to batch
+        // both entries, then poll only one store for apply (both entries land in
+        // the same shard store).
+
         let cmd_ino = ShardCommand::CreateInode {
             info: Box::new(info.clone()),
         };
-        self.raft_group_manager
-            .propose(shard_ino, cmd_ino.serialize())
-            .await?;
-
-        // Phase B: dir entry on the parent's shard.
         let cmd_dir = ShardCommand::AddDirEntry {
             parent_inode,
             name: name.to_string(),
             inode,
         };
-        self.raft_group_manager
-            .propose(shard_dir, cmd_dir.serialize())
-            .await?;
 
-        // Wait for the inode record to be visible on shard_ino (its
-        // authoritative location). Subsequent getattr/setattr/update_size
+        if shard_ino == shard_dir {
+            // Same shard: batch both entries into one Raft message.
+            self.raft_group_manager
+                .propose_many(shard_ino, vec![cmd_ino.serialize(), cmd_dir.serialize()])
+                .await?;
+        } else {
+            // Cross-shard: sequential propose to two Raft groups.
+            self.raft_group_manager
+                .propose(shard_ino, cmd_ino.serialize())
+                .await?;
+            self.raft_group_manager
+                .propose(shard_dir, cmd_dir.serialize())
+                .await?;
+        }
+
+        // Strict mode: Wait for the inode record to be visible on shard_ino
+        // (its authoritative location). Subsequent getattr/setattr/update_size
         // route by calculate_shard(inode), so this is the only store we
         // need to poll. Poll up to 5s to absorb propose-forwarding latency.
         let shard_store = {
@@ -565,14 +885,14 @@ impl MetaShardManager {
                 .clone()
         };
         let mut retries = 0;
-        while retries < 100 {
+        while retries < 2500 {
             if shard_store.get_inode(inode).is_some() {
                 break;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
             retries += 1;
         }
-        if retries >= 100 {
+        if retries >= 2500 {
             return Err("create: timeout waiting for inode apply".to_string());
         }
 
@@ -588,11 +908,11 @@ impl MetaShardManager {
                 .clone()
         };
         let mut retries = 0;
-        while retries < 100 {
+        while retries < 2500 {
             if dir_store.get_dir_entry_inode(parent_inode, name).is_some() {
                 return Ok(());
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
             retries += 1;
         }
         Err("create: timeout waiting for dir_entry apply".to_string())
@@ -602,9 +922,7 @@ impl MetaShardManager {
         let shard_id = self.shard_strategy.calculate_shard(inode);
 
         let cmd = ShardCommand::UpdateFile { inode, size, mtime };
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
         Ok(())
     }
@@ -694,6 +1012,15 @@ impl MetaShardManager {
         name: &str,
         inode: u64,
     ) -> Result<(), String> {
+        // Stage the deletion BEFORE proposing Raft so the entry becomes
+        // immediately invisible to subsequent reads (POSIX semantics on the
+        // same client). MetaCache Deleted markers are swept after Raft
+        // apply confirms RemoveDirEntry/DeleteInode; if propose fails, we
+        // fall back to ShardStore (stale Deleted markers never win over
+        // live entries on a propose failure because lookup/getattr call
+        // `get_dir_entry_inode`/`get_inode` after MetaCache misses).
+        self.meta_cache.stage_delete(parent_inode, name, inode);
+
         let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
         let shard_ino = self.shard_strategy.calculate_shard(inode);
 
@@ -702,12 +1029,28 @@ impl MetaShardManager {
             parent_inode,
             name: name.to_string(),
         };
-        self.raft_group_manager
-            .propose(shard_dir, cmd_dir.serialize())
-            .await?;
+        self.propose_meta(shard_dir, cmd_dir.serialize()).await?;
 
-        self.wait_for_entry_removed(shard_dir, parent_inode, name)
-            .await;
+        // Also drop the cross-shard DirStatSummary (if any) from the parent
+        // shard. Unlink/rmdir means ls on parent must not show a stale cached
+        // summary for a name that no longer exists. Routed via the same
+        // parent_shard — still no service-to-service forwarding.
+        let cmd_summary = ShardCommand::DeleteChildSummary {
+            parent_inode,
+            name: name.to_string(),
+        };
+        if let Err(e) = self.propose_meta(shard_dir, cmd_summary.serialize()).await {
+            warn!(
+                "propose_remove_direntry: DeleteChildSummary propose failed (non-fatal) \
+                 parent={} name={}: {}",
+                parent_inode, name, e
+            );
+        }
+
+        if !self.is_async_meta_persist() {
+            self.wait_for_entry_removed(shard_dir, parent_inode, name)
+                .await;
+        }
 
         // Phase B: Check nlink to decide between DecrementNlink and DeleteInode.
         // For hardlinks (nlink > 1), only decrement nlink so other links survive.
@@ -725,11 +1068,7 @@ impl MetaShardManager {
             // Hardlink: decrement nlink, keep inode alive for remaining links.
             let expected_nlink = nlink - 1;
             let cmd = ShardCommand::DecrementNlink { inode };
-            if let Err(e) = self
-                .raft_group_manager
-                .propose(shard_ino, cmd.serialize())
-                .await
-            {
+            if let Err(e) = self.propose_meta(shard_ino, cmd.serialize()).await {
                 log::warn!(
                     "DecrementNlink propose failed for inode {} on shard {}: {}. \
                      Dir entry already removed; nlink may be stale.",
@@ -742,17 +1081,15 @@ impl MetaShardManager {
                 // Without this wait, a subsequent getattr may read the stale
                 // nlink value (before decrement), causing T5.04 intermittent
                 // failures (expected nlink=1, actual nlink=2).
-                self.wait_for_nlink(shard_ino, inode, expected_nlink).await;
+                if !self.is_async_meta_persist() {
+                    self.wait_for_nlink(shard_ino, inode, expected_nlink).await;
+                }
             }
         } else {
             // Last link: delete the inode record. Best-effort: if this fails,
             // GC will collect the orphan inode later.
             let cmd_ino = ShardCommand::DeleteInode { inode };
-            if let Err(e) = self
-                .raft_group_manager
-                .propose(shard_ino, cmd_ino.serialize())
-                .await
-            {
+            if let Err(e) = self.propose_meta(shard_ino, cmd_ino.serialize()).await {
                 log::warn!(
                     "DeleteInode propose failed for inode {} on shard {}: {}. \
                      Dir entry already removed; inode will be GC'd.",
@@ -764,6 +1101,170 @@ impl MetaShardManager {
         }
 
         Ok(())
+    }
+
+    /// Batch delete multiple files in one RPC, using `propose_many` to merge
+    /// all Raft commits into minimal replication cycles.
+    ///
+    /// All entries must share the same `parent_inode` shard (caller groups by
+    /// shard). The optimization:
+    /// - Phase A: all `RemoveDirEntry` commands go to the same `shard_dir`
+    ///   (same parent → same shard) → **one** `propose_many` call.
+    /// - Phase B: `DeleteInode`/`DecrementNlink` commands are grouped by
+    ///   `shard_ino` → **one** `propose_many` per distinct inode shard.
+    ///
+    /// For N entries on the same shard, this reduces Raft commits from 2N
+    /// (sequential `delete_file`) to 2 (one for dir entries, one for inodes).
+    ///
+    /// Returns per-entry `Result<(), String>`. Entry indices match input order.
+    pub async fn batch_delete_files(&self, entries: &[(u64, String)]) -> Vec<Result<(), String>> {
+        let n = entries.len();
+        let mut results = vec![Ok(()); n];
+
+        // Step 1: Resolve all inodes from dir entries (read-only, no Raft).
+        // Track which entries resolved successfully.
+        let mut resolved: Vec<(usize, u64, u64, String)> = Vec::with_capacity(n);
+        // (entry_idx, parent_inode, inode, name)
+
+        let shard_dir = self.shard_strategy.calculate_shard(entries[0].0);
+        {
+            let stores = self.shard_stores.read().unwrap();
+            let shard_store = match stores.get(&shard_dir) {
+                Some(s) => s,
+                None => {
+                    // Entire batch fails — shard not found.
+                    let err = format!("shard {} not found", shard_dir.0);
+                    return vec![Err(err); n];
+                }
+            };
+            for (idx, (parent_inode, name)) in entries.iter().enumerate() {
+                match shard_store.get_dir_entry_inode(*parent_inode, name) {
+                    Some(inode) => {
+                        resolved.push((idx, *parent_inode, inode, name.clone()));
+                    }
+                    None => {
+                        results[idx] = Err("file not found".to_string());
+                    }
+                }
+            }
+        }
+
+        if resolved.is_empty() {
+            return results;
+        }
+
+        // Stage all deletions BEFORE the Raft propose so subsequent reads
+        // on this filer immediately return ENOENT (matches POSIX semantics
+        // for a single client thread that unlinks then stats).
+        for (_, parent_inode, inode, name) in &resolved {
+            self.meta_cache.stage_delete(*parent_inode, name, *inode);
+        }
+
+        // Step 2: Batch all RemoveDirEntry commands into one propose_many on
+        // shard_dir. All entries share the same parent → same shard_dir.
+        // Pair each RemoveDirEntry with a DeleteChildSummary so stale
+        // cross-shard stat summaries are cleared with the dentry.
+        let mut dir_cmds: Vec<Vec<u8>> = Vec::with_capacity(resolved.len() * 2);
+        for (_, parent_inode, _, name) in &resolved {
+            dir_cmds.push(
+                ShardCommand::RemoveDirEntry {
+                    parent_inode: *parent_inode,
+                    name: name.clone(),
+                }
+                .serialize(),
+            );
+            dir_cmds.push(
+                ShardCommand::DeleteChildSummary {
+                    parent_inode: *parent_inode,
+                    name: name.clone(),
+                }
+                .serialize(),
+            );
+        }
+
+        match self
+            .raft_group_manager
+            .propose_many(shard_dir, dir_cmds)
+            .await
+        {
+            Ok(_) => {
+                debug!(
+                    "batch_delete: Phase A committed {} RemoveDirEntry + {} DeleteChildSummary cmds to shard {}",
+                    resolved.len(),
+                    resolved.len(),
+                    shard_dir.0
+                );
+            }
+            Err(e) => {
+                // If not leader, fail entire batch — caller should redirect.
+                warn!(
+                    "batch_delete: Phase A propose_many failed for shard {}: {}",
+                    shard_dir.0, e
+                );
+                for (idx, _, _, _) in &resolved {
+                    results[*idx] = Err(e.clone());
+                }
+                return results;
+            }
+        }
+
+        // Step 3: Check nlink for each resolved inode, group by shard_ino.
+        // Same-shard inodes go into one propose_many.
+        let mut inode_groups: HashMap<ShardId, Vec<(usize, u64, u32)>> = HashMap::new();
+        // (entry_idx, inode, nlink)
+
+        for (idx, _, inode, _) in &resolved {
+            let shard_ino = self.shard_strategy.calculate_shard(*inode);
+            let nlink = {
+                let stores = self.shard_stores.read().unwrap();
+                stores
+                    .get(&shard_ino)
+                    .and_then(|s| s.get_inode(*inode).map(|info| info.nlink))
+                    .unwrap_or(0)
+            };
+            inode_groups
+                .entry(shard_ino)
+                .or_default()
+                .push((*idx, *inode, nlink));
+        }
+
+        // Step 4: For each inode shard, batch DeleteInode/DecrementNlink.
+        for (shard_ino, group) in &inode_groups {
+            let cmds: Vec<Vec<u8>> = group
+                .iter()
+                .map(|(_, inode, nlink)| {
+                    if *nlink > 1 {
+                        ShardCommand::DecrementNlink { inode: *inode }.serialize()
+                    } else {
+                        ShardCommand::DeleteInode { inode: *inode }.serialize()
+                    }
+                })
+                .collect();
+
+            match self.raft_group_manager.propose_many(*shard_ino, cmds).await {
+                Ok(_) => {
+                    debug!(
+                        "batch_delete: Phase B committed {} inode ops to shard {}",
+                        group.len(),
+                        shard_ino.0
+                    );
+                }
+                Err(e) => {
+                    // Phase A succeeded (dir entries removed) but Phase B
+                    // failed. Inodes are orphaned — GC will clean them up.
+                    // Surface success to caller (file is invisible to users).
+                    warn!(
+                        "batch_delete: Phase B propose_many failed for shard {}: {} \
+                         — {} inodes orphaned, GC will reclaim",
+                        shard_ino.0,
+                        e,
+                        group.len()
+                    );
+                }
+            }
+        }
+
+        results
     }
 
     /// Poll the shard store until the inode's nlink reaches `expected`, or
@@ -797,6 +1298,13 @@ impl MetaShardManager {
         &self,
         parent_inode: u64,
         name: &str,
+        // P3.1: Real mode/uid/gid from the client, embedded directly in the
+        // CreateInode command. This eliminates the follow-up SetAttr propose
+        // in handle_mkdir (handle_mkdir_phase_a already had its own params so
+        // it does not need updating).
+        mode: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<InodeInfo, String> {
         // Phase 3: Allocate the directory's inode on a different shard from
         // the parent. The dir_entry goes on the parent's shard (so lookup
@@ -807,6 +1315,12 @@ impl MetaShardManager {
         let target_shard = self.pick_child_dir_shard(parent_shard);
         let inode = self.alloc_inode_in_shard(target_shard);
         let now = chrono::Utc::now().timestamp() as u64;
+        // Ensure S_IFDIR bit is set even if caller only provided perms.
+        let dir_mode = if mode & 0o170000 != 0 {
+            mode
+        } else {
+            mode | 0o040000
+        };
         let info = InodeInfo {
             inode,
             name: name.to_string(),
@@ -816,9 +1330,9 @@ impl MetaShardManager {
             mtime: now,
             atime: now,
             ctime: now,
-            mode: 0o040755,
-            uid: 0,
-            gid: 0,
+            mode: dir_mode,
+            uid,
+            gid,
             blocks: 0,
             fid: None,
             volume_id: None,
@@ -840,6 +1354,174 @@ impl MetaShardManager {
             .await?;
 
         Ok(info)
+    }
+
+    /// Phase A of two-phase mkdir: create ONLY the inode record on target_shard.
+    ///
+    /// Called by `handle_mkdir_phase_a` when the client routes the request to
+    /// target_shard's leader. This creates the directory inode record but does
+    /// NOT add the dir entry (that's Phase B on parent_shard).
+    ///
+    /// The inode is pre-allocated by the client via `alloc_inode_batch`, so we
+    /// just propose the CreateInode command to Raft.
+    ///
+    /// Returns the InodeInfo on success.
+    /// See docs/shard-routing-no-forward-principle.md §3
+    pub async fn create_directory_phase_a(
+        &self,
+        ino: u64,
+        parent_inode: u64,
+        name: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<InodeInfo, String> {
+        let target_shard = self.shard_strategy.calculate_shard(ino);
+
+        // Verify shard store exists
+        {
+            let stores = self.shard_stores.read().unwrap();
+            if stores.get(&target_shard).is_none() {
+                return Err(format!("shard {} not found", target_shard.0));
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let dir_mode = (mode & 0o7777) | 0o040000;
+        let info = InodeInfo {
+            inode: ino,
+            name: name.to_string(),
+            parent_inode,
+            file_type: FileType::Directory,
+            size: 0,
+            mtime: now,
+            atime: now,
+            ctime: now,
+            mode: dir_mode,
+            uid,
+            gid,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: vec![],
+            inline_data: None,
+            extended: HashMap::new(),
+            symlink_target: None,
+            nlink: 2,
+            version: 0,
+            delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
+        };
+
+        // Propose ONLY CreateInode (no AddDirEntry — that's Phase B).
+        // Use propose_meta_commit (wait for Raft commit) — propose_ff would
+        // silently drop the entry if leadership changes, leaving an orphan
+        // inode that Phase B's AddDirEntry points to → EIO on lookup.
+        let cmd = ShardCommand::CreateInode {
+            info: Box::new(info.clone()),
+        };
+        self.propose_meta_commit(target_shard, cmd.serialize())
+            .await?;
+
+        debug!(
+            "mkdir phase A: inode={} parent={} name={} shard={} (CreateInode only)",
+            ino, parent_inode, name, target_shard.0
+        );
+
+        Ok(info)
+    }
+
+    /// Phase B of two-phase mkdir: add ONLY the dir entry on parent_shard.
+    ///
+    /// Called by `handle_mkdir_phase_b` when the client routes the request to
+    /// parent_shard's leader. This adds the directory entry pointing to the
+    /// inode created in Phase A. It does NOT create the inode record (that was
+    /// Phase A on target_shard).
+    ///
+    /// Along with AddDirEntry, we atomically (in Raft log order) persist a
+    /// DirStatSummary for the new child on the PARENT shard. This enables
+    /// `ls -l` on a cross-shard directory to return mode/uid/gid/size/mtime
+    /// locally without an extra RPC to the child shard (see docs/metacache.md §3.2).
+    ///
+    /// Returns Ok(()) on success.
+    /// See docs/shard-routing-no-forward-principle.md §3
+    pub async fn create_directory_phase_b(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        ino: u64,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(), String> {
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+        let child_shard = self.shard_strategy.calculate_shard(ino);
+
+        // Verify shard store exists
+        {
+            let stores = self.shard_stores.read().unwrap();
+            if stores.get(&parent_shard).is_none() {
+                return Err(format!("shard {} not found", parent_shard.0));
+            }
+        }
+
+        // Propose AddDirEntry first — the canonical dentry is required for
+        // the lookup path even if the summary goes missing (a reader will
+        // just fall back to the child shard and backfill).
+        let cmd = ShardCommand::AddDirEntry {
+            parent_inode,
+            name: name.to_string(),
+            inode: ino,
+        };
+        self.propose_meta_commit(parent_shard, cmd.serialize())
+            .await?;
+
+        // Now drop the DirStatSummary on the same parent shard leader.
+        // `version_ts` uses millisecond wall clock; we only need monotonic
+        // ordering per-child and in practice the same filer never proposes
+        // two summaries for a single mkdir in reverse order.
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let summary = crate::shard_store::DirStatSummary {
+            child_inode: ino,
+            mode_and_type: (mode & 0o7777) | 0o040000,
+            uid,
+            gid,
+            size: 0,
+            mtime: now_ms / 1000,
+            ctime: now_ms / 1000,
+            atime: now_ms / 1000,
+            nlink: 2,
+            child_shard_id: child_shard.0,
+            version_ts: now_ms,
+        };
+        let summary_cmd = ShardCommand::UpdateChildSummary {
+            parent_inode,
+            name: name.to_string(),
+            summary,
+        };
+        // Fire-and-forget commit: even if this secondary Raft fails, the
+        // dentry is already committed; reader backfill will re-populate the
+        // summary lazily on first miss.
+        if let Err(e) = self
+            .propose_meta_commit(parent_shard, summary_cmd.serialize())
+            .await
+        {
+            warn!(
+                "mkdir phase B: UpdateChildSummary parent={} name={} ino={} propose failed (non-fatal): {}",
+                parent_inode, name, ino, e
+            );
+        }
+
+        debug!(
+            "mkdir phase B: inode={} parent={} name={} shard={} (AddDirEntry + UpdateChildSummary child_shard={})",
+            ino, parent_inode, name, parent_shard.0, child_shard.0
+        );
+
+        Ok(())
     }
 
     /// Create directory for a given path, auto-creating parent directories (mkdir -p behavior)
@@ -867,7 +1549,9 @@ impl MetaShardManager {
                 current_inode = ino;
             } else {
                 // Create this directory component
-                let info = self.create_directory(current_inode, part).await?;
+                let info = self
+                    .create_directory(current_inode, part, 0o040755, 0, 0)
+                    .await?;
                 current_inode = info.inode;
             }
         }
@@ -925,12 +1609,12 @@ impl MetaShardManager {
                 new_name: new_name.to_string(),
             };
 
-            self.raft_group_manager
-                .propose(old_shard, cmd.serialize())
-                .await?;
+            self.propose_meta(old_shard, cmd.serialize()).await?;
 
-            self.wait_for_entry_appeared(old_shard, new_parent_inode, new_name)
-                .await;
+            if !self.is_async_meta_persist() {
+                self.wait_for_entry_appeared(old_shard, new_parent_inode, new_name)
+                    .await;
+            }
             Ok(())
         } else {
             // Cross-shard rename: decompose into AddDirEntry + RemoveDirEntry
@@ -955,22 +1639,22 @@ impl MetaShardManager {
                 name: new_name.to_string(),
                 inode,
             };
-            self.raft_group_manager
-                .propose(new_shard, add_cmd.serialize())
-                .await?;
-            self.wait_for_entry_appeared(new_shard, new_parent_inode, new_name)
-                .await;
+            self.propose_meta(new_shard, add_cmd.serialize()).await?;
+            if !self.is_async_meta_persist() {
+                self.wait_for_entry_appeared(new_shard, new_parent_inode, new_name)
+                    .await;
+            }
 
             // Phase C: RemoveDirEntry on old_parent's shard
             let rem_cmd = ShardCommand::RemoveDirEntry {
                 parent_inode: old_parent_inode,
                 name: old_name.to_string(),
             };
-            self.raft_group_manager
-                .propose(old_shard, rem_cmd.serialize())
-                .await?;
-            self.wait_for_entry_removed(old_shard, old_parent_inode, old_name)
-                .await;
+            self.propose_meta(old_shard, rem_cmd.serialize()).await?;
+            if !self.is_async_meta_persist() {
+                self.wait_for_entry_removed(old_shard, old_parent_inode, old_name)
+                    .await;
+            }
 
             // Phase D: RenameInode on inode's shard (update name + parent)
             let inode_shard = self.shard_strategy.calculate_shard(inode);
@@ -979,11 +1663,7 @@ impl MetaShardManager {
                 new_name: new_name.to_string(),
                 new_parent_inode,
             };
-            if let Err(e) = self
-                .raft_group_manager
-                .propose(inode_shard, rename_cmd.serialize())
-                .await
-            {
+            if let Err(e) = self.propose_meta(inode_shard, rename_cmd.serialize()).await {
                 log::warn!(
                     "cross-shard rename: RenameInode proposal failed (dir entries already moved): {}",
                     e
@@ -1003,10 +1683,7 @@ impl MetaShardManager {
                     mtime: Some(now),
                     atime: Some(now),
                 };
-                let _ = self
-                    .raft_group_manager
-                    .propose(p_shard, attr_cmd.serialize())
-                    .await;
+                let _ = self.propose_meta(p_shard, attr_cmd.serialize()).await;
             }
 
             Ok(())
@@ -1117,16 +1794,25 @@ impl MetaShardManager {
     }
 
     pub fn get_inode(&self, inode: u64) -> Option<InodeInfo> {
-        // Inode records are stored on the shard derived from the inode itself
-        // (calculate_shard(inode)). create_file() and create_directory() now
-        // propose the inode record separately from the dir entry, so each
-        // lands on its correct shard. No multi-shard scan is needed.
+        // P3: Check MetaCache first (Staging/Dirty/Clean entries, plus Deleted
+        // marker for pending unlinks). If the entry is already there, return
+        // directly — skips a RocksDB round-trip + deserialization.
+        if let Some(cached_result) = self.meta_cache.get_inode(inode) {
+            return cached_result;
+        }
+
+        // Cache miss → fetch from ShardStore and write back as Clean so the
+        // next lookup hits the fast path.
         let shard_id = self.shard_strategy.calculate_shard(inode);
 
         let stores = self.shard_stores.read().unwrap();
         let shard_store = stores.get(&shard_id)?;
 
-        shard_store.get_inode(inode)
+        let info = shard_store.get_inode(inode)?;
+        if info.delete_time == 0 {
+            self.meta_cache.cache_put_clean(info.clone());
+        }
+        Some(info)
     }
 
     /// 遍历所有 shard 的所有 inode, 收集 chunk 映射 (needle_id, volume_id).
@@ -1267,7 +1953,25 @@ impl MetaShardManager {
         }
 
         // Cross-shard path: resolve each inode from its own shard.
+        //
+        // Fallback #1 (remote / offline shard): when stores.get(inode_shard)
+        // returns None (this filer doesn't own the child shard) OR
+        // get_inode_metadata returns None (e.g. inode was created by Phase A
+        // but Phase B hasn't replicated to every local follower yet, or the
+        // shard is currently on a different filer), we use the
+        // DirStatSummary cached on the parent shard via child_summaries —
+        // this is exactly the fast-path the cross-shard summary design was
+        // built for: we can still return mode/uid/gid/size/mtime back to
+        // FUSE without a round-trip to the child shard's leader. The
+        // child_shard_id still comes from calculate_shard so callers can
+        // route SetAttr / other ops correctly.
+        //
+        // Fallback #2 (no summary either): drop the entry from the returned
+        // list. The FUSE client will later re-lookup that specific name if
+        // the user calls stat(), which triggers a proper per-child getattr
+        // that routes to the correct shard (no forwarding).
         let stores = self.shard_stores.read().unwrap();
+        let parent_store = stores.get(&parent_shard);
         let mut result = Vec::with_capacity(limit + 1);
 
         for (name, inode) in pairs {
@@ -1275,22 +1979,49 @@ impl MetaShardManager {
                 break;
             }
             let inode_shard = self.shard_strategy.calculate_shard(inode);
-            if let Some(shard_store) = stores.get(&inode_shard) {
-                if let Some(meta) = shard_store.get_inode_metadata(inode) {
-                    result.push(DirEntry {
-                        inode,
-                        name,
-                        mode: meta.mode,
-                        uid: meta.uid,
-                        gid: meta.gid,
-                        size: meta.size,
-                        atime: meta.atime,
-                        mtime: meta.mtime,
-                        ctime: meta.ctime,
-                        nlink: meta.nlink,
-                    });
-                }
+            // Try local child shard store first (covers same-filer
+            // multi-shard ownership, or a follower that has applied the
+            // CreateInode locally).
+            let meta = stores
+                .get(&inode_shard)
+                .and_then(|ss| ss.get_inode_metadata(inode));
+            if let Some(meta) = meta {
+                result.push(DirEntry {
+                    inode,
+                    name,
+                    mode: meta.mode,
+                    uid: meta.uid,
+                    gid: meta.gid,
+                    size: meta.size,
+                    atime: meta.atime,
+                    mtime: meta.mtime,
+                    ctime: meta.ctime,
+                    nlink: meta.nlink,
+                });
+                continue;
             }
+            // Fallback: parent shard cached DirStatSummary (written during
+            // mkdir Phase B's UpdateChildSummary apply on this leader).
+            let summary = parent_store.and_then(|ps| ps.get_child_summary(parent_inode, &name));
+            if let Some(s) = summary {
+                result.push(DirEntry {
+                    inode,
+                    name,
+                    mode: s.mode_and_type,
+                    uid: s.uid,
+                    gid: s.gid,
+                    size: s.size,
+                    atime: s.atime,
+                    mtime: s.mtime,
+                    ctime: s.ctime,
+                    nlink: s.nlink,
+                });
+                continue;
+            }
+            // No local info available — drop from this page. Callers will
+            // trigger a per-name getattr if a user actually queries that
+            // entry (e.g. `ls -l` does a per-entry stat after readdir, so
+            // each missing attr still gets routed to the owning shard).
         }
 
         // has_more if we fetched limit+1 pairs (more entries in BTreeMap)
@@ -1344,6 +2075,19 @@ impl MetaShardManager {
     pub fn get_shard_stats(&self, shard_id: ShardId) -> Option<ShardStats> {
         let stores = self.shard_stores.read().unwrap();
         stores.get(&shard_id).map(|s| s.get_stats())
+    }
+
+    /// Phase 5 §5.3: borrow a shard's `ShardStore` for direct
+    /// RocksDB access (used by `RaftLeasePersistence` for local
+    /// reads of `CF_LEASES`). Returns `None` if the shard isn't
+    /// initialized on this node.
+    ///
+    /// Sync variant of [`get_shard_store`]: that one is async and
+    /// creates the shard on-demand; this one is for callers that
+    /// already know the shard exists (the filer at startup) and
+    /// want a non-async path.
+    pub fn try_get_shard_store(&self, shard_id: ShardId) -> Option<Arc<ShardStore>> {
+        self.shard_stores.read().unwrap().get(&shard_id).cloned()
     }
 
     pub fn list_shards(&self) -> Vec<ShardId> {
@@ -1505,6 +2249,12 @@ impl MetaShardManager {
         // `calculate_shard(parent_inode)`. Kept in the signature so FUSE
         // clients that still pass `ShardId(parent)` do not break.
         _shard_id: ShardId,
+        // P3.1: Real mode/uid/gid from the client, embedded directly into
+        // the CreateInode command so we eliminate the follow-up SetAttr
+        // propose. Eliminates one Raft round-trip per create().
+        mode: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<u64, String> {
         let t0 = std::time::Instant::now();
 
@@ -1522,9 +2272,14 @@ impl MetaShardManager {
             mtime: now,
             atime: now,
             ctime: now,
-            mode: 0o100644,
-            uid: 0,
-            gid: 0,
+            // Ensure S_IFREG is set even if the caller only passed permission bits
+            mode: if mode & 0o170000 != 0 {
+                mode
+            } else {
+                mode | 0o100000
+            },
+            uid,
+            gid,
             blocks: 0,
             fid: None,
             volume_id: None,
@@ -1546,9 +2301,12 @@ impl MetaShardManager {
             .await?;
 
         log::info!(
-            "create_file_with_shard latency: total={}ms, inode={}",
+            "create_file_with_shard latency: total={}ms, inode={}, mode={:o}, uid={}, gid={}",
             t0.elapsed().as_millis(),
-            inode
+            inode,
+            mode,
+            uid,
+            gid
         );
         Ok(inode)
     }
@@ -1614,9 +2372,7 @@ impl MetaShardManager {
             size,
             mtime: chrono::Utc::now().timestamp_millis() as u64 * 1_000_000,
         };
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
         Ok(())
     }
 
@@ -1637,12 +2393,12 @@ impl MetaShardManager {
                 new_name: new_name.to_string(),
             };
 
-            self.raft_group_manager
-                .propose(old_shard_id, cmd.serialize())
-                .await?;
+            self.propose_meta(old_shard_id, cmd.serialize()).await?;
 
-            self.wait_for_entry_appeared(old_shard_id, new_parent_ino, new_name)
-                .await;
+            if !self.is_async_meta_persist() {
+                self.wait_for_entry_appeared(old_shard_id, new_parent_ino, new_name)
+                    .await;
+            }
             Ok(())
         } else {
             Err("cross-shard rename not supported yet".to_string())
@@ -1662,6 +2418,37 @@ impl MetaShardManager {
         mtime: Option<u64>,
         atime: Option<u64>,
     ) -> Result<(), String> {
+        // MetaCache Dirty write-through: apply the caller's intended values to
+        // the cached copy BEFORE the Raft propose. Subsequent getattrs on this
+        // filer see the new mode/uid/... immediately (no stale reads between
+        // propose and apply). The Dirty flag is demoted to Clean once ShardStore
+        // apply confirms via confirm_dirty().
+        let current_for_dirty = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).and_then(|s| s.get_inode(inode))
+        };
+        let meta_cache = self.meta_cache.clone();
+        meta_cache.mark_dirty(inode, current_for_dirty, |info| {
+            if let Some(sz) = size {
+                info.size = sz;
+            }
+            if let Some(m) = mode {
+                info.mode = (m as u32) & 0o7777;
+            }
+            if let Some(u) = uid {
+                info.uid = u as u32;
+            }
+            if let Some(g) = gid {
+                info.gid = g as u32;
+            }
+            if let Some(mt) = mtime {
+                info.mtime = mt;
+            }
+            if let Some(at) = atime {
+                info.atime = at;
+            }
+        });
+
         let cmd = ShardCommand::SetAttr {
             inode,
             size,
@@ -1672,20 +2459,24 @@ impl MetaShardManager {
             atime,
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for the command to be applied to the state machine.
-        // Must check ALL changed fields (mode, uid, gid, size), not just mode,
-        // otherwise chown (UID|GID only) returns before Raft applies the change,
-        // causing subsequent GetAttr to read stale data.
-        if mode.is_some()
-            || uid.is_some()
-            || gid.is_some()
-            || size.is_some()
-            || mtime.is_some()
-            || atime.is_some()
+        // Strict mode only: Wait for the command to be applied to the state
+        // machine. Must check ALL changed fields (mode, uid, gid, size), not
+        // just mode, otherwise chown (UID|GID only) returns before Raft
+        // applies the change, causing subsequent GetAttr to read stale data.
+        //
+        // In async mode (default), skip the wait — propose_meta already
+        // returned after submitting to RaftCore (fire-and-forget). Apply
+        // happens asynchronously; readers use retry logic in net_handler
+        // (handle_lookup/handle_getattr) to absorb the visibility gap.
+        if !self.is_async_meta_persist()
+            && (mode.is_some()
+                || uid.is_some()
+                || gid.is_some()
+                || size.is_some()
+                || mtime.is_some()
+                || atime.is_some())
         {
             let store = {
                 let stores = self.shard_stores.read().unwrap();
@@ -1733,30 +2524,52 @@ impl MetaShardManager {
         shard_id: ShardId,
         size: Option<u64>,
     ) -> Result<(), String> {
+        // MetaCache Dirty write-through for size (same rationale as setattr()).
+        let current_for_dirty = {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).and_then(|s| s.get_inode(inode))
+        };
+        self.meta_cache
+            .mark_dirty(inode, current_for_dirty, |info| {
+                if let Some(sz) = size {
+                    info.size = sz;
+                }
+            });
+
         let cmd = ShardCommand::SetAttrData { inode, size };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for the command to be applied
-        if let Some(expected_size) = size {
-            let store = {
-                let stores = self.shard_stores.read().unwrap();
-                stores.get(&shard_id).cloned()
-            };
-            if let Some(store) = store {
-                let mut retries = 0;
-                while retries < 20 {
-                    if let Some(info) = store.get_inode(inode) {
-                        if info.size == expected_size {
-                            return Ok(());
+        // Strict mode only: Wait for the command to be applied.
+        //
+        // In async mode (default), propose_meta fire-and-forget returns
+        // immediately after submitting to RaftCore. The size update will
+        // commit and apply asynchronously. Readers (handle_getattr) retry
+        // briefly to absorb the visibility gap.
+        //
+        // Trade-off: if leader crashes before commit, the size update is
+        // lost. For performance mode this is acceptable — the FUSE client's
+        // write path already persists data chunks to volume servers; only
+        // the inode size metadata may be stale until Raft catches up.
+        if !self.is_async_meta_persist() {
+            if let Some(expected_size) = size {
+                let store = {
+                    let stores = self.shard_stores.read().unwrap();
+                    stores.get(&shard_id).cloned()
+                };
+                if let Some(store) = store {
+                    let mut retries = 0;
+                    while retries < 20 {
+                        if let Some(info) = store.get_inode(inode) {
+                            if info.size == expected_size {
+                                return Ok(());
+                            }
                         }
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                        retries += 1;
                     }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                    retries += 1;
+                    return Err("setattr_data timeout waiting for apply".to_string());
                 }
-                return Err("setattr_data timeout waiting for apply".to_string());
             }
         }
 
@@ -1874,7 +2687,14 @@ impl MetaShardManager {
         }
         inode_info.version = timestamp;
 
+        // MetaCache Dirty write-through for setattr_meta: the CRDT merged
+        // value is what we intend; Raft apply confirms it via SetAttrMeta
+        // handler.
+        let merged_copy = inode_info.clone();
         store.update_inode(inode_info)?;
+        self.meta_cache.mark_dirty(inode, Some(merged_copy), |_| {
+            // merged_copy already reflects the final state; no further change.
+        });
 
         debug!(
             "setattr_meta CRDT merged: inode={}, mode={:?}, uid={:?}, gid={:?}, client={}, ts={}",
@@ -1905,27 +2725,28 @@ impl MetaShardManager {
             size,
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for the command to be applied
-        let store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores.get(&shard_id).cloned()
-        };
-        if let Some(store) = store {
-            let mut retries = 0;
-            while retries < 20 {
-                if let Some(info) = store.get_inode(inode) {
-                    if info.fid.is_some() && !info.chunks.is_empty() {
-                        return Ok(());
+        // Strict mode only: Wait for the command to be applied.
+        // In async mode, propose_meta returns immediately; readers retry.
+        if !self.is_async_meta_persist() {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(store) = store {
+                let mut retries = 0;
+                while retries < 20 {
+                    if let Some(info) = store.get_inode(inode) {
+                        if info.fid.is_some() && !info.chunks.is_empty() {
+                            return Ok(());
+                        }
                     }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    retries += 1;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                retries += 1;
+                return Err("set_chunks timeout waiting for apply".to_string());
             }
-            return Err("set_chunks timeout waiting for apply".to_string());
         }
 
         Ok(())
@@ -1946,27 +2767,28 @@ impl MetaShardManager {
             value,
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for the command to be applied
-        let store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores.get(&shard_id).cloned()
-        };
-        if let Some(store) = store {
-            let mut retries = 0;
-            while retries < 20 {
-                if let Some(info) = store.get_inode(inode) {
-                    if info.extended.contains_key(key) {
-                        return Ok(());
+        // Strict mode only: Wait for the command to be applied.
+        // In async mode, propose_meta returns immediately; readers retry.
+        if !self.is_async_meta_persist() {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(store) = store {
+                let mut retries = 0;
+                while retries < 20 {
+                    if let Some(info) = store.get_inode(inode) {
+                        if info.extended.contains_key(key) {
+                            return Ok(());
+                        }
                     }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    retries += 1;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                retries += 1;
+                return Err("set_xattr timeout waiting for apply".to_string());
             }
-            return Err("set_xattr timeout waiting for apply".to_string());
         }
 
         Ok(())
@@ -1985,27 +2807,28 @@ impl MetaShardManager {
             key: key.to_string(),
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for the command to be applied
-        let store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores.get(&shard_id).cloned()
-        };
-        if let Some(store) = store {
-            let mut retries = 0;
-            while retries < 20 {
-                if let Some(info) = store.get_inode(inode) {
-                    if !info.extended.contains_key(key) {
-                        return Ok(());
+        // Strict mode only: Wait for the command to be applied.
+        // In async mode, propose_meta returns immediately; readers retry.
+        if !self.is_async_meta_persist() {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(store) = store {
+                let mut retries = 0;
+                while retries < 20 {
+                    if let Some(info) = store.get_inode(inode) {
+                        if !info.extended.contains_key(key) {
+                            return Ok(());
+                        }
                     }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    retries += 1;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                retries += 1;
+                return Err("remove_xattr timeout waiting for apply".to_string());
             }
-            return Err("remove_xattr timeout waiting for apply".to_string());
         }
 
         Ok(())
@@ -2029,27 +2852,30 @@ impl MetaShardManager {
             replica_chunks,
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for the command to be applied
-        let store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores.get(&shard_id).cloned()
-        };
-        if let Some(store) = store {
-            let mut retries = 0;
-            while retries < 20 {
-                if let Some(info) = store.get_inode(inode) {
-                    if info.reliability_state == target_state {
-                        return Ok(());
+        // Strict mode only: Wait for the command to be applied.
+        // In async mode, propose_meta returns immediately. This is a
+        // background scrubber operation, not on the client critical path,
+        // but we still respect the global async flag for consistency.
+        if !self.is_async_meta_persist() {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(store) = store {
+                let mut retries = 0;
+                while retries < 20 {
+                    if let Some(info) = store.get_inode(inode) {
+                        if info.reliability_state == target_state {
+                            return Ok(());
+                        }
                     }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    retries += 1;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                retries += 1;
+                return Err("update_reliability timeout waiting for apply".to_string());
             }
-            return Err("update_reliability timeout waiting for apply".to_string());
         }
 
         Ok(())
@@ -2073,27 +2899,27 @@ impl MetaShardManager {
             ec_chunks,
         };
 
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for the command to be applied
-        let store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores.get(&shard_id).cloned()
-        };
-        if let Some(store) = store {
-            let mut retries = 0;
-            while retries < 20 {
-                if let Some(info) = store.get_inode(inode) {
-                    if info.reliability_state == target_state {
-                        return Ok(());
+        // Strict mode only: Wait for the command to be applied.
+        if !self.is_async_meta_persist() {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(store) = store {
+                let mut retries = 0;
+                while retries < 20 {
+                    if let Some(info) = store.get_inode(inode) {
+                        if info.reliability_state == target_state {
+                            return Ok(());
+                        }
                     }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    retries += 1;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-                retries += 1;
+                return Err("update_to_ec timeout waiting for apply".to_string());
             }
-            return Err("update_to_ec timeout waiting for apply".to_string());
         }
 
         Ok(())
@@ -2264,16 +3090,25 @@ impl MetaShardManager {
         name: &str,
         shard_id: ShardId,
     ) -> Result<u64, String> {
-        // Use get_dir_entry_inode because the inode record may be on a
-        // different shard than the dir entry.
+        // P3: Check MetaCache first (Staging/Dirty/Clean + Deleted markers for
+        // pending unlinks). Hit skips the ShardStore dir-index lookup.
+        if let Some(cached_result) = self.meta_cache.get_direntry(parent_inode, name) {
+            return cached_result.ok_or_else(|| "entry not found".to_string());
+        }
+
+        // Miss → read from ShardStore and backfill a Clean direntry so the
+        // next lookup on this (parent, name) pair is served from MetaCache.
         let stores = self.shard_stores.read().unwrap();
         let shard_store = stores
             .get(&shard_id)
             .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
 
-        shard_store
+        let child = shard_store
             .get_dir_entry_inode(parent_inode, name)
-            .ok_or_else(|| "entry not found".to_string())
+            .ok_or_else(|| "entry not found".to_string())?;
+        self.meta_cache
+            .cache_put_clean_direntry(parent_inode, name, child);
+        Ok(child)
     }
 
     pub async fn get_entry(&self, inode: u64, shard_id: ShardId) -> Result<InodeInfo, String> {
@@ -2531,29 +3366,39 @@ impl MetaShardManager {
             name: bucket.to_string(),
             inode,
         };
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for apply (increased timeout to accommodate propose forwarding
-        // latency: follower → leader → commit → AppendEntries → follower apply)
-        let mut retries = 0;
-        while retries < 100 {
-            let applied = {
-                let stores = self.shard_stores.read().unwrap();
-                stores
-                    .get(&shard_id)
-                    .map(|s| s.get_inode(inode).is_some())
-                    .unwrap_or(false)
-            };
-            if applied {
-                self.register_root_inode(bucket, inode);
-                return Ok(inode);
+        // Strict mode only: Wait for apply (increased timeout to accommodate
+        // propose forwarding latency: follower → leader → commit →
+        // AppendEntries → follower apply).
+        //
+        // In async mode (default), skip the wait — propose_meta fire-and-
+        // forget returns immediately. We optimistically register the root
+        // inode in memory and return it. If a subsequent operation on this
+        // bucket races with apply, the reader retries (handle_lookup etc.).
+        if !self.is_async_meta_persist() {
+            let mut retries = 0;
+            while retries < 100 {
+                let applied = {
+                    let stores = self.shard_stores.read().unwrap();
+                    stores
+                        .get(&shard_id)
+                        .map(|s| s.get_inode(inode).is_some())
+                        .unwrap_or(false)
+                };
+                if applied {
+                    self.register_root_inode(bucket, inode);
+                    return Ok(inode);
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                retries += 1;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            retries += 1;
+            return Err("failed to create bucket root: timeout waiting for apply".to_string());
         }
-        Err("failed to create bucket root: timeout waiting for apply".to_string())
+
+        // Async mode: optimistically register and return.
+        self.register_root_inode(bucket, inode);
+        Ok(inode)
     }
 
     /// Ensure the root inode for a bucket, creating it if it does not exist.
@@ -2786,50 +3631,63 @@ impl MetaShardManager {
             inline_data,
             is_append,
         };
-        self.raft_group_manager
-            .propose(shard_id, cmd.serialize())
-            .await?;
+        self.propose_meta(shard_id, cmd.serialize()).await?;
 
-        // Wait for the apply to complete on this (leader) node so that
-        // notify_inode_change and subsequent reads see the updated data.
-        // Without this poll, a subscriber re-fetching the entry right
-        // after notify could see the pre-apply (stale) state.
-        let shard_store = {
-            let stores = self.shard_stores.read().unwrap();
-            stores
-                .get(&shard_id)
-                .cloned()
-                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
-        };
-        let mut retries = 0;
-        while retries < 50 {
-            if let Some(info) = shard_store.get_inode(inode) {
-                if is_append {
-                    // Append mode: the Filer computes the new size, so we
-                    // can't check info.size == size. Instead, check that
-                    // inline_data is non-empty (the append succeeded).
-                    if info
-                        .inline_data
-                        .as_ref()
-                        .map(|d| !d.is_empty())
-                        .unwrap_or(false)
-                    {
+        // Strict mode only: Wait for the apply to complete on this (leader)
+        // node so that notify_inode_change and subsequent reads see the
+        // updated data. Without this poll, a subscriber re-fetching the
+        // entry right after notify could see the pre-apply (stale) state.
+        //
+        // In async mode (default), skip the wait entirely — propose_meta
+        // fire-and-forget returns immediately after submitting to RaftCore.
+        // This is the CRITICAL performance path for small-file inline writes:
+        //   FUSE write → update_inode_size_chunks → propose_ff → return
+        // Skipping the ~10-50ms apply wait is what gives us 10-50x IOPS.
+        //
+        // Trade-off: if leader crashes before commit, the inline data is
+        // lost. Acceptable for performance mode (default). The FUSE client's
+        // read path retries briefly to absorb the visibility gap.
+        //
+        // Readers that need to see the just-written data (handle_read for
+        // inline, handle_getattr for size) use retry logic in net_handler.rs.
+        if !self.is_async_meta_persist() {
+            let shard_store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores
+                    .get(&shard_id)
+                    .cloned()
+                    .ok_or_else(|| format!("shard {} not found", shard_id.0))?
+            };
+            let mut retries = 0;
+            while retries < 50 {
+                if let Some(info) = shard_store.get_inode(inode) {
+                    if is_append {
+                        // Append mode: the Filer computes the new size, so we
+                        // can't check info.size == size. Instead, check that
+                        // inline_data is non-empty (the append succeeded).
+                        if info
+                            .inline_data
+                            .as_ref()
+                            .map(|d| !d.is_empty())
+                            .unwrap_or(false)
+                        {
+                            return Ok(());
+                        }
+                    } else if info.size == size && info.chunks.len() == target_chunk_count {
                         return Ok(());
                     }
-                } else if info.size == size && info.chunks.len() == target_chunk_count {
-                    return Ok(());
                 }
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                retries += 1;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            retries += 1;
+            log::warn!(
+                "update_inode_size_chunks: timed out waiting for apply (inode={}, size={}, chunks={}), \
+                 propose committed; apply will catch up via Raft replication",
+                inode,
+                size,
+                target_chunk_count
+            );
         }
-        log::warn!(
-            "update_inode_size_chunks: timed out waiting for apply (inode={}, size={}, chunks={}), \
-             propose committed; apply will catch up via Raft replication",
-            inode,
-            size,
-            target_chunk_count
-        );
         Ok(())
     }
 
@@ -3525,7 +4383,26 @@ impl MetaShardManager {
     /// Phase B (`DeleteInode`) is skipped after Phase A (`RemoveDirEntry`)
     /// succeeded.
     ///
-    /// This is a best-effort sweep. We skip:
+    /// This is a best-effort sweep with multiple safety layers:
+    ///   1. **Grace age guard**: skip inodes younger than
+    ///      `MIN_ORPHAN_AGE_SECS` (default 5 min) measured from `ctime`.
+    ///      Phase A + Phase B for a healthy create finishes in << 1 s, so
+    ///      this absorbs Phase B in-flight proposals, Raft replication lag,
+    ///      and the 1-2 s window when `stores.get(parent_shard)` returns
+    ///      `None` because the parent shard is owned by another filer node
+    ///      (see guards #2 and #3).
+    ///   2. **Parent shard unknown (multi-filer)**: if this filer does not
+    ///      own the parent's shard locally we **cannot prove** the dentry
+    ///      is missing — bail out and defer the decision to the filer that
+    ///      actually owns the parent shard (its next GC pass will have the
+    ///      authoritative CF_DIRENTRIES view). Otherwise we'd falsely
+    ///      reclaim a live inode simply because the parent's shard is on a
+    ///      different box.
+    ///   3. **Parent shard known → dentry + child_summaries**: if either
+    ///      the real dentry OR the cached DirStatSummary on the parent
+    ///      shard claims this name → keep the inode. The summary is the
+    ///      authoritative hint when multi-filer makes the child's inode
+    ///      record unavailable locally (see §3.2 of metacache design).
     /// - directories with `nlink >= 2` (real directories have nlink=2+;
     ///   an orphaned directory would still have nlink=2 from creation,
     ///   so we can't distinguish from a live one — but live dirs always
@@ -3534,8 +4411,34 @@ impl MetaShardManager {
     ///
     /// Returns the count of orphan inodes removed.
     pub fn collect_orphan_inodes(&self) -> usize {
+        /// Inodes newer than this many seconds old are never GC'd as
+        /// orphans. Absorbs Phase A → Phase B Raft latency plus multi-filer
+        /// shard-migration skew. Tunable via `POWERFS_ORPHAN_MIN_AGE_SECS`.
+        const DEFAULT_MIN_AGE_SECS: u64 = 5 * 60;
+        fn min_age_secs() -> u64 {
+            std::env::var("POWERFS_ORPHAN_MIN_AGE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_MIN_AGE_SECS)
+        }
+        fn now_secs() -> u64 {
+            use std::time::SystemTime;
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+        // `ctime` and `mtime` are stored as **ms** in InodeInfo (see the
+        // `atime/mtime/ctime` fields + the net protocol ms-based encoding).
+        // To compare with wall-clock seconds above, convert ctime_ms to
+        // seconds before comparing.
+        const MS_PER_SEC: u64 = 1000;
+
         let stores = self.shard_stores.read().unwrap();
         let mut removed = 0usize;
+        let age_threshold_ms = min_age_secs().saturating_mul(MS_PER_SEC);
+        let now_s = now_secs();
+        let now_ms = now_s.saturating_mul(MS_PER_SEC);
 
         for (shard_id, store) in stores.iter() {
             let inodes = store.list_all_inodes();
@@ -3548,21 +4451,37 @@ impl MetaShardManager {
                     continue;
                 }
 
-                // Look up the dir entry on the parent's shard. Use
-                // get_dir_entry_inode (not lookup) because with split-create
-                // the inode record lives on calculate_shard(inode), which may
-                // differ from the parent's shard. lookup() would fail to find
-                // the inode record locally and falsely report an orphan.
-                let parent_shard = self.shard_strategy.calculate_shard(info.parent_inode);
-                let has_dir_entry = stores
-                    .get(&parent_shard)
-                    .map(|s| {
-                        s.get_dir_entry_inode(info.parent_inode, &info.name)
-                            .is_some()
-                    })
-                    .unwrap_or(false);
+                // ---- Grace age guard (#1) ----
+                // Saturating subtraction: ctime==0 (old migrations) is treated
+                // as "definitely older than threshold" to avoid holding
+                // pre-existing garbage forever.
+                let age_ms = now_ms.saturating_sub(info.ctime);
+                if info.ctime > 0 && age_ms < age_threshold_ms {
+                    continue;
+                }
 
-                if has_dir_entry {
+                // ---- Parent ownership guard (#2) ----
+                // If this filer node doesn't own the parent shard, we have
+                // NO authoritative dentry map for it. Refuse to make the
+                // orphan call; the filer that actually owns the parent
+                // shard will re-run collect_orphan_inodes and decide.
+                let parent_shard = self.shard_strategy.calculate_shard(info.parent_inode);
+                let Some(parent_store) = stores.get(&parent_shard) else {
+                    continue;
+                };
+
+                // ---- Dentry + summary guard (#3) ----
+                // Presence in EITHER the real dentry table OR the cross-shard
+                // DirStatSummary cache is sufficient proof that some parent
+                // directory still points at this inode.
+                let has_dentry = parent_store
+                    .get_dir_entry_inode(info.parent_inode, &info.name)
+                    .is_some();
+                let has_summary = parent_store
+                    .get_child_summary(info.parent_inode, &info.name)
+                    .map(|s| s.child_inode == info.inode)
+                    .unwrap_or(false);
+                if has_dentry || has_summary {
                     continue;
                 }
 
@@ -3570,12 +4489,13 @@ impl MetaShardManager {
                 // Remove the inode record from its own shard.
                 log::info!(
                     "GC orphan: inode={} (name={:?}, parent={}) on shard {} has no dir entry \
-                     on parent shard {} — removing",
+                     on parent shard {} (age_ms={}) — removing",
                     info.inode,
                     info.name,
                     info.parent_inode,
                     shard_id.0,
-                    parent_shard.0
+                    parent_shard.0,
+                    age_ms,
                 );
                 if let Err(e) = store.delete_inode(info.inode) {
                     log::warn!(
@@ -3866,6 +4786,79 @@ impl MetaShardManager {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
+
+                // ===== Phase 2: MetaCache periodic maintenance =====
+                //
+                // Runs before orphan/GC scans so that (1) Staging entries
+                // lost during leader-change windows are dropped fast, and
+                // (2) Deleted tombstones older than deleted_timeout_ms get
+                // swept out before the next orphan scan considers the
+                // inode "still referenced by a dentry cache".
+                let mc = mgr.meta_cache();
+                mc.sweep_expired_staging();
+                mc.sweep_expired_deletions(std::time::Duration::from_millis(
+                    mc.trim.deleted_timeout_ms,
+                ));
+                // trim_pass only does work when usage > high_watermark; when
+                // under watermark it's a no-op (just an atomic read).
+                let trim_result = mc.trim_pass();
+
+                // ===== Phase 3: Lease Recall =====
+                //
+                // If trim_pass returned recall_candidates (inodes that are
+                // Clean but pinned by refcount > 0), push Invalidate
+                // notifications to the lease holders so they release their
+                // leases. The next trim_pass can then evict them.
+                //
+                // Also periodically sweep leaked refcounts (inodes where
+                // refcount > 0 but no active lease exists — e.g. client
+                // crashed before sending ReleaseInodeLease).
+                if !trim_result.recall_candidates.is_empty() {
+                    let notifier_opt = mgr.inode_notifier.read().unwrap().clone();
+                    let lease_mgr_opt = mgr.lease_mgr.read().unwrap().clone();
+                    if let (Some(notifier), Some(lease_mgr)) = (notifier_opt, lease_mgr_opt) {
+                        for inode in &trim_result.recall_candidates {
+                            // Look up the lease holder and push Invalidate.
+                            // The holder string is the client's numeric id
+                            // (e.g. "12345"); parse it to u64 for the
+                            // notifier's connection lookup.
+                            if let Some(holder) = lease_mgr.get_holder(*inode) {
+                                if let Ok(client_id) = holder.parse::<u64>() {
+                                    // Version 0 signals "recall" (not a
+                                    // content change); the client releases
+                                    // the lease and drops its cache.
+                                    notifier.notify_client(client_id, *inode, 0);
+                                    mc.mark_recalled(*inode);
+                                    debug!(
+                                        "Phase 3 recall: pushed Invalidate to \
+                                         client {} for inode {} (memory pressure)",
+                                        client_id, inode
+                                    );
+                                }
+                            } else {
+                                // No active lease but refcount > 0 — this
+                                // is a leak; sweep_leaked_refcounts below
+                                // will fix it.
+                                debug!(
+                                    "Phase 3 recall: inode {} has refcount > 0 \
+                                     but no active lease (leak, will sweep)",
+                                    inode
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Periodically sweep leaked refcounts (every GC cycle).
+                // Uses get_holder as the "is lease active" predicate:
+                // if get_holder returns None, the refcount should be 0.
+                {
+                    let lease_mgr_opt = mgr.lease_mgr.read().unwrap().clone();
+                    if let Some(lease_mgr) = lease_mgr_opt {
+                        mc.sweep_leaked_refcounts(|inode| lease_mgr.get_holder(inode).is_some());
+                    }
+                }
+
                 // Phase 5: 先重试上次失败的 pending_reclaims（WAL 崩溃恢复）
                 let retried = mgr
                     .retry_pending_reclaims(&volume_router, &volume_client_pool)

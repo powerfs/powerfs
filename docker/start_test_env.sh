@@ -157,28 +157,44 @@ start_filers() {
 }
 
 start_fuse() {
-    log_step "[6/6] Starting FUSE Client"
+    log_step "[6/6] Starting FUSE Clients (fuse-1, fuse-2)"
     cd "$DOCKER_DIR"
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d fuse-test
+    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d fuse-1 fuse-2
 
     if [ "$WAIT" -eq 1 ]; then
-        log_info "Waiting for FUSE mount to be ready..."
+        log_info "Waiting for FUSE mounts to be ready..."
         local timeout=60
         local elapsed=0
+        local fuse1_ready=0
+        local fuse2_ready=0
         while [ "$elapsed" -lt "$timeout" ]; do
-            if docker exec fuse-test sh -c 'mount | grep -q /mnt/fuse' 2>/dev/null; then
-                log_pass "FUSE mounted at /mnt/fuse (${elapsed}s)"
+            if [ "$fuse1_ready" -eq 0 ] && docker exec fuse-1-test sh -c 'mount | grep -q /mnt/fuse' 2>/dev/null; then
+                log_pass "fuse-1 mounted at /mnt/fuse (${elapsed}s)"
+                fuse1_ready=1
+            fi
+            if [ "$fuse2_ready" -eq 0 ] && docker exec fuse-2-test sh -c 'mount | grep -q /mnt/fuse' 2>/dev/null; then
+                log_pass "fuse-2 mounted at /mnt/fuse (${elapsed}s)"
+                fuse2_ready=1
+            fi
+            if [ "$fuse1_ready" -eq 1 ] && [ "$fuse2_ready" -eq 1 ]; then
                 return 0
             fi
             sleep 2
             elapsed=$((elapsed + 2))
         done
-        log_error "FUSE mount failed after ${timeout}s"
-        log_info "Checking fuse-test logs:"
-        docker logs fuse-test 2>&1 | tail -30
+        if [ "$fuse1_ready" -eq 0 ]; then
+            log_error "fuse-1 mount failed after ${timeout}s"
+            log_info "Checking fuse-1-test logs:"
+            docker logs fuse-1-test 2>&1 | tail -30
+        fi
+        if [ "$fuse2_ready" -eq 0 ]; then
+            log_error "fuse-2 mount failed after ${timeout}s"
+            log_info "Checking fuse-2-test logs:"
+            docker logs fuse-2-test 2>&1 | tail -30
+        fi
         return 1
     else
-        log_pass "FUSE container started (use --wait to wait for mount)"
+        log_pass "FUSE containers started (use --wait to wait for mounts)"
     fi
 }
 
@@ -199,10 +215,11 @@ show_summary() {
     echo "    Redis:     localhost:6380"
     echo ""
     if [ "$BACKEND_ONLY" -eq 0 ]; then
-        echo "  FUSE Mount:"
-        echo "    Container: fuse-test"
-        echo "    Mount point: /mnt/fuse (inside container)"
-        echo "    Test inside container: docker exec -it fuse-test ls /mnt/fuse"
+        echo "  FUSE Mounts:"
+        echo "    fuse-1: container=fuse-1-test, mount=/mnt/fuse, admin=9991"
+        echo "    fuse-2: container=fuse-2-test, mount=/mnt/fuse, admin=9992"
+        echo "    Test inside container: docker exec -it fuse-1-test ls /mnt/fuse"
+        echo "    Multi-client test: docker exec -it fuse-2-test ls /mnt/fuse"
         echo ""
         echo "  Run P1 protocol validation:"
         echo "    ./scripts/test_p1_fuse.sh"

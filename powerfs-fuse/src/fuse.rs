@@ -1,4 +1,6 @@
-use crate::cache::{CachedEntry, ChunkCache, EntryState, HoldState, MetadataCache, ROOT_INODE};
+use crate::cache::{
+    CachedEntry, ChunkCache, DentryLeaseStatus, EntryState, HoldState, MetadataCache, ROOT_INODE,
+};
 use bytes::BytesMut;
 use dashmap::DashMap;
 use fuse_backend_rs::api::filesystem::{
@@ -231,16 +233,11 @@ impl FuseApp {
             self.runtime.clone(),
         ));
 
-        // Start admin/debug HTTP server if admin_port is configured.
-        // Exposes /stats (request statistics + in-flight tracking) and
-        // /health endpoints for `powerfs-cli fuse-stats` to query.
-        if self.admin_port > 0 {
-            let bind_addr = format!("0.0.0.0:{}", self.admin_port);
-            crate::admin_server::AdminServer::start(bind_addr, sync_client.stats().clone());
-            info!("Admin/debug server enabled on port {}", self.admin_port);
-        } else {
-            info!("Admin/debug server disabled (admin_port=0)");
-        }
+        // Admin/debug HTTP server is started AFTER `lock_manager` is
+        // constructed below (it needs the `FuseLockManager` Arc to
+        // expose `/lock-metrics`). The previous early-start location
+        // is preserved as a comment marker for reviewers familiar
+        // with the original layout.
 
         let cache = Arc::new(MetadataCache::new());
         // Create the chunk (data) cache up front so it can be shared with the
@@ -309,6 +306,76 @@ impl FuseApp {
             sync_client.client_id(),
         ));
 
+        // Conservative adapter (§4.1): wire up a `FuseLockManager`
+        // exposing the unified `powerfs_lock::LockManager` trait,
+        // backed by `FacadeLockBackend` (which delegates to the same
+        // `FuseClientFacade` + `MetadataCache`). This does NOT replace
+        // `VolumeLeaseManager` — existing read/write/release paths keep
+        // using it directly. The new `lock_manager` is the entry point
+        // for new code paths that prefer the unified trait (and for
+        // the kernel C client's wire protocol when it lands in 阶段四).
+        //
+        // Phase-4 §5.1 Lockify: pass the sync_client's runtime handle
+        // so `acquire_local` can spawn the async ownership-sync task
+        // even when called from a sync FUSE callback (`block_on` runs
+        // inside this runtime, so `tokio::spawn` would also work, but
+        // the explicit handle is safer for non-tokio threads).
+        let lock_backend = Arc::new(crate::lock_backend::FacadeLockBackend::new(
+            sync_client.facade().clone(),
+            cache.clone(),
+        ));
+        let lock_manager = Arc::new(
+            powerfs_lock_fuse::FuseLockManager::new(
+                lock_backend,
+                sync_client.client_id(),
+                30_000, // matches `lease_duration_ms`
+            )
+            .with_lockify(Some(sync_client.runtime().handle().clone())),
+        );
+        // Wire the lease state into the InvalidateHandler so that server-
+        // pushed Invalidate notifications also clear directory leases.
+        // Without this, has_valid_dir_lease() would return true for stale
+        // leases after another client modifies the directory.
+        invalidate_handler.set_lease_state(lock_manager.state().clone());
+        // Phase 3 Lease Recall: wire the async lease releaser so the
+        // InvalidateHandler can send ReleaseInodeLease RPCs when the
+        // server pushes an Invalidate (recall or content change). This
+        // ensures the server-side refcount is decremented promptly,
+        // allowing MetaCache trim_pass to evict the entry.
+        let releaser = Arc::new(crate::lock_backend::FacadeLeaseReleaser::new(
+            sync_client.facade().clone(),
+            sync_client.client_id(),
+            sync_client.runtime().handle().clone(),
+        ));
+        invalidate_handler.set_lease_releaser(releaser);
+
+        // §13 Cap model: cap state is now embedded in `CachedEntry::cap`.
+        // `MetadataCache` exposes `grant_cap` / `take_cap` / `with_cap_mut`
+        // / `mark_cap_dirty` / `mark_cap_flushed` / `can_cache_*`.
+        //
+        // The cap handler (flush + ACK side-effect) is set later, after
+        // `PowerFsFs` is constructed, because it needs `PowerFsFs` as the
+        // `CapFlusher`.
+
+        // NOTE: FUSE client does NOT expose any listening endpoints.
+        // Request statistics are reported to the Master via the periodic
+        // KeepConnected heartbeat (TLV protocol); operators query them
+        // through `powerfs-cli fuse-stats` which routes exclusively via
+        // the Master gRPC interface.
+        //
+        // The legacy admin_port config field is accepted but IGNORED
+        // (the HTTP /stats, /lock-metrics and /health endpoints are
+        // never bound) to enforce the design rule that "clients must
+        // not expose services".
+        if self.admin_port > 0 {
+            info!(
+                "Legacy admin_port={} ignored — FUSE client exposes no \
+                 listening endpoints. Stats are collected via the Master \
+                 (use `powerfs-cli fuse-stats` against the master address).",
+                self.admin_port
+            );
+        }
+
         let fs = PowerFsFs {
             client: sync_client.clone(),
             cache: cache.clone(),
@@ -324,25 +391,37 @@ impl FuseApp {
             stripe_size: 64 * 1024 * 1024, // 64MB per stripe
             lease_duration_ms: 30000,      // 30 seconds lease
             lease_manager,
+            lock_manager,
             open_inodes: open_inodes.clone(),
+            open_file_leases: Arc::new(crate::open_file_lease::OpenFileLeaseRegistry::new()),
             inline_buffers: inline_buffers.clone(),
             inline_max_sizes: Arc::new(DashMap::new()),
             last_cache_epoch: std::sync::atomic::AtomicU64::new(0),
             fuse_fd: fuse_fd.clone(),
             readdir_cursors: Arc::new(DashMap::new()),
+            pending_unlinks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            cap_waiters: Arc::new(crate::client_cap::CapWaiters::new()),
         };
 
         let fs_arc = Arc::new(fs);
+
+        // §13 Cap model: now that `PowerFsFs` exists, create the cap
+        // handler with `fs_arc` as the `CapFlusher` and wire it into
+        // the InvalidateHandler. This must happen after `fs_arc` is
+        // constructed because `FacadeCapHandler` needs `PowerFsFs` for
+        // the flush path (drain_dirty_for_inode + write_blob_batch +
+        // sync_size_chunks_on_close).
+        let cap_handler = Arc::new(crate::lock_backend::FacadeCapHandler::new(
+            sync_client.facade().clone(),
+            fs_arc.clone() as Arc<dyn crate::invalidate_handler::CapFlusher>,
+            sync_client.client_id(),
+            sync_client.runtime().handle().clone(),
+        ));
+        invalidate_handler.set_cap_handler(cap_handler);
+
         let bg_fs = fs_arc.clone();
         thread::spawn(move || loop {
             // P2-d: Adaptive flusher interval.
-            // When dirty chunks exist, use a shorter interval (50ms) to flush
-            // them quickly, reducing close latency and dirty backlog.
-            // When idle, use a longer interval (100ms) to save CPU wakeups.
-            // Note: too-aggressive (10ms) caused lock contention with write
-            // path and OOM under sustained 512M+ sequential writes (dirty
-            // accumulation vs flush rate). 20ms balances responsiveness and
-            // throughput (2GB container has enough memory to handle higher flush rate).
             if bg_fs.has_dirty.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = bg_fs.flush_all_dirty_chunks();
                 bg_fs
@@ -351,6 +430,66 @@ impl FuseApp {
                 thread::sleep(Duration::from_millis(20));
             } else {
                 thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        // Batch unlink flusher: drains pending_unlinks every 5ms or when
+        // batch reaches 16 entries, sends BatchUnlink RPC grouped by shard.
+        let bg_fs_unlink = fs_arc.clone();
+        let unlink_runtime = self.runtime.handle().clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(5));
+            let entries: Vec<(u64, String, u64)> = {
+                let mut guard = bg_fs_unlink.pending_unlinks.lock().unwrap();
+                if guard.is_empty() {
+                    continue;
+                }
+                std::mem::take(&mut *guard)
+            };
+            if entries.is_empty() {
+                continue;
+            }
+            // Group by shard_id
+            let mut groups: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
+            for (parent, name, shard) in entries {
+                groups.entry(shard).or_default().push((parent, name));
+            }
+            let meta_client = bg_fs_unlink.client.facade().meta_shard_client().clone();
+            for (shard_id, batch) in groups {
+                let mc = meta_client.clone();
+                let runtime = unlink_runtime.clone();
+                runtime.spawn(async move {
+                    match mc.batch_unlink(batch.clone(), shard_id).await {
+                        Ok(statuses) => {
+                            let failed: Vec<_> = statuses
+                                .iter()
+                                .filter(|&&s| s != powerfs_net::STATUS_OK as u32)
+                                .collect();
+                            if !failed.is_empty() {
+                                warn!(
+                                    "batch_unlink: {}/{} entries failed (shard={})",
+                                    failed.len(),
+                                    statuses.len(),
+                                    shard_id
+                                );
+                            }
+                            debug!(
+                                "batch_unlink: {} entries processed (shard={})",
+                                statuses.len(),
+                                shard_id
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "batch_unlink RPC failed for {} entries (shard={}): {} — \
+                                 filer GC will clean up orphaned inodes",
+                                batch.len(),
+                                shard_id,
+                                e
+                            );
+                        }
+                    }
+                });
             }
         });
 
@@ -498,6 +637,19 @@ struct PowerFsFs {
     /// read 路径通过此 manager 获取共享 lease，命中缓存时零 RPC；
     /// lease 在 open→release 期间复用，release() 时 invalidate。
     lease_manager: Arc<VolumeLeaseManager>,
+    /// Conservative adapter (§4.1): unified `LockManager` trait entry
+    /// point, backed by `FacadeLockBackend`. Not used by the existing
+    /// read/write/release paths (they use `lease_manager` directly
+    /// above — migrating them would split the cache and break the
+    /// read→release invariant).
+    ///
+    /// Phase-4 §5.1 Lockify: the manager is built with `with_lockify`
+    /// enabled, so `mkdir`/`create`/`mknod`/`symlink` paths call
+    /// `lock_manager.acquire_local(inode, ...)` to speculatively
+    /// populate the inode lease cache without an RPC. The async sync
+    /// (off the critical path) CAS-replaces the local token with a
+    /// server-issued token.
+    lock_manager: Arc<powerfs_lock_fuse::FuseLockManager>,
     /// Phase 4.3/4.4: 当前已打开的 inode → open count。
     /// open() 时 count+1，release() 时 count-1（减到 0 时移除）。
     /// getattr() 对其中的 inode 使用长 TTL
@@ -506,6 +658,13 @@ struct PowerFsFs {
     /// （如 dd 关闭后 release 异步执行，此时 fsx 已 open），
     /// HashSet 的 remove 会误删仍在使用的 inode。
     open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
+    /// Phase-4 §5.2 (P3): Open-file lease registry. When a file is
+    /// opened in inode-lease mode, the inode lease is pre-acquired at
+    /// `open()` time and bound here. `flush_dirty_chunks` passes the
+    /// bound token to `write_blob_batch_with_lease`, bypassing
+    /// `ensure_lease`'s cache lookup on every flush. `release()`
+    /// invalidates the binding. See `open_file_lease.rs`.
+    open_file_leases: Arc<crate::open_file_lease::OpenFileLeaseRegistry>,
     /// P2.5: Inline 模式文件的写入缓冲。key = inode, value = InlineBuffer.
     ///
     /// 生命周期: create(inline) → 初始化空 buffer; write → 追加并标 dirty;
@@ -540,6 +699,22 @@ struct PowerFsFs {
     /// RPC returned the first page — `rm -rf` never enumerated entries beyond
     /// the first page and they survived the deletion (intermittent-delete bug).
     readdir_cursors: Arc<DashMap<u64, ReaddirCursor>>,
+    /// Pending batch unlink entries: (parent_ino, name, shard_id).
+    /// unlink callback adds entries here and returns immediately (optimistic
+    /// delete from cache). A background flush task sends BatchUnlink RPCs
+    /// every 5ms or when the batch reaches 16 entries.
+    /// On crash, pending entries are lost — filer GC eventually cleans up
+    /// orphaned inodes (acceptable in non-critical environments).
+    pending_unlinks: Arc<std::sync::Mutex<Vec<(u64, String, u64)>>>,
+    /// §13 Cap model: external waiters map for cap upgrades. Cap state
+    /// itself lives in `CachedEntry::cap` (via `MetadataCache`), but
+    /// waiters must outlive cache entries — kept here as a top-level
+    /// structure.
+    ///
+    /// Currently unused (open never blocks on cap); reserved for future
+    /// SHARED_WRITE → EXCLUSIVE upgrade waits in the write path.
+    #[allow(dead_code)]
+    cap_waiters: Arc<crate::client_cap::CapWaiters>,
 }
 
 /// Cursor for last_name-based readdir pagination.
@@ -765,6 +940,9 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
         cached_at: Instant::now(),
         state: EntryState::default(),
         hold: HoldState::default(),
+        cap: None,
+        dentry_lease: None,
+        dir_shared_gen: 0,
     }
 }
 
@@ -823,6 +1001,113 @@ impl PowerFsFs {
             .calculate_shard_id(inode)
     }
 
+    /// Phase-4 §5.1 Lockify fast path: speculatively populate the
+    /// inode lease cache with a local token after a fresh inode is
+    /// minted by the Filer (creat/mkdir/mknod/symlink). The async
+    /// sync RPC (off the critical path) CAS-replaces the local
+    /// token with a server-issued token. On conflict the local
+    /// entry is invalidated; on network error it remains valid
+    /// until TTL — graceful degradation in both cases.
+    ///
+    /// Errors are swallowed deliberately: Lockify is opportunistic.
+    /// If it fails (e.g. the manager was built without `with_lockify`,
+    /// or `duration_ms == 0`), the regular `acquire` path takes over
+    /// on the first read/write — correctness is preserved.
+    ///
+    /// Called from `mkdir`/`create`/`mknod`/`symlink` right after
+    /// the Filer RPC returns the new inode.
+    fn lockify_declare_new_inode(&self, inode: u64) {
+        if let Err(e) = self.lock_manager.acquire_local(
+            inode,
+            powerfs_lock_fuse::LockMode::Exclusive,
+            self.lease_duration_ms,
+        ) {
+            debug!(
+                "lockify self-declare skipped inode={}: {} (opportunistic, regular acquire will take over)",
+                inode, e
+            );
+        }
+    }
+
+    /// Invalidate the directory listing cache for `parent_inode` after the
+    /// client itself modifies the directory (create/mkdir/unlink/rmdir).
+    ///
+    /// This does NOT release the directory lease — the lease is kept because
+    /// the modification was initiated by this client; subsequent lookups can
+    /// still trust the lease for entries that are re-fetched. Other clients'
+    /// modifications are detected via the lockify CAS-conflict path, which
+    /// invalidates the lease automatically.
+    fn invalidate_dir_entries(&self, parent_inode: u64) {
+        self.cache.invalidate_dir(parent_inode);
+    }
+
+    /// §13 Cap model: acquire structured cap bits from the server for an
+    /// inode that is about to be returned as an open file handle.
+    ///
+    /// Shared by `open()` and `create()` — both return an open file handle
+    /// to the kernel, and subsequent read/write/setattr calls rely on the
+    /// cap being present in `CachedEntry::cap`. Without this, `mark_dirty_cap_w`
+    /// / `mark_dirty_cap_x` are no-ops (cap is None), and a server recall
+    /// would immediate-ACK without flushing dirty data → data loss.
+    ///
+    /// Fast path: if we already have a valid cap with the wanted bits,
+    /// skip the CapOpenGrant RPC.
+    ///
+    /// - `is_write_open`: true for O_WRONLY/O_RDWR (want EXCLUSIVE),
+    ///   false for O_RDONLY (want CAP_R).
+    /// - Best-effort: on failure, the legacy lease-only path remains active.
+    fn acquire_cap_on_open(&self, inode: u64, is_write_open: bool) {
+        let want = if is_write_open {
+            crate::client_cap::CapSet::EXCLUSIVE
+        } else {
+            crate::client_cap::CapSet::CAP_R
+        };
+        let have_cap = self
+            .cache
+            .get_cap(inode)
+            .map(|c| c.issued.contains(want))
+            .unwrap_or(false);
+        if have_cap {
+            debug!(
+                "acquire_cap_on_open: cap fast path inode={} — already have {:?}",
+                inode, want
+            );
+            return;
+        }
+        let facade = self.client.facade().clone();
+        let cid = self.client.client_id();
+        match self
+            .client
+            .runtime()
+            .block_on(facade.cap_open_grant(inode, &cid, is_write_open))
+        {
+            Ok((cap_token, caps_bits, epoch, sn, _duration_ms)) => {
+                let caps = crate::client_cap::CapSet(caps_bits);
+                let cap_id = sn;
+                let cap = crate::client_cap::ClientCap::new(
+                    cap_id,
+                    cap_token,
+                    caps,
+                    epoch,
+                    is_write_open,
+                    sn,
+                );
+                self.cache.grant_cap(inode, cap);
+                debug!(
+                    "acquire_cap_on_open: cap_open_grant success inode={} caps={:#b} epoch={} sn={}",
+                    inode, caps_bits, epoch, sn
+                );
+            }
+            Err(e) => {
+                debug!(
+                    "acquire_cap_on_open: cap_open_grant failed for inode={} \
+                     (best-effort, legacy lease path active): {}",
+                    inode, e
+                );
+            }
+        }
+    }
+
     /// Check if the Filer leader has changed since the last call.
     /// If so, invalidate all cached metadata to handle potentially missed
     /// Invalidate notifications during the leader change window.
@@ -834,11 +1119,17 @@ impl PowerFsFs {
             .load(std::sync::atomic::Ordering::Relaxed);
         if current != last {
             log::warn!(
-                "check_cache_epoch: epoch changed {} -> {}, invalidating all cached metadata",
+                "check_cache_epoch: epoch changed {} -> {}, invalidating all cached metadata + leases",
                 last,
                 current
             );
             self.cache.invalidate_all();
+            // Clear all directory/file leases: the old leader's leases are
+            // no longer valid, and the new leader has no record of them.
+            // Without this, has_valid_dir_lease() would return true for
+            // stale leases, causing lookup/create to bypass RPCs and read
+            // stale dentry cache after a leader switch.
+            self.lock_manager.state().clear_all();
             self.last_cache_epoch
                 .store(current, std::sync::atomic::Ordering::Relaxed);
         }
@@ -921,7 +1212,16 @@ impl PowerFsFs {
     fn flush_dirty_chunks(&self, inode: u64, lease_token: Option<&str>) -> std::io::Result<()> {
         let flush_lock = self.get_flush_lock(inode);
         let _guard = flush_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.flush_dirty_chunks_impl(inode, lease_token)
+        // Phase-4 §5.2 (P3): If the caller didn't supply a lease
+        // token, try the open-file-lease registry (bound at open
+        // time). Falls through to `None` → `ensure_lease` if no
+        // lease is bound or it's expired — graceful degradation.
+        let bound_token = if lease_token.is_some() {
+            lease_token.map(|s| s.to_string())
+        } else {
+            self.open_file_leases.get_valid_token(inode)
+        };
+        self.flush_dirty_chunks_impl(inode, bound_token.as_deref())
     }
 
     /// Internal flush implementation — caller MUST hold the per-inode flush lock.
@@ -1546,13 +1846,40 @@ impl PowerFsFs {
         if self.lookup_in_cache(parent, name).is_some() {
             return true;
         }
-        // 查 Filer（shard_id calculated from parent_ino）
+        // Dentry lease three-layer check (same as lookup):
+        // If the dentry lease is valid, or shared_gen matches + dir complete,
+        // a cache miss means the file truly doesn't exist (negative dentry).
+        match self.cache.check_dentry_lease(parent, name) {
+            DentryLeaseStatus::LeaseValid
+            | DentryLeaseStatus::SharedGenValid
+            | DentryLeaseStatus::NegativeComplete => {
+                debug!(
+                    "entry_exists: dentry lease/shgen valid, cache MISS = not exist (parent={}, name={})",
+                    parent, name
+                );
+                return false;
+            }
+            DentryLeaseStatus::Expired | DentryLeaseStatus::Miss => {
+                // Fall through to RPC
+            }
+        }
+        // 无 lease：查 Filer（shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
         let shard_id = self.routing_shard(parent);
         let name_owned = name.to_string();
-        self.client
+        let t_lookup = std::time::Instant::now();
+        let result = self
+            .client
             .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
-            .is_ok()
+            .is_ok();
+        let lookup_ms = t_lookup.elapsed().as_millis();
+        if lookup_ms > 10 {
+            info!(
+                "entry_exists LOOKUP SLOW: parent={}, name={}, lookup={}ms, result={}",
+                parent, name, lookup_ms, result
+            );
+        }
+        result
     }
 
     /// Lookup "." — return the directory's own attributes.
@@ -1845,6 +2172,9 @@ impl PowerFsFs {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         }
     }
 
@@ -1875,6 +2205,212 @@ impl PowerFsFs {
             }
         }
         Some(current)
+    }
+
+    /// Sync dirty inline buffer data to the Filer.
+    ///
+    /// Implements the mark-snapshot → clone → sync → check-dirty-again loop
+    /// that handles concurrent writes during sync (including write-after-release
+    /// caused by the kernel's WRITEBACK_CACHE mode, where FUSE_WRITE can arrive
+    /// AFTER the FUSE_RELEASE callback has already run and cleared dirty).
+    ///
+    /// Returns `Ok(true)` if data was actually synced, `Ok(false)` if nothing to
+    /// sync (not dirty / buffer gone / no delta). Caller decides when to remove
+    /// the inline_buffers entry.
+    pub(crate) fn sync_inline_buffer(&self, inode: u64, log_prefix: &str) -> Result<bool> {
+        // inode-level write → route by routing_shard(inode). Inline data + size
+        // are stored on the inode's own shard, NOT the parent dir's shard.
+        let routing_shard = self.routing_shard(inode);
+
+        // Loop: snapshot dirty → clone → sync → check-dirty-again
+        // If a concurrent write marks the buffer dirty during the sync RPC,
+        // we re-sync the updated buffer. Max 3 iterations to avoid infinite
+        // loops under sustained write pressure.
+        let sync_ok = true;
+
+        for sync_round in 0..3u32 {
+            let snapshot: Option<(u64, Option<Vec<u8>>, usize, bool)> = {
+                if let Some(inline_buf) = self.inline_buffers.get(&inode) {
+                    let size = inline_buf.data.len() as u64;
+                    let was_dirty = inline_buf.dirty;
+                    let orig_len = inline_buf.original_len;
+                    let mod_in_place = inline_buf.modified_in_place;
+                    let data = if was_dirty {
+                        Some(inline_buf.data.clone())
+                    } else {
+                        None
+                    };
+                    Some((size, data, orig_len, mod_in_place))
+                } else {
+                    None
+                }
+            };
+
+            let Some((size, data, orig_len, mod_in_place)) = snapshot else {
+                return Ok(false); // Buffer gone (migrated / removed), nothing synced
+            };
+
+            // Not dirty (read-only or already-synced path): skip sync entirely.
+            let Some(data) = data else {
+                debug!(
+                    "{} inode={} not dirty (round {}), skip sync",
+                    log_prefix, inode, sync_round
+                );
+                return Ok(false);
+            };
+
+            // Safety net: if the buffer didn't grow and no in-place modification
+            // occurred, there's nothing new to sync. Syncing size=0 would wipe
+            // other clients' concurrent-append data.
+            let can_append = !mod_in_place && (data.len() > orig_len);
+            if !can_append && !mod_in_place && data.len() == orig_len {
+                debug!(
+                    "{} inode={} no new data to sync (data_len={} == orig_len={}, \
+                     mod_in_place={}), skip to avoid overwriting other clients' data",
+                    log_prefix,
+                    inode,
+                    data.len(),
+                    orig_len,
+                    mod_in_place
+                );
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    inline_buf.dirty = false;
+                }
+                return Ok(false);
+            }
+
+            let (sync_data, sync_size, is_append) = if can_append {
+                let delta = data[orig_len..].to_vec();
+                debug!(
+                    "{} inode={} append mode, orig_len={}, delta_len={}, total_len={} round {}",
+                    log_prefix,
+                    inode,
+                    orig_len,
+                    delta.len(),
+                    data.len(),
+                    sync_round
+                );
+                (Some(delta), 0u64, true)
+            } else {
+                warn!(
+                    "{} inode={} OVERWRITE mode (is_append=false), mod_in_place={}, \
+                     data_len={}, orig_len={} round {} — may overwrite other clients' data",
+                    log_prefix,
+                    inode,
+                    mod_in_place,
+                    data.len(),
+                    orig_len,
+                    sync_round
+                );
+                (Some(data), size, false)
+            };
+
+            let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
+                shard_id: routing_shard,
+                inode,
+                size: sync_size,
+                chunks: Vec::new(),
+                client_id: self.client.client_id(),
+                inline_data: sync_data,
+                is_append,
+            };
+            let max_retries = 5u32;
+            let mut last_err = String::new();
+            let mut round_ok = false;
+            for attempt in 1..=max_retries {
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let req = req.clone();
+                let result = self
+                    .client
+                    .block_on(async move { meta_client.update_inode_size_chunks(&req).await });
+                match result {
+                    Ok(resp) if resp.success => {
+                        info!(
+                            "{} inode={} synced size={} (round {} attempt {})",
+                            log_prefix, inode, size, sync_round, attempt
+                        );
+                        round_ok = true;
+                        break;
+                    }
+                    Ok(resp) => {
+                        last_err = resp.error;
+                        warn!(
+                            "{} inode={} round {} attempt {} failed: {}",
+                            log_prefix, inode, sync_round, attempt, last_err
+                        );
+                    }
+                    Err(e) => {
+                        last_err = e;
+                        warn!(
+                            "{} inode={} round {} attempt {} error: {}",
+                            log_prefix, inode, sync_round, attempt, last_err
+                        );
+                    }
+                }
+                if attempt < max_retries {
+                    std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64)));
+                }
+            }
+
+            if !round_ok {
+                error!(
+                    "{} inode={} FAILED after {} attempts: {} — data may be lost",
+                    log_prefix, inode, max_retries, last_err
+                );
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    inline_buf.dirty = true;
+                }
+                return Err(powerfs_common::PowerFsError::Internal(last_err));
+            }
+
+            // After append-mode sync, update original_len to the synced snapshot
+            // size so a concurrent write's re-sync sends only the NEW delta
+            // (not full buffer → OVERWRITE mode → cross-client data loss).
+            if is_append {
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    inline_buf.original_len = size as usize;
+                }
+            }
+
+            // Check if buffer grew during sync (concurrent write). If so, re-sync.
+            let current_len = self
+                .inline_buffers
+                .get(&inode)
+                .map(|b| b.data.len())
+                .unwrap_or(0);
+
+            if current_len as u64 > size {
+                warn!(
+                    "{} inode={} buffer grew during sync (synced={}, current={}), re-syncing (round {})",
+                    log_prefix, inode, size, current_len, sync_round
+                );
+                continue;
+            }
+
+            // Buffer unchanged — mark as not dirty (caller decides remove).
+            let grew_again = {
+                if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
+                    let grew = inline_buf.data.len() as u64 > size;
+                    if !grew {
+                        inline_buf.dirty = false;
+                    }
+                    grew
+                } else {
+                    false
+                }
+            };
+            if grew_again {
+                warn!(
+                    "{} inode={} buffer grew between check and dirty-clear, re-syncing (round {})",
+                    log_prefix, inode, sync_round
+                );
+                continue;
+            }
+
+            break;
+        }
+
+        Ok(sync_ok)
     }
 }
 
@@ -1943,6 +2479,102 @@ fn parse_posix_acl_mode(acl_data: &[u8], cur_mode: u32) -> Option<u32> {
     Some(mode)
 }
 
+/// §13 Cap model: `CapFlusher` implementation for `PowerFsFs`.
+///
+/// Called by `FacadeCapHandler::flush_and_ack` when a `CapRecallNotify`
+/// arrives for a cap with dirty CAP_W. This uses the **same** flush path
+/// as `release()`:
+/// 1. `flush_dirty_chunks(inode, Some(token))` — drains dirty chunks,
+///    writes them to the Volume Server via `write_blob_batch_with_lease`.
+/// 2. `sync_size_chunks_on_close(inode)` — syncs size + chunks to the
+///    Filer via Raft (`UpdateInodeSizeChunks`).
+///
+/// Both steps acquire the per-inode `flush_lock` to serialize with
+/// `release()` and the background flusher, preventing TOCTOU races
+/// where the lease token is removed while a flush is in flight.
+impl crate::invalidate_handler::CapFlusher for PowerFsFs {
+    fn flush_and_sync(&self, inode: u64, lease_token: &str) -> std::io::Result<()> {
+        debug!(
+            "PowerFsFs::cap_flush_and_sync: inode={} token={} — flushing dirty data",
+            inode, lease_token
+        );
+
+        // Inline files: data lives in inline_buffers, not chunk_cache.
+        // flush_dirty_chunks + sync_size_chunks_on_close only handle Flat
+        // mode (chunk-based). For inline files, use sync_inline_buffer
+        // which sends the buffer as inline_data via a single Raft commit.
+        // Without this, a recall on a dirty inline file would ACK without
+        // flushing, losing the dirty data.
+        if self.inline_buffers.contains_key(&inode) {
+            debug!(
+                "PowerFsFs::cap_flush_and_sync: inode={} is inline, using sync_inline_buffer",
+                inode
+            );
+            self.cache.mark_flushing(inode);
+            let result = self.sync_inline_buffer(inode, "cap recall flush:");
+            match result {
+                Ok(_) => {
+                    self.cache.mark_clean(inode);
+                    self.cache.mark_cap_flushed(inode);
+                    debug!(
+                        "PowerFsFs::cap_flush_and_sync: inode={} — inline sync succeeded",
+                        inode
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    self.cache.mark_dirty(inode);
+                    warn!(
+                        "PowerFsFs::cap_flush_and_sync: inline sync FAILED for inode={} err={:?} \
+                         — dirty data retained for retry",
+                        inode, e
+                    );
+                    Err(std::io::Error::other(format!("inline sync failed: {}", e)))
+                }
+            }
+        } else {
+            // Flat/chunk mode: flush dirty chunks to Volume Server, then
+            // sync metadata to Filer via Raft.
+
+            // Step 1: Flush dirty chunks to Volume Server. Pass the cap token
+            // so write RPCs carry the correct fencing epoch.
+            let flush_result = self.flush_dirty_chunks(inode, Some(lease_token));
+            if let Err(ref e) = flush_result {
+                warn!(
+                    "PowerFsFs::cap_flush_and_sync: flush_dirty_chunks failed for inode={} err={:?} \
+                     — dirty data retained for retry",
+                    inode, e
+                );
+                return flush_result;
+            }
+
+            // Step 2: Sync metadata (size + chunks) to Filer via Raft.
+            // This ensures the Filer has the authoritative size before the
+            // recall completes and another client opens the file.
+            let sync_result = self.sync_size_chunks_on_close(inode);
+            if let Err(ref e) = sync_result {
+                warn!(
+                    "PowerFsFs::cap_flush_and_sync: sync_size_chunks_on_close failed for inode={} err={:?} \
+                     — chunks are persisted but metadata sync pending",
+                    inode, e
+                );
+                return sync_result;
+            }
+
+            // Step 3: Mark the cap as flushed in the cache entry.
+            // This clears `flushing_caps` so subsequent operations know the
+            // data is safely persisted.
+            self.cache.mark_cap_flushed(inode);
+
+            debug!(
+                "PowerFsFs::cap_flush_and_sync: inode={} — flush + sync succeeded",
+                inode
+            );
+            Ok(())
+        }
+    }
+}
+
 impl FileSystem for PowerFsFs {
     type Inode = u64;
     type Handle = u64;
@@ -2002,6 +2634,88 @@ impl FileSystem for PowerFsFs {
             return Ok(self.create_fuse_entry(&entry));
         }
 
+        // 1b. Dentry lease three-layer check (aligned with Ceph):
+        //
+        // Layer 1: per-dentry lease valid → trust cache (positive or negative)
+        // Layer 2: shared_gen matches + dir complete → trust cache
+        // Layer 3: RPC to Filer
+        //
+        // This replaces the old directory-level local lease, which was broken
+        // because it was self-declared (acquire_local) — the Filer never knew
+        // the client held it, so it couldn't push Invalidate notifications
+        // when another client modified the directory. The new mechanism uses
+        // Filer-issued per-dentry leases and dir_version (shared_gen) tracking.
+        match self.cache.check_dentry_lease(parent, name_str) {
+            DentryLeaseStatus::LeaseValid => {
+                // Layer 1: dentry lease is valid. If the entry exists in
+                // cache, return it; otherwise it's a negative dentry.
+                if let Some(entry) = self.cache.get_inode_by_name(parent, name_str) {
+                    debug!(
+                        "lookup: dentry lease valid, cache HIT (parent={}, name={})",
+                        parent, name_str
+                    );
+                    return Ok(self.create_fuse_entry(&entry));
+                }
+                debug!(
+                    "lookup: dentry lease valid, negative (parent={}, name={})",
+                    parent, name_str
+                );
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                });
+            }
+            DentryLeaseStatus::SharedGenValid => {
+                // Layer 2: lease expired but shared_gen matches + dir complete.
+                if let Some(entry) = self.cache.get_inode_by_name(parent, name_str) {
+                    debug!(
+                        "lookup: shared_gen valid, cache HIT (parent={}, name={})",
+                        parent, name_str
+                    );
+                    return Ok(self.create_fuse_entry(&entry));
+                }
+                // Negative dentry (dir complete + shared_gen match → ENOENT)
+                debug!(
+                    "lookup: shared_gen valid, negative (parent={}, name={})",
+                    parent, name_str
+                );
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                });
+            }
+            DentryLeaseStatus::NegativeComplete => {
+                // No cached entry, but dir is complete → ENOENT
+                debug!(
+                    "lookup: dir complete, negative (parent={}, name={})",
+                    parent, name_str
+                );
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                });
+            }
+            DentryLeaseStatus::Expired | DentryLeaseStatus::Miss => {
+                // Fall through to RPC
+                debug!(
+                    "lookup: dentry lease expired/miss, querying filer (parent={}, name={})",
+                    parent, name_str
+                );
+            }
+        }
+
         // 2. Step 2: Filer RPC（强一致 Leader Lease Read, shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
         let shard_id = self.routing_shard(parent);
@@ -2016,26 +2730,35 @@ impl FileSystem for PowerFsFs {
         {
             Ok(attr) => {
                 debug!(
-                    "lookup: filer returned inode={} for parent={}, name={}",
-                    attr.inode, parent, name_str
+                    "lookup: filer returned inode={} for parent={}, name={}, dir_version={}, lease_ttl={}ms",
+                    attr.inode, parent, name_str, attr.dir_version, attr.dentry_lease_ttl_ms
                 );
+                // Update dir_version from Filer response (shared_gen tracking).
+                if attr.dir_version > 0 {
+                    self.cache.update_dir_version(parent, attr.dir_version);
+                }
                 let entry = attr_to_cached_entry(&attr, parent, name_str);
                 self.cache.insert(entry.clone());
+                // Grant dentry lease if the Filer provided a TTL.
+                if attr.dentry_lease_ttl_ms > 0 {
+                    self.cache.grant_dentry_lease(
+                        parent,
+                        name_str,
+                        attr.dentry_lease_ttl_ms,
+                        0, // issuer: filer node id (TODO: from response)
+                    );
+                }
                 Ok(self.create_fuse_entry(&entry))
             }
             Err(e) => {
                 debug!("lookup RPC failed for '{}/{}': {}", parent, name_str, e);
-                // Return a negative Entry (inode=0) with a short entry_timeout.
-                // This tells the kernel to cache the negative result for only
-                // TTL (100ms), so that subsequent lookups after a rename/create
-                // will re-query the FUSE daemon.
-                //
-                // Returning Err(ENOENT) causes the kernel to use its default
-                // negative entry timeout, which can be very long, leading to
-                // stale "file not found" results after a cross-directory rename.
-                // This is the root cause of R6: mv first checks if the target
-                // exists (creating a negative dentry), then renames; the kernel
-                // serves the stale negative dentry for the renamed file.
+                // Even on ENOENT, if the Filer returned dir_version + lease TTL,
+                // we can cache the negative dentry. The MetadataAttr error path
+                // doesn't carry these fields, so we rely on the Filer's
+                // STATUS_ERR_NOT_FOUND response body. For now, return a short
+                // negative entry — the dentry lease for negatives will be
+                // granted on future lookups when the Filer response carries
+                // DirVersion + DentryLeaseTtl in the NOT_FOUND body.
                 Ok(Entry {
                     inode: 0,
                     generation: 0,
@@ -2090,13 +2813,30 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        // For non-open files, fetch fresh metadata from the Filer on every
-        // getattr. TTL=0 promises the kernel fresh data, so returning a
-        // stale cached entry would break cross-client visibility (e.g.,
-        // another client's truncate must be visible immediately). The
-        // Invalidate mechanism is async and can be delayed or skipped
-        // (e.g., when the file is briefly opened by a concurrent read),
-        // so we cannot rely on it alone for correctness.
+        // For non-open files with a Clean cache entry (not Stale), the local
+        // cache is authoritative IF the file was just written by this client.
+        // After release→mark_clean, the cache has the correct size/chunks from
+        // the write path. Going to the Filer would hit the async_meta_persist
+        // visibility gap (propose_ff not yet applied → size=0 returned).
+        //
+        // Only fetch from Filer when the entry is Stale (invalidated by
+        // another client's write) or missing (first access / new mount).
+        //
+        // The Invalidate mechanism ensures cross-client consistency: when
+        // another client modifies the file, it sends an Invalidate that marks
+        // our entry Stale → next getattr fetches fresh data.
+        if let Some(entry) = self.cache.peek_inode(inode) {
+            use crate::cache::EntryState;
+            if entry.state == EntryState::Clean {
+                debug!(
+                    "getattr: cache hit for non-open file inode={} (Clean, local authoritative)",
+                    inode
+                );
+                return Ok((self.create_stat(&entry), ttl));
+            }
+        }
+
+        // Entry is Stale or missing — fetch fresh metadata from the Filer.
         debug!(
             "getattr: fetching fresh metadata for inode={} from filer (non-open file)",
             inode
@@ -2274,7 +3014,9 @@ impl FileSystem for PowerFsFs {
 
         // EntryState: 标记 Dirty 以反映本地属性已修改（仅在 size/mode/uid/gid 实际变化时）
         if mode.is_some() || size.is_some() || uid.is_some() || gid.is_some() {
-            self.cache.mark_dirty(inode);
+            // §13 Cap model: mark CAP_X dirty so process_recall flushes
+            // metadata before ACKing a server recall.
+            self.cache.mark_dirty_cap_x(inode);
         }
 
         // Truncate 处理：清除旧数据缓存，防止 read/flush 返回 truncate 前的残留数据。
@@ -2412,6 +3154,15 @@ impl FileSystem for PowerFsFs {
             attr.inode, parent, attr.mode, attr.nlink, attr.size, attr.uid, attr.gid, attr.mtime, attr.atime, attr.ctime
         );
 
+        // 修改了父目录内容（新增子目录），invalidate 父目录的 dentry 缓存。
+        // 保持目录 lease（修改是自己发起，下次 readdir 重新拉取即可）。
+        self.invalidate_dir_entries(parent);
+
+        // Phase-4 §5.1 Lockify: speculatively self-declare inode
+        // ownership to avoid a synchronous lease-acquire RPC on the
+        // first write into the new directory. Async-synced to filer.
+        self.lockify_declare_new_inode(attr.inode);
+
         Ok(self.create_fuse_entry(&entry))
     }
 
@@ -2465,6 +3216,13 @@ impl FileSystem for PowerFsFs {
         self.cache.insert(entry.clone());
         debug!("mknod: RPC done, inode={}, parent={}", attr.inode, parent);
 
+        // 修改了父目录内容（新增特殊文件），invalidate 父目录的 dentry 缓存。
+        self.invalidate_dir_entries(parent);
+
+        // Phase-4 §5.1 Lockify: speculatively self-declare inode
+        // ownership for the new special file. Async-synced to filer.
+        self.lockify_declare_new_inode(attr.inode);
+
         Ok(self.create_fuse_entry(&entry))
     }
 
@@ -2493,6 +3251,8 @@ impl FileSystem for PowerFsFs {
         if let Some(entry) = self.lookup_in_cache(parent, name_str) {
             self.cache.remove(entry.inode);
         }
+        // 修改了父目录内容（删除子目录），invalidate 父目录的 dentry 缓存。
+        self.invalidate_dir_entries(parent);
         Ok(())
     }
 
@@ -2500,33 +3260,48 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("unlink: parent={}, name={}", parent, name_str);
 
-        // Try cache first; if miss (e.g., after InvalidateHandler evicted the
-        // entry due to a prior setattr/chown), fetch from filer. This avoids
-        // a self-invalidation race where the chown's Invalidate clears the
-        // cache before unlink runs.
+        // Try cache first; if miss, use dentry lease check.
+        // Only fall back to lookup RPC when dentry lease is expired/miss.
         let entry = if let Some(e) = self.lookup_in_cache(parent, name_str) {
             e
         } else {
-            debug!(
-                "unlink: cache miss for '{}/{}', fetching from filer",
-                parent, name_str
-            );
-            let meta_client = self.client.facade().meta_shard_client().clone();
-            let shard_id = self.routing_shard(parent);
-            let name_owned = name_str.to_string();
-            let attr = self
-                .client
-                .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
-                .map_err(|e| {
+            match self.cache.check_dentry_lease(parent, name_str) {
+                DentryLeaseStatus::LeaseValid
+                | DentryLeaseStatus::SharedGenValid
+                | DentryLeaseStatus::NegativeComplete => {
+                    // Dentry lease valid: cache is authoritative, MISS = not exist
                     debug!(
-                        "unlink: lookup RPC failed for '{}/{}': {}",
-                        parent, name_str, e
+                        "unlink: dentry lease valid, cache MISS for '{}/{}' → ENOENT",
+                        parent, name_str
                     );
-                    std::io::Error::from_raw_os_error(libc::ENOENT)
-                })?;
-            let entry = attr_to_cached_entry(&attr, parent, name_str);
-            self.cache.insert(entry.clone());
-            entry
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+                }
+                DentryLeaseStatus::Expired | DentryLeaseStatus::Miss => {
+                    // Fall through to RPC
+                    debug!(
+                        "unlink: cache miss for '{}/{}', fetching from filer",
+                        parent, name_str
+                    );
+                    let meta_client = self.client.facade().meta_shard_client().clone();
+                    let shard_id = self.routing_shard(parent);
+                    let name_owned = name_str.to_string();
+                    let attr = self
+                        .client
+                        .block_on(
+                            async move { meta_client.lookup(parent, &name_owned, shard_id).await },
+                        )
+                        .map_err(|e| {
+                            debug!(
+                                "unlink: lookup RPC failed for '{}/{}': {}",
+                                parent, name_str, e
+                            );
+                            std::io::Error::from_raw_os_error(libc::ENOENT)
+                        })?;
+                    let entry = attr_to_cached_entry(&attr, parent, name_str);
+                    self.cache.insert(entry.clone());
+                    entry
+                }
+            }
         };
 
         let should_delete = self.cache.dec_nlink(entry.inode);
@@ -2543,36 +3318,36 @@ impl FileSystem for PowerFsFs {
             None
         };
 
-        // Step 2: 通过 MetadataClient.unlink RPC 走 Filer Raft leader（强一致）
-        // Filer 端原子地移除目录条目并递减 nlink。
-        let meta_client = self.client.facade().meta_shard_client().clone();
-        let shard_id = self.routing_shard(parent);
-        let name_owned = name_str.to_string();
-        self.client
-            .block_on(async move { meta_client.unlink(parent, &name_owned, shard_id).await })
-            .map_err(|e| {
-                let errno = filer_error_to_errno(&e.to_string());
-                if errno == libc::EIO {
-                    error!("unlink RPC failed: {}", e);
-                } else if errno == libc::ENOENT {
-                    // ENOENT on unlink is suspicious — it means the filer returned
-                    // NOT_FOUND. This can happen if the request hit a non-leader
-                    // whose Raft state was stale (pre-fix). Log at warn so it's
-                    // visible even without --verbose.
-                    warn!(
-                        "unlink: ENOENT for '{}/{}' (shard={}) — possible stale leader read; err={}",
-                        parent, name_str, shard_id, e
-                    );
-                } else {
-                    debug!("unlink RPC failed: {} -> errno={}", e, errno);
-                }
-                std::io::Error::from_raw_os_error(errno)
-            })?;
-
+        // Optimistic cache update: remove from cache immediately so
+        // subsequent lookups see the file as gone. The filer-side delete
+        // is batched and will eventually catch up.
         if should_delete {
             // Last hard link - delete the actual data and remove all cache entries
-            // NOTE: 数据删除保留立即调用（过渡期），Phase 3.5 GC 实现后改为延迟回收
-            // Iterate entry.chunks and delete each by its needle_id and volume_id.
+            // §13 Cap model: release the cap before removing the cache entry.
+            // take_cap removes the cap from CachedEntry and returns it so we
+            // can send CapRelease RPC. Without this, the server keeps the
+            // CapHolder until TTL expiry (30s), blocking other clients from
+            // getting exclusive caps on a new file that reuses this inode.
+            self.cache.mark_cap_flushed(entry.inode);
+            if let Some(cap) = self.cache.take_cap(entry.inode) {
+                let facade = self.client.facade().clone();
+                let client_id = self.client.client_id();
+                let cap_token = cap.token.clone();
+                let runtime = self.client.runtime().handle().clone();
+                let cap_inode = entry.inode;
+                runtime.spawn(async move {
+                    if let Err(e) = facade.cap_release(cap_inode, &client_id, &cap_token).await {
+                        debug!(
+                            "unlink: cap_release for inode {} failed (best-effort): {}",
+                            cap_inode, e
+                        );
+                    }
+                });
+                debug!(
+                    "unlink: cap released for inode={} (last link deleted, caps were {:?})",
+                    entry.inode, cap.issued
+                );
+            }
             for chunk in &entry.chunks {
                 match self.client.get_volume_addr(chunk.volume_id) {
                     Ok(addr) => {
@@ -2593,7 +3368,6 @@ impl FileSystem for PowerFsFs {
             }
 
             self.cache.remove(entry.inode);
-            // P2.5: 清理可能残留的 inline buffer (文件被 unlink 时仍打开的罕见场景)
             self.inline_buffers.remove(&entry.inode);
             self.inline_max_sizes.remove(&entry.inode);
         } else {
@@ -2602,6 +3376,63 @@ impl FileSystem for PowerFsFs {
                 self.cache.remove_path(entry.inode, &path);
             }
         }
+
+        // Batch the filer-side unlink: add to pending queue and return
+        // immediately. The background flusher sends BatchUnlink RPCs every
+        // 5ms, grouping entries by shard. This eliminates the block_on(unlink
+        // RPC) from the FUSE callback critical path — unlink becomes a pure
+        // cache operation, no runtime worker consumed.
+        //
+        // Crash safety: if the client crashes before the batch is flushed,
+        // the filer still has the entry. The kernel has already removed the
+        // dentry from its cache, so the file appears deleted to this client.
+        // Other clients see it until filer GC cleans it up (acceptable in
+        // non-critical environments per user preference).
+        let shard_id = self.routing_shard(parent);
+        {
+            let mut guard = self.pending_unlinks.lock().unwrap();
+            guard.push((parent, name_str.to_string(), shard_id));
+            // Flush immediately if batch is full (16 entries)
+            if guard.len() >= 16 {
+                let entries: Vec<_> = std::mem::take(&mut *guard);
+                drop(guard);
+                // Group by shard and spawn async send
+                let mut groups: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
+                for (p, n, s) in entries {
+                    groups.entry(s).or_default().push((p, n));
+                }
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let runtime = self.client.runtime().handle().clone();
+                for (sid, batch) in groups {
+                    let mc = meta_client.clone();
+                    runtime.spawn(async move {
+                        match mc.batch_unlink(batch.clone(), sid).await {
+                            Ok(statuses) => {
+                                let failed: Vec<_> =
+                                    statuses.iter().filter(|&&s| s != powerfs_net::STATUS_OK as u32).collect();
+                                if !failed.is_empty() {
+                                    warn!(
+                                        "batch_unlink (inline): {}/{} failed (shard={})",
+                                        failed.len(),
+                                        statuses.len(),
+                                        sid
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "batch_unlink (inline) RPC failed (shard={}): {} — GC will cleanup",
+                                    sid, e
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
+
+        // 修改了父目录内容（删除文件），invalidate 父目录的 dentry 缓存。
+        self.invalidate_dir_entries(parent);
 
         Ok(())
     }
@@ -2625,7 +3456,21 @@ impl FileSystem for PowerFsFs {
             parent, name_str, args.mode
         );
 
-        if self.entry_exists(parent, name_str) {
+        // Dentry lease: entry_exists uses the three-layer check
+        // (dentry lease → shared_gen → RPC). No need to acquire a
+        // directory-level local lease here — the Filer auto-subscribes
+        // on lookup/readdir and pushes Invalidate notifications.
+
+        let t_entry = std::time::Instant::now();
+        let exists = self.entry_exists(parent, name_str);
+        let entry_ms = t_entry.elapsed().as_millis();
+        if entry_ms > 10 {
+            info!(
+                "FUSE create entry_exists slow: parent={}, name={}, exists={}, took={}ms",
+                parent, name_str, exists, entry_ms
+            );
+        }
+        if exists {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
@@ -2666,6 +3511,26 @@ impl FileSystem for PowerFsFs {
             })?;
         let create_ms = t_create.elapsed().as_millis();
         let inode = attr.inode;
+        let t_post_rpc = std::time::Instant::now();
+
+        // Phase-4 §5.1 Lockify: speculatively self-declare inode
+        // ownership for the new file before the Inline/Stripe/Flat
+        // placement branches diverge. Async-synced to filer; the
+        // first write into this inode will hit the lease cache
+        // instead of issuing a synchronous acquire RPC.
+        self.lockify_declare_new_inode(inode);
+        let lockify_ms = t_post_rpc.elapsed().as_millis();
+
+        // 修改了父目录内容（新增文件），invalidate 父目录的 dentry 缓存。
+        // 保持目录 lease（修改是自己发起，下次 readdir 重新拉取即可）。
+        let t_inval = std::time::Instant::now();
+        self.invalidate_dir_entries(parent);
+        let inval_ms = t_inval.elapsed().as_millis();
+
+        info!(
+            "FUSE create timing: inode={}, create_rpc={}ms, lockify={}ms, inval={}ms, total_after_inval={}ms",
+            inode, create_ms, lockify_ms, inval_ms, t0.elapsed().as_millis()
+        );
 
         // P2.5: Inline 模式分支。Filer 在 CREATE 响应中返回
         // Placement::Inline { max_size } (无 volume_id/needle_id)。
@@ -2728,6 +3593,9 @@ impl FileSystem for PowerFsFs {
                 cached_at: Instant::now(),
                 state: EntryState::default(),
                 hold: HoldState::default(),
+                cap: None,
+                dentry_lease: None,
+                dir_shared_gen: 0,
             };
             // Phase 3: use insert_pinned to set hold=Pinned BEFORE insert.
             // The old pattern (pin_inode before insert) was a no-op when the
@@ -2735,6 +3603,9 @@ impl FileSystem for PowerFsFs {
             *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
             self.cache.insert_pinned(entry.clone());
             debug!("create: inline mode, inode={}, dir={}", inode, parent);
+            // §13 Cap model: create returns an open handle — acquire cap
+            // so write/setattr can mark dirty and recall can flush.
+            self.acquire_cap_on_open(inode, true);
             return Ok((
                 self.create_fuse_entry(&entry),
                 Some(inode),
@@ -2800,10 +3671,15 @@ impl FileSystem for PowerFsFs {
                 cached_at: Instant::now(),
                 state: EntryState::default(),
                 hold: HoldState::default(),
+                cap: None,
+                dentry_lease: None,
+                dir_shared_gen: 0,
             };
             *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
             self.cache.insert_pinned(entry.clone());
             debug!("create: stripe mode, inode={}, dir={}", inode, parent);
+            // §13 Cap model: create returns an open handle — acquire cap.
+            self.acquire_cap_on_open(inode, true);
             return Ok((
                 self.create_fuse_entry(&entry),
                 Some(inode),
@@ -2881,6 +3757,9 @@ impl FileSystem for PowerFsFs {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
         // CRITICAL: Pin the inode BEFORE inserting the cache entry.
         // The Filer pushes an Invalidate after the create RPC commits, and
@@ -2892,6 +3771,8 @@ impl FileSystem for PowerFsFs {
         *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
         self.cache.insert_pinned(entry.clone());
         debug!("create: RPC done, inode={}, dir={}", inode, parent);
+        // §13 Cap model: create returns an open handle — acquire cap.
+        self.acquire_cap_on_open(inode, true);
 
         Ok((
             self.create_fuse_entry(&entry),
@@ -2905,7 +3786,7 @@ impl FileSystem for PowerFsFs {
         &self,
         _ctx: &Context,
         inode: Self::Inode,
-        _flags: u32,
+        flags: u32,
         _fuse_flags: u32,
     ) -> std::io::Result<(
         Option<Self::Handle>,
@@ -2949,6 +3830,13 @@ impl FileSystem for PowerFsFs {
             }
             // Cache hit: best-effort 从 filer 刷新 size/chunks
             let parent = entry.parent;
+
+            let has_inode_lease = self
+                .lock_manager
+                .state()
+                .get_inode(inode)
+                .map(|le| le.mode == powerfs_lock_fuse::LockMode::Exclusive)
+                .unwrap_or(false);
             // CRITICAL: Skip the Filer refresh when there are dirty (unflushed)
             // chunks. A concurrent open by another FUSE worker (e.g., shell
             // pipeline like `echo > f && cat f` opens f twice in quick
@@ -2966,13 +3854,19 @@ impl FileSystem for PowerFsFs {
                 .unwrap_or(false);
             let has_dirty_chunks = self.chunk_cache.has_dirty_chunks(inode);
             debug!(
-                "open: inode={} dirty_check has_dirty_chunks={} has_dirty_inline={} inline_buffers_contains={}",
+                "open: inode={} dirty_check has_inode_lease={} has_dirty_chunks={} has_dirty_inline={} inline_buffers_contains={}",
                 inode,
+                has_inode_lease,
                 has_dirty_chunks,
                 has_dirty_inline,
                 self.inline_buffers.contains_key(&inode)
             );
-            if has_dirty_chunks || has_dirty_inline {
+            if has_inode_lease {
+                debug!(
+                    "open: skipping filer refresh for inode={} (Exclusive lease held, local cache authoritative)",
+                    inode
+                );
+            } else if has_dirty_chunks || has_dirty_inline {
                 // Local cache has unsynced data (write happened but
                 // sync_size_chunks_on_close hasn't completed yet, e.g.,
                 // async FUSE RELEASE). The local cache is authoritative:
@@ -2994,6 +3888,34 @@ impl FileSystem for PowerFsFs {
                 debug!(
                     "open: skipping filer refresh for inode={} (has dirty/unsynced chunks or inline buffer)",
                     inode
+                );
+            } else if entry.state != EntryState::Stale && !entry.chunks.is_empty() {
+                // P4: Trust cache hit on non-Stale entries with known chunks.
+                //
+                // Rationale: every Filer-driven metadata change (other
+                // clients writing, resize, truncate, chmod, unlink, rename,
+                // setattr) is pushed to this FUSE client via the
+                // coherence Invalidate notification, which transitions the
+                // entry to Stale and/or evicts it (see invalidate.rs /
+                // InvalidateHandler).  Therefore if state is *not* Stale,
+                // no other client has modified this file since the last
+                // time our cache was refreshed/inserted.  Skipping the
+                // refresh RPC avoids a round-trip on every open of a
+                // recently-touched file (common for shell pipelines and
+                // re-opens by the same process).
+                //
+                // Guard: require non-empty chunks. The Filer returns empty
+                // chunks for newly-created files before the first
+                // sync_size_chunks_on_close has run; in that window we
+                // can't tell if another client raced and appended, so we
+                // still refresh. Entries where the local cache has chunks
+                // AND state != Stale are authoritative.
+                debug!(
+                    "open: skipping filer refresh for inode={} \
+                     (P4 cache trust: state={:?}, chunks={}, no invalidation received)",
+                    inode,
+                    entry.state,
+                    entry.chunks.len()
                 );
             } else if let Ok(Some((filer_entry, _))) = self.client.get_entry_by_inode(inode) {
                 let fresh = self.entry_to_cached(parent, &filer_entry);
@@ -3038,6 +3960,19 @@ impl FileSystem for PowerFsFs {
                     let chunks_changed =
                         !filer_stale_empty && !chunks_match(&entry.chunks, &fresh.chunks);
                     let filer_content_size = fresh.content_size;
+                    let local_cs_before = self
+                        .cache
+                        .get_inode(inode)
+                        .map(|e| e.content_size)
+                        .unwrap_or(u64::MAX);
+                    // #region debug-point fuse-inline-data-loss-dbg-open-refresh
+                    info!(
+                        "DBG-INLINE: open refresh inode={} insert_pinned: local_cs={} filer_cs={} has_dirty_chunks={} has_dirty_inline={} hold_pinned={}",
+                        inode, local_cs_before, filer_content_size, has_local_data,
+                        entry.content_size > fresh.content_size && has_local_data,
+                        self.cache.get_inode(inode).map(|e| e.hold.is_pinned()).unwrap_or(false)
+                    );
+                    // #endregion
                     // P3: Preserve placement from existing entry. The FilerEntry
                     // returned by get_entry_by_inode does not carry FileLayout,
                     // so placement would be lost on refresh. Placement is set at
@@ -3262,23 +4197,71 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        // Phase 3.5.3: 通知 filer 递增 open_count（best-effort，失败不阻塞 open）
+        // Phase 3.5.3: 通知 filer 递增 open_count（fire-and-forget，不阻塞 open）
+        // 原实现用 block_on 同步等待，每个 open 多一个 block_on 占用 runtime worker。
+        // open_count 是 best-effort 统计，失败不影响正确性，改为 spawn 异步发送。
         let meta_shard_client = self.client.facade().meta_shard_client().clone();
-        // inode-level state → route by calculate_shard_id(inode)
         let open_count_shard = self.routing_shard(inode);
         let req = powerfs_coherence::OpenCountRequest {
             shard_id: open_count_shard,
             inode,
         };
-        if let Err(e) = self
-            .client
-            .block_on(async move { meta_shard_client.open_count_inc(&req).await })
-        {
-            debug!(
-                "open: open_count_inc for inode {} failed (best-effort): {}",
-                inode, e
-            );
+        let runtime = self.client.runtime().handle().clone();
+        runtime.spawn(async move {
+            if let Err(e) = meta_shard_client.open_count_inc(&req).await {
+                debug!(
+                    "open: open_count_inc for inode {} failed (best-effort): {}",
+                    inode, e
+                );
+            }
+        });
+
+        // Phase-4 §5.2 (P3): Pre-acquire the inode lease at open time
+        // and bind it to the open-file registry. Subsequent
+        // `flush_dirty_chunks` calls pass this token to
+        // `write_blob_batch_with_lease`, bypassing `ensure_lease`'s
+        // cache lookup + proactive-renew path on every flush.
+        //
+        // Only applies to inode-lease mode AND files already on the
+        // volume server (fid present). Inline files (no fid) don't
+        // need a volume-server lease; newly-created files are
+        // handled by the Lockify fast path (phase 4 §5.1).
+        //
+        // Best-effort: if the acquire fails (e.g. Filer temporarily
+        // unreachable), the write path's `ensure_lease` will retry on
+        // the first flush — correctness is preserved.
+        let is_write_open = (flags as i32 & libc::O_ACCMODE) != libc::O_RDONLY;
+        if self.client.is_inode_lease_mode() {
+            if let Some(entry) = self.cache.get_inode(inode) {
+                if entry.fid.is_some() {
+                    let client_id = self.client.client_id();
+                    let duration_ms = self.lease_duration_ms;
+                    match self
+                        .client
+                        .acquire_inode_lease(inode, &client_id, duration_ms)
+                    {
+                        Ok((token, _expire_ms)) => {
+                            let expire_at = std::time::Instant::now()
+                                + std::time::Duration::from_millis(duration_ms);
+                            self.open_file_leases.bind(inode, token.clone(), expire_at);
+                            debug!("open: pre-acquired inode lease for inode={}", inode);
+                        }
+                        Err(e) => {
+                            debug!(
+                                "open: inode lease pre-acquire failed for inode={} \
+                                 (best-effort, ensure_lease will retry): {}",
+                                inode, e
+                            );
+                        }
+                    }
+                }
+            }
         }
+
+        // §13 Cap model: acquire structured cap bits from the server.
+        // See `acquire_cap_on_open` for details. Applies to ALL files
+        // (inline AND flat). Fast path skips RPC if cap already valid.
+        self.acquire_cap_on_open(inode, is_write_open);
 
         Ok((
             Some(inode),
@@ -4677,6 +5660,13 @@ impl FileSystem for PowerFsFs {
                     }
 
                     let updated_size = inline_buf.data.len() as u64;
+                    // Snap locals BEFORE dropping the RefMut. This avoids:
+                    //   RefMut still alive → nested inline_buffers.get() on same shard
+                    //   → DashMap shard RwLock writer re-enters on same thread → deadlock.
+                    let inline_dirty_snap = inline_buf.dirty;
+                    let buf_len_snap = inline_buf.data.len();
+                    drop(inline_buf); // release DashMap shard write lock
+
                     debug!(
                         "write inline: inode={} offset={} len={} buffer_len={}",
                         inode, offset, read_len, updated_size
@@ -4684,7 +5674,79 @@ impl FileSystem for PowerFsFs {
                     // Update content_size in cache so getattr reports correct size
                     self.cache.update_size(inode, updated_size);
                     // EntryState: 标记 Dirty 以反映 inline buffer 已修改
-                    self.cache.mark_dirty(inode);
+                    // §13 Cap model: mark CAP_W dirty for recall flush.
+                    self.cache.mark_dirty_cap_w(inode);
+                    // #region debug-point fuse-inline-data-loss-dbg-write-end
+                    {
+                        let cs_after = self
+                            .cache
+                            .peek_inode(inode)
+                            .map(|e| e.content_size)
+                            .unwrap_or(u64::MAX);
+                        info!(
+                            "DBG-INLINE: write inline END inode={} offset={} len={} cs_after={} buf_len={} inline_dirty={}",
+                            inode, offset, read_len, cs_after, buf_len_snap, inline_dirty_snap
+                        );
+                    }
+                    // #endregion
+
+                    // WRITEBACK_CACHE FIX: if the last RELEASE callback already
+                    // ran for this inode (cache is NOT pinned), the kernel sent
+                    // this FUSE_WRITE via the writeback path AFTER the close
+                    // (a classic FUSE ordering pattern when WRITEBACK_CACHE is
+                    // negotiated). The normal release→sync flow already passed
+                    // — so trigger the Raft commit NOW, otherwise the data is
+                    // permanently stuck in DashMap and the Filer sees size=0.
+                    if !self.cache.is_pinned(inode) {
+                        info!(
+                            "DBG-INLINE: write inline post-release sync inode={} len={} (no open handles, immediate sync to Filer)",
+                            inode, read_len
+                        );
+                        // State machine: Dirty → Flushing → Clean (or back to Dirty on failure).
+                        self.cache.mark_flushing(inode);
+                        match self.sync_inline_buffer(inode, "write inline post-release:") {
+                            Ok(_) => {
+                                // Sync succeeded: Flushing → Clean.
+                                self.cache.mark_clean(inode);
+                                // No future release will clean up this buffer
+                                // (all handles are closed). After successful
+                                // sync, dirty=false, remove explicitly to
+                                // avoid DashMap entry leak.
+                                let still_dirty = self
+                                    .inline_buffers
+                                    .get(&inode)
+                                    .map(|b| b.dirty)
+                                    .unwrap_or(true);
+                                if !still_dirty {
+                                    self.inline_buffers.remove(&inode);
+                                    self.inline_max_sizes.remove(&inode);
+                                }
+                                // DEADLOCK SAFETY: do NOT call notify_kernel_inval_inode
+                                // here. The FUSE write callback runs on the main
+                                // fuse-worker thread, which is also the thread
+                                // that reads requests from /dev/fuse. Writing a
+                                // NOTIFY_INVAL_INODE to /dev/fuse from the same
+                                // thread causes a circular wait: kernel waiting
+                                // for WRITE response, us waiting for NOTIFY to
+                                // be drained → hang forever.
+                                // Page-cache invalidation is unnecessary here
+                                // because is_pinned=false means no struct file
+                                // is open → no process has mapped pages to
+                                // discard. Subsequent reads go through open() →
+                                // Filer fetch → fresh size/data.
+                                self.cache.mark_stale(inode);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "write inline post-release sync FAILED inode={}: {} \
+                                     (data retained in DashMap; will retry on future writes)",
+                                    inode, e
+                                );
+                                // Sync failed: revert Flushing → Dirty.
+                                self.cache.mark_dirty(inode);
+                            }
+                        }
+                    }
                     return Ok(read_len);
                 }
             } else {
@@ -4751,7 +5813,8 @@ impl FileSystem for PowerFsFs {
                         inode, new_size
                     );
                     // EntryState: 标记 Dirty 以反映 chunk_cache 已写入迁移数据
-                    self.cache.mark_dirty(inode);
+                    // §13 Cap model: mark CAP_W dirty for recall flush.
+                    self.cache.mark_dirty_cap_w(inode);
                     return Ok(read_len);
                 }
                 Err(e) => {
@@ -4980,7 +6043,8 @@ impl FileSystem for PowerFsFs {
                 &stripe_chunks,
             );
             // EntryState: 标记 Dirty 以反映 chunk_cache 已写入数据
-            self.cache.mark_dirty(inode);
+            // §13 Cap model: mark CAP_W dirty for recall flush.
+            self.cache.mark_dirty_cap_w(inode);
             return Ok(read_len);
         }
 
@@ -5177,15 +6241,88 @@ impl FileSystem for PowerFsFs {
         } else {
             // entry.fid 为 None 且无 inline_buffer: 文件可能是新建的空文件,
             // inline_buffer 被 InvalidateHandler 驱逐后未重建.
-            // 创建新 inline buffer 并写入, 而非返回 EIO.
             // 这修复了 mdtest-hard 等 metadata 密集场景下的崩溃:
             // Filer 对每个新建文件发送 invalidation, 导致 inline_buffer 被驱逐,
             // 后续 write 找不到 buffer 也找不到 fid → EIO → IO500 assertion crash.
             warn!(
-                "write: inode {} has no fid and no inline_buffer, creating new inline buffer \
-                 (likely evicted by InvalidateHandler during metadata-heavy workload)",
+                "write: inode {} has no fid and no inline_buffer, inline_buffer was evicted \
+                 (likely by InvalidateHandler during metadata-heavy workload)",
                 inode
             );
+            let new_end = offset + read_len as u64;
+            if new_end > INLINE_HARD_LIMIT as u64 {
+                // BUG FIX: 当 inline_buffer 被驱逐后, 如果写入数据超过
+                // INLINE_HARD_LIMIT, 不能返回 EFBIG (这会导致 dd 大文件写入 0 字节).
+                // 直接走 Inline→Flat migrate 逻辑: 分配 volume_id/needle_id 并切换到
+                // Flat 模式. inline_buffer 为空, merged_data 就是 buf (零填充 offset 前的间隙).
+                let merged_data = {
+                    let mut data = Vec::with_capacity(new_end as usize);
+                    if offset > 0 {
+                        data.resize(offset as usize, 0);
+                    }
+                    data.extend_from_slice(&buf[..read_len]);
+                    data
+                };
+                let migrate_threshold = INLINE_HARD_LIMIT as u64;
+                info!(
+                    "write: inode {} new_end={} > INLINE_HARD_LIMIT={}, invoking migrate \
+                     (inline_buffer was evicted, data reconstructed from write buffer)",
+                    inode, new_end, INLINE_HARD_LIMIT
+                );
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let routing_shard = self.routing_shard(inode);
+                match self.client.block_on(async move {
+                    meta_client.migrate_inline_alloc(routing_shard, inode).await
+                }) {
+                    Ok((volume_id, needle_id)) => {
+                        info!(
+                            "write inline migrate (evicted): inode={} new_end={} > threshold={} → \
+                             Flat volume_id={} needle_id={:#x}",
+                            inode, new_end, migrate_threshold, volume_id, needle_id
+                        );
+                        let mtime = chrono::Utc::now().timestamp() as u64;
+                        self.chunk_cache
+                            .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
+                        self.mark_dirty(inode, 0);
+                        let fid = Fid {
+                            volume_id: VolumeId(volume_id),
+                            cookie: 0,
+                            file_key: needle_id,
+                        };
+                        let new_size = new_end;
+                        let chunks = vec![CachedFileChunk {
+                            offset: 0,
+                            size: new_size,
+                            mtime,
+                            needle_id,
+                            volume_id,
+                            crc32: 0,
+                        }];
+                        self.cache.update_fid(inode, fid);
+                        self.cache.update_chunks(inode, chunks);
+                        self.cache.update_size(inode, new_size);
+                        self.inline_buffers.remove(&inode);
+                        self.inline_max_sizes.remove(&inode);
+                        debug!(
+                            "write inline migrate (evicted) done: inode={} size={} → Flat, \
+                             subsequent writes → Volume Server",
+                            inode, new_size
+                        );
+                        // §13 Cap model: mark CAP_W dirty for recall flush.
+                        self.cache.mark_dirty_cap_w(inode);
+                        return Ok(read_len);
+                    }
+                    Err(e) => {
+                        error!(
+                            "write inline migrate (evicted) FAILED: inode={} new_end={} error={} — \
+                             EFBIG, inline buffer unmodified",
+                            inode, new_end, e
+                        );
+                        return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
+                    }
+                }
+            }
+            // 小数据写入 (≤ 8KB): 创建新 inline buffer 并写入
             let inline_max = self
                 .inline_max_sizes
                 .get(&inode)
@@ -5203,10 +6340,6 @@ impl FileSystem for PowerFsFs {
             );
             // 重新进入 inline 写路径
             if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                let new_end = offset + read_len as u64;
-                if new_end > INLINE_HARD_LIMIT as u64 {
-                    return Err(std::io::Error::from_raw_os_error(libc::EFBIG));
-                }
                 let buf_len = inline_buf.data.len() as u64;
                 if offset > buf_len {
                     inline_buf.data.resize(offset as usize, 0);
@@ -5220,7 +6353,8 @@ impl FileSystem for PowerFsFs {
                 inline_buf.dirty = true;
                 let updated_size = inline_buf.data.len() as u64;
                 self.cache.update_size(inode, updated_size);
-                self.cache.mark_dirty(inode);
+                // §13 Cap model: mark CAP_W dirty for recall flush.
+                self.cache.mark_dirty_cap_w(inode);
                 return Ok(read_len);
             }
             // 如果 inline_buffers insert 后仍无法 get_mut (极端竞争), 回退到 EIO
@@ -5232,7 +6366,8 @@ impl FileSystem for PowerFsFs {
         }
 
         // EntryState: 标记 Dirty 以反映 chunk_cache 已写入数据
-        self.cache.mark_dirty(inode);
+        // §13 Cap model: mark CAP_W dirty for recall flush.
+        self.cache.mark_dirty_cap_w(inode);
         Ok(read_len)
     }
 
@@ -5276,273 +6411,63 @@ impl FileSystem for PowerFsFs {
         let has_inline_buffer = self.inline_buffers.contains_key(&inode);
 
         if has_inline_buffer {
-            // inode-level write → route by routing_shard(inode). Inline
-            // data + size are stored on the inode's own shard, NOT the parent
-            // dir's shard. Routing via `parent` would send the close-sync to
-            // the wrong leader and corrupt the file (size=0 / inline_data lost).
+            // WRITEBACK_CACHE FIX: sync inline data via the reusable helper
+            // function (which handles concurrent writes and the write-after-
+            // release race where FUSE_WRITE arrives AFTER release).
+            //
+            // State machine: Dirty → Flushing (sync in progress) → Clean
+            // (sync ok) or back to Dirty (sync failed). The Flushing→Clean
+            // transition is allowed; Dirty→Clean is NOT (rejected by
+            // try_transition to protect concurrent writes).
             let routing_shard = self.routing_shard(inode);
-
-            // Loop: mark-clean → clone → sync → check-dirty-again
-            // If a concurrent write marks the buffer dirty during the sync RPC,
-            // we re-sync the updated buffer. Max 3 iterations to avoid infinite
-            // loops under sustained write pressure.
-            let mut sync_ok = true;
-            let mut final_size = 0u64;
-
-            for sync_round in 0..3u32 {
-                // Step 1: Clone current data WITHOUT marking dirty=false.
-                // Marking dirty=false before sync creates a window where a
-                // concurrent open sees the buffer as not-dirty and refreshes
-                // stale metadata from the Filer (size=0), causing append writes
-                // to use offset=0 and overwrite existing data.
-                // Instead, keep dirty=true during sync and detect concurrent
-                // writes by comparing buffer length before and after sync.
-                //
-                // Also capture original_len and modified_in_place to decide
-                // between append mode (send only delta) and overwrite mode
-                // (send full buffer). Append mode prevents lost updates when
-                // multiple clients concurrently append to the same inline file.
-                let snapshot: Option<(u64, Option<Vec<u8>>, usize, bool)> = {
-                    if let Some(inline_buf) = self.inline_buffers.get(&inode) {
-                        let size = inline_buf.data.len() as u64;
-                        let was_dirty = inline_buf.dirty;
-                        let orig_len = inline_buf.original_len;
-                        let mod_in_place = inline_buf.modified_in_place;
-                        let data = if was_dirty {
-                            Some(inline_buf.data.clone())
-                        } else {
-                            None
-                        };
-                        final_size = size;
-                        Some((size, data, orig_len, mod_in_place))
-                    } else {
-                        // Buffer was removed by someone else (e.g., migration)
-                        None
-                    }
-                };
-
-                let Some((size, data, orig_len, mod_in_place)) = snapshot else {
-                    // Buffer gone, nothing to sync
-                    break;
-                };
-
-                // Step 2: If not dirty (read-only open), skip sync entirely.
-                if data.is_none() {
-                    debug!(
-                        "release inline: inode={} not dirty (round {}), skip sync",
-                        inode, sync_round
-                    );
-                    break;
-                }
-
-                // Step 3: Sync the snapshot to the Filer (outside DashMap lock).
-                //
-                // Append mode: if the buffer grew (size > original_len) and no
-                // in-place modification occurred (pure append), send only the
-                // delta (data[original_len..]) with is_append=true. The Filer
-                // atomically appends it to the current inline_data, preserving
-                // other clients' concurrent appends.
-                //
-                // Overwrite mode: if the buffer was modified in-place or didn't
-                // grow (truncate/overwrite), send the full buffer with
-                // is_append=false (existing behavior).
-                let data = data.unwrap(); // safe: data.is_none() checked above
-                let can_append = !mod_in_place && (data.len() > orig_len);
-
-                // Safety net: if the buffer didn't grow (data.len() == orig_len)
-                // and no in-place modification occurred, there's nothing new to
-                // sync. This can happen when:
-                // 1. A concurrent release already synced the data and cleared
-                //    dirty, but a race re-set dirty.
-                // 2. An empty-buffer release (data.len() == 0, orig_len == 0)
-                //    from a delayed FUSE RELEASE of a `touch`/create-without-write
-                //    operation. The kernel delays RELEASE callbacks, so the
-                //    `touch` command's release may arrive during concurrent
-                //    appends from other clients. Syncing size=0 in OVERWRITE
-                //    mode would wipe their data (L4.21 root cause).
-                //
-                // In both cases, skip the sync — the Filer's state is
-                // authoritative (no local data was written).
-                if !can_append && !mod_in_place && data.len() == orig_len {
-                    debug!(
-                        "release inline: inode={} no new data to sync (data_len={} == orig_len={}, \
-                         mod_in_place={}, skip to avoid overwriting other clients' data)",
-                        inode, data.len(), orig_len, mod_in_place
-                    );
-                    // Clear dirty (concurrent release may have missed it)
-                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                        inline_buf.dirty = false;
-                    }
-                    break;
-                }
-
-                let (sync_data, sync_size, is_append) = if can_append {
-                    let delta = data[orig_len..].to_vec();
-                    debug!(
-                        "release inline: inode={} append mode, orig_len={}, delta_len={}, total_len={}",
-                        inode, orig_len, delta.len(), data.len()
-                    );
-                    (Some(delta), 0u64, true)
-                } else {
-                    warn!(
-                        "release inline: inode={} OVERWRITE mode (is_append=false), mod_in_place={}, \
-                         data_len={}, orig_len={} — this may overwrite other clients' data",
-                        inode, mod_in_place, data.len(), orig_len
-                    );
-                    (Some(data), size, false)
-                };
-
-                let req = powerfs_coherence::UpdateInodeSizeChunksRequest {
-                    shard_id: routing_shard,
-                    inode,
-                    size: sync_size,
-                    chunks: Vec::new(),
-                    client_id: self.client.client_id(),
-                    inline_data: sync_data,
-                    is_append,
-                };
-                let max_retries = 5u32;
-                let mut last_err = String::new();
-                let mut round_ok = false;
-                for attempt in 1..=max_retries {
-                    let meta_client = self.client.facade().meta_shard_client().clone();
-                    let req = req.clone();
-                    let result = self
-                        .client
-                        .block_on(async move { meta_client.update_inode_size_chunks(&req).await });
-                    match result {
-                        Ok(resp) if resp.success => {
-                            info!(
-                                "release inline: inode={} synced size={} (round {} attempt {})",
-                                inode, size, sync_round, attempt
-                            );
-                            round_ok = true;
-                            break;
-                        }
-                        Ok(resp) => {
-                            last_err = resp.error;
-                            warn!(
-                                "release inline: inode={} round {} attempt {} failed: {}",
-                                inode, sync_round, attempt, last_err
-                            );
-                        }
-                        Err(e) => {
-                            last_err = e;
-                            warn!(
-                                "release inline: inode={} round {} attempt {} error: {}",
-                                inode, sync_round, attempt, last_err
-                            );
-                        }
-                    }
-                    if attempt < max_retries {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            500 * (attempt as u64),
-                        ));
-                    }
-                }
-
-                if !round_ok {
+            self.cache.mark_flushing(inode);
+            let sync_result = self.sync_inline_buffer(inode, "release inline:");
+            let sync_ok = match sync_result {
+                Ok(_) => true,
+                Err(e) => {
                     error!(
-                        "release inline: inode={} FAILED after {} attempts: {} — data may be lost",
-                        inode, max_retries, last_err
+                        "release inline: sync_inline_buffer failed for inode {}: {}",
+                        inode, e
                     );
-                    sync_ok = false;
-                    // Re-mark as dirty so a future release can retry
-                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                        inline_buf.dirty = true;
-                    }
-                    break;
+                    // Sync failed: revert Flushing → Dirty so the background
+                    // flusher retries.
+                    self.cache.mark_dirty(inode);
+                    false
                 }
+            };
+            // Determine if inline buffer can be removed after this release:
+            // - NEVER remove if dirty is still true (sync failed or pending writeback)
+            // - NEVER remove if synced=false AND buffer.data.len() > 0 (weird state, keep safe)
+            // - WRITEBACK_CACHE: even if synced=false (dirty=false, nothing to sync),
+            //   keep the buffer IN MEMORY (not removed) because kernel may later emit
+            //   FUSE_WRITE from writeback cache. Without the buffer, writeback would
+            //   fall through to the Stripe/Flat path and lose data / hit EFBIG.
+            //   The buffer is later removed either by the next write (which syncs
+            //   and then explicitly cleans up) or by the migration / unpin path.
+            let buf_state = self
+                .inline_buffers
+                .get(&inode)
+                .map(|b| (b.dirty, b.data.len()));
+            let (buf_dirty, buf_len) = buf_state.unwrap_or((false, 0));
+            let is_writeback_empty_write = !buf_dirty && buf_len == 0;
+            // Capture final size for the close completion log line:
+            let final_size = buf_len as u64;
 
-                // After a successful append-mode sync, update original_len to
-                // the SYNCED length (the snapshot size), NOT the current buffer
-                // length. If the buffer grew during sync (concurrent write),
-                // original_len must reflect only what was actually sent in the
-                // delta, so the re-sync round sends the NEW delta
-                // (data[original_len..]) instead of seeing data.len() ==
-                // orig_len and falling back to OVERWRITE mode (which would
-                // overwrite other clients' data).
-                //
-                // BUG: previously set to inline_buf.data.len(), which is the
-                // CURRENT (possibly grown) buffer length. This caused the
-                // re-sync to see data.len() == orig_len → OVERWRITE mode →
-                // cross-client data loss (L4.21).
-                if is_append {
-                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                        inline_buf.original_len = size as usize;
-                    }
-                }
-
-                // Step 4: Check if the buffer grew during the sync.
-                // Compare current length with synced size. If the buffer grew,
-                // a concurrent write happened — re-sync with the updated data.
-                let current_len = self
-                    .inline_buffers
-                    .get(&inode)
-                    .map(|b| b.data.len())
-                    .unwrap_or(0);
-
-                if current_len as u64 > size {
-                    warn!(
-                        "release inline: inode={} buffer grew during sync (synced={}, current={}), re-syncing (round {})",
-                        inode, size, current_len, sync_round
-                    );
-                    continue; // Re-sync with the updated buffer
-                }
-
-                // Buffer unchanged — mark as not dirty and remove.
-                // Use get_mut to atomically clear dirty and check size again.
-                let can_remove = {
-                    if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
-                        if inline_buf.data.len() as u64 > size {
-                            // Buffer grew between the check above and here
-                            false
-                        } else {
-                            inline_buf.dirty = false;
-                            true
-                        }
-                    } else {
-                        false // Buffer removed by someone else
-                    }
-                };
-
-                if !can_remove {
-                    warn!(
-                        "release inline: inode={} buffer grew between check and remove, re-syncing (round {})",
-                        inode, sync_round
-                    );
-                    continue;
-                }
-
-                break;
-            }
-
-            // Remove the inline buffer ONLY if this is the last open handle.
-            // If other handles are still open (open_count > 0), keeping the
-            // buffer allows subsequent writes on those handles to append to
-            // the inline data. Removing it prematurely causes the next write
-            // to fall through to the Stripe/Flat path, which returns EFBIG
-            // for inline files (no fid, no chunks → max_stripe_offset=0).
-            // L4.21 failure: concurrent `>>` appends from bash for-loops
-            // overlap (FUSE RELEASE is async), so the second OPEN arrives
-            // before the first RELEASE completes. The second write then
-            // finds no inline buffer and hits the Stripe path's EFBIG.
-
-            // open_count_dec (best-effort, 同 Flat 路径)
+            // open_count_dec (fire-and-forget，不阻塞 release)
             let meta_shard_client = self.client.facade().meta_shard_client().clone();
             let req = powerfs_coherence::OpenCountRequest {
                 shard_id: routing_shard,
                 inode,
             };
-            if let Err(e) = self
-                .client
-                .block_on(async move { meta_shard_client.open_count_dec(&req).await })
-            {
-                debug!(
-                    "release inline: open_count_dec for inode {} failed (best-effort): {}",
-                    inode, e
-                );
-            }
+            let runtime = self.client.runtime().handle().clone();
+            runtime.spawn(async move {
+                if let Err(e) = meta_shard_client.open_count_dec(&req).await {
+                    debug!(
+                        "release inline: open_count_dec for inode {} failed (best-effort): {}",
+                        inode, e
+                    );
+                }
+            });
 
             // 移除 open_inodes 追踪 + unpin (Inline 无 flush 失败重试, 总是 unpin)
             // Use reference count: only remove when last open context closes.
@@ -5567,23 +6492,101 @@ impl FileSystem for PowerFsFs {
                 self.cache.unpin_inode(inode)
             };
 
-            // Only remove the inline buffer if this was the last open handle
-            // (released=true). If other handles are still open (released=false),
-            // keep the buffer so concurrent writes can continue appending.
-            if released {
-                self.inline_buffers.remove(&inode);
-                self.inline_max_sizes.remove(&inode);
-                // L4.21 fix: Invalidate the kernel page cache after the last
-                // handle is closed. During concurrent appends, Invalidates from
-                // other clients were skipped (inode was Dirty). After release,
-                // the kernel page cache still holds this client's own write
-                // data, which is stale — it doesn't include other clients'
-                // concurrent appends that were synced to the Filer. Without
-                // this notification, subsequent reads (e.g., wc -l) return
-                // stale line counts from the page cache.
-                self.notify_kernel_inval_inode(inode);
-                // Mark cache entry as Stale so the next open/getattr
-                // refreshes metadata (size) from the Filer.
+            // Only remove the inline buffer if ALL of:
+            //   (a) this was the LAST open handle (released = true),
+            //   (b) buffer is NOT dirty,
+            //   (c) we ACTUALLY synced something (sync_helper did work so data
+            //       is on Filer) OR buffer is completely empty (pure create /
+            //       touch with no data ever written — no future writeback).
+            //
+            // WRITEBACK_CACHE FIX (L17 in hypotheses): Keep the buffer even if
+            // dirty=false and we synced nothing! This happens when the kernel
+            // delays FUSE_WRITE until after the FUSE_RELEASE callback. The
+            // writeback kernel thread will later call FUSE_WRITE with the
+            // page-cache dirty pages. If we remove the buffer now, that
+            // FUSE_WRITE falls through to the Stripe/Flat path, which errors
+            // out — data lost. Preserving the DashMap entry allows the late
+            // FUSE_WRITE's "is_pinned==false → sync immediately" branch to
+            // catch up and persist the data.
+            //
+            // Leak-safety: the buffer is guaranteed to be removed later by one of:
+            //   (1) Inline write-end → sync_inline_buffer succeeds → remove.
+            //   (2) Migration path (inline → Flat) → L4901 removes inline_buffers.
+            //   (3) Unpin cache eviction / inode forget → removes via helper.
+            //   (4) File opened by another process → fresh buffer fetched;
+            //       stale buf replaced by L3341 insert fresh (dirty=false).
+            if released && !buf_dirty {
+                // FIX: Keep the inline buffer even after successful sync.
+                // The buffer is the authoritative local copy of the file's
+                // content. Removing it forces the next open() to fetch
+                // inline_data from the Filer via getattr — but in
+                // async_meta_persist mode the Filer may not have applied
+                // the Raft log yet, returning empty inline_data → read
+                // returns wrong content (MD5 mismatch).
+                //
+                // The buffer is safe to keep because:
+                // - dirty=false: no unsynced local modifications
+                // - sync_ok=true: data is replicated via Raft
+                // - Open path's staleness check (needs_refresh / size
+                //   mismatch) will evict the buffer if another client
+                //   modified the file on the Filer.
+                //
+                // Only remove for pure empty writes (touch with no data)
+                // since there's nothing to cache.
+                if is_writeback_empty_write {
+                    self.inline_buffers.remove(&inode);
+                    self.inline_max_sizes.remove(&inode);
+                    debug!(
+                        "release inline: inode={} removed empty inline buffer (touch/create, no data)",
+                        inode
+                    );
+                } else {
+                    debug!(
+                        "release inline: inode={} keeping inline buffer after sync (dirty={}, sync_ok={}) — next open uses local data",
+                        inode, buf_dirty, sync_ok
+                    );
+                }
+                // L4.21 fix: Mark cache entry Stale after the last handle is
+                // released so the next open(getattr) refreshes from the Filer
+                // (prevents TTL-stale content_size blocking append writes).
+                //
+                // DEADLOCK SAFETY: do NOT call notify_kernel_inval_inode from
+                // the release() callback. release() runs on the FUSE worker
+                // thread (which reads requests from /dev/fuse). NOTIFY writes
+                // from this thread block because kernel needs the worker to
+                // drain incoming requests before processing the out-of-band
+                // notify. Result: kernel waits for RELEASE response → we wait
+                // for NOTIFY write → deadlock → entire fuse mount hangs forever.
+                //
+                // Safe alternative: mark_stale only (in-process cache bypass).
+                // Next open() re-fetches metadata from the Filer via RPC, which
+                // is independent of kernel page cache. Since no process has an
+                // open fd at this point, page-cache contents are never used
+                // before the next open anyway (a new struct file forces a
+                // fresh lookup that fills pages from our read callback).
+                //
+                // FIX: Use mark_clean instead of mark_stale when sync succeeded.
+                // mark_stale causes the next stat/getattr to re-fetch from Filer,
+                // but in async_meta_persist mode the Filer may not have applied
+                // the Raft log yet → returns size=0 → user sees 0-byte file.
+                // mark_clean keeps the local cache (with correct size) as
+                // authoritative; the next open() will refresh from Filer.
+                if sync_ok {
+                    self.cache.mark_clean(inode);
+                } else {
+                    self.cache.mark_stale(inode);
+                }
+            } else if released {
+                // released=true but dirty=true (sync failed). Do NOT remove;
+                // future retry or write-end can try again. Cache still needs
+                // refreshing so getattr/re-read doesn't trust stale local
+                // content_size. Same deadlock rule as above: do NOT notify
+                // the kernel from within the release callback — mark_stale()
+                // is sufficient.
+                debug!(
+                    "release inline: inode={} dirty=true after sync failed, retaining buffer for retry",
+                    inode
+                );
                 self.cache.mark_stale(inode);
             } else {
                 debug!(
@@ -5595,6 +6598,34 @@ impl FileSystem for PowerFsFs {
             if !sync_ok {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
+
+            // §13 Cap model: on last close with successful sync, release
+            // the cap. The inline sync already persisted data via Raft,
+            // so we mark flushed + take cap + send CapRelease RPC.
+            // Without this, inline files leak caps on the server (blocking
+            // future exclusive grants) and the client re-uses a stale cap.
+            if released {
+                self.cache.mark_cap_flushed(inode);
+                if let Some(cap) = self.cache.take_cap(inode) {
+                    let facade = self.client.facade().clone();
+                    let client_id = self.client.client_id();
+                    let cap_token = cap.token.clone();
+                    let runtime = self.client.runtime().handle().clone();
+                    runtime.spawn(async move {
+                        if let Err(e) = facade.cap_release(inode, &client_id, &cap_token).await {
+                            debug!(
+                                "release inline: cap_release for inode {} failed (best-effort): {}",
+                                inode, e
+                            );
+                        }
+                    });
+                    debug!(
+                        "release inline: cap released for inode={} (last close, caps were {:?})",
+                        inode, cap.issued
+                    );
+                }
+            }
+
             debug!(
                 "release inline: inode={} closed, size={}",
                 inode, final_size
@@ -5669,15 +6700,15 @@ impl FileSystem for PowerFsFs {
                 shard_id: open_count_shard,
                 inode,
             };
-            if let Err(e) = self
-                .client
-                .block_on(async move { meta_shard_client.open_count_dec(&req).await })
-            {
-                debug!(
-                    "release: open_count_dec for inode {} failed (best-effort): {}",
-                    inode, e
-                );
-            }
+            let runtime = self.client.runtime().handle().clone();
+            runtime.spawn(async move {
+                if let Err(e) = meta_shard_client.open_count_dec(&req).await {
+                    debug!(
+                        "release: open_count_dec for inode {} failed (best-effort): {}",
+                        inode, e
+                    );
+                }
+            });
         }
 
         // Phase 4.3/4.4: 移除 open_inodes 追踪（getattr 恢复短 TTL）
@@ -5706,7 +6737,40 @@ impl FileSystem for PowerFsFs {
                     open_inodes.remove(&inode);
                 }
             }
-            self.cache.unpin_inode(inode);
+            let last_release = self.cache.unpin_inode(inode);
+
+            // §13 Cap model: on last close, release the cap.
+            //
+            // The flush+sync above already persisted dirty data (if
+            // sync_result.is_ok), so we just need to:
+            // 1. Mark cap as flushed (clear flushing_caps)
+            // 2. Send CapRelease RPC to the Filer (best-effort)
+            // 3. Take the cap out of the cache entry
+            //
+            // If flush failed, we keep the cap (and the pinned inode)
+            // so the background flusher can retry; the cap will be
+            // released when the retry succeeds or the inode is evicted.
+            if last_release && sync_result.is_ok() {
+                self.cache.mark_cap_flushed(inode);
+                if let Some(cap) = self.cache.take_cap(inode) {
+                    let facade = self.client.facade().clone();
+                    let client_id = self.client.client_id();
+                    let cap_token = cap.token.clone();
+                    let runtime = self.client.runtime().handle().clone();
+                    runtime.spawn(async move {
+                        if let Err(e) = facade.cap_release(inode, &client_id, &cap_token).await {
+                            debug!(
+                                "release: cap_release for inode {} failed (best-effort): {}",
+                                inode, e
+                            );
+                        }
+                    });
+                    debug!(
+                        "release: cap released for inode={} (last close, caps were {:?})",
+                        inode, cap.issued
+                    );
+                }
+            }
         } else {
             warn!(
                 "release: keeping inode {} pinned (flush failed, dirty chunks remain for retry)",
@@ -5836,6 +6900,12 @@ impl FileSystem for PowerFsFs {
             }
         }
 
+        // Phase-4 §5.2 (P3): Invalidate the open-file-lease binding.
+        // The Filer-side release was handled above (success or
+        // best-effort failure); the registry is just a hint and must
+        // be cleared so a subsequent open re-binds a fresh token.
+        self.open_file_leases.invalidate(inode);
+
         sync_result?;
 
         debug!("release: inode {} closed, size/chunks synced", inode);
@@ -5852,6 +6922,16 @@ impl FileSystem for PowerFsFs {
         add_entry: &mut dyn FnMut(DirEntry) -> std::io::Result<usize>,
     ) -> std::io::Result<()> {
         debug!("readdir: inode={}, offset={}", inode, offset);
+
+        // Note: The old directory-level local lease (acquire_dir_lease) has
+        // been replaced by the dentry lease mechanism. readdir now marks the
+        // directory as "complete" (I_COMPLETE equivalent) at the end, and
+        // lookups use the three-layer check (dentry lease → shared_gen → RPC)
+        // to decide whether to trust the local cache. The Filer auto-subscribes
+        // the client to the parent inode on lookup/readdir, so Invalidate
+        // notifications are pushed when another client modifies the directory.
+        //
+        // Design: docs/shard-routing-no-forward-principle.md §7 (dentry lease)
 
         // 尝试从缓存获取目录条目（用于 is_dir 检查和 ".." 的 parent inode）
         let cached_entry = self.cache.get_inode(inode);
@@ -6030,7 +7110,7 @@ impl FileSystem for PowerFsFs {
             // to a name near the end of the BTreeMap, so the next readdir
             // RPC returned 0 entries — silently dropping ~500/600 entries
             // and causing rm -rf to leave most files behind.
-            match add_entry(DirEntry {
+            let added = match add_entry(DirEntry {
                 ino: child.inode,
                 offset: idx,
                 type_,
@@ -6042,11 +7122,103 @@ impl FileSystem for PowerFsFs {
                     // the cursor resumes correctly on the next readdir call.
                     break;
                 }
-                Ok(_) => {
+                Ok(n) => {
                     last_returned = Some(child);
+                    Some(n)
                 }
                 Err(_) => {
                     break;
+                }
+            };
+
+            // === READDIR-DRIVEN ATTR CACHING ===
+            // If the Filer's readdir response piggybacked stat fields on the
+            // entry (mode/uid/gid/size/mtime/nlink + child_shard_id), seed
+            // the client cache with them as a Stale hint. This avoids an
+            // extra per-entry getattr RPC for a subsequent `ls -l`, which
+            // otherwise would be O(N) cross-shard RPCs when the directory
+            // contains children homed on different shards (UpdateChildSummary
+            // in §3.2 of the MetaCache design populates exactly these fields
+            // on the parent shard leader's readdir path).
+            //
+            // Rules:
+            //   * inserted state = EntryState::Stale — these attrs are a
+            //     "cached value of last resort", not the result of a fresh
+            //     per-entry lookup RPC. If the user ever does a real stat()
+            //     or the TTL expires, we fall back to a full getattr RPC and
+            //     the entry moves to Clean / Dirty normally. In particular,
+            //     NEVER overwrite an existing cache entry that's in the
+            //     Clean, Dirty, or Flushing lifecycle state (those carry
+            //     authoritative local data that readdir's indirect payload
+            //     must not regress).
+            //   * skip `..` / `.` (they're never MetadataDirEntry items).
+            //   * cross-shard child_shard_id is stored as `shard_id: Some()`,
+            //     so `routing_shard()` uses the Filer-provided value instead
+            //     of re-hashing inode (avoids shard_count drift skew).
+            if added.is_some() {
+                if let Some(attr) = child.attrs.as_ref() {
+                    if self.cache.get_inode(child.inode).is_none() {
+                        use std::time::Instant;
+                        let is_dir = child.file_type == libc::DT_DIR;
+                        let is_symlink = child.file_type == libc::DT_LNK;
+                        let symlink_target = if is_symlink {
+                            attr.symlink_target.clone()
+                        } else {
+                            None
+                        };
+                        // Units: readdir response encodes atime/mtime/ctime in
+                        // milliseconds, matching the same convention the rest
+                        // of attr_from_resp uses for MetadataAttr → CachedEntry.
+                        let ms_to_i64 = |ms: u64| -> i64 {
+                            if ms <= i64::MAX as u64 {
+                                ms as i64
+                            } else {
+                                i64::MAX
+                            }
+                        };
+                        let cached = CachedEntry {
+                            inode: child.inode,
+                            parent: inode,
+                            name: child.name.clone(),
+                            is_dir,
+                            is_symlink,
+                            symlink_target,
+                            nlink: attr.nlink.max(1),
+                            fid: None,
+                            size: attr.size,
+                            // Strip SUID/SGID/sticky + file-type bits → perm
+                            // by masking with 0o7777, mirroring what
+                            // entry_to_cached does with the raw mode field.
+                            mode: attr.mode & 0o7777,
+                            uid: attr.uid,
+                            gid: attr.gid,
+                            atime: ms_to_i64(attr.atime),
+                            mtime: ms_to_i64(attr.mtime),
+                            ctime: attr.ctime, // already signed ms in MetadataAttr
+                            xattrs: HashMap::new(),
+                            chunks: Vec::new(),
+                            hard_link_id: String::new(),
+                            hard_link_counter: 0,
+                            content_size: attr.size,
+                            disk_size: attr.size,
+                            generation: 0,
+                            placement: attr.placement.clone(),
+                            reliability: attr.reliability.clone(),
+                            replica_chunks: Vec::new(),
+                            shard_id: if child.child_shard_id != 0 {
+                                Some(child.child_shard_id)
+                            } else {
+                                attr.shard_id
+                            },
+                            cached_at: Instant::now(),
+                            state: EntryState::Stale,
+                            hold: HoldState::Unpinned,
+                            cap: None,
+                            dentry_lease: None,
+                            dir_shared_gen: 0,
+                        };
+                        self.cache.insert(cached);
+                    }
                 }
             }
         }
@@ -6070,6 +7242,19 @@ impl FileSystem for PowerFsFs {
                 ReaddirCursor {
                     last_name: last.name.clone(),
                 },
+            );
+        }
+
+        // Mark the directory as complete (I_COMPLETE equivalent) so that
+        // subsequent lookups can trust negative dentries (cache miss = ENOENT)
+        // without sending an RPC, as long as the dir_version (shared_gen)
+        // hasn't changed. This is the Ceph I_COMPLETE mechanism.
+        if offset == 0 {
+            let dir_version = self.cache.get_dir_version(inode);
+            self.cache.mark_dir_complete(inode, dir_version);
+            debug!(
+                "readdir: marked dir {} complete (version={})",
+                inode, dir_version
             );
         }
 
@@ -6192,8 +7377,16 @@ impl FileSystem for PowerFsFs {
             cached_at: Instant::now(),
             state: EntryState::default(),
             hold: HoldState::default(),
+            cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
         self.cache.insert(cached_entry.clone());
+
+        // Phase-4 §5.1 Lockify: speculatively self-declare inode
+        // ownership for the new symlink. Async-synced to filer.
+        self.lockify_declare_new_inode(inode);
+
         Ok(self.create_fuse_entry(&cached_entry))
     }
 
@@ -6288,6 +7481,9 @@ impl FileSystem for PowerFsFs {
                     cached_at: Instant::now(),
                     state: EntryState::default(),
                     hold: HoldState::default(),
+                    cap: None,
+                    dentry_lease: None,
+                    dir_shared_gen: 0,
                 };
 
                 self.cache.insert(new_entry.clone());

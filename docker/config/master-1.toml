@@ -8,12 +8,14 @@ redis_url = "redis://172.30.0.50:6379"
 
 [master]
 port = 9333                    # HTTP/gRPC端口
+raft_port = 9335               # Raft gRPC端口 (必须与port和net_port和metrics_port不同)
+metrics_port = 9300            # Metrics/Admin HTTP端口 (必须与其他三个master端口都不同, 无加减推导)
 net_port = 9334                # powerfs-net端口 (必须与port不同)
 dir = "/data/master"
 ip = "0.0.0.0"
 advertise_addr = "172.30.0.11:9333"
 raft_id = 1
-peers = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+raft_peers = ["172.30.0.11:9335", "172.30.0.12:9335", "172.30.0.13:9335"]
 
 [volume]
 grpc_port = 8080
@@ -30,6 +32,7 @@ advertise_addr = "172.30.0.21"
 [filer]
 port = 8888
 grpc_port = 8889
+metrics_port = 8900             # Metrics HTTP端口 (必须与port/grpc_port/net_port都不同, 禁用加减推导)
 net_port = 9334
 ip = "0.0.0.0"
 master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
