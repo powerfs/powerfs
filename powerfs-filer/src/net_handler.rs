@@ -691,6 +691,59 @@ impl FilerNetHandler {
         }
     }
 
+    /// Build a response for `meta_shard_manager` write-path errors that
+    /// preserves the "no inter-service forwarding" contract.
+    ///
+    /// The handler-level `check_leader` gate catches obvious non-leader cases
+    /// at the top of each RPC, but between that check and the actual
+    /// `propose`/`propose_ff` call inside `meta_shard_manager` the Raft
+    /// state can flip (election, network blip, schedule skew). When that
+    /// happens `RaftGroupManager::propose{,_ff,_many}` return a string
+    /// starting with `"not_leader: shard N requires client redirect ..."`
+    /// instead of committing. Returning a generic SERVER_ERROR here would be
+    /// catastrophic: the client sees a permanent failure, retries the SAME
+    /// follower node (no shard_router update) N times, then reports IO error
+    /// to the kernel. Instead we return STATUS_ERR_REDIRECT with the real
+    /// leader address in the response body (TLV FieldId::Owner), so the
+    /// client retry path updates `shard_router` and fires the next request
+    /// straight at the correct leader.
+    ///
+    /// For any other error (inode full, parent missing, quota, ...) we keep
+    /// STATUS_ERR_SERVER_ERROR as before.
+    async fn build_err_redirect_or_server(
+        &self,
+        msg: &NetMessage,
+        shard_id: ShardId,
+        err: &str,
+    ) -> NetMessage {
+        let is_redirect = err.contains("not_leader") || err.contains("redirect");
+        if !is_redirect {
+            return Self::build_response(msg, STATUS_ERR_SERVER_ERROR, Vec::new());
+        }
+        let owner_net_addr = match self
+            .meta_shard_manager
+            .get_shard_leader_status(shard_id)
+            .await
+        {
+            Some((false, leader_grpc)) if !leader_grpc.is_empty() => {
+                Self::grpc_addr_to_net_addr(&leader_grpc, self.net_port)
+            }
+            _ => {
+                // Leader unknown (election in flight) or we're still the
+                // leader (race window); fall back to redirecting to the
+                // current node's own net address. This mimics the
+                // `check_leader` "election in progress" branch — the client
+                // will retry on this node, which will eventually either
+                // serve the write or return a precise redirect.
+                let self_grpc = self.meta_shard_manager.get_node_grpc_address();
+                Self::grpc_addr_to_net_addr(&self_grpc, self.net_port)
+            }
+        };
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_string(FieldId::Owner, &owner_net_addr);
+        Self::build_response(msg, STATUS_ERR_REDIRECT, enc.into_bytes())
+    }
+
     /// Convert InodeInfo to EntryInfo for powerfs-net response
     fn inode_to_entry_info(info: &InodeInfo) -> EntryInfo {
         let is_dir = matches!(info.file_type, FileType::Directory);
@@ -1079,11 +1132,7 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_SETATTR failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -1118,11 +1167,7 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_SETATTR_DATA failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -1189,11 +1234,7 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_SETATTR_META failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -1460,11 +1501,7 @@ impl FilerNetHandler {
                         .map(|(_, n)| format!(" (needle_id={:#x} leaked, acceptable)", n))
                         .unwrap_or_default()
                 );
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -1546,11 +1583,7 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_MKDIR failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -1622,11 +1655,9 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_MKDIR_PHASE_A failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self
+                    .build_err_redirect_or_server(msg, target_shard, &e)
+                    .await)
             }
         }
     }
@@ -1689,11 +1720,9 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_MKDIR_PHASE_B failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self
+                    .build_err_redirect_or_server(msg, parent_shard, &e)
+                    .await)
             }
         }
     }
@@ -1757,11 +1786,7 @@ impl FilerNetHandler {
                             "FILER_NET_UNLINK failed: parent_ino={}, name={}, inode={}, err={}",
                             parent_ino, name, info.inode, e
                         );
-                        Ok(Self::build_response(
-                            msg,
-                            STATUS_ERR_SERVER_ERROR,
-                            Vec::new(),
-                        ))
+                        Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
                     }
                 }
             }
@@ -1893,15 +1918,19 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_RMDIR failed: {}", e);
-                // Encode the error string in the body (FieldId::Name) so the
-                // FUSE client can map "not empty" -> libc::ENOTEMPTY.
-                let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    enc.into_bytes(),
-                ))
+                if e.contains("not_leader") || e.contains("redirect") {
+                    Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
+                } else {
+                    // Encode the error string in the body (FieldId::Name) so the
+                    // FUSE client can map "not empty" -> libc::ENOTEMPTY.
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, &e);
+                    Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        enc.into_bytes(),
+                    ))
+                }
             }
         }
     }
@@ -1963,11 +1992,7 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_RENAME failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -2084,11 +2109,7 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_SYMLINK failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -2157,11 +2178,7 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_LINK failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -2199,13 +2216,17 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_ALLOC_INODE failed: {}", e);
-                let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    enc.into_bytes(),
-                ))
+                if e.contains("not_leader") || e.contains("redirect") {
+                    Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
+                } else {
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, &e);
+                    Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        enc.into_bytes(),
+                    ))
+                }
             }
         }
     }
@@ -2326,14 +2347,18 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_UPDATE_SIZE_CHUNKS failed: {}", e);
-                // 失败: STATUS_ERR + FieldId::Name = error string
-                let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    enc.into_bytes(),
-                ))
+                if e.contains("not_leader") || e.contains("redirect") {
+                    Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
+                } else {
+                    // 失败: STATUS_ERR + FieldId::Name = error string
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, &e);
+                    Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        enc.into_bytes(),
+                    ))
+                }
             }
         }
     }
@@ -2361,13 +2386,17 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_OPEN_COUNT_INC failed: {}", e);
-                let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    enc.into_bytes(),
-                ))
+                if e.contains("not_leader") || e.contains("redirect") {
+                    Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
+                } else {
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, &e);
+                    Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        enc.into_bytes(),
+                    ))
+                }
             }
         }
     }
@@ -2395,13 +2424,17 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_OPEN_COUNT_DEC failed: {}", e);
-                let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Name, &e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    enc.into_bytes(),
-                ))
+                if e.contains("not_leader") || e.contains("redirect") {
+                    Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
+                } else {
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, &e);
+                    Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        enc.into_bytes(),
+                    ))
+                }
             }
         }
     }
@@ -2520,11 +2553,7 @@ impl FilerNetHandler {
             }
             Err(e) => {
                 warn!("FILER_NET_SETXATTR failed: {}", e);
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
@@ -2605,11 +2634,7 @@ impl FilerNetHandler {
                     "FILER_NET_REMOVEXATTR: failed for inode {} key {}: {}",
                     inode, key, e
                 );
-                Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_SERVER_ERROR,
-                    Vec::new(),
-                ))
+                Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
             }
         }
     }
