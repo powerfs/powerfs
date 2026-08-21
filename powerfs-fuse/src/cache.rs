@@ -125,6 +125,57 @@ pub struct CachedEntry {
     ///
     /// Cleared on `release()` (last close) via `take_cap`.
     pub cap: Option<crate::client_cap::ClientCap>,
+
+    /// Dentry-level lease (per-name, like Ceph's Dentry::lease_ttl).
+    ///
+    /// When `Some` and `expire_at > now`, this dentry is authoritative:
+    ///   - Positive dentry (inode != 0): cached attr is valid
+    ///   - Negative dentry (inode == 0): file truly doesn't exist
+    ///
+    /// Granted by the Filer in lookup/readdir responses. Invalidated when
+    /// the parent directory's version changes (detected via `dir_version`
+    /// mismatch or explicit Invalidate notification).
+    pub dentry_lease: Option<DentryLease>,
+
+    /// The parent directory's version (shared_gen) when this dentry was
+    /// last validated. Compared against the cached `dir_version` to detect
+    /// stale dentries after lease expiry (Ceph's cap_shared_gen mechanism).
+    pub dir_shared_gen: u64,
+}
+
+/// Per-dentry lease metadata, granted by the Filer.
+///
+/// Modeled after Ceph's Dentry lease (Dentry.h: lease_mds, lease_ttl,
+/// lease_seq, lease_gen). The Filer issues a lease TTL in lookup/readdir
+/// responses; the client stores it here and trusts the dentry (positive
+/// or negative) until `expire_at`.
+#[derive(Debug, Clone)]
+pub struct DentryLease {
+    /// When this lease expires (client-local clock).
+    pub expire_at: Instant,
+    /// Filer-issued lease duration (ms), for refresh accounting.
+    pub duration_ms: u64,
+    /// Filer node id that issued the lease (for future lease migration).
+    pub issuer: u64,
+}
+
+/// Result of checking a dentry's lease status (three-layer, like Ceph).
+///
+/// Layer 1: per-dentry lease (DentryLease::expire_at)
+/// Layer 2: dir shared_gen match + dir_complete (I_COMPLETE)
+/// Layer 3: RPC to Filer
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DentryLeaseStatus {
+    /// Dentry lease is valid → trust cache (positive or negative).
+    LeaseValid,
+    /// Lease expired but shared_gen matches + dir is complete → trust cache.
+    SharedGenValid,
+    /// No entry in cache, but dir is complete → ENOENT (negative complete).
+    NegativeComplete,
+    /// Lease expired or no lease, shared_gen mismatch → must RPC.
+    Expired,
+    /// No cached entry, dir not complete → must RPC.
+    Miss,
 }
 
 impl CachedEntry {
@@ -220,6 +271,14 @@ pub struct UpdateAttrParams {
 struct DirCacheEntry {
     entries: Vec<(u64, String, bool)>, // (inode, name, is_dir)
     cached_at: Instant,
+    /// Directory version (shared_gen) from the Filer when this listing
+    /// was fetched. Compared against incoming Invalidate notifications
+    /// to detect stale listings (Ceph's I_COMPLETE + shared_gen mechanism).
+    dir_version: u64,
+    /// Whether this directory listing is complete (I_COMPLETE equivalent).
+    /// Set true after a full readdir; cleared on any invalidate.
+    /// When true, negative dentries (cache miss) can be trusted locally.
+    complete: bool,
 }
 
 /// Default TTL for metadata cache entries (seconds). Entries older than this are
@@ -247,6 +306,15 @@ pub struct MetadataCache {
     metadata_ttl: Duration,
     /// Latest known generation per path (from notifications)
     path_generations: RwLock<HashMap<String, u64>>,
+    /// Per-directory version (shared_gen) tracking.
+    ///
+    /// Updated from:
+    ///   - Filer lookup/readdir responses (carries dir_version)
+    ///   - Invalidate notifications (increments to match server)
+    ///
+    /// Compared against CachedEntry::dir_shared_gen to detect stale
+    /// dentries after their per-dentry lease expires.
+    dir_versions: RwLock<HashMap<u64, u64>>,
 }
 
 impl MetadataCache {
@@ -272,6 +340,7 @@ impl MetadataCache {
             dir_cache_ttl: Duration::from_secs(5),
             metadata_ttl,
             path_generations: RwLock::new(HashMap::new()),
+            dir_versions: RwLock::new(HashMap::new()),
         };
         // Initialize root directory (inode 1)
         let now = chrono::Utc::now().timestamp();
@@ -308,6 +377,8 @@ impl MetadataCache {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
         cache
     }
@@ -331,6 +402,23 @@ impl MetadataCache {
     /// The TTL check is a safety net for lost Invalidate notifications, not
     /// the primary invalidation mechanism. InvalidateHandler sets Stale
     /// directly when the Filer pushes a notification.
+    /// Look up a cached entry by (parent_inode, name).
+    /// Used by the dentry lease check in lookup — when the lease is valid
+    /// but the entry might be positive or negative.
+    pub fn get_inode_by_name(&self, parent_inode: u64, name: &str) -> Option<CachedEntry> {
+        let cache = self.inode_cache.read().unwrap();
+        for (_, entry) in cache.iter() {
+            if entry.parent == parent_inode && entry.name == name {
+                // Only return non-Stale, non-Tombstone entries
+                if entry.state == EntryState::Stale || entry.state == EntryState::Tombstone {
+                    return None;
+                }
+                return Some(entry.clone());
+            }
+        }
+        None
+    }
+
     pub fn get_inode(&self, inode: u64) -> Option<CachedEntry> {
         let mut cache = self.inode_cache.write().unwrap();
         let entry = cache.get(&inode).cloned()?;
@@ -1107,6 +1195,135 @@ impl MetadataCache {
     pub fn invalidate_dir(&self, parent_inode: u64) {
         let mut dir_cache = self.dir_cache.write().unwrap();
         dir_cache.remove(&parent_inode);
+        // Bump dir_version so stale dentries with dir_shared_gen mismatch
+        // are detected on next lookup (Ceph's clear_dir_complete_and_ordered).
+        let mut versions = self.dir_versions.write().unwrap();
+        let v = versions.entry(parent_inode).or_insert(0);
+        *v = v.wrapping_add(1);
+    }
+
+    /// Get the current dir_version (shared_gen) for a parent directory.
+    /// Returns 0 if unknown (first access — no dentry can match yet).
+    pub fn get_dir_version(&self, parent_inode: u64) -> u64 {
+        self.dir_versions
+            .read()
+            .unwrap()
+            .get(&parent_inode)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Update dir_version from a Filer response (lookup/readdir carry the
+    /// parent's version). Only moves forward — never decreases.
+    pub fn update_dir_version(&self, parent_inode: u64, version: u64) {
+        let mut versions = self.dir_versions.write().unwrap();
+        let entry = versions.entry(parent_inode).or_insert(0);
+        if version > *entry {
+            *entry = version;
+        }
+    }
+
+    /// Check if a dentry's dir_shared_gen matches the parent's current
+    /// dir_version. When true and the parent dir_cache is complete,
+    /// the dentry (positive or negative) can be trusted without RPC.
+    pub fn dentry_shared_gen_valid(&self, parent_inode: u64, dn_shared_gen: u64) -> bool {
+        let versions = self.dir_versions.read().unwrap();
+        let current = versions.get(&parent_inode).copied().unwrap_or(0);
+        dn_shared_gen == current
+    }
+
+    /// Check if the parent directory's listing is complete (I_COMPLETE
+    /// equivalent). When true, negative dentries are trustworthy.
+    pub fn is_dir_complete(&self, parent_inode: u64) -> bool {
+        let dir_cache = self.dir_cache.read().unwrap();
+        dir_cache
+            .get(&parent_inode)
+            .map(|e| e.complete)
+            .unwrap_or(false)
+    }
+
+    /// Mark a directory's listing as complete (after full readdir).
+    pub fn mark_dir_complete(&self, parent_inode: u64, version: u64) {
+        let mut dir_cache = self.dir_cache.write().unwrap();
+        if let Some(entry) = dir_cache.get_mut(&parent_inode) {
+            entry.complete = true;
+            entry.dir_version = version;
+        }
+    }
+
+    /// Grant a dentry lease on a cached entry (positive or negative).
+    /// Called after a Filer lookup/readdir response that carries a
+    /// dentry lease TTL.
+    pub fn grant_dentry_lease(&self, parent_inode: u64, name: &str, duration_ms: u64, issuer: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        // Find entry by (parent, name) — dentry leases are per-name, not
+        // per-inode (negative dentries have no inode). We iterate since
+        // the cache is keyed by inode.
+        for (_, entry) in cache.iter_mut() {
+            if entry.parent == parent_inode && entry.name == name {
+                entry.dentry_lease = Some(DentryLease {
+                    expire_at: Instant::now() + Duration::from_millis(duration_ms),
+                    duration_ms,
+                    issuer,
+                });
+                entry.dir_shared_gen = self.get_dir_version(parent_inode);
+                return;
+            }
+        }
+        // Entry not found — dentry lease for a name not in cache.
+        // This can happen for negative dentries that were evicted.
+        // The lease is lost; next lookup will RPC and re-acquire.
+    }
+
+    /// Check if a cached dentry (by parent + name) has a valid lease.
+    /// Returns Some(true) if lease is valid (trust cache, skip RPC),
+    /// Some(false) if lease expired but shared_gen still matches
+    /// (trust if dir_complete), None if no entry or lease missing.
+    pub fn check_dentry_lease(&self, parent_inode: u64, name: &str) -> DentryLeaseStatus {
+        let cache = self.inode_cache.read().unwrap();
+        for (_, entry) in cache.iter() {
+            if entry.parent == parent_inode && entry.name == name {
+                // Layer 1: dentry lease valid?
+                if let Some(ref lease) = entry.dentry_lease {
+                    if Instant::now() < lease.expire_at {
+                        return DentryLeaseStatus::LeaseValid;
+                    }
+                }
+                // Layer 2: shared_gen matches and dir is complete?
+                if self.dentry_shared_gen_valid(parent_inode, entry.dir_shared_gen)
+                    && self.is_dir_complete(parent_inode)
+                {
+                    return DentryLeaseStatus::SharedGenValid;
+                }
+                return DentryLeaseStatus::Expired;
+            }
+        }
+        // No cached entry for this name.
+        // Layer 2 (negative): dir complete + shared_gen current → ENOENT
+        if self.is_dir_complete(parent_inode) {
+            return DentryLeaseStatus::NegativeComplete;
+        }
+        DentryLeaseStatus::Miss
+    }
+
+    /// Invalidate (clear) dentry leases for all children of a directory.
+    /// Called when the parent receives an Invalidate notification.
+    pub fn invalidate_dentry_leases(&self, parent_inode: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        let mut count = 0u32;
+        for (_, entry) in cache.iter_mut() {
+            if entry.parent == parent_inode && entry.dentry_lease.is_some() {
+                entry.dentry_lease = None;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            log::debug!(
+                "MetadataCache: cleared {} dentry leases for parent={}",
+                count,
+                parent_inode
+            );
+        }
     }
 
     /// Mark all cached entries as Stale. Called when Filer reconnects or
@@ -1162,12 +1379,15 @@ impl MetadataCache {
 
     /// Set directory listing cache
     pub fn set_dir_listing(&self, parent_inode: u64, entries: Vec<(u64, String, bool)>) {
+        let version = self.get_dir_version(parent_inode);
         let mut dir_cache = self.dir_cache.write().unwrap();
         dir_cache.insert(
             parent_inode,
             DirCacheEntry {
                 entries,
                 cached_at: Instant::now(),
+                dir_version: version,
+                complete: true, // full readdir → I_COMPLETE
             },
         );
     }
@@ -1766,6 +1986,8 @@ impl MetadataCache {
                 state: EntryState::default(),
                 hold: HoldState::default(),
                 cap: None,
+                dentry_lease: None,
+                dir_shared_gen: 0,
             },
         );
         drop(cache);
@@ -1912,6 +2134,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         let entry = cache.get_inode(inode).unwrap();
@@ -1957,6 +2181,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         assert!(cache.get_inode(inode).is_some());
@@ -2002,6 +2228,8 @@ mod tests {
                 state: EntryState::default(),
                 hold: HoldState::default(),
                 cap: None,
+                dentry_lease: None,
+                dir_shared_gen: 0,
             });
         }
 
@@ -2045,6 +2273,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         cache.update_size(inode, 1024);
@@ -2088,6 +2318,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         cache.rename(1, "old.txt", 1, "new.txt").unwrap();
@@ -2134,6 +2366,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         assert_eq!(cache.get_nlink(inode), 1);
@@ -2181,6 +2415,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         cache.set_symlink_target(inode, "/target/path".to_string());
@@ -2230,6 +2466,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         // Fresh entry should be returned
@@ -2282,6 +2520,8 @@ mod tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         // Wait some time (but less than TTL)
@@ -2821,6 +3061,8 @@ mod cap_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         // No cap initially.
@@ -2890,6 +3132,8 @@ mod cap_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         let cap = crate::client_cap::ClientCap::new(
@@ -2923,8 +3167,7 @@ mod cap_tests {
         let inode = 300u64;
         let now = chrono::Utc::now().timestamp();
         // Insert with an old cached_at to simulate TTL expiry.
-        let old_instant = Instant::now()
-            - std::time::Duration::from_secs(300);
+        let old_instant = Instant::now() - std::time::Duration::from_secs(300);
         cache.insert(CachedEntry {
             inode,
             parent: 1,
@@ -2956,6 +3199,8 @@ mod cap_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         // Without cap: TTL expired → get_inode returns None.
@@ -3029,6 +3274,8 @@ mod cap_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         let cap = crate::client_cap::ClientCap::new(
@@ -3045,11 +3292,7 @@ mod cap_tests {
         cache.mark_dirty_cap_w(inode);
 
         let action = cache.with_cap_mut(inode, |cap| {
-            crate::client_cap::process_recall(
-                cap,
-                crate::client_cap::CapSet::CAP_R,
-                2,
-            )
+            crate::client_cap::process_recall(cap, crate::client_cap::CapSet::CAP_R, 2)
         });
         assert!(action.is_some());
         match action.unwrap() {
@@ -3258,6 +3501,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         // No generation tracking -> not stale
@@ -3313,6 +3558,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         cache.update_path_generation("/clear_test.txt", 5);
@@ -3371,6 +3618,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         // New → Dirty (write path)
@@ -3434,6 +3683,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         // Write → Dirty → Flushing (flusher starts)
@@ -3492,6 +3743,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         });
 
         // Initially not pinned
@@ -3560,6 +3813,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
 
         cache.insert(make_entry(pinned_ino));
@@ -3621,6 +3876,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
 
         // Insert 3 entries (fills cache: root=1, ino=2, ino=3, ino=4 → cap=3 means 3 entries after root)
@@ -3689,6 +3946,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
 
         let ino = cache.allocate_inode();
@@ -3748,6 +4007,8 @@ mod chunk_cache_tests {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
 
         let ino = cache.allocate_inode();
@@ -3802,6 +4063,8 @@ mod chunk_cache_tests {
             state: EntryState::New,
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
 
         assert!(

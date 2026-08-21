@@ -13,8 +13,8 @@
 #   - Mixed file/dir trees
 #
 # Prerequisites:
-#   - Docker cluster running with fuse-test container
-#   - FUSE mounted at /mnt/fuse in fuse-test container
+#   - Docker cluster running with fuse-1-test container
+#   - FUSE mounted at /mnt/fuse in fuse-1-test container
 
 set -u
 PASS=0
@@ -23,7 +23,7 @@ FAILED_TESTS=()
 
 MOUNT="/mnt/fuse"
 TEST_DIR="$MOUNT/deep_dir_test"
-FUSE="docker exec fuse-test"
+FUSE="docker exec fuse-1-test"
 
 log()  { echo "[$(date '+%H:%M:%S')] $1"; }
 ok()   { echo "  OK: $1"; PASS=$((PASS+1)); }

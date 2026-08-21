@@ -1,4 +1,6 @@
-use crate::cache::{CachedEntry, ChunkCache, EntryState, HoldState, MetadataCache, ROOT_INODE};
+use crate::cache::{
+    CachedEntry, ChunkCache, DentryLeaseStatus, EntryState, HoldState, MetadataCache, ROOT_INODE,
+};
 use bytes::BytesMut;
 use dashmap::DashMap;
 use fuse_backend_rs::api::filesystem::{
@@ -711,6 +713,7 @@ struct PowerFsFs {
     ///
     /// Currently unused (open never blocks on cap); reserved for future
     /// SHARED_WRITE → EXCLUSIVE upgrade waits in the write path.
+    #[allow(dead_code)]
     cap_waiters: Arc<crate::client_cap::CapWaiters>,
 }
 
@@ -938,6 +941,8 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
         state: EntryState::default(),
         hold: HoldState::default(),
         cap: None,
+        dentry_lease: None,
+        dir_shared_gen: 0,
     }
 }
 
@@ -1022,54 +1027,6 @@ impl PowerFsFs {
                 inode, e
             );
         }
-    }
-
-    /// Acquire a Shared lease on a directory inode (lockify self-declare,
-    /// background async sync). While held, `entry_exists` and `lookup` trust
-    /// the local dentry cache and skip the lookup RPC to the Filer.
-    ///
-    /// Called from `readdir` (and any path that wants to pin a directory's
-    /// contents for cache consistency). The lease is opportunistic: if
-    /// lockify is disabled or the acquire fails, callers fall through to
-    /// the normal cache-miss-then-RPC path. Correctness is preserved either
-    /// way — the lease is a performance hint, not a correctness requirement.
-    ///
-    /// Design: see `docs/shard-routing-no-forward-principle.md` §7.
-    fn acquire_dir_lease(&self, dir_inode: u64) {
-        match self.lock_manager.acquire_local(
-            dir_inode,
-            powerfs_lock_fuse::LockMode::Shared,
-            self.lease_duration_ms,
-        ) {
-            Ok(_) => {
-                info!(
-                    "acquire_dir_lease OK dir_inode={} duration={}ms — subsequent lookups/entry_exists skip RPC",
-                    dir_inode, self.lease_duration_ms
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "acquire_dir_lease FAILED dir_inode={}: {} — lookups will fall back to RPC",
-                    dir_inode, e
-                );
-            }
-        }
-    }
-
-    /// Check whether the client currently holds a valid (non-expired) Shared
-    /// lease on the given directory inode. Used by `entry_exists` and `lookup`
-    /// to decide whether to trust the local dentry cache and skip the Filer
-    /// RPC.
-    ///
-    /// Returns `false` if no lease is cached or the lease has expired. In
-    /// either case the caller falls back to the normal cache-miss-then-RPC
-    /// path.
-    fn has_valid_dir_lease(&self, dir_inode: u64) -> bool {
-        self.lock_manager
-            .state()
-            .get_inode(dir_inode)
-            .map(|entry| entry.mode == powerfs_lock_fuse::LockMode::Shared)
-            .unwrap_or(false)
     }
 
     /// Invalidate the directory listing cache for `parent_inode` after the
@@ -1889,13 +1846,22 @@ impl PowerFsFs {
         if self.lookup_in_cache(parent, name).is_some() {
             return true;
         }
-        // 持有目录 Shared lease 时，信任缓存，不再发 lookup RPC。
-        if self.has_valid_dir_lease(parent) {
-            debug!(
-                "entry_exists: dir lease held, cache MISS = not exist (parent={}, name={})",
-                parent, name
-            );
-            return false;
+        // Dentry lease three-layer check (same as lookup):
+        // If the dentry lease is valid, or shared_gen matches + dir complete,
+        // a cache miss means the file truly doesn't exist (negative dentry).
+        match self.cache.check_dentry_lease(parent, name) {
+            DentryLeaseStatus::LeaseValid
+            | DentryLeaseStatus::SharedGenValid
+            | DentryLeaseStatus::NegativeComplete => {
+                debug!(
+                    "entry_exists: dentry lease/shgen valid, cache MISS = not exist (parent={}, name={})",
+                    parent, name
+                );
+                return false;
+            }
+            DentryLeaseStatus::Expired | DentryLeaseStatus::Miss => {
+                // Fall through to RPC
+            }
         }
         // 无 lease：查 Filer（shard_id calculated from parent_ino）
         let meta_client = self.client.facade().meta_shard_client().clone();
@@ -2207,6 +2173,8 @@ impl PowerFsFs {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         }
     }
 
@@ -2666,34 +2634,86 @@ impl FileSystem for PowerFsFs {
             return Ok(self.create_fuse_entry(&entry));
         }
 
-        // 1b. Directory lease fast path: if we hold a Shared lease on the
-        // parent directory, no other client can have modified it. A cache
-        // miss therefore means the file truly doesn't exist — return a
-        // negative entry WITHOUT sending a lookup RPC to the Filer.
+        // 1b. Dentry lease three-layer check (aligned with Ceph):
         //
-        // This is the primary performance benefit of the directory lease:
-        // it eliminates lookup RPCs for nonexistent files (e.g., during
-        // `ls -la` or path resolution through multiple directories).
+        // Layer 1: per-dentry lease valid → trust cache (positive or negative)
+        // Layer 2: shared_gen matches + dir complete → trust cache
+        // Layer 3: RPC to Filer
         //
-        // Safety: the lease is a Shared (read) lease. While held, no other
-        // client can acquire an Exclusive (write) lease, so the directory
-        // content is guaranteed unchanged. Files we just created are in the
-        // inode_cache (checked above), so they won't reach this path.
-        //
-        // Design: see docs/shard-routing-no-forward-principle.md §7
-        if self.has_valid_dir_lease(parent) {
-            debug!(
-                "lookup: dir lease held, cache MISS = negative (parent={}, name={})",
-                parent, name_str
-            );
-            return Ok(Entry {
-                inode: 0,
-                generation: 0,
-                attr: unsafe { std::mem::zeroed() },
-                attr_flags: 0,
-                attr_timeout: Duration::ZERO,
-                entry_timeout: Duration::ZERO,
-            });
+        // This replaces the old directory-level local lease, which was broken
+        // because it was self-declared (acquire_local) — the Filer never knew
+        // the client held it, so it couldn't push Invalidate notifications
+        // when another client modified the directory. The new mechanism uses
+        // Filer-issued per-dentry leases and dir_version (shared_gen) tracking.
+        match self.cache.check_dentry_lease(parent, name_str) {
+            DentryLeaseStatus::LeaseValid => {
+                // Layer 1: dentry lease is valid. If the entry exists in
+                // cache, return it; otherwise it's a negative dentry.
+                if let Some(entry) = self.cache.get_inode_by_name(parent, name_str) {
+                    debug!(
+                        "lookup: dentry lease valid, cache HIT (parent={}, name={})",
+                        parent, name_str
+                    );
+                    return Ok(self.create_fuse_entry(&entry));
+                }
+                debug!(
+                    "lookup: dentry lease valid, negative (parent={}, name={})",
+                    parent, name_str
+                );
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                });
+            }
+            DentryLeaseStatus::SharedGenValid => {
+                // Layer 2: lease expired but shared_gen matches + dir complete.
+                if let Some(entry) = self.cache.get_inode_by_name(parent, name_str) {
+                    debug!(
+                        "lookup: shared_gen valid, cache HIT (parent={}, name={})",
+                        parent, name_str
+                    );
+                    return Ok(self.create_fuse_entry(&entry));
+                }
+                // Negative dentry (dir complete + shared_gen match → ENOENT)
+                debug!(
+                    "lookup: shared_gen valid, negative (parent={}, name={})",
+                    parent, name_str
+                );
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                });
+            }
+            DentryLeaseStatus::NegativeComplete => {
+                // No cached entry, but dir is complete → ENOENT
+                debug!(
+                    "lookup: dir complete, negative (parent={}, name={})",
+                    parent, name_str
+                );
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                });
+            }
+            DentryLeaseStatus::Expired | DentryLeaseStatus::Miss => {
+                // Fall through to RPC
+                debug!(
+                    "lookup: dentry lease expired/miss, querying filer (parent={}, name={})",
+                    parent, name_str
+                );
+            }
         }
 
         // 2. Step 2: Filer RPC（强一致 Leader Lease Read, shard_id calculated from parent_ino）
@@ -2710,26 +2730,35 @@ impl FileSystem for PowerFsFs {
         {
             Ok(attr) => {
                 debug!(
-                    "lookup: filer returned inode={} for parent={}, name={}",
-                    attr.inode, parent, name_str
+                    "lookup: filer returned inode={} for parent={}, name={}, dir_version={}, lease_ttl={}ms",
+                    attr.inode, parent, name_str, attr.dir_version, attr.dentry_lease_ttl_ms
                 );
+                // Update dir_version from Filer response (shared_gen tracking).
+                if attr.dir_version > 0 {
+                    self.cache.update_dir_version(parent, attr.dir_version);
+                }
                 let entry = attr_to_cached_entry(&attr, parent, name_str);
                 self.cache.insert(entry.clone());
+                // Grant dentry lease if the Filer provided a TTL.
+                if attr.dentry_lease_ttl_ms > 0 {
+                    self.cache.grant_dentry_lease(
+                        parent,
+                        name_str,
+                        attr.dentry_lease_ttl_ms,
+                        0, // issuer: filer node id (TODO: from response)
+                    );
+                }
                 Ok(self.create_fuse_entry(&entry))
             }
             Err(e) => {
                 debug!("lookup RPC failed for '{}/{}': {}", parent, name_str, e);
-                // Return a negative Entry (inode=0) with a short entry_timeout.
-                // This tells the kernel to cache the negative result for only
-                // TTL (100ms), so that subsequent lookups after a rename/create
-                // will re-query the FUSE daemon.
-                //
-                // Returning Err(ENOENT) causes the kernel to use its default
-                // negative entry timeout, which can be very long, leading to
-                // stale "file not found" results after a cross-directory rename.
-                // This is the root cause of R6: mv first checks if the target
-                // exists (creating a negative dentry), then renames; the kernel
-                // serves the stale negative dentry for the renamed file.
+                // Even on ENOENT, if the Filer returned dir_version + lease TTL,
+                // we can cache the negative dentry. The MetadataAttr error path
+                // doesn't carry these fields, so we rely on the Filer's
+                // STATUS_ERR_NOT_FOUND response body. For now, return a short
+                // negative entry — the dentry lease for negatives will be
+                // granted on future lookups when the Filer response carries
+                // DirVersion + DentryLeaseTtl in the NOT_FOUND body.
                 Ok(Entry {
                     inode: 0,
                     generation: 0,
@@ -3231,38 +3260,48 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("unlink: parent={}, name={}", parent, name_str);
 
-        // Try cache first; if miss, try dir lease (trust cache MISS = not exist).
-        // Only fall back to lookup RPC when no dir lease is held.
+        // Try cache first; if miss, use dentry lease check.
+        // Only fall back to lookup RPC when dentry lease is expired/miss.
         let entry = if let Some(e) = self.lookup_in_cache(parent, name_str) {
             e
-        } else if self.has_valid_dir_lease(parent) {
-            // Dir lease held: cache is authoritative, MISS = not exist
-            debug!(
-                "unlink: dir lease held, cache MISS for '{}/{}' → ENOENT",
-                parent, name_str
-            );
-            return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
         } else {
-            debug!(
-                "unlink: cache miss for '{}/{}', fetching from filer",
-                parent, name_str
-            );
-            let meta_client = self.client.facade().meta_shard_client().clone();
-            let shard_id = self.routing_shard(parent);
-            let name_owned = name_str.to_string();
-            let attr = self
-                .client
-                .block_on(async move { meta_client.lookup(parent, &name_owned, shard_id).await })
-                .map_err(|e| {
+            match self.cache.check_dentry_lease(parent, name_str) {
+                DentryLeaseStatus::LeaseValid
+                | DentryLeaseStatus::SharedGenValid
+                | DentryLeaseStatus::NegativeComplete => {
+                    // Dentry lease valid: cache is authoritative, MISS = not exist
                     debug!(
-                        "unlink: lookup RPC failed for '{}/{}': {}",
-                        parent, name_str, e
+                        "unlink: dentry lease valid, cache MISS for '{}/{}' → ENOENT",
+                        parent, name_str
                     );
-                    std::io::Error::from_raw_os_error(libc::ENOENT)
-                })?;
-            let entry = attr_to_cached_entry(&attr, parent, name_str);
-            self.cache.insert(entry.clone());
-            entry
+                    return Err(std::io::Error::from_raw_os_error(libc::ENOENT));
+                }
+                DentryLeaseStatus::Expired | DentryLeaseStatus::Miss => {
+                    // Fall through to RPC
+                    debug!(
+                        "unlink: cache miss for '{}/{}', fetching from filer",
+                        parent, name_str
+                    );
+                    let meta_client = self.client.facade().meta_shard_client().clone();
+                    let shard_id = self.routing_shard(parent);
+                    let name_owned = name_str.to_string();
+                    let attr = self
+                        .client
+                        .block_on(
+                            async move { meta_client.lookup(parent, &name_owned, shard_id).await },
+                        )
+                        .map_err(|e| {
+                            debug!(
+                                "unlink: lookup RPC failed for '{}/{}': {}",
+                                parent, name_str, e
+                            );
+                            std::io::Error::from_raw_os_error(libc::ENOENT)
+                        })?;
+                    let entry = attr_to_cached_entry(&attr, parent, name_str);
+                    self.cache.insert(entry.clone());
+                    entry
+                }
+            }
         };
 
         let should_delete = self.cache.dec_nlink(entry.inode);
@@ -3297,9 +3336,7 @@ impl FileSystem for PowerFsFs {
                 let runtime = self.client.runtime().handle().clone();
                 let cap_inode = entry.inode;
                 runtime.spawn(async move {
-                    if let Err(e) =
-                        facade.cap_release(cap_inode, &client_id, &cap_token).await
-                    {
+                    if let Err(e) = facade.cap_release(cap_inode, &client_id, &cap_token).await {
                         debug!(
                             "unlink: cap_release for inode {} failed (best-effort): {}",
                             cap_inode, e
@@ -3419,21 +3456,18 @@ impl FileSystem for PowerFsFs {
             parent, name_str, args.mode
         );
 
-        // 目录 lease: 首次访问父目录时获取 Shared lease。
-        // 后续 create 的 entry_exists 在 lease 有效期内跳过 lookup RPC，
-        // 将每个 create 的 block_on 从 2 个降到 1 个（仅 create RPC 本身）。
-        // 设计文档: docs/shard-routing-no-forward-principle.md §7
-        if !self.has_valid_dir_lease(parent) {
-            self.acquire_dir_lease(parent);
-        }
+        // Dentry lease: entry_exists uses the three-layer check
+        // (dentry lease → shared_gen → RPC). No need to acquire a
+        // directory-level local lease here — the Filer auto-subscribes
+        // on lookup/readdir and pushes Invalidate notifications.
 
         let t_entry = std::time::Instant::now();
         let exists = self.entry_exists(parent, name_str);
         let entry_ms = t_entry.elapsed().as_millis();
         if entry_ms > 10 {
             info!(
-                "FUSE create entry_exists slow: parent={}, name={}, exists={}, took={}ms, has_dir_lease={}",
-                parent, name_str, exists, entry_ms, self.has_valid_dir_lease(parent)
+                "FUSE create entry_exists slow: parent={}, name={}, exists={}, took={}ms",
+                parent, name_str, exists, entry_ms
             );
         }
         if exists {
@@ -3560,6 +3594,8 @@ impl FileSystem for PowerFsFs {
                 state: EntryState::default(),
                 hold: HoldState::default(),
                 cap: None,
+                dentry_lease: None,
+                dir_shared_gen: 0,
             };
             // Phase 3: use insert_pinned to set hold=Pinned BEFORE insert.
             // The old pattern (pin_inode before insert) was a no-op when the
@@ -3636,6 +3672,8 @@ impl FileSystem for PowerFsFs {
                 state: EntryState::default(),
                 hold: HoldState::default(),
                 cap: None,
+                dentry_lease: None,
+                dir_shared_gen: 0,
             };
             *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
             self.cache.insert_pinned(entry.clone());
@@ -3720,6 +3758,8 @@ impl FileSystem for PowerFsFs {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
         // CRITICAL: Pin the inode BEFORE inserting the cache entry.
         // The Filer pushes an Invalidate after the create RPC commits, and
@@ -6572,9 +6612,7 @@ impl FileSystem for PowerFsFs {
                     let cap_token = cap.token.clone();
                     let runtime = self.client.runtime().handle().clone();
                     runtime.spawn(async move {
-                        if let Err(e) =
-                            facade.cap_release(inode, &client_id, &cap_token).await
-                        {
+                        if let Err(e) = facade.cap_release(inode, &client_id, &cap_token).await {
                             debug!(
                                 "release inline: cap_release for inode {} failed (best-effort): {}",
                                 inode, e
@@ -6720,9 +6758,7 @@ impl FileSystem for PowerFsFs {
                     let cap_token = cap.token.clone();
                     let runtime = self.client.runtime().handle().clone();
                     runtime.spawn(async move {
-                        if let Err(e) =
-                            facade.cap_release(inode, &client_id, &cap_token).await
-                        {
+                        if let Err(e) = facade.cap_release(inode, &client_id, &cap_token).await {
                             debug!(
                                 "release: cap_release for inode {} failed (best-effort): {}",
                                 inode, e
@@ -6887,19 +6923,15 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<()> {
         debug!("readdir: inode={}, offset={}", inode, offset);
 
-        // Acquire a Shared lease on the directory so subsequent
-        // `entry_exists` / `lookup` calls trust the local dentry cache
-        // and skip the Filer lookup RPC. This is the key optimization for
-        // `cp N files` into the same directory: without it, each `create`
-        // triggers a lookup RPC (2N RPCs total); with it, only the create
-        // RPC is issued (N RPCs total).
+        // Note: The old directory-level local lease (acquire_dir_lease) has
+        // been replaced by the dentry lease mechanism. readdir now marks the
+        // directory as "complete" (I_COMPLETE equivalent) at the end, and
+        // lookups use the three-layer check (dentry lease → shared_gen → RPC)
+        // to decide whether to trust the local cache. The Filer auto-subscribes
+        // the client to the parent inode on lookup/readdir, so Invalidate
+        // notifications are pushed when another client modifies the directory.
         //
-        // The lease is opportunistic: if lockify is disabled, the acquire
-        // silently fails and callers fall through to the normal RPC path.
-        // Design: docs/shard-routing-no-forward-principle.md §7
-        if offset == 0 {
-            self.acquire_dir_lease(inode);
-        }
+        // Design: docs/shard-routing-no-forward-principle.md §7 (dentry lease)
 
         // 尝试从缓存获取目录条目（用于 is_dir 检查和 ".." 的 parent inode）
         let cached_entry = self.cache.get_inode(inode);
@@ -7182,6 +7214,8 @@ impl FileSystem for PowerFsFs {
                             state: EntryState::Stale,
                             hold: HoldState::Unpinned,
                             cap: None,
+                            dentry_lease: None,
+                            dir_shared_gen: 0,
                         };
                         self.cache.insert(cached);
                     }
@@ -7208,6 +7242,19 @@ impl FileSystem for PowerFsFs {
                 ReaddirCursor {
                     last_name: last.name.clone(),
                 },
+            );
+        }
+
+        // Mark the directory as complete (I_COMPLETE equivalent) so that
+        // subsequent lookups can trust negative dentries (cache miss = ENOENT)
+        // without sending an RPC, as long as the dir_version (shared_gen)
+        // hasn't changed. This is the Ceph I_COMPLETE mechanism.
+        if offset == 0 {
+            let dir_version = self.cache.get_dir_version(inode);
+            self.cache.mark_dir_complete(inode, dir_version);
+            debug!(
+                "readdir: marked dir {} complete (version={})",
+                inode, dir_version
             );
         }
 
@@ -7331,6 +7378,8 @@ impl FileSystem for PowerFsFs {
             state: EntryState::default(),
             hold: HoldState::default(),
             cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
         };
         self.cache.insert(cached_entry.clone());
 
@@ -7432,7 +7481,9 @@ impl FileSystem for PowerFsFs {
                     cached_at: Instant::now(),
                     state: EntryState::default(),
                     hold: HoldState::default(),
-                cap: None,
+                    cap: None,
+                    dentry_lease: None,
+                    dir_shared_gen: 0,
                 };
 
                 self.cache.insert(new_entry.clone());

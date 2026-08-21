@@ -78,7 +78,10 @@ fn s2_two_writers_conflict_degrades_to_shared_write() {
 
     let r1 = mgr.open_grant(inode, "C1", true);
     let s1 = snapshot(&mgr, inode);
-    eprintln!("  [C1 open(RDWR)] → {:?} caps={:?}", s1.logical, r1.granted_caps);
+    eprintln!(
+        "  [C1 open(RDWR)] → {:?} caps={:?}",
+        s1.logical, r1.granted_caps
+    );
     assert!(r1.granted_caps.is_exclusive(), "C1 gets EXCLUSIVE");
     assert_eq!(s1.logical, CapState::ExclusiveWrite);
 
@@ -183,20 +186,37 @@ fn s5_three_writers_all_shared_write() {
     let inode = 10_005;
 
     let r1 = mgr.open_grant(inode, "C1", true);
-    eprintln!("  [C1 open(RDWR)] caps={:?} state={:?}", r1.granted_caps, mgr.logical_state(inode));
+    eprintln!(
+        "  [C1 open(RDWR)] caps={:?} state={:?}",
+        r1.granted_caps,
+        mgr.logical_state(inode)
+    );
     assert!(r1.granted_caps.is_exclusive());
 
     let r2 = mgr.open_grant(inode, "C2", true);
-    eprintln!("  [C2 open(RDWR)] caps={:?} recalls={} state={:?}", r2.granted_caps, r2.recall_tasks.len(), mgr.logical_state(inode));
+    eprintln!(
+        "  [C2 open(RDWR)] caps={:?} recalls={} state={:?}",
+        r2.granted_caps,
+        r2.recall_tasks.len(),
+        mgr.logical_state(inode)
+    );
     assert_eq!(r2.granted_caps, CapSet::NONE);
 
     // C3 opens RDWR — already SHARED_WRITE, no new recall needed
     let r3 = mgr.open_grant(inode, "C3", true);
     let s3 = snapshot(&mgr, inode);
-    eprintln!("  [C3 open(RDWR)] caps={:?} recalls={} state={:?}", r3.granted_caps, r3.recall_tasks.len(), s3.logical);
+    eprintln!(
+        "  [C3 open(RDWR)] caps={:?} recalls={} state={:?}",
+        r3.granted_caps,
+        r3.recall_tasks.len(),
+        s3.logical
+    );
 
     assert_eq!(r3.granted_caps, CapSet::NONE, "C3 gets NONE");
-    assert!(r3.recall_tasks.is_empty(), "no recall — already SHARED_WRITE");
+    assert!(
+        r3.recall_tasks.is_empty(),
+        "no recall — already SHARED_WRITE"
+    );
     assert_eq!(s3.logical, CapState::SharedWrite);
     assert_eq!(s3.holder_count, 3);
 
@@ -227,7 +247,11 @@ fn s6_three_writers_release_triggers_upgrade() {
     mgr.recall_ack(inode, "C2", &r2.token).unwrap();
     let up2 = mgr.release_cap(inode, "C2", &r2.token).unwrap();
     let s_after = snapshot(&mgr, inode);
-    eprintln!("  [C2 release] upgrade={} state={:?}", up2.is_some(), s_after.logical);
+    eprintln!(
+        "  [C2 release] upgrade={} state={:?}",
+        up2.is_some(),
+        s_after.logical
+    );
 
     assert!(up2.is_some(), "C3 should upgrade — only 1 writer left");
     assert_eq!(up2.as_ref().unwrap().holder, "C3");
@@ -256,7 +280,11 @@ fn s7_release_second_writer_upgrades_first() {
     mgr.recall_ack(inode, "C2", &r2.token).unwrap();
     let upgrade = mgr.release_cap(inode, "C2", &r2.token).unwrap();
     let s = snapshot(&mgr, inode);
-    eprintln!("  [C2 release] upgrade={} state={:?}", upgrade.is_some(), s.logical);
+    eprintln!(
+        "  [C2 release] upgrade={} state={:?}",
+        upgrade.is_some(),
+        s.logical
+    );
 
     assert!(upgrade.is_some());
     assert_eq!(upgrade.as_ref().unwrap().holder, "C1");
@@ -276,20 +304,38 @@ fn s8_reader_writer_reader_mixed() {
     let inode = 10_008;
 
     let r1 = mgr.open_grant(inode, "C1", false);
-    eprintln!("  [C1 RDONLY] caps={:?} state={:?}", r1.granted_caps, mgr.logical_state(inode));
+    eprintln!(
+        "  [C1 RDONLY] caps={:?} state={:?}",
+        r1.granted_caps,
+        mgr.logical_state(inode)
+    );
     assert_eq!(mgr.logical_state(inode), CapState::SharedRead);
 
     let r2 = mgr.open_grant(inode, "C2", true);
-    eprintln!("  [C2 RDWR] caps={:?} recalls={} state={:?}", r2.granted_caps, r2.recall_tasks.len(), mgr.logical_state(inode));
+    eprintln!(
+        "  [C2 RDWR] caps={:?} recalls={} state={:?}",
+        r2.granted_caps,
+        r2.recall_tasks.len(),
+        mgr.logical_state(inode)
+    );
     assert_eq!(mgr.logical_state(inode), CapState::SharedWrite);
 
     // C3 opens RDONLY while in SHARED_WRITE — gets CAP_R (can cache reads
     // since all writes go through sync RPC)
     let r3 = mgr.open_grant(inode, "C3", false);
     let s3 = snapshot(&mgr, inode);
-    eprintln!("  [C3 RDONLY] caps={:?} recalls={} state={:?}", r3.granted_caps, r3.recall_tasks.len(), s3.logical);
+    eprintln!(
+        "  [C3 RDONLY] caps={:?} recalls={} state={:?}",
+        r3.granted_caps,
+        r3.recall_tasks.len(),
+        s3.logical
+    );
 
-    assert_eq!(r3.granted_caps, CapSet::CAP_R, "C3 gets CAP_R in SHARED_WRITE");
+    assert_eq!(
+        r3.granted_caps,
+        CapSet::CAP_R,
+        "C3 gets CAP_R in SHARED_WRITE"
+    );
     assert!(r3.recall_tasks.is_empty());
     assert_eq!(s3.logical, CapState::SharedWrite);
 
@@ -318,7 +364,10 @@ fn s9_epoch_fencing_on_repeated_recalls() {
     // transition from ExclusiveWrite→SharedWrite already happened; C3
     // joining SHARED_WRITE doesn't recall). Instead, test force-reclaim.
     let r3 = mgr.open_grant(inode, "C3", true);
-    eprintln!("  [C3 RDWR] recalls={} (already SHARED_WRITE)", r3.recall_tasks.len());
+    eprintln!(
+        "  [C3 RDWR] recalls={} (already SHARED_WRITE)",
+        r3.recall_tasks.len()
+    );
     assert!(r3.recall_tasks.is_empty());
 
     // Force-reclaim C1 (timed out recall) — bumps epoch again
@@ -329,9 +378,16 @@ fn s9_epoch_fencing_on_repeated_recalls() {
     std::thread::sleep(std::time::Duration::from_millis(2));
     let reclaimed = mgr_fast.drain_expired_recalls();
     let epoch_after_force = mgr_fast.current_epoch();
-    eprintln!("  [force-reclaim] reclaimed={} epoch={}", reclaimed.len(), epoch_after_force);
+    eprintln!(
+        "  [force-reclaim] reclaimed={} epoch={}",
+        reclaimed.len(),
+        epoch_after_force
+    );
     assert_eq!(reclaimed.len(), 1, "C1 should be force-reclaimed");
-    assert!(epoch_after_force > epoch_2, "epoch must bump on force-reclaim");
+    assert!(
+        epoch_after_force > epoch_2,
+        "epoch must bump on force-reclaim"
+    );
 
     eprintln!("  ✅ Epoch monotonically increases on every recall/force-reclaim");
 }
@@ -348,7 +404,10 @@ fn s10_full_lifecycle_open_conflict_release_upgrade() {
     // Phase 1: C1 opens RDWR → EXCLUSIVE_WRITE
     let r1 = mgr.open_grant(inode, "C1", true);
     assert_eq!(mgr.logical_state(inode), CapState::ExclusiveWrite);
-    eprintln!("  Phase 1: C1 open(RDWR) → ExclusiveWrite caps={:?}", r1.granted_caps);
+    eprintln!(
+        "  Phase 1: C1 open(RDWR) → ExclusiveWrite caps={:?}",
+        r1.granted_caps
+    );
 
     // Phase 2: C2 opens RDWR → recall C1, degrade to SHARED_WRITE
     let r2 = mgr.open_grant(inode, "C2", true);
@@ -381,15 +440,16 @@ fn s10_full_lifecycle_open_conflict_release_upgrade() {
     assert!(up2.is_some(), "C3 should upgrade");
     assert_eq!(up2.as_ref().unwrap().holder, "C3");
     assert_eq!(mgr.logical_state(inode), CapState::ExclusiveWrite);
-    eprintln!(
-        "  Phase 6: C2 release → C3 upgrades to ExclusiveWrite 🎉"
-    );
+    eprintln!("  Phase 6: C2 release → C3 upgrades to ExclusiveWrite 🎉");
 
     // Phase 7: C3 releases → back to Free
     let up3 = mgr.release_cap(inode, "C3", &r3.token).unwrap();
     // C3's token may have changed after upgrade — use the upgrade token
     if let Some(u) = &up3 {
-        eprintln!("  Phase 7: C3 release → upgrade={:?} (unexpected)", u.holder);
+        eprintln!(
+            "  Phase 7: C3 release → upgrade={:?} (unexpected)",
+            u.holder
+        );
     }
     // After C3 releases, inode should be cleaned up
     assert_eq!(mgr.logical_state(inode), CapState::Free);
@@ -409,7 +469,10 @@ fn s11_open_never_blocks_all_conflict_cases() {
         ("RDONLY+RDWR", &[(false, "C1"), (true, "C2")]),
         ("RDWR+RDONLY", &[(true, "C1"), (false, "C2")]),
         ("RDWR+RDWR", &[(true, "C1"), (true, "C2")]),
-        ("RDWR+RDWR+RDWR", &[(true, "C1"), (true, "C2"), (true, "C3")]),
+        (
+            "RDWR+RDWR+RDWR",
+            &[(true, "C1"), (true, "C2"), (true, "C3")],
+        ),
         (
             "RDONLY+RDONLY+RDWR+RDWR",
             &[(false, "C1"), (false, "C2"), (true, "C3"), (true, "C4")],
@@ -459,13 +522,16 @@ fn s12_idempotent_reopen_same_client() {
     let r3 = mgr.open_grant(inode, "C1", false); // same client, different mode
 
     eprintln!(
-        "  C1 open(RDWR) token={} caps={:?}", r1.token, r1.granted_caps
+        "  C1 open(RDWR) token={} caps={:?}",
+        r1.token, r1.granted_caps
     );
     eprintln!(
-        "  C1 open(RDWR) token={} caps={:?} (same)", r2.token, r2.granted_caps
+        "  C1 open(RDWR) token={} caps={:?} (same)",
+        r2.token, r2.granted_caps
     );
     eprintln!(
-        "  C1 open(RDONLY) token={} caps={:?} (same)", r3.token, r3.granted_caps
+        "  C1 open(RDONLY) token={} caps={:?} (same)",
+        r3.token, r3.granted_caps
     );
 
     assert_eq!(r1.token, r2.token, "same token on reopen");
@@ -522,7 +588,10 @@ fn s14_validate_cap_for_write_setattr() {
     let caps2 = mgr.validate_cap(inode, "C2", &r2.token).unwrap();
     assert!(!caps2.has_w(), "C2 has NO CAP_W — must use sync RPC");
     assert!(!caps2.has_x(), "C2 has NO CAP_X — setattr via sync RPC");
-    eprintln!("  [C2 SHARED_WRITE] caps={:?} → write=sync setattr=sync", caps2);
+    eprintln!(
+        "  [C2 SHARED_WRITE] caps={:?} → write=sync setattr=sync",
+        caps2
+    );
 
     // C1's caps were downgraded server-side (recall in flight)
     let caps1_after = mgr.validate_cap(inode, "C1", &r1.token).unwrap();
@@ -545,13 +614,62 @@ fn s99_state_transition_matrix_summary() {
     eprintln!("  ────────────────┼────────────────────┼──────────────────┼────────┼─────────");
 
     let cases: &[(CapState, &str, bool, CapState, usize, CapSet)] = &[
-        (CapState::Free, "open(RDONLY)", false, CapState::SharedRead, 0, CapSet::CAP_R),
-        (CapState::Free, "open(RDWR)", true, CapState::ExclusiveWrite, 0, CapSet::EXCLUSIVE),
-        (CapState::SharedRead, "open(RDONLY)", false, CapState::SharedRead, 0, CapSet::CAP_R),
-        (CapState::SharedRead, "open(RDWR)", true, CapState::SharedWrite, 1, CapSet::NONE),
-        (CapState::ExclusiveWrite, "open(RDONLY)", false, CapState::SharedRead, 1, CapSet::CAP_R),
-        (CapState::ExclusiveWrite, "open(RDWR)", true, CapState::SharedWrite, 1, CapSet::NONE),
-        (CapState::SharedWrite, "open(RDWR)", true, CapState::SharedWrite, 0, CapSet::NONE),
+        (
+            CapState::Free,
+            "open(RDONLY)",
+            false,
+            CapState::SharedRead,
+            0,
+            CapSet::CAP_R,
+        ),
+        (
+            CapState::Free,
+            "open(RDWR)",
+            true,
+            CapState::ExclusiveWrite,
+            0,
+            CapSet::EXCLUSIVE,
+        ),
+        (
+            CapState::SharedRead,
+            "open(RDONLY)",
+            false,
+            CapState::SharedRead,
+            0,
+            CapSet::CAP_R,
+        ),
+        (
+            CapState::SharedRead,
+            "open(RDWR)",
+            true,
+            CapState::SharedWrite,
+            1,
+            CapSet::NONE,
+        ),
+        (
+            CapState::ExclusiveWrite,
+            "open(RDONLY)",
+            false,
+            CapState::SharedRead,
+            1,
+            CapSet::CAP_R,
+        ),
+        (
+            CapState::ExclusiveWrite,
+            "open(RDWR)",
+            true,
+            CapState::SharedWrite,
+            1,
+            CapSet::NONE,
+        ),
+        (
+            CapState::SharedWrite,
+            "open(RDWR)",
+            true,
+            CapState::SharedWrite,
+            0,
+            CapSet::NONE,
+        ),
     ];
 
     for (from, event, is_write, to, recalls, granted) in cases {
@@ -599,7 +717,11 @@ fn s99_state_transition_matrix_summary() {
 
         eprintln!(
             "  {:?} │ {:18} │ {:16} │ {:6} │ {:?}",
-            from, event, format!("{:?}", to), recalls, granted
+            from,
+            event,
+            format!("{:?}", to),
+            recalls,
+            granted
         );
     }
 

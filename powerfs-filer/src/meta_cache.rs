@@ -128,10 +128,12 @@ pub struct CachedInode {
 #[derive(Clone, Debug)]
 pub(crate) struct InodeCapRecord {
     /// Global monotonic cap id  `cap_id`).
+    #[allow(dead_code)]
     pub cap_id: u64,
     /// Currently issued caps  `_issued`).
     pub caps: CapSet,
     /// Epoch at grant time — used for fencing stale clients.
+    #[allow(dead_code)]
     pub epoch: u64,
     /// True if the client is a writer (opened O_WRONLY/O_RDWR).
     pub is_writer: bool,
@@ -170,7 +172,12 @@ impl CachedInode {
         let was_empty = cm.is_empty();
         cm.insert(
             client_id.to_string(),
-            InodeCapRecord { cap_id, caps, epoch, is_writer },
+            InodeCapRecord {
+                cap_id,
+                caps,
+                epoch,
+                is_writer,
+            },
         );
         // First cap → ref the inode  `get(PIN_CAPS)`). We don't
         // need an explicit PIN since MetaCache's `refcount` is already
@@ -202,9 +209,8 @@ impl CachedInode {
 
     /// Snapshot of `(client_id, caps)` pairs — used for diagnostics
     /// and leader-handoff recall  `CInode::export_client_caps`).
-    pub(crate) fn snapshot_client_caps(
-        &self,
-    ) -> Vec<(String, CapSet, u64 /* epoch */)> {
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_client_caps(&self) -> Vec<(String, CapSet, u64 /* epoch */)> {
         self.client_caps
             .lock()
             .unwrap()
@@ -1248,7 +1254,7 @@ impl MetaCache {
         }
     }
 
-    /// Detach a client's cap from a cached inode 
+    /// Detach a client's cap from a cached inode
     /// `CInode::remove_client_cap`).
     ///
     /// Called by `CapManager::release_cap` / `close_session` /

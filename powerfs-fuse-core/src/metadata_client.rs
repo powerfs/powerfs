@@ -59,6 +59,14 @@ pub struct MetadataAttr {
     /// None 表示 Filer 未携带 (旧版本或 mkdir 等简单响应),
     /// 客户端回退到 ShardMap::route(inode)。
     pub shard_id: Option<u64>,
+    /// Parent directory's version (shared_gen) from the Filer lookup response.
+    /// Used by the dentry lease mechanism to detect stale dentries.
+    /// 0 = Filer didn't provide it (old version); client falls back to RPC.
+    pub dir_version: u64,
+    /// Dentry lease TTL in milliseconds, granted by the Filer in lookup
+    /// responses. When non-zero, the client may trust the dentry (positive
+    /// or negative) for this duration without sending further lookup RPCs.
+    pub dentry_lease_ttl_ms: u64,
 }
 
 impl MetadataAttr {

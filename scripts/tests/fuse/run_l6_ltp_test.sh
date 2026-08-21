@@ -2,9 +2,9 @@
 # =============================================================================
 # PowerFS L6 LTP 标准测试集 (xfstests-dev/ltp tools)
 #
-# 在 fuse-test 容器内运行：
-#   docker cp scripts/tests/fuse/run_l6_ltp_test.sh fuse-test:/tmp/
-#   docker exec fuse-test /tmp/run_l6_ltp_test.sh
+# 在 fuse-1-test 容器内运行：
+#   docker cp scripts/tests/fuse/run_l6_ltp_test.sh fuse-1-test:/tmp/
+#   docker exec fuse-1-test /tmp/run_l6_ltp_test.sh
 #
 # 使用 xfstests-dev/ltp 工具集 (fsstress, fsx, doio, iogen, aio-stress)
 # 这些是社区标准文件系统测试工具，覆盖 L6 测试计划的核心场景。

@@ -55,8 +55,10 @@ services:
     volumes:
       - master-1-data:/data
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
       - "9433:9333"
+      - "9435:9335"
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://172.30.0.50:6379
@@ -80,8 +82,10 @@ services:
     volumes:
       - master-2-data:/data
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
       - "9434:9333"
+      - "9436:9335"
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://172.30.0.50:6379
@@ -105,8 +109,10 @@ services:
     volumes:
       - master-3-data:/data
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
-      - "9435:9333"
+      - "9437:9333"
+      - "9438:9335"
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://172.30.0.50:6379
@@ -131,6 +137,7 @@ services:
     volumes:
       - volume-1-data:/data
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8180:8080"
       - "8191:8091"
@@ -157,6 +164,7 @@ services:
     volumes:
       - volume-2-data:/data
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8181:8080"
       - "8192:8092"
@@ -183,6 +191,7 @@ services:
     volumes:
       - volume-3-data:/data
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
       - "8182:8080"
       - "8193:8093"
@@ -211,6 +220,7 @@ services:
     volumes:
       - filer-1-data:/data/filer
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-init:/app/powerfs-init:ro
     depends_on:
       master-1:
         condition: service_healthy
@@ -226,6 +236,7 @@ services:
     volumes:
       - filer-2-data:/data/filer
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-init:/app/powerfs-init:ro
     depends_on:
       master-1:
         condition: service_healthy
@@ -241,6 +252,7 @@ services:
     volumes:
       - filer-3-data:/data/filer
       - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-init:/app/powerfs-init:ro
     depends_on:
       master-1:
         condition: service_healthy
@@ -343,10 +355,10 @@ services:
       init-filer-3:
         condition: service_completed_successfully
 
-  # ── Wave 4: FUSE Client ──
-  fuse-test:
+  # ── Wave 4: FUSE Clients (multi-client for cap coherence testing) ──
+  fuse-1:
     image: powerfs-test:latest
-    container_name: fuse-test
+    container_name: fuse-1-test
     cpus: '2.0'
     mem_limit: 2g
     init: true
@@ -354,7 +366,7 @@ services:
       powerfs-network:
         ipv4_address: 172.30.0.40
     ports:
-      - "9999:9999"
+      - "9991:9999"
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:
@@ -366,6 +378,65 @@ services:
     restart: unless-stopped
     environment:
       - RUST_LOG=debug
+      - POWERFS_CLIENT_ID=fuse-1
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mkdir -p /mnt/fuse
+        /app/powerfs-fuse --config /config/fuse.toml &
+        FUSE_PID=$$!
+        for i in $$(seq 1 30); do
+          if mount | grep -q "/mnt/fuse"; then
+            echo "FUSE mounted at /mnt/fuse"
+            break
+          fi
+          sleep 1
+        done
+        echo "FUSE ready, mount point: /mnt/fuse"
+        wait $$FUSE_PID
+    volumes:
+      - /tmp/powerfs/test:/tmp/test-results
+      - ./config:/config:ro
+      - /home/portion/powerfs/target/release/powerfs-fuse:/app/powerfs-fuse:ro
+      - /home/portion/powerfs/target/release/powerfs-cli:/app/powerfs-cli:ro
+    healthcheck:
+      test: ["CMD-SHELL", "ls /mnt/fuse > /dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      master-1:
+        condition: service_started
+      volume-1:
+        condition: service_started
+      filer-1:
+        condition: service_started
+
+  fuse-2:
+    image: powerfs-test:latest
+    container_name: fuse-2-test
+    cpus: '2.0'
+    mem_limit: 2g
+    init: true
+    networks:
+      powerfs-network:
+        ipv4_address: 172.30.0.41
+    ports:
+      - "9992:9999"
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    privileged: true
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=debug
+      - POWERFS_CLIENT_ID=fuse-2
     entrypoint: /bin/sh
     command:
       - -c
@@ -413,7 +484,7 @@ services:
       - /tmp/powerfs/test:/mnt/powerfs
       - ./benchmark:/benchmark
     depends_on:
-      fuse-test:
+      fuse-1:
         condition: service_healthy
     command: sleep infinity
 
@@ -426,6 +497,7 @@ services:
         ipv4_address: 172.30.0.60
     volumes:
       - ./config/monitor.toml:/app/config/monitor.toml:ro
+      - /home/portion/powerfs/target/release/powerfs-monitor:/app/powerfs-monitor:ro
     ports:
       - "8083:8081"
     command: >

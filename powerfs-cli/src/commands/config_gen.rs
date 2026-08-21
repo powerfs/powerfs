@@ -57,6 +57,7 @@ struct RedisEntry {
 #[derive(Debug, Deserialize, Default)]
 struct PortsConfig {
     master: Option<u16>,
+    master_raft: Option<u16>,
     master_net: Option<u16>,
     volume_grpc: Option<u16>,
     volume_http: Option<u16>,
@@ -110,6 +111,7 @@ impl Defaults {
     const S3_ACCESS_KEY: &'static str = "powerfs";
     const S3_SECRET_KEY: &'static str = "powerfs123";
     const MASTER_PORT: u16 = 9333;
+    const MASTER_RAFT_PORT: u16 = 9335;
     const MASTER_NET_PORT: u16 = 9334;
     const VOLUME_GRPC_PORT: u16 = 8080;
     const VOLUME_HTTP_PORT: u16 = 8091;
@@ -138,6 +140,7 @@ struct ResolvedConfig {
     output: String,
     data_dir: String,
     master_port: u16,
+    master_raft_port: u16,
     master_net_port: u16,
     volume_grpc_port: u16,
     volume_http_port: u16,
@@ -207,6 +210,8 @@ pub struct ConfigGenArgs {
 
     #[arg(long)]
     pub master_port: Option<u16>,
+    #[arg(long)]
+    pub master_raft_port: Option<u16>,
     #[arg(long)]
     pub master_net_port: Option<u16>,
     #[arg(long)]
@@ -327,6 +332,11 @@ fn resolve(args: &ConfigGenArgs) -> Result<ResolvedConfig, String> {
         output: opt_str(&args.output, misc.output, Defaults::OUTPUT),
         data_dir: opt_str(&args.data_dir, storage.data_dir, Defaults::DATA_DIR),
         master_port: opt_u16(args.master_port, ports.master, Defaults::MASTER_PORT),
+        master_raft_port: opt_u16(
+            args.master_raft_port,
+            ports.master_raft,
+            Defaults::MASTER_RAFT_PORT,
+        ),
         master_net_port: opt_u16(
             args.master_net_port,
             ports.master_net,
@@ -486,6 +496,7 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
     // 6. Port range validation
     let all_ports = [
         ("master_port", cfg.master_port),
+        ("master_raft_port", cfg.master_raft_port),
         ("master_net_port", cfg.master_net_port),
         ("volume_grpc_port", cfg.volume_grpc_port),
         ("volume_http_port", cfg.volume_http_port),
@@ -504,10 +515,22 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
 
     // 7. Port collision detection (same host, different services must use different ports)
     //    We check that ports meant for the *same node type* don't conflict.
+    if cfg.master_port == cfg.master_raft_port {
+        return Err(format!(
+            "master_port ({}) and master_raft_port ({}) must differ",
+            cfg.master_port, cfg.master_raft_port
+        ));
+    }
     if cfg.master_port == cfg.master_net_port {
         return Err(format!(
             "master_port ({}) and master_net_port ({}) must differ",
             cfg.master_port, cfg.master_net_port
+        ));
+    }
+    if cfg.master_raft_port == cfg.master_net_port {
+        return Err(format!(
+            "master_raft_port ({}) and master_net_port ({}) must differ",
+            cfg.master_raft_port, cfg.master_net_port
         ));
     }
     if cfg.volume_http_port == cfg.volume_net_port {
@@ -564,7 +587,7 @@ pub fn config_gen(args: &ConfigGenArgs) -> Result<(), String> {
     let master_peers: Vec<String> = cfg
         .masters
         .iter()
-        .map(|ip| format!("{}:{}", ip, cfg.master_port))
+        .map(|ip| format!("{}:{}", ip, cfg.master_raft_port))
         .collect();
 
     let filer_peers: Vec<String> = cfg
@@ -654,6 +677,7 @@ fn build_config(
         },
         master: MasterConfig {
             port: cfg.master_port,
+            raft_port: cfg.master_raft_port,
             net_port: cfg.master_net_port,
             dir: format!("{}/master", cfg.data_dir),
             raft_dir: None,
@@ -661,7 +685,7 @@ fn build_config(
             ip: Some("0.0.0.0".to_string()),
             advertise_addr: Some(format!("{}:{}", ip, cfg.master_port)),
             raft_id,
-            peers: master_peers.to_vec(),
+            raft_peers: master_peers.to_vec(),
         },
         volume: VolumeConfig {
             grpc_port: cfg.volume_grpc_port,

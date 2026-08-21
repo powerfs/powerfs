@@ -674,13 +674,10 @@ impl CapManager {
     /// Returns the list of `(inode, cap_id)` pairs that were removed,
     /// so the caller (net layer) can push any required recall/upgrade
     /// notifications to remaining holders.
-    pub fn close_session(
-        &self,
-        client_id: &str,
-    ) -> Vec<(u64, u64)> {
+    pub fn close_session(&self, client_id: &str) -> Vec<(u64, u64)> {
         let session = {
             let mut sessions = self.sessions.lock().unwrap();
-            sessions.remove(client_id).map(|s| s.clone())
+            sessions.remove(client_id)
         };
         let Some(session) = session else {
             return Vec::new();
@@ -1097,8 +1094,7 @@ impl CapManager {
         let cap_id = removed.cap_id;
         if let Some(sess) = self.sessions.lock().unwrap().get(client_id) {
             sess.remove_cap(inode, cap_id);
-            sess.release_caps_total
-                .fetch_add(1, Ordering::Relaxed);
+            sess.release_caps_total.fetch_add(1, Ordering::Relaxed);
         }
 
         // Decr MetaCache refcount and detach the inode-embedded cap.
@@ -1183,9 +1179,7 @@ impl CapManager {
                     reclaimed.push((*inode, h.client_id.clone()));
                     self.penalty.on_recall_ack_timeout(&h.client_id);
                     // Clean up session reverse index.
-                    if let Some(sess) =
-                        self.sessions.lock().unwrap().get(&h.client_id)
-                    {
+                    if let Some(sess) = self.sessions.lock().unwrap().get(&h.client_id) {
                         sess.remove_cap(*inode, h.cap_id);
                     }
                     if let Some(mc) = &self.meta_cache {
