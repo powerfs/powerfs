@@ -349,12 +349,30 @@ mod tests {
             meta_cache,
         });
 
-        refresh_prometheus(&state);
-
-        assert_eq!(LEASE_ACTIVE_COUNT.get(), 1, "one active lease");
-        assert_eq!(LEASE_ACQUIRE_TOTAL.get(), 2, "two acquire calls");
-        assert!(LEASE_ACQUIRE_CONFLICT_TOTAL.get() >= 1, "one conflict");
-        assert_eq!(LEASE_HAS_QUEUED_WAITERS.get(), 0, "no waiters queued");
+        // IntGauges live in the SHARED default prometheus registry. Other
+        // parallel tests can overwrite them with their own (possibly zero)
+        // snapshot between our refresh_prometheus() and gauge.get().
+        // Retry up to 5 times with a tiny sleep; as long as OUR refresh
+        // wins the race at least once the test passes.
+        let mut ok = false;
+        for _ in 0..5u32 {
+            refresh_prometheus(&state);
+            let active = LEASE_ACTIVE_COUNT.get();
+            let acq = LEASE_ACQUIRE_TOTAL.get();
+            let cfl = LEASE_ACQUIRE_CONFLICT_TOTAL.get();
+            let wait = LEASE_HAS_QUEUED_WAITERS.get();
+            if active == 1 && acq == 2 && cfl >= 1 && wait == 0 {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            ok,
+            "lease prometheus gauges did not settle to expected values \
+             (active=1, acquire=2, conflict>=1, waiters=0) after 5 retries — \
+             shared registry race or propagation broken"
+        );
     }
 
     #[test]
@@ -384,33 +402,45 @@ mod tests {
         assert_eq!(s.direntry_hit_total, 1, "one direntry hit");
         assert_eq!(s.inode_miss_total, 1, "one inode miss");
 
-        // 2) Verify refresh_prometheus at least moves the gauges to >= the
-        //    snapshot we expect. Note: IntGauges live in the default
-        //    prometheus registry and are shared across parallel tests, so
-        //    we assert with lower bounds (equality would race with other
-        //    tests concurrently calling refresh_prometheus on the same
-        //    statics).
+        // 2) Verify refresh_prometheus propagates the snapshot to the
+        //    shared IntGauges. IntGauges live in the default prometheus
+        //    registry and are SHARED across parallel tests — other threads
+        //    calling refresh_prometheus on their own (possibly empty)
+        //    MetaCache instances can overwrite the gauges between our
+        //    refresh and our get().
+        //
+        // We therefore retry refresh + probe up to 5 times with a small
+        // sleep between attempts; as long as OUR refresh wins the race
+        // at least once the test passes. This keeps the test meaningful
+        // (it still validates the propagation path) while tolerating
+        // parallel-test interference on the global registry.
         let state = Arc::new(MetricsAppState {
             lease_mgr,
             meta_cache: mc,
         });
-        refresh_prometheus(&state);
 
+        let mut ok = false;
+        for _ in 0..5u32 {
+            refresh_prometheus(&state);
+            let bf = MC_BACKFILL_CLEAN_TOTAL.get();
+            let ih = MC_INODE_HIT_TOTAL.get();
+            let dh = MC_DIRENTRY_HIT_TOTAL.get();
+            let im = MC_INODE_MISS_TOTAL.get();
+            if bf >= s.backfill_clean_total as i64
+                && ih >= s.inode_hit_total as i64
+                && dh >= s.direntry_hit_total as i64
+                && im >= s.inode_miss_total as i64
+            {
+                ok = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
-            MC_BACKFILL_CLEAN_TOTAL.get() >= s.backfill_clean_total as i64,
-            "prometheus backfill gauge reflects snapshot"
-        );
-        assert!(
-            MC_INODE_HIT_TOTAL.get() >= s.inode_hit_total as i64,
-            "prometheus inode_hit gauge reflects snapshot"
-        );
-        assert!(
-            MC_DIRENTRY_HIT_TOTAL.get() >= s.direntry_hit_total as i64,
-            "prometheus direntry_hit gauge reflects snapshot"
-        );
-        assert!(
-            MC_INODE_MISS_TOTAL.get() >= s.inode_miss_total as i64,
-            "prometheus inode_miss gauge reflects snapshot"
+            ok,
+            "prometheus gauges did not settle to >= MetaCache snapshot \
+             (backfill>=2, inode_hit>=1, direntry_hit>=1, inode_miss>=1) \
+             after 5 retries — shared registry race or propagation broken"
         );
     }
 }
