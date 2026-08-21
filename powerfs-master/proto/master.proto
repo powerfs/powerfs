@@ -717,6 +717,7 @@ message MasterNodeInfo {
     double mem_usage = 8;
     double disk_usage = 9;
     uint64 uptime = 10;
+    uint32 metrics_port = 11;
 }
 
 message MasterStatusResponse {

@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = master_cfg.port;
     let raft_port = master_cfg.raft_port;
     let net_port = master_cfg.net_port;
+    let metrics_port = master_cfg.metrics_port;
     let dir = master_cfg.dir;
 
     let raft_id = args.raft_id.unwrap_or(master_cfg.raft_id);
@@ -113,8 +114,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Master Port: {}", port);
     info!("  Raft Port: {}", raft_port);
     info!("  Net Port: {}", net_port);
+    info!("  Metrics/Admin Port: {}", metrics_port);
     info!("  Raft ID: {}", raft_id);
     info!("  Data Dir: {}", dir);
+
+    // 端口冲突自检：全部 4 个端口必须唯一（无端口加减推导, 配置文件显式配置）
+    {
+        let used = [
+            ("port", port),
+            ("raft_port", raft_port),
+            ("net_port", net_port),
+            ("metrics_port", metrics_port),
+        ];
+        for (i, (na, a)) in used.iter().enumerate() {
+            for (nb, b) in &used[i + 1..] {
+                if a == b {
+                    eprintln!(
+                        "ERROR: master.{} and master.{} both use port {} — must be distinct (all ports explicitly configured, no derivation)",
+                        na, nb, a
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 
     let master = MasterNode::new(
         &bind_address,
@@ -124,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         raft_id,
         peers,
         net_port,
+        metrics_port,
     )
     .await?;
 
