@@ -4,7 +4,7 @@
 # Tests implemented features (xattr, fallocate, mknod) for correctness.
 #
 # Usage:
-#   docker exec fuse-test /tmp/test_fuse_features.sh
+#   docker exec fuse-1-test /tmp/test_fuse_features.sh
 #
 # Expected results:
 #   xattr:        PASS (FUSE implements setxattr/getxattr/listxattr/removexattr)

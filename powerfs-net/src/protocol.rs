@@ -154,9 +154,18 @@ pub struct HandshakeRequest {
     pub features: u32,   // Supported features
 }
 
-/// Channel constants (与内核 POWERFS_NET_CHANNEL_DATA/META 一致)
+/// Channel constants (与内核 POWERFS_NET_CHANNEL_DATA/META/LOCK 一致)
 pub const CHANNEL_DATA: u8 = 0;
 pub const CHANNEL_META: u8 = 1;
+/// Logical lock channel (§8.4 方案 A). Lock messages ride the same TCP
+/// connection as data/meta but are routed by `MsgType::is_lock_channel()`
+/// to an independent receive queue + dedicated worker pool, so IO
+/// congestion cannot block lock handoff (acquire/grant/revoke/release/renew).
+/// Value `2` is used for flow-control stats grouping only; it is NOT
+/// encoded into `route_hash` (which reserves only bit 0 for the physical
+/// data/meta path). A dedicated lock connection (方案 B) would handshake
+/// with `channel = CHANNEL_LOCK` and requires the 2-bit route_hash upgrade.
+pub const CHANNEL_LOCK: u8 = 2;
 
 impl HandshakeRequest {
     pub const SIZE: usize = 20;
@@ -575,6 +584,27 @@ pub enum MsgType {
     /// Response: XattrKeys (repeated string, NUL-separated) or empty.
     ListXattr = 0x003b,
 
+    /// Mkdir Phase A: CreateInode on target_shard (client-routed two-phase mkdir).
+    /// Request: ShardId(target) + Ino + ParentIno + Name + Mode + Uid + Gid
+    /// Response: Ino + Mode + Uid + Gid + Size + Nlink + Mtime + Atime + Ctime + IsDir + Name + ShardId
+    /// See docs/shard-routing-no-forward-principle.md §3
+    MkdirPhaseA = 0x003c,
+
+    /// Mkdir Phase B: AddDirEntry on parent_shard (client-routed two-phase mkdir).
+    /// Request: ShardId(parent) + ParentIno + Name + Ino + Mode + Uid + Gid
+    /// Response: status only (Phase A already returned the full attr)
+    /// See docs/shard-routing-no-forward-principle.md §3
+    MkdirPhaseB = 0x003d,
+
+    /// Batch unlink: remove multiple directory entries in one RPC + one Raft
+    /// propose_many. Client batches consecutive unlink calls and flushes
+    /// periodically or when the batch is full.
+    ///
+    /// Request: ShardId(parent) + count(u32) + [(ParentIno + NameLen + Name)] * count
+    /// Response: status + per-entry status codes
+    /// See docs/shard-routing-no-forward-principle.md §8
+    BatchUnlink = 0x003e,
+
     // Status
     StatFs = 0x0040,
 
@@ -627,6 +657,49 @@ pub enum MsgType {
     AcquireInodeLease = 0x0085,
     ReleaseInodeLease = 0x0086,
     RenewInodeLease = 0x0087,
+    /// Phase 4 §5.2 Early Grant: client → Filer, acknowledges a pushed
+    /// `Revoke` (Early Revoke) notification. The holder signals it has
+    /// flushed dirty data and is releasing the lease; the Filer then
+    /// grants the next queued waiter immediately (Early Grant) without
+    /// waiting for the old holder's dirty-page writeback. The SN on the
+    /// new grant preserves global IO ordering.
+    /// Request TLV: Ino + ClientId + LeaseToken. Response: STATUS only.
+    RevokeInodeLeaseAck = 0x0088,
+
+    /// Get debug configuration from master (centralized debug control).
+    ///
+    /// Request TLV: NodeId(string) — requesting node's identifier (e.g. "fuse-1")
+    /// Response TLV: LogLevel(string) + TargetFilter(string) + FlagCount(u32)
+    ///               + [FlagName(string) + FlagOn(u8)] * FlagCount
+    ///
+    /// Master merges "all" defaults with node-specific overrides and returns
+    /// the effective config. Nodes poll every 2s and apply locally via
+    /// `powerfs_common::dynamic_log`.
+    GetDebugConfig = 0x0089,
+
+    // ===== Capability (Cap) model — §13 Capability 模型 =====
+    // Client → Filer: request caps for an open() call. Always succeeds
+    // (open never blocks). Response carries granted caps + token + epoch.
+    // Request TLV: Ino + ClientId + IsWriteOpen(u8)
+    // Response TLV: Status + LeaseToken + CapSet(u8) + LeaseEpoch(u64) + SN(u64)
+    CapOpenGrant = 0x0091,
+    // Client → Filer: acknowledge a cap recall (flush done, caps released).
+    // Request TLV: Ino + ClientId + LeaseToken. Response: STATUS only.
+    CapRecallAck = 0x0092,
+    // Client → Filer: release caps on close(). Triggers upgrade detection.
+    // Request TLV: Ino + ClientId + LeaseToken. Response: STATUS +
+    // (optional) UpgradeTask if a surviving writer is upgraded.
+    CapRelease = 0x0093,
+    // Filer → Client (push): recall notification. Tells the client which
+    // caps to release and what to retain. Client must flush dirty data
+    // (if CAP_W recalled) then send CapRecallAck.
+    // Notification TLV: Ino + LeaseToken + CapSet(recall) + CapSet(retained) + LeaseEpoch
+    CapRecallNotify = 0x0094,
+    // Filer → Client (push): upgrade notification. Tells a SHARED_WRITE
+    // writer it's been promoted back to EXCLUSIVE_WRITE (can resume local
+    // caching). Carries new caps + epoch + SN.
+    // Notification TLV: Ino + LeaseToken + CapSet(granted) + LeaseEpoch + SN
+    CapUpgradeNotify = 0x0095,
 
     // Raft inter-node operations
     /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
@@ -666,6 +739,9 @@ impl MsgType {
             0x0039 => Some(Self::GetXattr),
             0x003a => Some(Self::RemoveXattr),
             0x003b => Some(Self::ListXattr),
+            0x003c => Some(Self::MkdirPhaseA),
+            0x003d => Some(Self::MkdirPhaseB),
+            0x003e => Some(Self::BatchUnlink),
             0x0040 => Some(Self::StatFs),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
@@ -696,6 +772,13 @@ impl MsgType {
             0x0085 => Some(Self::AcquireInodeLease),
             0x0086 => Some(Self::ReleaseInodeLease),
             0x0087 => Some(Self::RenewInodeLease),
+            0x0088 => Some(Self::RevokeInodeLeaseAck),
+            0x0089 => Some(Self::GetDebugConfig),
+            0x0091 => Some(Self::CapOpenGrant),
+            0x0092 => Some(Self::CapRecallAck),
+            0x0093 => Some(Self::CapRelease),
+            0x0094 => Some(Self::CapRecallNotify),
+            0x0095 => Some(Self::CapUpgradeNotify),
             0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
@@ -709,6 +792,45 @@ impl MsgType {
         let v = self.as_u16();
         (0x0010..=0x001D).contains(&v)
     }
+
+    /// `true` for lock/lease message types that must be routed to the
+    /// independent lock receive queue + dedicated worker pool (§8.4/§8.6).
+    ///
+    /// Covers the existing lease ops (range + inode) and `Invalidate`
+    /// (the Early Revoke notification path — §8.5 P0 `LockRevoke`).
+    /// New lock wire types added by `powerfs-lock-net` should be listed
+    /// here too so they bypass the IO worker pool.
+    pub fn is_lock_channel(self) -> bool {
+        matches!(
+            self,
+            MsgType::Invalidate
+                | MsgType::RangeLease
+                | MsgType::AcquireLease
+                | MsgType::ReleaseLease
+                | MsgType::RenewLease
+                | MsgType::LeaseStatus
+                | MsgType::AcquireLeaseBatch
+                | MsgType::AcquireInodeLease
+                | MsgType::ReleaseInodeLease
+                | MsgType::RenewInodeLease
+                | MsgType::RevokeInodeLeaseAck
+                // §13 Cap model — same lock channel for priority routing
+                | MsgType::CapOpenGrant
+                | MsgType::CapRecallAck
+                | MsgType::CapRelease
+                | MsgType::CapRecallNotify
+                | MsgType::CapUpgradeNotify
+        )
+    }
+}
+
+/// Free-function form of [`MsgType::is_lock_channel`] for call sites that
+/// only have the raw `u16` msg_type (e.g. before `NetMessage::msg_type()`
+/// decoding). Returns `false` for unknown/invalid msg_type values.
+pub fn is_lock_msg_type(msg_type: u16) -> bool {
+    MsgType::from_u16(msg_type)
+        .map(|t| t.is_lock_channel())
+        .unwrap_or(false)
 }
 
 // ============================================================================
@@ -976,6 +1098,62 @@ pub enum FieldId {
     /// overwriting. Used by FUSE release to support cross-client concurrent
     /// appends to inline files without lost updates.
     IsAppend = 0xBE,
+
+    // ===== Debug control fields (0xBF-0xC3) =====
+    // 用于 GetDebugConfig 请求/响应的 TLV 编码
+    /// Node identifier (string). GetDebugConfig 请求中标识调用方节点
+    /// (如 "fuse-1", "filer-2", "all")。Master 据此合并 "all" 默认 + 节点覆盖。
+    NodeId = 0xBF,
+    /// Log level (string, "off"|"error"|"warn"|"info"|"debug"|"trace").
+    /// GetDebugConfig 响应中携带有效日志级别。
+    LogLevel = 0xC0,
+    /// Target filter (string, 如 "powerfs_fuse::fuse")。
+    /// GetDebugConfig 响应中携带有效 target 过滤器，空串表示无过滤。
+    TargetFilter = 0xC1,
+    /// Flag name (string). GetDebugConfig 响应中每个开关的名称。
+    FlagName = 0xC2,
+    /// Flag enabled (u8, 0/1). GetDebugConfig 响应中每个开关的状态。
+    FlagOn = 0xC3,
+
+    // ===== Capability (Cap) model fields (0xC4-0xC8) — §13 =====
+    /// CapSet bitfield (u8). CAP_R=0b001, CAP_W=0b010, CAP_X=0b100, EXCLUSIVE=0b111.
+    /// Used in CapOpenGrant response, CapRecallNotify, CapUpgradeNotify.
+    CapSet = 0xC4,
+    /// Fencer epoch (u64). Increments on every recall/force-reclaim so
+    /// stale IO from an unresponsive client is fenced off by the storage layer.
+    CapEpoch = 0xC5,
+    /// IsWriteOpen flag (u8, 0/1). CapOpenGrant request: 1 = O_WRONLY/O_RDWR,
+    /// 0 = O_RDONLY. Determines whether the server grants EXCLUSIVE caps
+    /// (single writer) or CAP_R (reader).
+    IsWriteOpen = 0xC6,
+    /// Global sequence number (u64). Allocated by the filer leader on every
+    /// cap grant. Orders IO across cap handoffs so a rolled-back grant's
+    /// IO is sequenced behind the new grant's IO (§5.2 / §13.6.1).
+    CapSn = 0xC7,
+    /// Has-upgrade flag (u8, 0/1). CapRelease response: 1 if a surviving
+    /// writer was upgraded to EXCLUSIVE_WRITE, followed by upgrade fields
+    /// (LeaseToken + CapSet + CapEpoch + CapSn). 0 = no upgrade.
+    HasUpgrade = 0xC8,
+
+    // ===== Dentry lease fields (0xC9-0xCA) — per-dentry lease model =====
+    /// Directory version / shared_gen (u64). Returned in lookup and readdir
+    /// responses so clients can track when a directory's content changes.
+    /// Clients compare their cached dentry's `dir_shared_gen` against this
+    /// value to detect stale dentries after their per-dentry lease expires.
+    DirVersion = 0xC9,
+    /// Dentry lease TTL in milliseconds (u64). Returned in lookup responses.
+    /// When non-zero, the client may trust the dentry (positive or negative)
+    /// for this duration without sending further lookup RPCs.
+    DentryLeaseTtl = 0xCA,
+    // ===== Filer node discovery fields (0xCB-0xCC) =====
+    /// Filer HTTP (S3) server port (u64). Reported in RegisterFiler TLV so
+    /// the Master can proxy `/admin/shards` to the correct listener (the
+    /// S3 router also serves the shard introspection endpoints).
+    FilerHttpPort = 0xCB,
+    /// Filer metrics HTTP server port (u64). Reported in RegisterFiler TLV
+    /// so the Master can proxy `/admin/meta-cache-stats` and
+    /// `/admin/lease-stats` when serving the new `GetFilerStats` gRPC.
+    FilerMetricsPort = 0xCC,
 }
 
 impl FieldId {
@@ -1081,6 +1259,20 @@ impl FieldId {
             0xBC => Some(Self::XattrKeys),
             0xBD => Some(Self::ShardMapEntries),
             0xBE => Some(Self::IsAppend),
+            0xBF => Some(Self::NodeId),
+            0xC0 => Some(Self::LogLevel),
+            0xC1 => Some(Self::TargetFilter),
+            0xC2 => Some(Self::FlagName),
+            0xC3 => Some(Self::FlagOn),
+            0xC4 => Some(Self::CapSet),
+            0xC5 => Some(Self::CapEpoch),
+            0xC6 => Some(Self::IsWriteOpen),
+            0xC7 => Some(Self::CapSn),
+            0xC8 => Some(Self::HasUpgrade),
+            0xC9 => Some(Self::DirVersion),
+            0xCA => Some(Self::DentryLeaseTtl),
+            0xCB => Some(Self::FilerHttpPort),
+            0xCC => Some(Self::FilerMetricsPort),
             _ => None,
         }
     }
@@ -1324,6 +1516,13 @@ pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
         // GetXattr (0x0039) - body < 4KB (xattr value)
         0x0039 => Some((4 * 1024, 0)),
 
+        // MkdirPhaseA (0x003c) - body < 4KB (attr response, same as Mkdir)
+        0x003c => Some((4 * 1024, 0)),
+        // MkdirPhaseB (0x003d) - body < 256B (status only)
+        0x003d => Some((256, 0)),
+        // BatchUnlink (0x003e) - body < 64KB (up to ~256 entries × 256B each)
+        0x003e => Some((64 * 1024, 0)),
+
         // ReadNeedle (0x0063) - data ≤ 2MB, body < 256KB
         0x0063 => Some((256 * 1024, 2 * 1024 * 1024)),
 
@@ -1445,6 +1644,8 @@ fn required_fields_for(msg_type: u16) -> &'static [FieldId] {
         0x0013 => &[FieldId::Ino, FieldId::Mode],
         // Mkdir 响应：必须含 Ino + Mode + IsDir
         0x0014 => &[FieldId::Ino, FieldId::Mode, FieldId::IsDir],
+        // MkdirPhaseA 响应（CreateInode）：必须含 Ino + Mode + IsDir
+        0x003c => &[FieldId::Ino, FieldId::Mode, FieldId::IsDir],
         // Symlink 响应：必须含 Ino + Mode + SymlinkTarget
         0x0019 => &[FieldId::Ino, FieldId::Mode, FieldId::SymlinkTarget],
         // Readlink 响应：必须含 SymlinkTarget
@@ -2346,5 +2547,56 @@ mod tests {
             0,
         );
         assert_eq!(hdr.load_factor(), 0);
+    }
+
+    // ----- §8.4 CHANNEL_LOCK routing -----
+
+    #[test]
+    fn test_channel_constants_distinct() {
+        assert_eq!(CHANNEL_DATA, 0);
+        assert_eq!(CHANNEL_META, 1);
+        assert_eq!(CHANNEL_LOCK, 2);
+        assert_ne!(CHANNEL_DATA, CHANNEL_META);
+        assert_ne!(CHANNEL_DATA, CHANNEL_LOCK);
+        assert_ne!(CHANNEL_META, CHANNEL_LOCK);
+    }
+
+    #[test]
+    fn test_is_lock_channel_for_lease_ops() {
+        // All lease/lock message types must route to the lock queue.
+        assert!(MsgType::AcquireLease.is_lock_channel());
+        assert!(MsgType::ReleaseLease.is_lock_channel());
+        assert!(MsgType::RenewLease.is_lock_channel());
+        assert!(MsgType::LeaseStatus.is_lock_channel());
+        assert!(MsgType::AcquireLeaseBatch.is_lock_channel());
+        assert!(MsgType::AcquireInodeLease.is_lock_channel());
+        assert!(MsgType::ReleaseInodeLease.is_lock_channel());
+        assert!(MsgType::RenewInodeLease.is_lock_channel());
+        assert!(MsgType::RangeLease.is_lock_channel());
+        // Invalidate = Early Revoke notification path (§8.5 P0).
+        assert!(MsgType::Invalidate.is_lock_channel());
+    }
+
+    #[test]
+    fn test_is_lock_channel_false_for_io_and_meta() {
+        // IO and metadata ops must NOT route to the lock queue.
+        assert!(!MsgType::Ping.is_lock_channel());
+        assert!(!MsgType::Lookup.is_lock_channel());
+        assert!(!MsgType::Create.is_lock_channel());
+        assert!(!MsgType::ReadDir.is_lock_channel());
+        assert!(!MsgType::WriteNeedle.is_lock_channel());
+        assert!(!MsgType::ReadNeedle.is_lock_channel());
+        assert!(!MsgType::StatFs.is_lock_channel());
+        assert!(!MsgType::GetTopology.is_lock_channel());
+    }
+
+    #[test]
+    fn test_is_lock_msg_type_free_function() {
+        // Free-function form must agree with the method form, and reject
+        // unknown msg_type values (returns false, not routed).
+        assert!(is_lock_msg_type(MsgType::AcquireLease.as_u16()));
+        assert!(is_lock_msg_type(MsgType::RenewInodeLease.as_u16()));
+        assert!(!is_lock_msg_type(MsgType::Lookup.as_u16()));
+        assert!(!is_lock_msg_type(0xFFFF)); // unknown
     }
 }

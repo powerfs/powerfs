@@ -14,6 +14,12 @@ const CF_METADATA: &str = "metadata"; // For storing root_inodes and other persi
 const CF_ORSET_STATE: &str = "orset_state"; // For storing CRDT OR-Set state
 const CF_TOMBSTONES: &str = "tombstones"; // For storing CRDT tombstones
 const CF_PENDING_RECLAIMS: &str = "pending_reclaims"; // Phase 5: WAL for GC data chunk reclamation
+const CF_LEASES: &str = "leases"; // Phase 5 §5.3: lease state persistence (token → serialized LeaseEntry)
+const CF_CHILD_SUMMARIES: &str = "child_summaries"; // P4 DirStatSummary cache on parent shard for cross-shard subdirs
+/// Reserved key in `CF_LEASES` for the persisted epoch counter. A NUL
+/// byte prefix ensures it can never collide with a real lease token
+/// (tokens are NUL-free opaque strings from `powerfs-lease`).
+const LEASE_EPOCH_KEY: &[u8] = b"\x00epoch";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeInfo {
@@ -76,6 +82,45 @@ pub struct InodeInfo {
     pub replica_chunks: Vec<StoredFileChunk>,
 }
 
+impl InodeInfo {
+    /// Build a minimal tombstone used by MetaCache Deleted state.
+    ///
+    /// When an entry is in `Deleted` state, the caller short-circuits with
+    /// ENOENT, so the only meaningful field is `inode` (used as HashMap key).
+    pub fn tombstone(inode: u64) -> Self {
+        use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
+
+        Self {
+            inode,
+            name: String::new(),
+            parent_inode: 0,
+            file_type: FileType::File,
+            size: 0,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: Vec::new(),
+            inline_data: None,
+            extended: std::collections::HashMap::new(),
+            symlink_target: None,
+            nlink: 0,
+            version: 0,
+            delete_time: 0,
+            reliability: Reliability::default(),
+            reliability_state: ReliabilityState::default(),
+            compression_state: CompressionState::default(),
+            replica_chunks: Vec::new(),
+        }
+    }
+}
+
 /// Lightweight directory entry for readdir responses.
 /// Contains only the fields needed by readdir, avoiding expensive
 /// clones of chunks/inline_data/extended/replica_chunks from full InodeInfo.
@@ -127,6 +172,52 @@ pub enum FileType {
     Symlink,
 }
 
+// ---------------------------------------------------------------------------
+// DirStatSummary — lightweight cross-shard child stat cache
+// ---------------------------------------------------------------------------
+//
+// Stores a compact snapshot of a directory child's metadata on the *parent's*
+// shard. When `ls -l` walks a directory whose children live on different
+// shards, the reader can pull mode/uid/gid/size/mtime/nlink from this local
+// cache instead of issuing N RPCs to N child-shard leaders.
+//
+// Consistency contract (no-forward principle):
+//   * WRITES: the client routes `UpdateChildSummary` directly to the
+//     parent-shard leader (it already knows parent_inode → shard_id via
+//     shard_router). No filer-to-filer forwarding is ever performed.
+//   * FRESHNESS: every mutation (chmod/chown/rename/truncate/unlink/rmdir)
+//     that touches the child inode also issues `UpdateChildSummary` or
+//     `DeleteChildSummary` on the parent shard. The `version_ts` monotonic
+//     counter guards against delayed out-of-order updates.
+//
+// Persistence:
+//   * RocksDB CF_CHILD_SUMMARIES, key = `{parent_inode_be}:{name}`
+//   * In-memory HashMap mirror for O(1) reads, loaded on ShardStore::open().
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirStatSummary {
+    /// The inode number on the child shard.
+    pub child_inode: u64,
+    /// POSIX mode + S_IFMT bits (matches InodeInfo::mode semantics).
+    pub mode_and_type: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub size: u64,
+    /// Seconds since UNIX epoch (matches InodeInfo time fields).
+    pub mtime: u64,
+    pub ctime: u64,
+    pub atime: u64,
+    pub nlink: u32,
+    /// Shard the child inode actually lives on. Reserved for future
+    /// reader-side redirect optimization; today readers still consult the
+    /// full inode record via shard_router for chunk/fid/xattr data.
+    pub child_shard_id: u64,
+    /// Monotonic logical clock (millisecond wall clock is acceptable since
+    /// update source is always the child-shard leader which just advanced
+    /// the inode version). Later writes with strictly smaller version_ts
+    /// are ignored to protect against stale out-of-order delivery.
+    pub version_ts: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardStats {
     pub inode_count: u64,
@@ -142,12 +233,17 @@ pub struct ShardStore {
     db: DB,
     inodes: RwLock<HashMap<u64, InodeInfo>>,
     directory_entries: RwLock<HashMap<u64, BTreeMap<String, u64>>>,
+    /// P4: cross-shard DirStatSummary cache on the parent shard.
+    /// Keyed by (parent_inode, child_name) for O(1) lookups.
+    child_summaries: RwLock<HashMap<(u64, String), DirStatSummary>>,
     stats: RwLock<ShardStats>,
     root_inodes: RwLock<HashMap<String, u64>>, // Persistent bucket->root_inode mapping
     next_inode: std::sync::Mutex<u64>, // 下一个可分配 inode（leader 单点分配 + CF_METADATA 持久化，§4 1.4）
     // Phase 3.5.3: per-inode open 计数（内存追踪，filer 重启重置为 0；
     // fuse 端重新 open 时上报，grace_period 兜底重启窗口）
     open_counts: RwLock<HashMap<u64, u32>>,
+    // P3: MetaCache 引用，Raft apply 后回调 confirm_*() 清除 staging
+    meta_cache: RwLock<Option<std::sync::Arc<crate::meta_cache::MetaCache>>>,
 }
 
 impl ShardStore {
@@ -186,9 +282,52 @@ impl ShardStore {
             ColumnFamilyDescriptor::new(CF_ORSET_STATE, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_TOMBSTONES, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_PENDING_RECLAIMS, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_LEASES, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_CHILD_SUMMARIES, make_cf_opts()),
         ];
+        let known_names: std::collections::HashSet<&'static str> = [
+            CF_INODES,
+            CF_DIR_ENTRIES,
+            CF_STATS,
+            CF_METADATA,
+            CF_ORSET_STATE,
+            CF_TOMBSTONES,
+            CF_PENDING_RECLAIMS,
+            CF_LEASES,
+            CF_CHILD_SUMMARIES,
+        ]
+        .iter()
+        .cloned()
+        .collect();
 
-        let db = DB::open_cf_descriptors(&opts, db_path, cf_descriptors)
+        // Robust open: first list existing CFs on-disk, then build the final
+        // descriptor list as (existing set ∪ known set). This avoids the
+        // classic `Column families not opened` crash when a new CF was added
+        // to the code but the DB on disk carries it, or when a historical CF
+        // was persisted by an older binary that we still want to open.
+        let mut final_descriptors: Vec<ColumnFamilyDescriptor> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(existing) = DB::list_cf(&opts, db_path) {
+            for name in existing {
+                if name == "default" {
+                    continue;
+                }
+                let opts_cf = if known_names.contains(name.as_str()) {
+                    make_cf_opts()
+                } else {
+                    rocksdb::Options::default()
+                };
+                seen.insert(name.clone());
+                final_descriptors.push(ColumnFamilyDescriptor::new(name, opts_cf));
+            }
+        }
+        for desc in cf_descriptors {
+            if !seen.contains(desc.name()) {
+                final_descriptors.push(desc);
+            }
+        }
+
+        let db = DB::open_cf_descriptors(&opts, db_path, final_descriptors)
             .map_err(|e| format!("failed to open rocksdb: {}", e))?;
 
         let mut store = Self {
@@ -197,6 +336,7 @@ impl ShardStore {
             db,
             inodes: RwLock::new(HashMap::new()),
             directory_entries: RwLock::new(HashMap::new()),
+            child_summaries: RwLock::new(HashMap::new()),
             stats: RwLock::new(ShardStats {
                 inode_count: 0,
                 file_count: 0,
@@ -207,6 +347,7 @@ impl ShardStore {
             root_inodes: RwLock::new(HashMap::new()),
             next_inode: std::sync::Mutex::new(inode_range.0),
             open_counts: RwLock::new(HashMap::new()),
+            meta_cache: RwLock::new(None),
         };
 
         store.load_data()?;
@@ -214,9 +355,16 @@ impl ShardStore {
         Ok(store)
     }
 
+    /// P3: 注入 MetaCache 引用，Raft apply 后回调 confirm_*() 清除 staging。
+    /// 由 MetaShardManager 在创建 ShardStore 后调用。
+    pub fn set_meta_cache(&self, cache: std::sync::Arc<crate::meta_cache::MetaCache>) {
+        *self.meta_cache.write().unwrap() = Some(cache);
+    }
+
     fn load_data(&mut self) -> Result<(), String> {
         self.load_inodes()?;
         self.load_dir_entries()?;
+        self.load_child_summaries()?;
         self.load_stats()?;
         self.load_root_inodes()?;
         info!("Shard {} loaded data from rocksdb", self.shard_id.0);
@@ -452,6 +600,50 @@ impl ShardStore {
         Ok(())
     }
 
+    /// Load DirStatSummary rows from `CF_CHILD_SUMMARIES`.
+    ///
+    /// Key format on disk: `{parent_inode:8BE}{name_bytes}` — using a fixed
+    /// 8-byte big-endian prefix keeps sibling entries sorted by
+    /// parent_inode, which helps the read-side prefix scan used by
+    /// `list_child_summaries()`.
+    fn load_child_summaries(&mut self) -> Result<(), String> {
+        let cf = match self.db.cf_handle(CF_CHILD_SUMMARIES) {
+            Some(cf) => cf,
+            None => return Ok(()),
+        };
+
+        let mut it = self.db.raw_iterator_cf(cf);
+        it.seek_to_first();
+        let mut map = self.child_summaries.write().unwrap();
+        let mut count: usize = 0;
+        while it.valid() {
+            if let (Some(key), Some(val)) = (it.key(), it.value()) {
+                if key.len() >= 8 {
+                    let mut p_bytes = [0u8; 8];
+                    p_bytes.copy_from_slice(&key[..8]);
+                    let parent = u64::from_be_bytes(p_bytes);
+                    let name = match String::from_utf8(key[8..].to_vec()) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            it.next();
+                            continue;
+                        }
+                    };
+                    if let Ok(summary) = serde_json::from_slice::<DirStatSummary>(val) {
+                        map.insert((parent, name), summary);
+                        count += 1;
+                    }
+                }
+            }
+            it.next();
+        }
+        info!(
+            "Shard {} loaded {} child summaries from rocksdb",
+            self.shard_id.0, count
+        );
+        Ok(())
+    }
+
     fn load_stats(&mut self) -> Result<(), String> {
         let cf = match self.db.cf_handle(CF_STATS) {
             Some(cf) => cf,
@@ -530,9 +722,15 @@ impl ShardStore {
                 atime,
             } => {
                 self.setattr(inode, size, mode, uid, gid, mtime, atime);
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_dirty(inode);
+                }
             }
             ShardCommand::SetAttrData { inode, size } => {
                 self.setattr_data(inode, size);
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_dirty(inode);
+                }
             }
             ShardCommand::SetAttrMeta {
                 inode,
@@ -545,6 +743,9 @@ impl ShardStore {
                 timestamp: _,
             } => {
                 self.setattr_meta(inode, mode, uid, gid, mtime, atime);
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_dirty(inode);
+                }
             }
             ShardCommand::CreateSymlink {
                 parent_inode,
@@ -630,6 +831,10 @@ impl ShardStore {
                         e
                     );
                 }
+                // P3: Raft apply 完成，清除 MetaCache staging
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_create_inode(info.inode);
+                }
             }
             ShardCommand::AddDirEntry {
                 parent_inode,
@@ -645,6 +850,10 @@ impl ShardStore {
                         e
                     );
                 }
+                // P3: Raft apply 完成，清除 MetaCache staging
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_add_direntry(parent_inode, &name);
+                }
             }
             ShardCommand::DeleteInode { inode } => {
                 if let Err(e) = self.delete_inode(inode) {
@@ -654,6 +863,10 @@ impl ShardStore {
                         inode,
                         e
                     );
+                }
+                // P3: Raft apply 完成，清除 MetaCache deleted marker
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_delete_inode(inode);
                 }
             }
             ShardCommand::RemoveDirEntry { parent_inode, name } => {
@@ -665,6 +878,10 @@ impl ShardStore {
                         name,
                         e
                     );
+                }
+                // P3: Raft apply 完成，清除 MetaCache deleted marker
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_remove_direntry(parent_inode, &name);
                 }
             }
             ShardCommand::IncrementNlink { inode } => {
@@ -765,7 +982,268 @@ impl ShardStore {
                     );
                 }
             }
+            // ----- Phase 5 §5.3: lease state persistence -----
+            ShardCommand::LeasePut { token, value } => {
+                self.lease_put(&token, &value);
+            }
+            ShardCommand::LeaseDelete { token } => {
+                self.lease_delete(&token);
+            }
+            ShardCommand::LeaseSaveEpoch { epoch } => {
+                self.lease_save_epoch(epoch);
+            }
+
+            // ----- P4 cross-shard DirStatSummary on parent shard -----
+            ShardCommand::UpdateChildSummary {
+                parent_inode,
+                name,
+                summary,
+            } => {
+                // version_ts guard: don't regress to a strictly older value.
+                // Equal ts is permitted (idempotent re-apply).
+                let do_write = {
+                    let current = self.child_summaries.read().unwrap();
+                    !matches!(
+                        current.get(&(parent_inode, name.clone())),
+                        Some(old) if old.version_ts > summary.version_ts
+                    )
+                };
+                if do_write {
+                    if let Err(e) = self.put_child_summary_raw(parent_inode, &name, &summary) {
+                        log::error!(
+                            "Shard {} put_child_summary parent={} name={}: {}",
+                            self.shard_id.0,
+                            parent_inode,
+                            name,
+                            e
+                        );
+                    }
+                }
+            }
+            ShardCommand::DeleteChildSummary { parent_inode, name } => {
+                if let Err(e) = self.delete_child_summary_raw(parent_inode, &name) {
+                    log::error!(
+                        "Shard {} delete_child_summary parent={} name={}: {}",
+                        self.shard_id.0,
+                        parent_inode,
+                        name,
+                        e
+                    );
+                }
+            }
         }
+    }
+
+    /// Persist (or overwrite) a serialized lease entry under `token`
+    /// in `CF_LEASES`. Called from `apply_command` when
+    /// `ShardCommand::LeasePut` is committed by Raft.
+    ///
+    /// The value bytes are opaque from the shard store's perspective —
+    /// the lease manager (`RaftLeasePersistence`) handles
+    /// serialization via `powerfs_lease::persistence::encode_entry`.
+    pub fn lease_put(&self, token: &str, value: &[u8]) {
+        let cf = match self.db.cf_handle(CF_LEASES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {} lease_put: CF_LEASES not found (token={})",
+                    self.shard_id.0,
+                    token
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.db.put_cf(cf, token.as_bytes(), value) {
+            log::error!(
+                "Shard {} lease_put failed (token={}): {}",
+                self.shard_id.0,
+                token,
+                e
+            );
+        }
+    }
+
+    /// Delete a persisted lease entry by token. Idempotent.
+    pub fn lease_delete(&self, token: &str) {
+        let cf = match self.db.cf_handle(CF_LEASES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {} lease_delete: CF_LEASES not found (token={})",
+                    self.shard_id.0,
+                    token
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.db.delete_cf(cf, token.as_bytes()) {
+            log::error!(
+                "Shard {} lease_delete failed (token={}): {}",
+                self.shard_id.0,
+                token,
+                e
+            );
+        }
+    }
+
+    /// Persist the Fencer epoch counter to `CF_LEASES` under the
+    /// reserved key `LEASE_EPOCH_KEY`. Used by the lease manager to
+    /// survive leader switches without resetting the epoch to 0
+    /// (which would permit zombie clients back into the cluster).
+    pub fn lease_save_epoch(&self, epoch: u64) {
+        let cf = match self.db.cf_handle(CF_LEASES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {} lease_save_epoch: CF_LEASES not found",
+                    self.shard_id.0
+                );
+                return;
+            }
+        };
+        if let Err(e) = self.db.put_cf(cf, LEASE_EPOCH_KEY, epoch.to_le_bytes()) {
+            log::error!(
+                "Shard {} lease_save_epoch failed (epoch={}): {}",
+                self.shard_id.0,
+                epoch,
+                e
+            );
+        }
+    }
+
+    /// Local read: load all persisted lease entries from `CF_LEASES`
+    /// (excluding the reserved epoch key). Called by
+    /// `RaftLeasePersistence::load_all` on leader takeover.
+    ///
+    /// Returns `(token, value)` pairs in arbitrary order. The lease
+    /// manager re-decodes each entry via `decode_entry` and skips
+    /// already-expired ones.
+    pub fn lease_load_all(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let cf = self
+            .db
+            .cf_handle(CF_LEASES)
+            .ok_or_else(|| "CF_LEASES not found".to_string())?;
+
+        let mut out = Vec::new();
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = item.map_err(|e| format!("rocksdb iter: {}", e))?;
+            // Skip the reserved epoch key.
+            if key.as_ref() == LEASE_EPOCH_KEY {
+                continue;
+            }
+            let token = String::from_utf8(key.to_vec())
+                .map_err(|e| format!("non-utf8 lease token: {}", e))?;
+            out.push((token, value.to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Local read: load the persisted Fencer epoch counter. Returns 0
+    /// if never persisted (first-ever leader takeover), matching the
+    /// in-memory initial value.
+    pub fn lease_load_epoch(&self) -> Result<u64, String> {
+        let cf = self
+            .db
+            .cf_handle(CF_LEASES)
+            .ok_or_else(|| "CF_LEASES not found".to_string())?;
+        match self.db.get_cf(cf, LEASE_EPOCH_KEY) {
+            Ok(Some(bytes)) if bytes.len() == 8 => {
+                Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            Ok(_) => Ok(0),
+            Err(e) => Err(format!("rocksdb get epoch: {}", e)),
+        }
+    }
+
+    // --------- DirStatSummary: internal raw (RocksDB + in-memory) ---------
+
+    fn child_summary_key(parent_inode: u64, name: &str) -> Vec<u8> {
+        let mut k = Vec::with_capacity(8 + name.len());
+        k.extend_from_slice(&parent_inode.to_be_bytes());
+        k.extend_from_slice(name.as_bytes());
+        k
+    }
+
+    /// Persist + update in-memory DirStatSummary. Caller is expected to
+    /// check `version_ts` ordering before calling (see apply_command).
+    fn put_child_summary_raw(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        summary: &DirStatSummary,
+    ) -> Result<(), String> {
+        let cf = self
+            .db
+            .cf_handle(CF_CHILD_SUMMARIES)
+            .ok_or_else(|| "CF_CHILD_SUMMARIES not found".to_string())?;
+        let key = Self::child_summary_key(parent_inode, name);
+        let data = serde_json::to_vec(summary).map_err(|e| e.to_string())?;
+        self.db
+            .put_cf(cf, &key, &data)
+            .map_err(|e| format!("rocksdb put child_summary: {}", e))?;
+        self.child_summaries
+            .write()
+            .unwrap()
+            .insert((parent_inode, name.to_string()), summary.clone());
+        Ok(())
+    }
+
+    /// Delete a DirStatSummary by (parent_inode, name). OK if absent.
+    fn delete_child_summary_raw(&self, parent_inode: u64, name: &str) -> Result<(), String> {
+        let cf = self
+            .db
+            .cf_handle(CF_CHILD_SUMMARIES)
+            .ok_or_else(|| "CF_CHILD_SUMMARIES not found".to_string())?;
+        let key = Self::child_summary_key(parent_inode, name);
+        let _ = self.db.delete_cf(cf, &key);
+        self.child_summaries
+            .write()
+            .unwrap()
+            .remove(&(parent_inode, name.to_string()));
+        Ok(())
+    }
+
+    // --------- DirStatSummary: public API ---------
+
+    /// Read a single child summary from the in-memory cache. Returns None
+    /// if the parent has no cached summary for `name` (reader must fall
+    /// back to a normal inode lookup via the child shard).
+    pub fn get_child_summary(&self, parent_inode: u64, name: &str) -> Option<DirStatSummary> {
+        self.child_summaries
+            .read()
+            .unwrap()
+            .get(&(parent_inode, name.to_string()))
+            .cloned()
+    }
+
+    /// List ALL child summaries under parent_inode. Used by `ls -l` on
+    /// the parent shard leader: present entries are served locally;
+    /// missing entries are re-fetched from the child shard and populated
+    /// back via `put_child_summary` (MetaCache-style backfill).
+    pub fn list_child_summaries(&self, parent_inode: u64) -> Vec<(String, DirStatSummary)> {
+        let map = self.child_summaries.read().unwrap();
+        let mut out = Vec::new();
+        for ((p, n), s) in map.iter() {
+            if *p == parent_inode {
+                out.push((n.clone(), s.clone()));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Write a DirStatSummary directly (used by read-backfill and test
+    /// code). For consistency with Raft ordering this call does NOT
+    /// check version_ts; callers that need ordering protection should
+    /// route through `ShardCommand::UpdateChildSummary` instead.
+    pub fn put_child_summary_unchecked(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        summary: DirStatSummary,
+    ) -> Result<(), String> {
+        self.put_child_summary_raw(parent_inode, name, &summary)
     }
 
     fn create_file(&self, parent_inode: u64, name: String, inode: u64) {
@@ -1747,6 +2225,11 @@ impl ShardStore {
             dir.insert(name.to_string(), inode);
         }
 
+        // Bump parent directory's version (shared_gen equivalent).
+        // This invalidates cached dentry leases on all clients: when a client
+        // next checks dentry_shared_gen_valid(), the mismatch forces an RPC.
+        self.bump_dir_version(parent_inode);
+
         Ok(())
     }
 
@@ -1766,7 +2249,35 @@ impl ShardStore {
             dir.remove(name);
         }
 
+        // Bump parent directory's version (shared_gen equivalent).
+        self.bump_dir_version(parent_inode);
+
         Ok(())
+    }
+
+    /// Increment a directory's version counter (shared_gen).
+    ///
+    /// Called from add_dir_entry / remove_dir_entry to signal that the
+    /// directory's content changed. Clients compare their cached
+    /// `dir_shared_gen` against this version to detect stale dentries.
+    ///
+    /// If the parent inode lives on a different shard (cross-shard dir
+    /// entry), this is a no-op on this shard — the parent's own shard
+    /// will bump its version when it processes the AddDirEntry command.
+    fn bump_dir_version(&self, parent_inode: u64) {
+        let mut inodes = self.inodes.write().unwrap();
+        if let Some(info) = inodes.get_mut(&parent_inode) {
+            info.version = info.version.wrapping_add(1);
+            // Persist to RocksDB
+            if let Ok(data) = serde_json::to_vec(info) {
+                let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
+                let inode_key = parent_inode.to_be_bytes();
+                let _ = self.db.put_cf(cf_inodes, inode_key, &data);
+            }
+        }
+        // If parent_inode is not in this shard's inodes map (cross-shard),
+        // the version bump happens on the parent's own shard. This is fine —
+        // each shard only tracks its own inodes' versions.
     }
 
     pub fn delete_inode(&self, inode: u64) -> Result<(), String> {
@@ -2974,6 +3485,68 @@ mod tests {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
         }
+    }
+
+    /// Phase 5 §5.3: `CF_LEASES` storage layer round-trip + restart
+    /// persistence. Verifies that lease entries and the Fencer epoch
+    /// survive a process restart via RocksDB — the property that lets
+    /// the new leader recover leases after a switch. Also confirms
+    /// the reserved epoch key (`\x00epoch`) is excluded from
+    /// `lease_load_all`.
+    #[test]
+    fn test_lease_cf_persistence_and_restart() {
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_string();
+
+        let store = ShardStore::new(ShardId(0), (0, 16384), &db_path).unwrap();
+
+        // Round-trip: put two lease entries, load them back.
+        store.lease_put("token-alpha", b"lease-data-alpha");
+        store.lease_put("token-beta", b"lease-data-beta");
+
+        let entries = store.lease_load_all().unwrap();
+        assert_eq!(entries.len(), 2, "both leases should be persisted");
+        let mut tokens: Vec<String> = entries.iter().map(|(t, _)| t.clone()).collect();
+        tokens.sort();
+        assert_eq!(
+            tokens,
+            vec!["token-alpha".to_string(), "token-beta".to_string()]
+        );
+        // Values round-trip byte-for-byte.
+        for (token, value) in &entries {
+            let expected = match token.as_str() {
+                "token-alpha" => b"lease-data-alpha".to_vec(),
+                "token-beta" => b"lease-data-beta".to_vec(),
+                _ => panic!("unexpected token: {}", token),
+            };
+            assert_eq!(*value, expected, "value mismatch for {}", token);
+        }
+
+        // Epoch persistence — stored under the reserved \x00epoch key.
+        store.lease_save_epoch(42);
+        assert_eq!(store.lease_load_epoch().unwrap(), 42);
+
+        // Delete one lease; the other survives. This also proves the
+        // epoch key is excluded from lease_load_all (otherwise the
+        // count would be 2: token-beta + the epoch key).
+        store.lease_delete("token-alpha");
+        let entries = store.lease_load_all().unwrap();
+        assert_eq!(entries.len(), 1, "only token-beta should remain");
+        assert_eq!(entries[0].0, "token-beta");
+        // Epoch is untouched by a lease delete.
+        assert_eq!(store.lease_load_epoch().unwrap(), 42);
+
+        // --- Restart persistence: drop the store, reopen the same RocksDB ---
+        drop(store);
+        let store2 = ShardStore::new(ShardId(0), (0, 16384), &db_path).unwrap();
+
+        let entries2 = store2.lease_load_all().unwrap();
+        assert_eq!(entries2.len(), 1, "token-beta should survive restart");
+        assert_eq!(entries2[0].0, "token-beta");
+        assert_eq!(entries2[0].1, b"lease-data-beta");
+        // Epoch also survives the restart.
+        assert_eq!(store2.lease_load_epoch().unwrap(), 42);
     }
 
     #[test]

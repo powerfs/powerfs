@@ -3,8 +3,8 @@
 # PowerFS L4 多客户端一致性测试 (在宿主机运行, 通过 docker exec 操作两个 FUSE 客户端)
 #
 # 测试架构:
-#   Client A = fuse-test   (172.30.0.40)
-#   Client B = fuse-test-2 (172.30.0.41)
+#   Client A = fuse-1-test (172.30.0.40)
+#   Client B = fuse-2-test (172.30.0.41)
 #   两个客户端挂载同一 PowerFS 后端
 #
 # 测试项 (按 fs-test-plan.md):
@@ -22,8 +22,8 @@ PASS=0
 FAIL=0
 FAILED_TESTS=()
 
-CLIENT_A="fuse-test"
-CLIENT_B="fuse-test-2"
+CLIENT_A="fuse-1-test"
+CLIENT_B="fuse-2-test"
 TEST_DIR="/mnt/fuse/l4_consistency_v2"
 
 log()  { echo "[$(date '+%H:%M:%S')] $1"; }

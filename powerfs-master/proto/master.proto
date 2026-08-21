@@ -74,11 +74,25 @@ service MasterService {
     rpc GetMasterStatus(MasterStatusRequest) returns (MasterStatusResponse);
     rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
 
+    // ===== Debug & Log Level Control (admin control plane via gRPC) =====
+    // Per-master local log level (not replicated, affects the connected master only)
+    rpc GetLogLevel(GetLogLevelRequest) returns (GetLogLevelResponse);
+    rpc SetLogLevel(SetLogLevelRequest) returns (SetLogLevelResponse);
+    // Cluster-wide centralized debug config, polled by all nodes (filer/fuse/volume)
+    rpc GetDebugConfigs(GetDebugConfigsRequest) returns (GetDebugConfigsResponse);
+    rpc UpdateDebugConfig(UpdateDebugConfigRequest) returns (UpdateDebugConfigResponse);
+    rpc ClearDebugConfig(ClearDebugConfigRequest) returns (ClearDebugConfigResponse);
+
     // Filer routing service
     rpc GetFilerForInode(GetFilerForInodeRequest) returns (GetFilerForInodeResponse);
     rpc ListFilers(ListFilersRequest) returns (ListFilersResponse);
     rpc RegisterFiler(RegisterFilerRequest) returns (RegisterFilerResponse);
     rpc GetShardMapping(GetShardMappingRequest) returns (GetShardMappingResponse);
+    // Aggregated Filer observability (MetaCache/Lease/Shard stats). The CLI
+    // calls this exclusively via the Master — it never opens a direct HTTP
+    // connection to a Filer node; the Master proxies each registered Filer's
+    // metrics_port and http_port endpoints and assembles the response.
+    rpc GetFilerStats(FilerStatsRequest) returns (FilerStatsResponse);
 
     // ===== Allocator management (rebalance + volume scaling) =====
     rpc TriggerRebalanceCheck(TriggerRebalanceCheckRequest) returns (TriggerRebalanceCheckResponse);
@@ -717,6 +731,7 @@ message MasterNodeInfo {
     double mem_usage = 8;
     double disk_usage = 9;
     uint64 uptime = 10;
+    uint32 metrics_port = 11;
 }
 
 message MasterStatusResponse {
@@ -734,6 +749,67 @@ message TransferLeaderRequest {
 message TransferLeaderResponse {
     bool success = 1;
     string error = 2;
+}
+
+// ===== Debug & Log Level Control messages =====
+message GetLogLevelRequest {}
+
+message GetLogLevelResponse {
+    string level = 1;
+}
+
+message SetLogLevelRequest {
+    string level = 1; // off|error|warn|info|debug|trace
+}
+
+message SetLogLevelResponse {
+    bool success = 1;
+    string level = 2;    // new level on success
+    string prev = 3;     // previous level
+    string error = 4;    // error message on failure
+}
+
+message DebugConfigEntry {
+    string node = 1;                           // "all" for global default, or node id
+    bool has_log_level = 2;                    // presence marker for log_level
+    string log_level = 3;                      // off|error|warn|info|debug|trace (valid iff has_log_level=true)
+    bool has_target_filter = 4;                // presence marker for target_filter
+    string target_filter = 5;                  // target filter ("" means explicit clear)
+    map<string, bool> flags = 6;               // flag name -> on/off
+}
+
+message GetDebugConfigsRequest {}
+
+message GetDebugConfigsResponse {
+    repeated DebugConfigEntry configs = 1;     // all stored node configs ("all" + per-node)
+}
+
+message UpdateDebugConfigRequest {
+    string node = 1;                           // target node: "all" or specific id
+    bool has_level = 2;                        // presence marker for level
+    string level = 3;                          // new log level (valid iff has_level=true)
+    bool has_target_filter = 4;                // presence marker for target_filter
+    string target_filter = 5;                  // new target filter (valid iff has_target_filter=true; "" clears)
+    bool has_flag = 6;                         // presence marker for flag+on pair
+    string flag = 7;                           // flag name (valid iff has_flag=true)
+    bool on = 8;                               // flag value (valid iff has_flag=true)
+}
+
+message UpdateDebugConfigResponse {
+    bool success = 1;
+    DebugConfigEntry updated = 2;              // resulting node config after update
+    string error = 3;
+}
+
+message ClearDebugConfigRequest {
+    string node = 1;                           // node id to reset, or "all"
+}
+
+message ClearDebugConfigResponse {
+    bool success = 1;
+    string node = 2;
+    bool removed = 3;                          // true if config existed and was removed
+    string error = 4;
 }
 
 // Filer routing messages
@@ -759,6 +835,8 @@ message FilerInfo {
     bool is_healthy = 5;
     uint64 leader_count = 6;
     uint64 total_shards = 7;
+    uint32 net_port = 8;
+    uint32 metrics_port = 9;
 }
 
 message ListFilersResponse {
@@ -775,10 +853,39 @@ message RegisterFilerRequest {
     uint64 shard_count = 5;
     repeated uint64 shard_ids = 6;
     uint32 net_port = 7;
+    uint32 metrics_port = 8;
 }
 
 message RegisterFilerResponse {
     bool success = 1;
+    string error = 2;
+}
+
+message FilerStatsRequest {
+    // Optional — when empty, return stats for *all* registered filers.
+    // Otherwise filter to a single filer by `node_id` (matches the value
+    // advertised in `FilerInfo.node_id` / `GetMasterStatus.filers[].node_id`).
+    string node_id = 1;
+}
+
+message FilerNodeStats {
+    string node_id = 1;
+    string address = 2;
+    uint32 http_port = 3;
+    uint32 metrics_port = 4;
+    string meta_cache_stats_json = 5;
+    string lease_stats_json = 6;
+    string shards_json = 7;
+    string fetch_error = 8; // Non-empty if *any* of the 3 HTTP proxied calls failed for this filer.
+    // Basic identity fields — mirrors FilerInfo so the CLI can display a
+    // consistent header without falling back to a second ListFilers call.
+    bool is_healthy = 9;
+    uint32 leader_count = 10;
+    uint32 total_shards = 11;
+}
+
+message FilerStatsResponse {
+    repeated FilerNodeStats stats = 1;
     string error = 2;
 }
 

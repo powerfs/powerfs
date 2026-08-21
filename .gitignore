@@ -27,6 +27,7 @@ beegfs/
 articles/
 design/
 seaweedfs/
+ceph/
 Mooncake/
 rustfs/
 tifs/

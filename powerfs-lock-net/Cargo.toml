@@ -1,0 +1,16 @@
+[package]
+name = "powerfs-lock-net"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Wire protocol layer for PowerFS lock messages (TLV codec, mirrors docs/lock-protocol.md)"
+license.workspace = true
+
+[dependencies]
+powerfs-lock = { path = "../powerfs-lock" }
+log = { workspace = true }
+thiserror = { workspace = true }
+
+[lib]
+name = "powerfs_lock_net"
+path = "src/lib.rs"

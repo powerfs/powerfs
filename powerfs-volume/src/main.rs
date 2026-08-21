@@ -58,14 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = load_config(&args.config);
     let volume_cfg = cfg.volume.clone();
 
-    // Initialize env_logger at Debug (max verbosity) so its internal filter never
-    // blocks messages.  The effective level is gated by log::set_max_level()
-    // via powerfs_common::dynamic_log, allowing runtime adjustment via HTTP.
+    // 使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
+    // master 通过 GetDebugConfig 下发配置，volume 每 2s 轮询并本地应用
     let log_level = cfg.global.log_level.clone();
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
-        .init();
-    let _ = powerfs_common::dynamic_log::set_log_level(&log_level);
+    powerfs_common::dynamic_log::init(&log_level, None);
 
     powerfs_common::BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
         .log_startup();
@@ -125,6 +121,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Data Dir: {}", data_dir);
     info!("  Initial Volume Count: {}", initial_volume_count);
     info!("  Volume Size: {}", volume_size);
+
+    // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
+    {
+        let poller_node_id = node_id.clone();
+        let poller_masters: Vec<(String, u16)> = master_address
+            .iter()
+            .map(|a| {
+                let ip = a.split(':').next().unwrap_or(a).to_string();
+                (ip, volume_cfg.master_net_port)
+            })
+            .collect();
+        powerfs_common::debug_config_poller::DebugConfigPoller::new(poller_node_id, poller_masters)
+            .start();
+    }
 
     let node_id = NodeId(node_id);
     let storage_manager = Arc::new(

@@ -183,12 +183,21 @@ impl MetaState {
             MetaDelta::SetMtime {
                 mtime, timestamp, ..
             } => {
-                // Max strategy: update if timestamp is newer or value is larger
+                // LWW strategy: newer timestamp wins regardless of value.
+                // This correctly handles `touch -t` setting an earlier time:
+                // the user-set value must override the current time even if
+                // it is numerically smaller, because the operation timestamp
+                // is newer.
+                // When timestamps are equal (concurrent writes), use max value
+                // as a deterministic tiebreaker.
                 let new_val = *mtime;
                 let current = self.mtime.unwrap_or(0);
-                if new_val > current || *timestamp > self.mtime_timestamp {
-                    self.mtime = Some(new_val.max(current));
+                if *timestamp > self.mtime_timestamp {
+                    self.mtime = Some(new_val);
                     self.mtime_timestamp = *timestamp;
+                    MergeResult::Applied
+                } else if *timestamp == self.mtime_timestamp && new_val > current {
+                    self.mtime = Some(new_val);
                     MergeResult::Applied
                 } else {
                     MergeResult::Idempotent
@@ -197,11 +206,15 @@ impl MetaState {
             MetaDelta::SetAtime {
                 atime, timestamp, ..
             } => {
+                // LWW strategy (same as mtime above)
                 let new_val = *atime;
                 let current = self.atime.unwrap_or(0);
-                if new_val > current || *timestamp > self.atime_timestamp {
-                    self.atime = Some(new_val.max(current));
+                if *timestamp > self.atime_timestamp {
+                    self.atime = Some(new_val);
                     self.atime_timestamp = *timestamp;
+                    MergeResult::Applied
+                } else if *timestamp == self.atime_timestamp && new_val > current {
+                    self.atime = Some(new_val);
                     MergeResult::Applied
                 } else {
                     MergeResult::Idempotent
@@ -210,11 +223,15 @@ impl MetaState {
             MetaDelta::SetCtime {
                 ctime, timestamp, ..
             } => {
+                // LWW strategy (same as mtime/atime above)
                 let new_val = *ctime;
                 let current = self.ctime.unwrap_or(0);
-                if new_val > current || *timestamp > self.ctime_timestamp {
-                    self.ctime = Some(new_val.max(current));
+                if *timestamp > self.ctime_timestamp {
+                    self.ctime = Some(new_val);
                     self.ctime_timestamp = *timestamp;
+                    MergeResult::Applied
+                } else if *timestamp == self.ctime_timestamp && new_val > current {
+                    self.ctime = Some(new_val);
                     MergeResult::Applied
                 } else {
                     MergeResult::Idempotent
@@ -250,27 +267,33 @@ impl MetaState {
             self.gid = other.gid;
             self.gid_timestamp = other.gid_timestamp;
         }
-        // Max for timestamps - only update if other has a value and it's larger or newer
-        if other.mtime.is_some()
-            && (other.mtime.unwrap_or(0) > self.mtime.unwrap_or(0)
-                || other.mtime_timestamp > self.mtime_timestamp)
-        {
-            self.mtime = Some(other.mtime.unwrap_or(0).max(self.mtime.unwrap_or(0)));
+        // LWW for timestamps: newer timestamp wins regardless of value
+        if other.mtime.is_some() && other.mtime_timestamp > self.mtime_timestamp {
+            self.mtime = other.mtime;
             self.mtime_timestamp = other.mtime_timestamp;
-        }
-        if other.atime.is_some()
-            && (other.atime.unwrap_or(0) > self.atime.unwrap_or(0)
-                || other.atime_timestamp > self.atime_timestamp)
+        } else if other.mtime.is_some()
+            && other.mtime_timestamp == self.mtime_timestamp
+            && other.mtime.unwrap_or(0) > self.mtime.unwrap_or(0)
         {
-            self.atime = Some(other.atime.unwrap_or(0).max(self.atime.unwrap_or(0)));
+            self.mtime = other.mtime;
+        }
+        if other.atime.is_some() && other.atime_timestamp > self.atime_timestamp {
+            self.atime = other.atime;
             self.atime_timestamp = other.atime_timestamp;
-        }
-        if other.ctime.is_some()
-            && (other.ctime.unwrap_or(0) > self.ctime.unwrap_or(0)
-                || other.ctime_timestamp > self.ctime_timestamp)
+        } else if other.atime.is_some()
+            && other.atime_timestamp == self.atime_timestamp
+            && other.atime.unwrap_or(0) > self.atime.unwrap_or(0)
         {
-            self.ctime = Some(other.ctime.unwrap_or(0).max(self.ctime.unwrap_or(0)));
+            self.atime = other.atime;
+        }
+        if other.ctime.is_some() && other.ctime_timestamp > self.ctime_timestamp {
+            self.ctime = other.ctime;
             self.ctime_timestamp = other.ctime_timestamp;
+        } else if other.ctime.is_some()
+            && other.ctime_timestamp == self.ctime_timestamp
+            && other.ctime.unwrap_or(0) > self.ctime.unwrap_or(0)
+        {
+            self.ctime = other.ctime;
         }
         // Counter for nlink
         if other.nlink_delta != 0 {
@@ -392,9 +415,10 @@ mod tests {
         assert_eq!(state.mtime, Some(1000));
 
         // Second delta has lower value but higher timestamp
-        // Max strategy: take the maximum
+        // LWW strategy: newer timestamp wins regardless of value
+        // (correctly handles touch -t setting an earlier time)
         assert_eq!(state.apply_delta(&delta2), MergeResult::Applied);
-        assert_eq!(state.mtime, Some(1000)); // Max of 1000 and 500
+        assert_eq!(state.mtime, Some(500)); // LWW: delta2 wins due to higher timestamp
     }
 
     #[test]
@@ -551,16 +575,16 @@ mod tests {
         });
         assert_eq!(state.atime, Some(500));
 
-        // Smaller value with later timestamp → should apply but Max takes the larger
+        // Smaller value with later timestamp → LWW wins
         state.apply_delta(&MetaDelta::SetAtime {
             inode: 1,
             atime: 300,
             timestamp: 200,
             client_id: "client-b".to_string(),
         });
-        assert_eq!(state.atime, Some(500)); // Max(500, 300) = 500
+        assert_eq!(state.atime, Some(300)); // LWW: 300 wins due to higher timestamp
 
-        // Larger value → should apply
+        // Larger value with even later timestamp → should apply
         state.apply_delta(&MetaDelta::SetAtime {
             inode: 1,
             atime: 800,
@@ -713,16 +737,16 @@ mod tests {
         });
         assert_eq!(state.ctime, Some(1000));
 
-        // Smaller value should not override (Max strategy)
+        // Smaller value with later timestamp → LWW wins
         state.apply_delta(&MetaDelta::SetCtime {
             inode: 1,
             ctime: 500,
             timestamp: 200,
             client_id: "client-b".to_string(),
         });
-        assert_eq!(state.ctime, Some(1000));
+        assert_eq!(state.ctime, Some(500)); // LWW: 500 wins due to higher timestamp
 
-        // Larger value should override
+        // Larger value with even later timestamp → should apply
         state.apply_delta(&MetaDelta::SetCtime {
             inode: 1,
             ctime: 2000,

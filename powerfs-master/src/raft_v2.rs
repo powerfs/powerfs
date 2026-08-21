@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use log::info;
+use log::warn;
 use openraft::async_runtime::WatchReceiver;
 use openraft::type_config::TypeConfigExt;
 use openraft::Raft;
@@ -391,6 +392,62 @@ impl RaftNodeV2 {
     /// 获取当前 leader 的 NodeId（`None` 如果无 leader）。
     pub async fn current_leader(&self) -> Option<String> {
         self.raft.current_leader().await
+    }
+
+    /// 获取当前 leader 的 Raft 地址（`host:raft_port`），通过 `current_leader()` +
+    /// membership 节点表查询。无 leader 或 leader 不在 membership 中时返回 `None`。
+    ///
+    /// 用于 follower 在收到客户端请求时构造重定向响应：`leader_address` 字段从未被
+    /// `set_leader` 更新过（死代码），follower 必须实时查 raft 获取 leader。
+    ///
+    /// **防御性**：任何异常（无 leader / leader 不在 membership / 地址为空）都打 warn
+    /// 日志，便于排查路由死循环。调用方应检查返回值并返回 SERVER_ERROR 而非空 REDIRECT。
+    pub async fn current_leader_addr(&self) -> Option<String> {
+        let leader_id = match self.raft.current_leader().await {
+            Some(id) => id,
+            None => {
+                warn!(
+                    "current_leader_addr: raft reports no leader (node={}, state={:?}); \
+                     follower cannot redirect — caller should return SERVER_ERROR",
+                    self.node_id,
+                    self.raft.metrics().borrow_watched().state
+                );
+                return None;
+            }
+        };
+
+        let metrics_recv = self.raft.metrics();
+        let metrics = metrics_recv.borrow_watched();
+        let membership = metrics.membership_config.membership();
+        let addr = membership
+            .nodes()
+            .find(|(k, _)| *k.as_str() == leader_id)
+            .map(|(_, n)| n.addr.clone());
+        // Collect voter ids now (within the guard's borrow scope) for diagnostics.
+        let voters: Vec<String> = membership.voter_ids().map(|id| id.to_string()).collect();
+        // addr is owned Option<String>; voters is owned Vec<String> — neither borrows metrics.
+        drop(metrics);
+        drop(metrics_recv);
+
+        match addr {
+            Some(a) if !a.is_empty() => Some(a),
+            Some(a) => {
+                warn!(
+                    "current_leader_addr: leader node={} found in membership but address is \
+                     empty '{}'; membership may be inconsistent (node={})",
+                    leader_id, a, self.node_id
+                );
+                None
+            }
+            None => {
+                warn!(
+                    "current_leader_addr: leader node={} NOT found in membership (voters={:?}); \
+                     membership/stale or leader left cluster (node={})",
+                    leader_id, voters, self.node_id
+                );
+                None
+            }
+        }
     }
 
     /// 获取本节点 ID。

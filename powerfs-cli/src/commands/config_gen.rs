@@ -57,13 +57,16 @@ struct RedisEntry {
 #[derive(Debug, Deserialize, Default)]
 struct PortsConfig {
     master: Option<u16>,
+    master_raft: Option<u16>,
     master_net: Option<u16>,
+    master_metrics: Option<u16>,
     volume_grpc: Option<u16>,
     volume_http: Option<u16>,
     volume_net: Option<u16>,
     filer: Option<u16>,
     filer_grpc: Option<u16>,
     filer_net: Option<u16>,
+    filer_metrics: Option<u16>,
     s3: Option<u16>,
     monitor: Option<u16>,
 }
@@ -110,13 +113,16 @@ impl Defaults {
     const S3_ACCESS_KEY: &'static str = "powerfs";
     const S3_SECRET_KEY: &'static str = "powerfs123";
     const MASTER_PORT: u16 = 9333;
+    const MASTER_RAFT_PORT: u16 = 9335;
     const MASTER_NET_PORT: u16 = 9334;
+    const MASTER_METRICS_PORT: u16 = 9300;
     const VOLUME_GRPC_PORT: u16 = 8080;
     const VOLUME_HTTP_PORT: u16 = 8091;
     const VOLUME_NET_PORT: u16 = 8901;
     const FILER_PORT: u16 = 8888;
     const FILER_GRPC_PORT: u16 = 8889;
     const FILER_NET_PORT: u16 = 9334;
+    const FILER_METRICS_PORT: u16 = 8900;
     const S3_PORT: u16 = 9000;
     const MONITOR_PORT: u16 = 8081;
     const MAX_VOLUME_SIZE: u64 = 107_374_182_400; // 100 GB
@@ -138,13 +144,16 @@ struct ResolvedConfig {
     output: String,
     data_dir: String,
     master_port: u16,
+    master_raft_port: u16,
     master_net_port: u16,
+    master_metrics_port: u16,
     volume_grpc_port: u16,
     volume_http_port: u16,
     volume_net_port: u16,
     filer_port: u16,
     filer_grpc_port: u16,
     filer_net_port: u16,
+    filer_metrics_port: u16,
     s3_port: u16,
     monitor_port: u16,
     s3_access_key: String,
@@ -208,7 +217,11 @@ pub struct ConfigGenArgs {
     #[arg(long)]
     pub master_port: Option<u16>,
     #[arg(long)]
+    pub master_raft_port: Option<u16>,
+    #[arg(long)]
     pub master_net_port: Option<u16>,
+    #[arg(long)]
+    pub master_metrics_port: Option<u16>,
     #[arg(long)]
     pub volume_grpc_port: Option<u16>,
     #[arg(long)]
@@ -221,6 +234,8 @@ pub struct ConfigGenArgs {
     pub filer_grpc_port: Option<u16>,
     #[arg(long)]
     pub filer_net_port: Option<u16>,
+    #[arg(long)]
+    pub filer_metrics_port: Option<u16>,
     #[arg(long)]
     pub s3_port: Option<u16>,
     #[arg(long)]
@@ -327,10 +342,20 @@ fn resolve(args: &ConfigGenArgs) -> Result<ResolvedConfig, String> {
         output: opt_str(&args.output, misc.output, Defaults::OUTPUT),
         data_dir: opt_str(&args.data_dir, storage.data_dir, Defaults::DATA_DIR),
         master_port: opt_u16(args.master_port, ports.master, Defaults::MASTER_PORT),
+        master_raft_port: opt_u16(
+            args.master_raft_port,
+            ports.master_raft,
+            Defaults::MASTER_RAFT_PORT,
+        ),
         master_net_port: opt_u16(
             args.master_net_port,
             ports.master_net,
             Defaults::MASTER_NET_PORT,
+        ),
+        master_metrics_port: opt_u16(
+            args.master_metrics_port,
+            ports.master_metrics,
+            Defaults::MASTER_METRICS_PORT,
         ),
         volume_grpc_port: opt_u16(
             args.volume_grpc_port,
@@ -357,6 +382,11 @@ fn resolve(args: &ConfigGenArgs) -> Result<ResolvedConfig, String> {
             args.filer_net_port,
             ports.filer_net,
             Defaults::FILER_NET_PORT,
+        ),
+        filer_metrics_port: opt_u16(
+            args.filer_metrics_port,
+            ports.filer_metrics,
+            Defaults::FILER_METRICS_PORT,
         ),
         s3_port: opt_u16(args.s3_port, ports.s3, Defaults::S3_PORT),
         monitor_port: opt_u16(args.monitor_port, ports.monitor, Defaults::MONITOR_PORT),
@@ -486,13 +516,16 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
     // 6. Port range validation
     let all_ports = [
         ("master_port", cfg.master_port),
+        ("master_raft_port", cfg.master_raft_port),
         ("master_net_port", cfg.master_net_port),
+        ("master_metrics_port", cfg.master_metrics_port),
         ("volume_grpc_port", cfg.volume_grpc_port),
         ("volume_http_port", cfg.volume_http_port),
         ("volume_net_port", cfg.volume_net_port),
         ("filer_port", cfg.filer_port),
         ("filer_grpc_port", cfg.filer_grpc_port),
         ("filer_net_port", cfg.filer_net_port),
+        ("filer_metrics_port", cfg.filer_metrics_port),
         ("s3_port", cfg.s3_port),
         ("monitor_port", cfg.monitor_port),
     ];
@@ -504,11 +537,46 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
 
     // 7. Port collision detection (same host, different services must use different ports)
     //    We check that ports meant for the *same node type* don't conflict.
+    if cfg.master_port == cfg.master_raft_port {
+        return Err(format!(
+            "master_port ({}) and master_raft_port ({}) must differ",
+            cfg.master_port, cfg.master_raft_port
+        ));
+    }
     if cfg.master_port == cfg.master_net_port {
         return Err(format!(
             "master_port ({}) and master_net_port ({}) must differ",
             cfg.master_port, cfg.master_net_port
         ));
+    }
+    if cfg.master_raft_port == cfg.master_net_port {
+        return Err(format!(
+            "master_raft_port ({}) and master_net_port ({}) must differ",
+            cfg.master_raft_port, cfg.master_net_port
+        ));
+    }
+    // 4-way master port uniqueness — no derivation by port addition/subtraction allowed
+    for &(na, nb) in &[
+        ("master_port", "master_metrics_port"),
+        ("master_raft_port", "master_metrics_port"),
+        ("master_net_port", "master_metrics_port"),
+    ] {
+        let (a, b) = match (na, nb) {
+            ("master_port", "master_metrics_port") => (cfg.master_port, cfg.master_metrics_port),
+            ("master_raft_port", "master_metrics_port") => {
+                (cfg.master_raft_port, cfg.master_metrics_port)
+            }
+            ("master_net_port", "master_metrics_port") => {
+                (cfg.master_net_port, cfg.master_metrics_port)
+            }
+            _ => unreachable!(),
+        };
+        if a == b {
+            return Err(format!(
+                "{} ({}) and {} ({}) must differ — all 4 master ports explicitly configured, no port-addition derivation allowed",
+                na, a, nb, b
+            ));
+        }
     }
     if cfg.volume_http_port == cfg.volume_net_port {
         return Err(format!(
@@ -521,6 +589,35 @@ fn validate(cfg: &ResolvedConfig, allow_collocated: bool) -> Result<(), String> 
             "filer_port ({}) and filer_net_port ({}) must differ",
             cfg.filer_port, cfg.filer_net_port
         ));
+    }
+    // 4-way filer port uniqueness — no port-addition derivation.
+    for &(na, nb) in &[
+        ("filer_port", "filer_grpc_port"),
+        ("filer_port", "filer_metrics_port"),
+        ("filer_grpc_port", "filer_net_port"),
+        ("filer_grpc_port", "filer_metrics_port"),
+        ("filer_net_port", "filer_metrics_port"),
+    ] {
+        let (a, b) = match (na, nb) {
+            ("filer_port", "filer_grpc_port") => (cfg.filer_port, cfg.filer_grpc_port),
+            ("filer_port", "filer_metrics_port") => (cfg.filer_port, cfg.filer_metrics_port),
+            ("filer_grpc_port", "filer_net_port") => (cfg.filer_grpc_port, cfg.filer_net_port),
+            ("filer_grpc_port", "filer_metrics_port") => {
+                (cfg.filer_grpc_port, cfg.filer_metrics_port)
+            }
+            ("filer_net_port", "filer_metrics_port") => {
+                (cfg.filer_net_port, cfg.filer_metrics_port)
+            }
+            _ => unreachable!(),
+        };
+        if a == b {
+            return Err(format!(
+                "{} ({}) and {} ({}) must differ — all 4 filer ports \
+                 (port/grpc_port/net_port/metrics_port) explicitly \
+                 configured; no port-addition derivation allowed.",
+                na, a, nb, b
+            ));
+        }
     }
 
     Ok(())
@@ -564,7 +661,7 @@ pub fn config_gen(args: &ConfigGenArgs) -> Result<(), String> {
     let master_peers: Vec<String> = cfg
         .masters
         .iter()
-        .map(|ip| format!("{}:{}", ip, cfg.master_port))
+        .map(|ip| format!("{}:{}", ip, cfg.master_raft_port))
         .collect();
 
     let filer_peers: Vec<String> = cfg
@@ -654,6 +751,8 @@ fn build_config(
         },
         master: MasterConfig {
             port: cfg.master_port,
+            raft_port: cfg.master_raft_port,
+            metrics_port: cfg.master_metrics_port,
             net_port: cfg.master_net_port,
             dir: format!("{}/master", cfg.data_dir),
             raft_dir: None,
@@ -661,7 +760,7 @@ fn build_config(
             ip: Some("0.0.0.0".to_string()),
             advertise_addr: Some(format!("{}:{}", ip, cfg.master_port)),
             raft_id,
-            peers: master_peers.to_vec(),
+            raft_peers: master_peers.to_vec(),
         },
         volume: VolumeConfig {
             grpc_port: cfg.volume_grpc_port,
@@ -694,6 +793,7 @@ fn build_config(
             gc_grace_period_secs: None,
             inline_max_size: None,
             force_register: false,
+            metrics_port: cfg.filer_metrics_port,
         },
         s3: S3Config {
             port: cfg.s3_port,

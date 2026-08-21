@@ -26,7 +26,7 @@
 #
 # Prerequisites:
 #   - Test cluster running: ./docker/start_test_env.sh --wait
-#   - FUSE mounted at /mnt/fuse inside fuse-test container
+#   - FUSE mounted at /mnt/fuse inside fuse-1-test container
 # =============================================================================
 
 set -uo pipefail
@@ -34,7 +34,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULT_DIR="/tmp/powerfs/test/p1-$(date +%Y%m%d_%H%M%S)"
-FUSE_CONTAINER="fuse-test"
+FUSE_CONTAINER="fuse-1-test"
 FUSE_MOUNT="/mnt/fuse"
 
 QUICK=0
@@ -82,7 +82,7 @@ record_skip() { SKIP_COUNT=$((SKIP_COUNT + 1)); log_warn "SKIP: $1"; }
 preflight() {
     log_step "Pre-flight Checks"
 
-    # Check fuse-test container is running
+    # Check fuse-1-test container is running
     if ! docker ps --format '{{.Names}}' | grep -q "^${FUSE_CONTAINER}$"; then
         log_error "Container '$FUSE_CONTAINER' not running"
         log_info "Start it with: ./docker/start_test_env.sh --wait"

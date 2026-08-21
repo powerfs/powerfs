@@ -16,8 +16,8 @@
 #   - Non-blocking: output is line-buffered for `docker exec` polling
 #
 # Usage:
-#   docker cp scripts/tests/fuse/run_fuse_shard_test.sh fuse-test:/tmp/
-#   docker exec fuse-test stdbuf -oL /tmp/run_fuse_shard_test.sh
+#   docker cp scripts/tests/fuse/run_fuse_shard_test.sh fuse-1-test:/tmp/
+#   docker exec fuse-1-test stdbuf -oL /tmp/run_fuse_shard_test.sh
 # =============================================================================
 
 set -u

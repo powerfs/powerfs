@@ -1247,6 +1247,7 @@ async fn filer_put_balancer_config(
 // 写操作后失效 cluster/status 缓存（该缓存储存聚合后的 buckets 列表）。
 
 /// 从 endpoint 列表中挑一个在线 filer（优先健康节点），找不到返回 error Response。
+#[allow(clippy::result_large_err)]
 async fn pick_online_filer_for_bucket(
     state: &Arc<AppState>,
 ) -> std::result::Result<powerfs_monitor::filer_admin_client::FilerEndpoint, Response> {

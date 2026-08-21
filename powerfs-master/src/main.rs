@@ -54,16 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let master_cfg = cfg.master.clone();
 
     let log_level = cfg.global.log_level.clone();
-    env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Debug)
-        .init();
-    let _ = powerfs_common::dynamic_log::set_log_level(&log_level);
+    // 使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
+    powerfs_common::dynamic_log::init(&log_level, None);
 
     BuildInfo::current(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")).log_startup();
 
     // 从配置文件获取所有必需值 - 无硬编码默认值
     let port = master_cfg.port;
+    let raft_port = master_cfg.raft_port;
     let net_port = master_cfg.net_port;
+    let metrics_port = master_cfg.metrics_port;
     let dir = master_cfg.dir;
 
     let raft_id = args.raft_id.unwrap_or(master_cfg.raft_id);
@@ -77,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let peers = if !args.peer.is_empty() {
         args.peer
     } else {
-        master_cfg.peers
+        master_cfg.raft_peers
     };
 
     let ip = args.ip.unwrap_or_else(|| {
@@ -103,21 +103,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         });
 
+    // Raft inter-node gRPC address: advertise_ip:raft_port
+    // (advertise_addr is ip:port for MasterService; raft_port is separate)
+    let advertise_ip = advertise_addr.split(':').next().unwrap_or(&advertise_addr);
+    let raft_address = format!("{}:{}", advertise_ip, raft_port);
+
     info!("Starting PowerFS Master Node");
     info!("  Bind Address: {}", bind_address);
-    info!("  Raft Address: {}", advertise_addr);
+    info!("  Raft Address: {}", raft_address);
+    info!("  Master Port: {}", port);
+    info!("  Raft Port: {}", raft_port);
     info!("  Net Port: {}", net_port);
+    info!("  Metrics/Admin Port: {}", metrics_port);
     info!("  Raft ID: {}", raft_id);
     info!("  Data Dir: {}", dir);
 
+    // 端口冲突自检：全部 4 个端口必须唯一（无端口加减推导, 配置文件显式配置）
+    {
+        let used = [
+            ("port", port),
+            ("raft_port", raft_port),
+            ("net_port", net_port),
+            ("metrics_port", metrics_port),
+        ];
+        for (i, (na, a)) in used.iter().enumerate() {
+            for (nb, b) in &used[i + 1..] {
+                if a == b {
+                    eprintln!(
+                        "ERROR: master.{} and master.{} both use port {} — must be distinct (all ports explicitly configured, no derivation)",
+                        na, nb, a
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     let master = MasterNode::new(
         &bind_address,
-        &advertise_addr,
+        &raft_address,
         None::<ClusterConfig>,
         &raft_dir,
         raft_id,
         peers,
         net_port,
+        metrics_port,
     )
     .await?;
 

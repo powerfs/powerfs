@@ -188,13 +188,23 @@ impl PosixMetaService for PosixMetaServiceImpl {
 
         // Determine if creating file or directory based on mode
         let mode = entry.attributes.as_ref().map(|a| a.mode).unwrap_or(0);
+        let uid = entry.attributes.as_ref().map(|a| a.uid).unwrap_or(0);
+        let gid = entry.attributes.as_ref().map(|a| a.gid).unwrap_or(0);
         let is_directory = (mode & S_IFDIR) != 0;
 
         let inode = if is_directory {
             // Create directory
             match self
                 .meta_shard_manager
-                .create_directory(parent_inode, &name)
+                .create_directory(
+                    parent_inode,
+                    &name,
+                    // mode is u32 already (from POSIX attrs u32 bits); no
+                    // S_IFDIR bit needed because create_directory sets it.
+                    mode,
+                    uid,
+                    gid,
+                )
                 .await
             {
                 Ok(info) => info.inode,
@@ -211,7 +221,16 @@ impl PosixMetaService for PosixMetaServiceImpl {
             let shard_id = self.inode_to_shard_id(parent_inode);
             match self
                 .meta_shard_manager
-                .create_file_with_shard(parent_inode, &name, shard_id)
+                // P3.1: Pass mode/uid/gid directly; mode already has S_IFREG
+                // bit from POSIX attrs. Default 0o100644 if not supplied.
+                .create_file_with_shard(
+                    parent_inode,
+                    &name,
+                    shard_id,
+                    if mode != 0 { mode } else { 0o100644 },
+                    uid,
+                    gid,
+                )
                 .await
             {
                 Ok(ino) => ino,
@@ -292,7 +311,7 @@ impl PosixMetaService for PosixMetaServiceImpl {
                 // Create directory
                 let dir_info = match self
                     .meta_shard_manager
-                    .create_directory(current_inode, part)
+                    .create_directory(current_inode, part, 0o040755, 0, 0)
                     .await
                 {
                     Ok(info) => info,

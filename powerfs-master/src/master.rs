@@ -40,6 +40,7 @@ pub struct MasterNode {
     id: NodeId,
     address: SocketAddr,
     net_port: u16,
+    metrics_port: u16,
     topology: RwLock<Topology>,
     volumes: RwLock<HashMap<VolumeId, VolumeInfo>>,
     volume_routes: RwLock<HashMap<u64, VolumeRoute>>,
@@ -101,6 +102,9 @@ pub struct MasterNode {
     /// "anti_affinity". Controls which `VolumeAssigner` is used for new volume
     /// allocation. Raft-replicated via `SetPlacementStrategy` command.
     placement_strategy: RwLock<String>,
+    /// Centralized debug config store. Shared (Arc inside) across all clones.
+    /// Nodes poll `GetDebugConfig` to fetch their effective config every 2s.
+    debug_config: crate::debug_config::DebugConfigStore,
 }
 
 #[derive(Clone)]
@@ -124,6 +128,7 @@ pub struct FilerNodeInfo {
     pub grpc_port: u32,
     pub http_port: u32,
     pub net_port: u32,
+    pub metrics_port: u32,
     pub is_healthy: bool,
     pub leader_count: u64,
     pub total_shards: u64,
@@ -266,14 +271,16 @@ pub struct VolumeLocationUpdate {
 }
 
 impl MasterNode {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         bind_address: &str,
         raft_address: &str,
         cluster_config: Option<ClusterConfig>,
         raft_path: &str,
         raft_id: u64,
-        peers: Vec<String>,
+        raft_peers: Vec<String>,
         net_port: u16,
+        metrics_port: u16,
     ) -> Result<Self> {
         let addr: SocketAddr = bind_address.parse()?;
 
@@ -281,14 +288,12 @@ impl MasterNode {
         let config = cluster_config.unwrap_or_default();
         let raft_config = RaftConfig::default();
 
-        let peer_list: Vec<Peer> = peers
+        // raft_peers 配置中的地址格式为 ip:raft_port（RaftService gRPC 地址）。
+        // net_address 从 peer IP + 本节点 net_port 派生，用于 powerfs-net 通信。
+        let peer_list: Vec<Peer> = raft_peers
             .into_iter()
             .enumerate()
             .map(|(i, addr)| {
-                // Derive the powerfs-net address (ip:net_port) from the peer's
-                // gRPC address (ip:port) by replacing the port with this node's
-                // `net_port`. All master nodes in the cluster share the same
-                // `net_port`, so this yields the correct TLV endpoint.
                 let peer_ip = addr.split(':').next().unwrap_or(&addr);
                 let net_address = format!("{}:{}", peer_ip, net_port);
                 Peer {
@@ -399,6 +404,7 @@ impl MasterNode {
             id: node_id.clone(),
             address: addr,
             net_port,
+            metrics_port,
             topology: RwLock::new(Topology::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_routes: RwLock::new(HashMap::new()),
@@ -434,6 +440,7 @@ impl MasterNode {
             management_api: RwLock::new(None),
             volume_pins: RwLock::new(HashMap::new()),
             placement_strategy: RwLock::new("least_loaded".to_string()),
+            debug_config: crate::debug_config::DebugConfigStore::new(),
         };
 
         // P1.3: Replay Zone commands from Raft log to restore zone_registry.
@@ -634,6 +641,10 @@ impl MasterNode {
         self.address
     }
 
+    pub fn metrics_port(&self) -> u16 {
+        self.metrics_port
+    }
+
     pub async fn is_leader(&self) -> bool {
         self.raft_v2.is_leader()
     }
@@ -657,8 +668,19 @@ impl MasterNode {
         if self.raft_v2.is_leader() {
             return convert_to_net_addr(&self.raft_address);
         }
+        // Follower: 实时查 raft 当前 leader 地址。
+        // `leader_address` 字段从未被 `set_leader` 更新过（死代码），
+        // follower 必须通过 `current_leader_addr()` 从 raft metrics 查 leader。
+        if let Some(addr) = self.raft_v2.current_leader_addr().await {
+            return convert_to_net_addr(&addr);
+        }
         // 无 leader 且自身非 leader: 返回空字符串, 让调用方返回 SERVER_ERROR
         // (旧实现返回 first_peer 地址, 导致 follower 间互相 REDIRECT 形成循环)
+        warn!(
+            "get_leader: no leader available (self={}, is_leader=false, leader_address field empty); \
+             returning empty — caller MUST return SERVER_ERROR, NOT empty REDIRECT",
+            self.raft_v2.node_id()
+        );
         String::new()
     }
 
@@ -687,8 +709,17 @@ impl MasterNode {
         if self.raft_v2.is_leader() {
             return convert_to_grpc_addr(&self.raft_address);
         }
+        // Follower: 实时查 raft 当前 leader 地址（同 `get_leader`）。
+        if let Some(addr) = self.raft_v2.current_leader_addr().await {
+            return convert_to_grpc_addr(&addr);
+        }
         // No leader and self is not leader: return empty string.
         // (旧实现返回 first_peer 地址, 导致 follower 间互相 REDIRECT 形成循环)
+        warn!(
+            "get_leader_grpc_addr: no leader available (self={}, is_leader=false); \
+             returning empty — caller MUST return SERVER_ERROR, NOT empty REDIRECT",
+            self.raft_v2.node_id()
+        );
         String::new()
     }
 
@@ -738,6 +769,11 @@ impl MasterNode {
 
     pub fn list_filers(&self) -> Vec<FilerNodeInfo> {
         self.filer_nodes.read().unwrap().values().cloned().collect()
+    }
+
+    /// 获取集中式调试配置存储（用于 HTTP 端点和 GetDebugConfig handler 共享）
+    pub fn debug_config(&self) -> &crate::debug_config::DebugConfigStore {
+        &self.debug_config
     }
 
     pub fn get_shard_mapping(&self) -> Vec<(u64, String)> {
@@ -3454,6 +3490,22 @@ impl MasterNode {
             }
         }
 
+        // Start HTTP metrics server (Prometheus data collection only).
+        // Port is read explicitly from config metrics_port, no port arithmetic.
+        // Control-plane operations (log level, debug config) now go via MasterService gRPC.
+        // Exposes only: GET /metrics (Prometheus scrape endpoint).
+        {
+            let metrics_port = self.metrics_port;
+            let metrics_addr = format!("{}:{}", self.address.ip(), metrics_port);
+            info!(
+                "Starting metrics (Prometheus /metrics) server on {}",
+                metrics_addr
+            );
+            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr).await {
+                error!("Failed to start metrics server on {}: {}", metrics_addr, e);
+            }
+        }
+
         // Note: Raft inter-node transport is now handled entirely by openraft's
         // gRPC RaftService (started inside `RaftNodeV2::new`). The old TLV-based
         // message forwarder and `broadcast::Sender<OutgoingMessage>` have been
@@ -3473,6 +3525,7 @@ impl Clone for MasterNode {
             id: self.id.clone(),
             address: self.address,
             net_port: self.net_port,
+            metrics_port: self.metrics_port,
             topology: RwLock::new(self.topology.read().unwrap().clone()),
             volumes: RwLock::new(self.volumes.read().unwrap().clone()),
             volume_routes: RwLock::new(self.volume_routes.read().unwrap().clone()),
@@ -3508,6 +3561,7 @@ impl Clone for MasterNode {
             management_api: RwLock::new(self.management_api.read().unwrap().clone()),
             volume_pins: RwLock::new(self.volume_pins.read().unwrap().clone()),
             placement_strategy: RwLock::new(self.placement_strategy.read().unwrap().clone()),
+            debug_config: self.debug_config.clone(),
         }
     }
 }

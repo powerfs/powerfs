@@ -1395,11 +1395,12 @@ mod tests {
         let master = Arc::new(
             crate::master::MasterNode::new(
                 "127.0.0.1:50051",
-                "127.0.0.1:50051",
+                "127.0.0.1:50052",
                 None,
                 dir.path().join("raft").to_str().unwrap(),
                 1,
                 vec![],
+                0,
                 0,
             )
             .await

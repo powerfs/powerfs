@@ -59,6 +59,14 @@ pub struct MetadataAttr {
     /// None 表示 Filer 未携带 (旧版本或 mkdir 等简单响应),
     /// 客户端回退到 ShardMap::route(inode)。
     pub shard_id: Option<u64>,
+    /// Parent directory's version (shared_gen) from the Filer lookup response.
+    /// Used by the dentry lease mechanism to detect stale dentries.
+    /// 0 = Filer didn't provide it (old version); client falls back to RPC.
+    pub dir_version: u64,
+    /// Dentry lease TTL in milliseconds, granted by the Filer in lookup
+    /// responses. When non-zero, the client may trust the dentry (positive
+    /// or negative) for this duration without sending further lookup RPCs.
+    pub dentry_lease_ttl_ms: u64,
 }
 
 impl MetadataAttr {
@@ -89,6 +97,17 @@ pub struct MetadataDirEntry {
     pub name: String,
     pub file_type: u8,
     pub offset: u64,
+    /// Optional per-entry stat attributes carried by the Filer's readdir
+    /// response. If populated, callers (the FUSE `readdir` implementation)
+    /// can seed the client-side attr cache so a subsequent `ls -l` avoids
+    /// one per-entry getattr RPC — especially valuable for cross-shard
+    /// subdirectories where the parent shard already serves a lightweight
+    /// DirStatSummary (§3.2 of the MetaCache design).
+    pub attrs: Option<MetadataAttr>,
+    /// The shard that owns this child inode (when non-zero). Populated by
+    /// the Filer during readdir using the same shard-strategy used for
+    /// authoritative routing. Clients can route SetAttr/getattr directly.
+    pub child_shard_id: u64,
 }
 
 /// setattr 操作参数（仅更新提供的字段，None 表示不修改）
@@ -162,6 +181,14 @@ pub trait MetadataClient: Send + Sync {
         name: &str,
         shard_id: u64,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>;
+
+    /// batch_unlink：批量删除文件（一次 RPC + 一次 Raft propose_many）
+    /// entries: Vec of (parent_ino, name)，所有 entry 必须属于同一 shard
+    fn batch_unlink(
+        &self,
+        entries: Vec<(u64, String)>,
+        shard_id: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u32>>> + Send + '_>>;
 
     /// rmdir：删除空目录
     fn rmdir(

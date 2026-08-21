@@ -1,4 +1,5 @@
 pub mod powerfs {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("powerfs");
 }
 

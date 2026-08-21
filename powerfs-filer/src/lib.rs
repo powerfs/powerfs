@@ -1,16 +1,23 @@
+pub mod adaptive_grace;
 pub mod bucket_manager;
+pub mod cap_manager;
 pub mod crdt_meta;
 pub mod crdt_orset;
+pub mod early_grant;
 pub mod entry_manager;
 pub mod grpc_service;
 pub mod inode_lease_manager;
 pub mod inode_notifier;
+pub mod lease_persistence;
+pub mod meta_cache;
 pub mod meta_shard_manager;
 pub mod metadata_store;
+pub mod metrics;
 pub mod net_handler;
 pub mod posix_service;
 pub mod scrubber;
 pub mod powerfs {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("powerfs");
 }
 pub mod provider_impl;
@@ -30,6 +37,7 @@ pub use crdt_orset::{
 };
 pub use entry_manager::EntryManager;
 pub use grpc_service::FilerMetaServiceImpl;
+pub use lease_persistence::RaftLeasePersistence;
 pub use meta_shard_manager::{FilerStatus, MetaShardManager, ShardDetail};
 pub use metadata_store::{BucketInfo, EntryInfo, MetadataStore, VolumeRoute};
 pub use net_handler::FilerNetHandler;

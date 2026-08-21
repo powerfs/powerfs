@@ -160,6 +160,7 @@ impl ResilientMasterClient {
     /// This continues for up to `MAX_RETRY_ATTEMPTS` iterations,
     /// which is enough to try every endpoint at least once even in a
     /// 3-node cluster with a mid-loop leader change.
+    #[allow(clippy::result_large_err)]
     pub async fn call<F, Fut, T>(&self, f: F) -> Result<T, Status>
     where
         F: Fn(MasterServiceClient<Channel>) -> Fut + Send,

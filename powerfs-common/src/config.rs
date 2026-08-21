@@ -46,6 +46,12 @@ pub struct GlobalConfig {
 pub struct MasterConfig {
     /// HTTP/gRPC端口 - 必须配置
     pub port: u16,
+    /// Raft gRPC端口 - 必须配置，必须与port不同
+    /// RaftService (Vote/AppendEntries/Snapshot) 监听此端口
+    pub raft_port: u16,
+    /// Metrics/Admin HTTP 端口 - 必须配置，必须与 port/raft_port/net_port 都不同
+    /// /metrics, /admin/log-level, /admin/debug 都监听此端口
+    pub metrics_port: u16,
     /// 数据目录 - 必须配置
     pub dir: String,
     pub raft_dir: Option<String>,
@@ -53,7 +59,8 @@ pub struct MasterConfig {
     pub ip: Option<String>,
     pub advertise_addr: Option<String>,
     pub raft_id: u64,
-    pub peers: Vec<String>,
+    /// Raft 集群成员地址列表（ip:raft_port），包含自身
+    pub raft_peers: Vec<String>,
     /// powerfs-net 二进制协议端口 - 必须配置，FUSE客户端通过此端口连接
     pub net_port: u16,
 }
@@ -139,6 +146,12 @@ pub struct FilerConfig {
     /// 即使 force=true，master 仍会下发告警日志，便于事后审计。
     #[serde(default)]
     pub force_register: bool,
+    /// Prometheus metrics HTTP server port. **Must be explicitly configured
+    /// — no port-derivation shortcuts allowed.**  Exposes `/metrics`
+    /// (Prometheus text format) for lease manager + MetaCache counters.
+    /// Must be unique within the node (different from port / grpc_port /
+    /// net_port).
+    pub metrics_port: u16,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置
@@ -318,6 +331,11 @@ impl PowerFsConfig {
                 "master.port must be set (> 0)".to_string(),
             ));
         }
+        if self.master.raft_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "master.raft_port must be set (> 0) for Raft inter-node gRPC".to_string(),
+            ));
+        }
         if self.master.net_port == 0 {
             return Err(ConfigError::ValidationError(
                 "master.net_port must be set (> 0) for FUSE client connections".to_string(),
@@ -326,6 +344,16 @@ impl PowerFsConfig {
         if self.master.port == self.master.net_port {
             return Err(ConfigError::ValidationError(
                 "master.port and master.net_port must be different".to_string(),
+            ));
+        }
+        if self.master.port == self.master.raft_port {
+            return Err(ConfigError::ValidationError(
+                "master.port and master.raft_port must be different".to_string(),
+            ));
+        }
+        if self.master.net_port == self.master.raft_port {
+            return Err(ConfigError::ValidationError(
+                "master.net_port and master.raft_port must be different".to_string(),
             ));
         }
         if self.master.dir.is_empty() {
@@ -338,9 +366,9 @@ impl PowerFsConfig {
                 "master.raft_id must be set (> 0)".to_string(),
             ));
         }
-        if self.master.peers.is_empty() {
+        if self.master.raft_peers.is_empty() {
             return Err(ConfigError::ValidationError(
-                "master.peers must not be empty (at least one peer required for Raft cluster)"
+                "master.raft_peers must not be empty (at least one peer required for Raft cluster)"
                     .to_string(),
             ));
         }
@@ -565,6 +593,11 @@ impl PowerFsConfig {
                 "master.port must be set (> 0)".to_string(),
             ));
         }
+        if self.master.raft_port == 0 {
+            return Err(ConfigError::ValidationError(
+                "master.raft_port must be set (> 0) for Raft inter-node gRPC".to_string(),
+            ));
+        }
         if self.master.net_port == 0 {
             return Err(ConfigError::ValidationError(
                 "master.net_port must be set (> 0) for FUSE client connections".to_string(),
@@ -573,6 +606,16 @@ impl PowerFsConfig {
         if self.master.port == self.master.net_port {
             return Err(ConfigError::ValidationError(
                 "master.port and master.net_port must be different".to_string(),
+            ));
+        }
+        if self.master.port == self.master.raft_port {
+            return Err(ConfigError::ValidationError(
+                "master.port and master.raft_port must be different".to_string(),
+            ));
+        }
+        if self.master.net_port == self.master.raft_port {
+            return Err(ConfigError::ValidationError(
+                "master.net_port and master.raft_port must be different".to_string(),
             ));
         }
         if self.master.dir.is_empty() {
@@ -585,9 +628,9 @@ impl PowerFsConfig {
                 "master.raft_id must be set (> 0)".to_string(),
             ));
         }
-        if self.master.peers.is_empty() {
+        if self.master.raft_peers.is_empty() {
             return Err(ConfigError::ValidationError(
-                "master.peers must not be empty (at least one peer required for Raft cluster)"
+                "master.raft_peers must not be empty (at least one peer required for Raft cluster)"
                     .to_string(),
             ));
         }
@@ -806,10 +849,11 @@ redis_url = "redis://127.0.0.1:6379"
 
 [master]
 port = 9333              # HTTP/gRPC端口 (必填)
+raft_port = 9335         # Raft gRPC端口 (必填，必须与port和net_port不同)
 net_port = 9334          # powerfs-net端口 (必填，必须与port不同)
 dir = "./data/master"    # 数据目录 (必填)
 raft_id = 1
-peers = []
+raft_peers = []
 
 [volume]
 grpc_port = 8080         # gRPC端口 (必填)

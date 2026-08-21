@@ -1,7 +1,9 @@
 pub mod powerfs {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("powerfs");
 }
 
+pub use powerfs::fuse_clients_response::FuseClientInfo;
 pub use powerfs::kv_cache_service_server::{KvCacheService, KvCacheServiceServer};
 pub use powerfs::lookup_volume_response::VolumeIdLocation;
 pub use powerfs::master_service_server::{MasterService, MasterServiceServer};
@@ -15,6 +17,8 @@ pub use powerfs::{
     BatchGetResponse,
     BatchPutRequest,
     BatchPutResponse,
+    ClearDebugConfigRequest,
+    ClearDebugConfigResponse,
     ClientStats,
     ClusterInfoRequest,
     ClusterInfoResponse,
@@ -30,6 +34,7 @@ pub use powerfs::{
     CreateVolumeManagedRequest,
     CreateVolumeManagedResponse,
     DataCenterStats,
+    DebugConfigEntry,
     DeleteCollectionRequest,
     DeleteCollectionResponse,
     DeleteEntryRequest,
@@ -43,6 +48,10 @@ pub use powerfs::{
     Entry,
     EntryId,
     FileChunk,
+    FilerInfo,
+    FilerNodeStats,
+    FilerStatsRequest,
+    FilerStatsResponse,
     FuseAttributes,
     FuseClientsRequest,
     FuseClientsResponse,
@@ -50,10 +59,14 @@ pub use powerfs::{
     GetBlockResponse,
     GetCollectionRequest,
     GetCollectionResponse,
+    GetDebugConfigsRequest,
+    GetDebugConfigsResponse,
     GetEntryByInodeRequest,
     GetEntryByInodeResponse,
     GetEntryRequest,
     GetEntryResponse,
+    GetLogLevelRequest,
+    GetLogLevelResponse,
     GetMigrationTasksRequest,
     GetMigrationTasksResponse,
     GetSessionRequest,
@@ -75,6 +88,9 @@ pub use powerfs::{
     LookupDirectoryEntryResponse,
     LookupVolumeRequest,
     LookupVolumeResponse,
+    MasterNodeInfo,
+    MasterStatusRequest,
+    MasterStatusResponse,
     MetadataNotification,
     MigrationControlResponse,
     MigrationTaskInfo,
@@ -98,6 +114,8 @@ pub use powerfs::{
     RenameOp,
     ResumeMigrationsRequest,
     SetAttrOp,
+    SetLogLevelRequest,
+    SetLogLevelResponse,
     SetNodeMaintenanceRequest,
     SetPlacementStrategyRequest,
     StatisticsRequest,
@@ -107,6 +125,8 @@ pub use powerfs::{
     TransferLeaderResponse,
     TriggerRebalanceCheckRequest,
     TriggerRebalanceCheckResponse,
+    UpdateDebugConfigRequest,
+    UpdateDebugConfigResponse,
     UpdateEntryRequest,
     UpdateEntryResponse,
     UpdateMigrationPolicyRequest,

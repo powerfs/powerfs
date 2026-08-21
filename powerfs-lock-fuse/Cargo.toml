@@ -1,0 +1,23 @@
+[package]
+name = "powerfs-lock-fuse"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "FUSE userspace Rust impl of powerfs-lock::LockManager — wraps the existing VolumeLeaseManager / FuseClientFacade with the unified LockManager trait and adds Prometheus-style metrics"
+license.workspace = true
+
+[dependencies]
+powerfs-lock = { path = "../powerfs-lock" }
+powerfs-lease = { path = "../powerfs-lease" }
+async-trait = { workspace = true }
+log = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+
+[lib]
+name = "powerfs_lock_fuse"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

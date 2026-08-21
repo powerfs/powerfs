@@ -816,6 +816,12 @@ pub enum ShardError {
 - inode 记录存在 `calculate_shard(inode)` 对应的 shard
 - dir_entry 存在 `calculate_shard(parent_inode)` 对应的 shard
 
+> **注意（子目录换片）**：子目录的 inode 从 `pick_child_dir_shard(parent) = (parent_shard + 1) % shard_count`
+> 分配，因此 `calculate_shard(inode) != calculate_shard(parent_inode)`，子目录 create 跨 shard。
+> 处理方式见 [shard-routing-no-forward-principle.md](shard-routing-no-forward-principle.md) §2-§3：
+> - 文件 create：`calculate_shard(inode) == calculate_shard(parent_inode)`，单 shard
+> - 子目录 create：跨 shard，客户端协调两阶段（`MkdirPhaseA` + `MkdirPhaseB`），**服务端不转发**
+
 唯一变化：`calculate_shard` 从取模变为查表。对调用方透明。
 
 ### 7.4 伸缩操作接入管理接口
