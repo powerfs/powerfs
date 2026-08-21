@@ -676,6 +676,13 @@ impl MasterNetHandler {
         // that only send Owner will skip node registration, but zone allocation still works)
         let filer_addr = dec.next_string(FieldId::FilerAddress).unwrap_or_default();
         let net_port = dec.next_u64(FieldId::Blksize).unwrap_or(0) as u32;
+        // Filer HTTP (S3) port — used by the Master for proxying /admin/shards.
+        // Absent on old clients → default to 0 (meaning "unknown").
+        let http_port = dec.next_u64(FieldId::FilerHttpPort).unwrap_or(0) as u32;
+        // Filer metrics HTTP port — used by the Master for proxying
+        // /admin/meta-cache-stats and /admin/lease-stats.
+        // Absent on old clients → default to 0 (meaning "unknown").
+        let metrics_port = dec.next_u64(FieldId::FilerMetricsPort).unwrap_or(0) as u32;
         let shard_count = dec.next_u64(FieldId::Limit).unwrap_or(0);
         let shard_ids_blob = dec.next_bytes(FieldId::ShardIdList).unwrap_or_default();
         let force = dec.next_u8(FieldId::Force).unwrap_or(0) != 0;
@@ -746,8 +753,9 @@ impl MasterNetHandler {
                 node_id: filer_id.clone(),
                 address: filer_addr.clone(),
                 grpc_port: 0, // gRPC being removed; not used by TLV clients
-                http_port: 0,
+                http_port,
                 net_port,
+                metrics_port,
                 is_healthy: true,
                 leader_count: 0,
                 total_shards: shard_count,

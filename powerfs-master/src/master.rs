@@ -128,6 +128,7 @@ pub struct FilerNodeInfo {
     pub grpc_port: u32,
     pub http_port: u32,
     pub net_port: u32,
+    pub metrics_port: u32,
     pub is_healthy: bool,
     pub leader_count: u64,
     pub total_shards: u64,

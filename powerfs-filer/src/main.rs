@@ -464,11 +464,13 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         // `/admin/meta-cache-stats` (JSON) so operators can monitor active
         // leases, acquire/conflict counts, the Fencer SN high-water
         // (phase 4 §5.3), Early Grant waiter backpressure (phase 4 §5.2),
-        // and MetaCache hit/miss/dirty/staging counters. Port is
-        // `filer_cfg.metrics_port`, defaulting to `grpc_port + 1` so
-        // existing configs need no change.
+        // and MetaCache hit/miss/dirty/staging counters.
+        //
+        // The port MUST be explicitly provided via `filer.metrics_port`
+        // (no `grpc_port + 1` derivation — see design rule: all service
+        // ports declared statically in config.toml and unique).
         {
-            let metrics_port = filer_cfg.metrics_port.unwrap_or(grpc_port + 1);
+            let metrics_port = filer_cfg.metrics_port;
             let metrics_addr: std::net::SocketAddr =
                 format!("{}:{}", bind_ip, metrics_port).parse()?;
             let lease_mgr = net_handler.inode_lease_mgr.clone();
@@ -533,6 +535,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let shard_count = filer_cfg.shard_count as u64;
             let force_register = filer_cfg.force_register;
             let net_port_for_reg = net_port;
+            // S3 HTTP port (filer_cfg.port). The S3 server also serves the
+            // /admin/shards endpoint, so the Master needs this port to
+            // proxy shard-introspection in GetFilerStats.
+            let http_port_for_reg = filer_cfg.port;
+            // Filer Metrics HTTP port (explicitly configured — no derivation).
+            let metrics_port_for_reg = filer_cfg.metrics_port;
             // Filer 的可到达地址 (供 kernel 通过 ListFilers 发现本 Filer)
             let advertise_addr_for_reg = format!("{}:{}", advertise_ip, net_port);
 
@@ -544,6 +552,8 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     filer_id: filer_id.clone(),
                     advertise_addr: advertise_addr_for_reg.clone(),
                     net_port: net_port_for_reg as u32,
+                    http_port: http_port_for_reg as u32,
+                    metrics_port: metrics_port_for_reg as u32,
                     shard_count,
                     shard_ids,
                     force: force_register,

@@ -175,7 +175,7 @@ async fn main() {
         Commands::FuseStats(args) => commands::fuse_stats(client, args).await,
         Commands::Debug(args) => commands::debug(client, args).await,
         Commands::Topology(args) => commands::topology(&cli.master, args).await,
-        Commands::FilerStats(args) => commands::filer_stats(&cli.master, args).await,
+        Commands::FilerStats(args) => commands::filer_stats(client, args).await,
         Commands::Config { .. } => unreachable!("handled above"),
         Commands::Manage(args) => commands::manage(client, args).await,
     };

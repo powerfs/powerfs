@@ -146,12 +146,12 @@ pub struct FilerConfig {
     /// 即使 force=true，master 仍会下发告警日志，便于事后审计。
     #[serde(default)]
     pub force_register: bool,
-    /// Prometheus metrics HTTP server port. Optional — if absent, the
-    /// filer derives it as `grpc_port + 1`. Exposes `/metrics`
-    /// (Prometheus text format) and `/admin/lease-stats` (JSON) for
-    /// the inode lease manager (P7 可观测性).
-    #[serde(default)]
-    pub metrics_port: Option<u16>,
+    /// Prometheus metrics HTTP server port. **Must be explicitly configured
+    /// — no port-derivation shortcuts allowed.**  Exposes `/metrics`
+    /// (Prometheus text format) for lease manager + MetaCache counters.
+    /// Must be unique within the node (different from port / grpc_port /
+    /// net_port).
+    pub metrics_port: u16,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置

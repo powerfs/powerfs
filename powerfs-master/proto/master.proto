@@ -88,6 +88,11 @@ service MasterService {
     rpc ListFilers(ListFilersRequest) returns (ListFilersResponse);
     rpc RegisterFiler(RegisterFilerRequest) returns (RegisterFilerResponse);
     rpc GetShardMapping(GetShardMappingRequest) returns (GetShardMappingResponse);
+    // Aggregated Filer observability (MetaCache/Lease/Shard stats). The CLI
+    // calls this exclusively via the Master — it never opens a direct HTTP
+    // connection to a Filer node; the Master proxies each registered Filer's
+    // metrics_port and http_port endpoints and assembles the response.
+    rpc GetFilerStats(FilerStatsRequest) returns (FilerStatsResponse);
 
     // ===== Allocator management (rebalance + volume scaling) =====
     rpc TriggerRebalanceCheck(TriggerRebalanceCheckRequest) returns (TriggerRebalanceCheckResponse);
@@ -830,6 +835,8 @@ message FilerInfo {
     bool is_healthy = 5;
     uint64 leader_count = 6;
     uint64 total_shards = 7;
+    uint32 net_port = 8;
+    uint32 metrics_port = 9;
 }
 
 message ListFilersResponse {
@@ -846,10 +853,39 @@ message RegisterFilerRequest {
     uint64 shard_count = 5;
     repeated uint64 shard_ids = 6;
     uint32 net_port = 7;
+    uint32 metrics_port = 8;
 }
 
 message RegisterFilerResponse {
     bool success = 1;
+    string error = 2;
+}
+
+message FilerStatsRequest {
+    // Optional — when empty, return stats for *all* registered filers.
+    // Otherwise filter to a single filer by `node_id` (matches the value
+    // advertised in `FilerInfo.node_id` / `GetMasterStatus.filers[].node_id`).
+    string node_id = 1;
+}
+
+message FilerNodeStats {
+    string node_id = 1;
+    string address = 2;
+    uint32 http_port = 3;
+    uint32 metrics_port = 4;
+    string meta_cache_stats_json = 5;
+    string lease_stats_json = 6;
+    string shards_json = 7;
+    string fetch_error = 8; // Non-empty if *any* of the 3 HTTP proxied calls failed for this filer.
+    // Basic identity fields — mirrors FilerInfo so the CLI can display a
+    // consistent header without falling back to a second ListFilers call.
+    bool is_healthy = 9;
+    uint32 leader_count = 10;
+    uint32 total_shards = 11;
+}
+
+message FilerStatsResponse {
+    repeated FilerNodeStats stats = 1;
     string error = 2;
 }
 
