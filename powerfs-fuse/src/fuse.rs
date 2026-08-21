@@ -2464,41 +2464,79 @@ impl crate::invalidate_handler::CapFlusher for PowerFsFs {
             inode, lease_token
         );
 
-        // Step 1: Flush dirty chunks to Volume Server. Pass the cap token
-        // so write RPCs carry the correct fencing epoch.
-        let flush_result = self.flush_dirty_chunks(inode, Some(lease_token));
-        if let Err(ref e) = flush_result {
-            warn!(
-                "PowerFsFs::cap_flush_and_sync: flush_dirty_chunks failed for inode={} err={:?} \
-                 — dirty data retained for retry",
-                inode, e
+        // Inline files: data lives in inline_buffers, not chunk_cache.
+        // flush_dirty_chunks + sync_size_chunks_on_close only handle Flat
+        // mode (chunk-based). For inline files, use sync_inline_buffer
+        // which sends the buffer as inline_data via a single Raft commit.
+        // Without this, a recall on a dirty inline file would ACK without
+        // flushing, losing the dirty data.
+        if self.inline_buffers.contains_key(&inode) {
+            debug!(
+                "PowerFsFs::cap_flush_and_sync: inode={} is inline, using sync_inline_buffer",
+                inode
             );
-            return flush_result;
-        }
+            self.cache.mark_flushing(inode);
+            let result = self.sync_inline_buffer(inode, "cap recall flush:");
+            match result {
+                Ok(_) => {
+                    self.cache.mark_clean(inode);
+                    self.cache.mark_cap_flushed(inode);
+                    debug!(
+                        "PowerFsFs::cap_flush_and_sync: inode={} — inline sync succeeded",
+                        inode
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    self.cache.mark_dirty(inode);
+                    warn!(
+                        "PowerFsFs::cap_flush_and_sync: inline sync FAILED for inode={} err={:?} \
+                         — dirty data retained for retry",
+                        inode, e
+                    );
+                    Err(std::io::Error::other(format!("inline sync failed: {}", e)))
+                }
+            }
+        } else {
+            // Flat/chunk mode: flush dirty chunks to Volume Server, then
+            // sync metadata to Filer via Raft.
 
-        // Step 2: Sync metadata (size + chunks) to Filer via Raft.
-        // This ensures the Filer has the authoritative size before the
-        // recall completes and another client opens the file.
-        let sync_result = self.sync_size_chunks_on_close(inode);
-        if let Err(ref e) = sync_result {
-            warn!(
-                "PowerFsFs::cap_flush_and_sync: sync_size_chunks_on_close failed for inode={} err={:?} \
-                 — chunks are persisted but metadata sync pending",
-                inode, e
+            // Step 1: Flush dirty chunks to Volume Server. Pass the cap token
+            // so write RPCs carry the correct fencing epoch.
+            let flush_result = self.flush_dirty_chunks(inode, Some(lease_token));
+            if let Err(ref e) = flush_result {
+                warn!(
+                    "PowerFsFs::cap_flush_and_sync: flush_dirty_chunks failed for inode={} err={:?} \
+                     — dirty data retained for retry",
+                    inode, e
+                );
+                return flush_result;
+            }
+
+            // Step 2: Sync metadata (size + chunks) to Filer via Raft.
+            // This ensures the Filer has the authoritative size before the
+            // recall completes and another client opens the file.
+            let sync_result = self.sync_size_chunks_on_close(inode);
+            if let Err(ref e) = sync_result {
+                warn!(
+                    "PowerFsFs::cap_flush_and_sync: sync_size_chunks_on_close failed for inode={} err={:?} \
+                     — chunks are persisted but metadata sync pending",
+                    inode, e
+                );
+                return sync_result;
+            }
+
+            // Step 3: Mark the cap as flushed in the cache entry.
+            // This clears `flushing_caps` so subsequent operations know the
+            // data is safely persisted.
+            self.cache.mark_cap_flushed(inode);
+
+            debug!(
+                "PowerFsFs::cap_flush_and_sync: inode={} — flush + sync succeeded",
+                inode
             );
-            return sync_result;
+            Ok(())
         }
-
-        // Step 3: Mark the cap as flushed in the cache entry.
-        // This clears `flushing_caps` so subsequent operations know the
-        // data is safely persisted.
-        self.cache.mark_cap_flushed(inode);
-
-        debug!(
-            "PowerFsFs::cap_flush_and_sync: inode={} — flush + sync succeeded",
-            inode
-        );
-        Ok(())
     }
 }
 
@@ -4051,14 +4089,12 @@ impl FileSystem for PowerFsFs {
         // Best-effort: if the acquire fails (e.g. Filer temporarily
         // unreachable), the write path's `ensure_lease` will retry on
         // the first flush — correctness is preserved.
+        let is_write_open = (flags as i32 & libc::O_ACCMODE) != libc::O_RDONLY;
         if self.client.is_inode_lease_mode() {
             if let Some(entry) = self.cache.get_inode(inode) {
                 if entry.fid.is_some() {
                     let client_id = self.client.client_id();
                     let duration_ms = self.lease_duration_ms;
-                    // Determine open mode from flags: O_RDONLY → read-only,
-                    // O_WRONLY/O_RDWR → write open.
-                    let is_write_open = (flags as i32 & libc::O_ACCMODE) != libc::O_RDONLY;
                     match self
                         .client
                         .acquire_inode_lease(inode, &client_id, duration_ms)
@@ -4068,70 +4104,6 @@ impl FileSystem for PowerFsFs {
                                 + std::time::Duration::from_millis(duration_ms);
                             self.open_file_leases.bind(inode, token.clone(), expire_at);
                             debug!("open: pre-acquired inode lease for inode={}", inode);
-
-                            // §13 Cap model: fast path — if we already have
-                            // a valid cap with the wanted bits, skip the
-                            // CapOpenGrant RPC.
-                            //
-                            // want = CAP_R for read-only open,
-                            //        CAP_R|CAP_W|CAP_X (EXCLUSIVE) for write open.
-                            let want = if is_write_open {
-                                crate::client_cap::CapSet::EXCLUSIVE
-                            } else {
-                                crate::client_cap::CapSet::CAP_R
-                            };
-                            let have_cap = self.cache.get_cap(inode)
-                                .map(|c| c.issued.contains(want))
-                                .unwrap_or(false);
-                            if have_cap {
-                                debug!(
-                                    "open: cap fast path inode={} — already have {:?}",
-                                    inode, want
-                                );
-                            } else {
-                                // Slow path: synchronously fetch structured cap
-                                // bits from the server BEFORE returning from open.
-                                // By the time read/write/setattr execute, the cap
-                                // is guaranteed to be in `CachedEntry::cap`.
-                                //
-                                // Best-effort: if this fails (e.g. Filer
-                                // temporarily unreachable), the client falls
-                                // back to the legacy lease-only path.
-                                let facade = self.client.facade().clone();
-                                let cid = client_id.clone();
-                                match self
-                                    .client
-                                    .runtime()
-                                    .block_on(facade.cap_open_grant(inode, &cid, is_write_open))
-                                {
-                                    Ok((cap_token, caps_bits, epoch, sn)) => {
-                                        let caps = crate::client_cap::CapSet(caps_bits);
-                                        // Cap ID proxy: use SN until a dedicated
-                                        // CapId field is added to the protocol.
-                                        let cap_id = sn;
-                                        let cap = crate::client_cap::ClientCap::new(
-                                            cap_id,
-                                            cap_token,
-                                            caps,
-                                            epoch,
-                                            is_write_open,
-                                            sn,
-                                        );
-                                        self.cache.grant_cap(inode, cap);
-                                        debug!(
-                                            "open: cap_open_grant success inode={} caps={:#b} epoch={} sn={}",
-                                            inode, caps_bits, epoch, sn
-                                        );
-                                    }
-                                    Err(e) => {
-                                        debug!(
-                                            "open: cap_open_grant failed for inode={} \
-                                             (best-effort, legacy lease path active): {}",
-                                            inode, e
-                                        );
-                                    }
-                                }
-                            }
                         }
                         Err(e) => {
                             debug!(
@@ -4141,6 +4113,79 @@ impl FileSystem for PowerFsFs {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        // §13 Cap model: acquire structured cap bits from the server.
+        //
+        // Applies to ALL files (inline AND flat) — cap controls metadata
+        // authority (CAP_X) and cache permissions (CAP_R/CAP_W), which
+        // are needed regardless of where the data lives. Inline files
+        // need CAP_W for write buffering and CAP_X for setattr; without
+        // a cap, the recall path has nothing to flush.
+        //
+        // Fast path: if we already have a valid cap with the wanted
+        // bits, skip the CapOpenGrant RPC.
+        //
+        // want = CAP_R for read-only open,
+        //        CAP_R|CAP_W|CAP_X (EXCLUSIVE) for write open.
+        let want = if is_write_open {
+            crate::client_cap::CapSet::EXCLUSIVE
+        } else {
+            crate::client_cap::CapSet::CAP_R
+        };
+        let have_cap = self
+            .cache
+            .get_cap(inode)
+            .map(|c| c.issued.contains(want))
+            .unwrap_or(false);
+        if have_cap {
+            debug!(
+                "open: cap fast path inode={} — already have {:?}",
+                inode, want
+            );
+        } else {
+            // Slow path: synchronously fetch structured cap bits from
+            // the server BEFORE returning from open. By the time
+            // read/write/setattr execute, the cap is guaranteed to be
+            // in `CachedEntry::cap`.
+            //
+            // Best-effort: if this fails (e.g. Filer temporarily
+            // unreachable), the client falls back to the legacy
+            // lease-only path.
+            let facade = self.client.facade().clone();
+            let cid = self.client.client_id();
+            match self
+                .client
+                .runtime()
+                .block_on(facade.cap_open_grant(inode, &cid, is_write_open))
+            {
+                Ok((cap_token, caps_bits, epoch, sn, _duration_ms)) => {
+                    let caps = crate::client_cap::CapSet(caps_bits);
+                    // Cap ID proxy: use SN until a dedicated CapId field
+                    // is added to the protocol.
+                    let cap_id = sn;
+                    let cap = crate::client_cap::ClientCap::new(
+                        cap_id,
+                        cap_token,
+                        caps,
+                        epoch,
+                        is_write_open,
+                        sn,
+                    );
+                    self.cache.grant_cap(inode, cap);
+                    debug!(
+                        "open: cap_open_grant success inode={} caps={:#b} epoch={} sn={}",
+                        inode, caps_bits, epoch, sn
+                    );
+                }
+                Err(e) => {
+                    debug!(
+                        "open: cap_open_grant failed for inode={} \
+                         (best-effort, legacy lease path active): {}",
+                        inode, e
+                    );
                 }
             }
         }
@@ -6480,6 +6525,36 @@ impl FileSystem for PowerFsFs {
             if !sync_ok {
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
+
+            // §13 Cap model: on last close with successful sync, release
+            // the cap. The inline sync already persisted data via Raft,
+            // so we mark flushed + take cap + send CapRelease RPC.
+            // Without this, inline files leak caps on the server (blocking
+            // future exclusive grants) and the client re-uses a stale cap.
+            if released {
+                self.cache.mark_cap_flushed(inode);
+                if let Some(cap) = self.cache.take_cap(inode) {
+                    let facade = self.client.facade().clone();
+                    let client_id = self.client.client_id();
+                    let cap_token = cap.token.clone();
+                    let runtime = self.client.runtime().handle().clone();
+                    runtime.spawn(async move {
+                        if let Err(e) =
+                            facade.cap_release(inode, &client_id, &cap_token).await
+                        {
+                            debug!(
+                                "release inline: cap_release for inode {} failed (best-effort): {}",
+                                inode, e
+                            );
+                        }
+                    });
+                    debug!(
+                        "release inline: cap released for inode={} (last close, caps were {:?})",
+                        inode, cap.issued
+                    );
+                }
+            }
+
             debug!(
                 "release inline: inode={} closed, size={}",
                 inode, final_size
