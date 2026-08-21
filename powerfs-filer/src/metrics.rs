@@ -157,6 +157,48 @@ lazy_static::lazy_static! {
         "powerfs_filer_mc_direntry_deleted",
         "MetaCache: count of direntry Deleted tombstones currently held"
     ).unwrap();
+    static ref MC_INODE_TRIMMING: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_inode_trimming",
+        "MetaCache: count of inodes currently in transient Trimming state"
+    ).unwrap();
+    static ref MC_DIRENTRY_TRIMMING: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_direntry_trimming",
+        "MetaCache: count of direntries currently in transient Trimming state"
+    ).unwrap();
+    static ref MC_DIRENTRY_DIRTY: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_direntry_dirty",
+        "MetaCache: count of direntries currently in Dirty state (rare: only SetAttrData via dentry)"
+    ).unwrap();
+
+    // ===== MetaCache Phase-2 counters & memory gauges =====
+    static ref MC_TRIM_TOTAL: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_trim_total",
+        "MetaCache Phase 2: cumulative entries evicted by LRU trim passes"
+    ).unwrap();
+    static ref MC_STAGING_TIMEOUT_TOTAL: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_staging_timeout_total",
+        "MetaCache Phase 2: entries dropped because Staging was never confirmed by Raft"
+    ).unwrap();
+    static ref MC_DELETED_TIMEOUT_TOTAL: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_deleted_timeout_total",
+        "MetaCache Phase 2: Deleted tombstones swept by sweep_expired_deletions"
+    ).unwrap();
+    static ref MC_MEMORY_USAGE_BYTES: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_memory_usage_bytes",
+        "MetaCache Phase 2: estimated current bytes used by cached inodes + direntries"
+    ).unwrap();
+    static ref MC_MEMORY_LIMIT_BYTES: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_memory_limit_bytes",
+        "MetaCache Phase 2: configured hard memory ceiling (POWERFS_MC_MEMORY_LIMIT_BYTES default 2 GiB)"
+    ).unwrap();
+    static ref MC_MEMORY_HIGH_BYTES: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_memory_high_watermark_bytes",
+        "MetaCache Phase 2: trim_pass starts when usage exceeds this many bytes"
+    ).unwrap();
+    static ref MC_MEMORY_LOW_BYTES: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_memory_low_watermark_bytes",
+        "MetaCache Phase 2: trim_pass stops once usage drops below this many bytes"
+    ).unwrap();
 }
 
 /// Shared state passed into the axum Router: lease manager + meta cache.
@@ -202,9 +244,21 @@ pub fn refresh_prometheus(state: &MetricsAppState) {
     MC_INODE_STAGING.set(m.inode_staging_count as i64);
     MC_INODE_DIRTY.set(m.inode_dirty_count as i64);
     MC_INODE_DELETED.set(m.inode_deleted_count as i64);
+    MC_INODE_TRIMMING.set(m.inode_trimming_count as i64);
     MC_DIRENTRY_CLEAN.set(m.direntry_clean_count as i64);
     MC_DIRENTRY_STAGING.set(m.direntry_staging_count as i64);
+    MC_DIRENTRY_DIRTY.set(m.direntry_dirty_count as i64);
     MC_DIRENTRY_DELETED.set(m.direntry_deleted_count as i64);
+    MC_DIRENTRY_TRIMMING.set(m.direntry_trimming_count as i64);
+
+    // --- Phase 2: trim counters + memory gauges ---
+    MC_TRIM_TOTAL.set(m.trim_total as i64);
+    MC_STAGING_TIMEOUT_TOTAL.set(m.staging_timeout_total as i64);
+    MC_DELETED_TIMEOUT_TOTAL.set(m.deleted_timeout_total as i64);
+    MC_MEMORY_USAGE_BYTES.set(m.memory_usage_bytes as i64);
+    MC_MEMORY_LIMIT_BYTES.set(m.memory_limit_bytes as i64);
+    MC_MEMORY_HIGH_BYTES.set(m.memory_high_watermark_bytes as i64);
+    MC_MEMORY_LOW_BYTES.set(m.memory_low_watermark_bytes as i64);
 }
 
 /// Start the HTTP metrics server on the given address.
@@ -288,14 +342,26 @@ async fn meta_cache_stats_handler(
         "stage_delete_total": m.stage_delete_total,
         "backfill_clean_total": m.backfill_clean_total,
         "invalidate_all_total": m.invalidate_all_total,
+        "trim_total": m.trim_total,
+        "staging_timeout_total": m.staging_timeout_total,
+        "deleted_timeout_total": m.deleted_timeout_total,
+        "memory": {
+            "usage_bytes": m.memory_usage_bytes,
+            "limit_bytes": m.memory_limit_bytes,
+            "high_watermark_bytes": m.memory_high_watermark_bytes,
+            "low_watermark_bytes": m.memory_low_watermark_bytes,
+        },
         "state": {
             "inode_clean": m.inode_clean_count,
             "inode_staging": m.inode_staging_count,
             "inode_dirty": m.inode_dirty_count,
             "inode_deleted": m.inode_deleted_count,
+            "inode_trimming": m.inode_trimming_count,
             "direntry_clean": m.direntry_clean_count,
             "direntry_staging": m.direntry_staging_count,
+            "direntry_dirty": m.direntry_dirty_count,
             "direntry_deleted": m.direntry_deleted_count,
+            "direntry_trimming": m.direntry_trimming_count,
         }
     }))
 }

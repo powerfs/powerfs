@@ -4757,6 +4757,23 @@ impl MetaShardManager {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
+
+                // ===== Phase 2: MetaCache periodic maintenance =====
+                //
+                // Runs before orphan/GC scans so that (1) Staging entries
+                // lost during leader-change windows are dropped fast, and
+                // (2) Deleted tombstones older than deleted_timeout_ms get
+                // swept out before the next orphan scan considers the
+                // inode "still referenced by a dentry cache".
+                let mc = mgr.meta_cache();
+                mc.sweep_expired_staging();
+                mc.sweep_expired_deletions(std::time::Duration::from_millis(
+                    mc.trim.deleted_timeout_ms,
+                ));
+                // trim_pass only does work when usage > high_watermark; when
+                // under watermark it's a no-op (just an atomic read).
+                let _evicted = mc.trim_pass();
+
                 // Phase 5: 先重试上次失败的 pending_reclaims（WAL 崩溃恢复）
                 let retried = mgr
                     .retry_pending_reclaims(&volume_router, &volume_client_pool)
