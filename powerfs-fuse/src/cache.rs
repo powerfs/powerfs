@@ -650,9 +650,8 @@ impl MetadataCache {
         // Special case: the root inode (=1) conventionally has parent=1
         // (self-parent). It is NOT a cycle; skip the check entirely for it.
         let new_parent = entry.parent;
-        let would_cycle: bool;
-        if inode == 1 {
-            would_cycle = false;
+        let would_cycle: bool = if inode == 1 {
+            false
         } else {
             let ro_cache = self.inode_cache.read().unwrap();
             let mut wc = new_parent == inode;
@@ -675,8 +674,8 @@ impl MetadataCache {
                     }
                 }
             }
-            would_cycle = wc;
-        }
+            wc
+        };
 
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(existing) = cache.get_mut(&inode) {

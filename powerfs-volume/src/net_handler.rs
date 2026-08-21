@@ -642,7 +642,7 @@ impl VolumeNetHandler {
         }
 
         let mut stripe_specs: Vec<(u64, u64)> = Vec::with_capacity(specs_blob.len() / 16);
-        for chunk in specs_blob.chunks_exact(16) {
+        for chunk in specs_blob.as_chunks::<16>().0 {
             let start = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let count = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
             stripe_specs.push((start, count));

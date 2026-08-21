@@ -16,6 +16,7 @@ pub mod net_handler;
 pub mod posix_service;
 pub mod scrubber;
 pub mod powerfs {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("powerfs");
 }
 pub mod provider_impl;
