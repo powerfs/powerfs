@@ -973,14 +973,20 @@ use powerfs_meta_cache::MetaCache;
 - [ ] 流式 readdir: 按分片迭代，避免加载整个目录到内存
 - [ ] 验证: 100万子项目录 readdir 不 OOM + DirFrag 粒度正确卸载
 
-### 阶段 5: Follower 缓存优化 — 📋 规划中（Phase 4 完成后启动）
+### 阶段 5: ~~Follower 缓存优化~~ — ❌ 已取消（2026-08-21）
 
-**目标**: Follower 服务本地读请求（降低 Leader 压力），优先淘汰非 Auth 元数据
+**原目标**: Follower 服务本地读请求（降低 Leader 压力），优先淘汰非 Auth 元数据。
 
-- [ ] Follower Raft apply 回调同步填 MetaCache Clean（目前 confirm_* 只在 Leader 上有意义，需判定角色）
-- [ ] `TrimController` 中 `is_auth` 权重：非 Auth → 优先淘汰，Auth → 后淘汰
-- [ ] REDIRECT 机制允许 Follower 直接返回读缓存命中（需加"只读缓存命中"判断，写仍 REDIRECT）
-- [ ] 验证: Follower 读加速 + Auth/非Auth 淘汰优先级正确
+**取消理由**:
+
+与 PowerFS 核心设计原则冲突 —— **"所有读走 Leader，Follower 只是 Raft 副本"**：
+1. `NetHandler` 的 `build_err_redirect_or_server` 保证非 Leader 节点对任何客户端请求（读/写）都返回 `STATUS_ERR_REDIRECT(11)` + Leader 地址，客户端重定向到 Leader。这是"绝不服务间转发"原则的基石。
+2. Follower 的 MetaCache 因此**永远是空的**（`confirm_*` 回调在 Follower 上虽然会被 Raft apply 触发，但 Follower 从不服务读，填了也没用）。
+3. 要让 Follower 服务读，必须：① 区分 Auth/非 Auth 元数据；② 修改 REDIRECT 机制允许 Follower 直接返回读缓存命中；③ 处理 Follower 缓存一致性（Follower 没有 staging，不能返回刚创建未 commit 的数据）。这套复杂性与"Leader 唯一权威"的简化一致性模型相悖。
+4. Leader 读压力在实际负载下不是瓶颈（MetaCache 命中率 >95% 时 RocksDB 几乎不被触碰），没有足够动机引入 Follower 读加速。
+
+**保留的 Follower 相关字段**：`CachedInode.refcount`（仍用于 Phase 3 Lease Recall 联动，与 Follower 无关）、`is_auth` 字段**不预埋**（随 Phase 5 一并取消）。
+
 ---
 
 ## 与 Ceph MDCache 对比
@@ -1010,7 +1016,7 @@ use powerfs_meta_cache::MetaCache;
 
 1. **序列化开销**: miss 时需反序列化（Ceph 内存原生对象无此开销）
 2. **无实时 standby-replay**: Filer 故障切换依赖 Raft 重新选举，非热备
-3. **Phase 2-5 未全部实施**: 目前已落地 Phase 1 MVP + P3.1/P4/Topology 优化，Trim/Recall/DirFrag/Follower 优化后续迭代上线
+3. **Phase 2-4 未全部实施**: 目前已落地 Phase 1 MVP + P3.1/P4/Topology 优化 + Phase 2 单条目淘汰，Phase 3 Recall / Phase 4 DirFrag 后续迭代上线。Phase 5 Follower 读加速已取消（与"所有读走 Leader"原则冲突）。
 
 ---
 
@@ -1083,9 +1089,9 @@ powerfs_filer_mc_direntry_states{state="dirty"}  # Dirty dentry 数
 | **DirFrag 表** | `dirfrag_table: DashMap<DirFragId, DirFrag>` 存在 | ⏳ **推迟到 Phase 4**：目前 dentry 直接存在 `direntry_table` 的 `(parent_inode, name)` → `CachedDirEntry`，Phase 2 先实现**单条目粒度 trim**，Phase 4 再上线 DirFrag 分片淘汰。 |
 | **Staging 队列** | `staging_queue: VecDeque<(Inode, Instant)>` 独立队列 | ✅ **合并到 state 字段**：`CachedInode.state = Staging` 即表示 staging；`last_access_ms` 用作过期估计，无需单独队列减少内存。 |
 | **Deleted markers** | `deleted_markers: DashMap<Inode, Instant>` 独立表 | ✅ **合并到 state 字段**：`CachedInode.state = Deleted` 即表示墓碑（读返回 ENOENT）；`sweep_expired_deletions` 定期清理超时墓碑。 |
-| **CacheState 枚举** | 5 态：`Clean / Staging / Dirty / Deleted / Trimming` | ✅ **当前 4 态**（不含 `Trimming`）：Phase 2 实现 trim 时再加 `Trimming` 临时态（避免淘汰中的条目重复被读回填而冲突）。 |
-| **CachedInode 字段** | 含 `dirfrag_id: DirFragId`、`is_auth: bool` | ✅ **已预埋 refcount/last_access_ms，未预埋 dirfrag_id/is_auth**：refcount 字段用于 Phase 3 recall 联动；dirfrag_id/is_auth 随 Phase 4/5 再追加。 |
-| **TrimController** | 设计中有完整结构 | ⏳ **Phase 2 正在实施**：本轮将上线 memory_limit/high_watermark/low_watermark、current_usage Atomic、trim_pass() 定时扫描。 |
+| **CacheState 枚举** | 5 态：`Clean / Staging / Dirty / Deleted / Trimming` | ✅ **当前 5 态**（Phase 2 已补 `Trimming`）：trim_pass() 标记候选条目为 `Trimming` 避免并发读 miss 回填竞态。 |
+| **CachedInode 字段** | 含 `dirfrag_id: DirFragId`、`is_auth: bool` | ✅ **已预埋 refcount/last_access_ms，未预埋 dirfrag_id/is_auth**：refcount 字段用于 Phase 3 recall 联动；dirfrag_id 随 Phase 4 追加；`is_auth` **不预埋**（Phase 5 Follower 读加速已取消，不再需要 Auth/非Auth 区分）。 |
+| **TrimController** | 设计中有完整结构 | ✅ **Phase 2 已落地**：memory_limit/high_watermark/low_watermark（env `POWERFS_MC_*`）、current_usage AtomicUsize、trim_pass() LRU 扫描 + sweep_expired_staging/sweep_expired_deletions 定时清理。 |
 | **Prometheus 前缀** | `powerfs_metacache_*` | ✅ **改为 `powerfs_filer_mc_*`**：与现有 `powerfs_filer_*` 命名空间一致，方便 Grafana 面板聚合。 |
 | **跨 shard 子目录** | 未在 MetaCache 设计文档单列 | ✅ **补充实现（DirStatSummary）**：设计文档"大目录分片"原未提及，但 DirStatSummary 作为 Phase 1 跨 shard `ls -l` 优化核心组件已落地，避免 N 次 cross-shard getattr RPC。 |
 | **客户端路由** | 未在 MetaCache 设计文档单列 | ✅ **补充实现**：TopologyUpdateListener 动态更新 shard_router/shard_map（无需 Fuse 重启）+ Self-Redirect Guard 防重试耗尽。 |
