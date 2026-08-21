@@ -1084,6 +1084,73 @@ impl PowerFsFs {
         self.cache.invalidate_dir(parent_inode);
     }
 
+    /// §13 Cap model: acquire structured cap bits from the server for an
+    /// inode that is about to be returned as an open file handle.
+    ///
+    /// Shared by `open()` and `create()` — both return an open file handle
+    /// to the kernel, and subsequent read/write/setattr calls rely on the
+    /// cap being present in `CachedEntry::cap`. Without this, `mark_dirty_cap_w`
+    /// / `mark_dirty_cap_x` are no-ops (cap is None), and a server recall
+    /// would immediate-ACK without flushing dirty data → data loss.
+    ///
+    /// Fast path: if we already have a valid cap with the wanted bits,
+    /// skip the CapOpenGrant RPC.
+    ///
+    /// - `is_write_open`: true for O_WRONLY/O_RDWR (want EXCLUSIVE),
+    ///   false for O_RDONLY (want CAP_R).
+    /// - Best-effort: on failure, the legacy lease-only path remains active.
+    fn acquire_cap_on_open(&self, inode: u64, is_write_open: bool) {
+        let want = if is_write_open {
+            crate::client_cap::CapSet::EXCLUSIVE
+        } else {
+            crate::client_cap::CapSet::CAP_R
+        };
+        let have_cap = self
+            .cache
+            .get_cap(inode)
+            .map(|c| c.issued.contains(want))
+            .unwrap_or(false);
+        if have_cap {
+            debug!(
+                "acquire_cap_on_open: cap fast path inode={} — already have {:?}",
+                inode, want
+            );
+            return;
+        }
+        let facade = self.client.facade().clone();
+        let cid = self.client.client_id();
+        match self
+            .client
+            .runtime()
+            .block_on(facade.cap_open_grant(inode, &cid, is_write_open))
+        {
+            Ok((cap_token, caps_bits, epoch, sn, _duration_ms)) => {
+                let caps = crate::client_cap::CapSet(caps_bits);
+                let cap_id = sn;
+                let cap = crate::client_cap::ClientCap::new(
+                    cap_id,
+                    cap_token,
+                    caps,
+                    epoch,
+                    is_write_open,
+                    sn,
+                );
+                self.cache.grant_cap(inode, cap);
+                debug!(
+                    "acquire_cap_on_open: cap_open_grant success inode={} caps={:#b} epoch={} sn={}",
+                    inode, caps_bits, epoch, sn
+                );
+            }
+            Err(e) => {
+                debug!(
+                    "acquire_cap_on_open: cap_open_grant failed for inode={} \
+                     (best-effort, legacy lease path active): {}",
+                    inode, e
+                );
+            }
+        }
+    }
+
     /// Check if the Filer leader has changed since the last call.
     /// If so, invalidate all cached metadata to handle potentially missed
     /// Invalidate notifications during the leader change window.
@@ -3217,6 +3284,33 @@ impl FileSystem for PowerFsFs {
         // is batched and will eventually catch up.
         if should_delete {
             // Last hard link - delete the actual data and remove all cache entries
+            // §13 Cap model: release the cap before removing the cache entry.
+            // take_cap removes the cap from CachedEntry and returns it so we
+            // can send CapRelease RPC. Without this, the server keeps the
+            // CapHolder until TTL expiry (30s), blocking other clients from
+            // getting exclusive caps on a new file that reuses this inode.
+            self.cache.mark_cap_flushed(entry.inode);
+            if let Some(cap) = self.cache.take_cap(entry.inode) {
+                let facade = self.client.facade().clone();
+                let client_id = self.client.client_id();
+                let cap_token = cap.token.clone();
+                let runtime = self.client.runtime().handle().clone();
+                let cap_inode = entry.inode;
+                runtime.spawn(async move {
+                    if let Err(e) =
+                        facade.cap_release(cap_inode, &client_id, &cap_token).await
+                    {
+                        debug!(
+                            "unlink: cap_release for inode {} failed (best-effort): {}",
+                            cap_inode, e
+                        );
+                    }
+                });
+                debug!(
+                    "unlink: cap released for inode={} (last link deleted, caps were {:?})",
+                    entry.inode, cap.issued
+                );
+            }
             for chunk in &entry.chunks {
                 match self.client.get_volume_addr(chunk.volume_id) {
                     Ok(addr) => {
@@ -3473,6 +3567,9 @@ impl FileSystem for PowerFsFs {
             *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
             self.cache.insert_pinned(entry.clone());
             debug!("create: inline mode, inode={}, dir={}", inode, parent);
+            // §13 Cap model: create returns an open handle — acquire cap
+            // so write/setattr can mark dirty and recall can flush.
+            self.acquire_cap_on_open(inode, true);
             return Ok((
                 self.create_fuse_entry(&entry),
                 Some(inode),
@@ -3543,6 +3640,8 @@ impl FileSystem for PowerFsFs {
             *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
             self.cache.insert_pinned(entry.clone());
             debug!("create: stripe mode, inode={}, dir={}", inode, parent);
+            // §13 Cap model: create returns an open handle — acquire cap.
+            self.acquire_cap_on_open(inode, true);
             return Ok((
                 self.create_fuse_entry(&entry),
                 Some(inode),
@@ -3632,6 +3731,8 @@ impl FileSystem for PowerFsFs {
         *self.open_inodes.write().unwrap().entry(inode).or_insert(0) += 1;
         self.cache.insert_pinned(entry.clone());
         debug!("create: RPC done, inode={}, dir={}", inode, parent);
+        // §13 Cap model: create returns an open handle — acquire cap.
+        self.acquire_cap_on_open(inode, true);
 
         Ok((
             self.create_fuse_entry(&entry),
@@ -4118,77 +4219,9 @@ impl FileSystem for PowerFsFs {
         }
 
         // §13 Cap model: acquire structured cap bits from the server.
-        //
-        // Applies to ALL files (inline AND flat) — cap controls metadata
-        // authority (CAP_X) and cache permissions (CAP_R/CAP_W), which
-        // are needed regardless of where the data lives. Inline files
-        // need CAP_W for write buffering and CAP_X for setattr; without
-        // a cap, the recall path has nothing to flush.
-        //
-        // Fast path: if we already have a valid cap with the wanted
-        // bits, skip the CapOpenGrant RPC.
-        //
-        // want = CAP_R for read-only open,
-        //        CAP_R|CAP_W|CAP_X (EXCLUSIVE) for write open.
-        let want = if is_write_open {
-            crate::client_cap::CapSet::EXCLUSIVE
-        } else {
-            crate::client_cap::CapSet::CAP_R
-        };
-        let have_cap = self
-            .cache
-            .get_cap(inode)
-            .map(|c| c.issued.contains(want))
-            .unwrap_or(false);
-        if have_cap {
-            debug!(
-                "open: cap fast path inode={} — already have {:?}",
-                inode, want
-            );
-        } else {
-            // Slow path: synchronously fetch structured cap bits from
-            // the server BEFORE returning from open. By the time
-            // read/write/setattr execute, the cap is guaranteed to be
-            // in `CachedEntry::cap`.
-            //
-            // Best-effort: if this fails (e.g. Filer temporarily
-            // unreachable), the client falls back to the legacy
-            // lease-only path.
-            let facade = self.client.facade().clone();
-            let cid = self.client.client_id();
-            match self
-                .client
-                .runtime()
-                .block_on(facade.cap_open_grant(inode, &cid, is_write_open))
-            {
-                Ok((cap_token, caps_bits, epoch, sn, _duration_ms)) => {
-                    let caps = crate::client_cap::CapSet(caps_bits);
-                    // Cap ID proxy: use SN until a dedicated CapId field
-                    // is added to the protocol.
-                    let cap_id = sn;
-                    let cap = crate::client_cap::ClientCap::new(
-                        cap_id,
-                        cap_token,
-                        caps,
-                        epoch,
-                        is_write_open,
-                        sn,
-                    );
-                    self.cache.grant_cap(inode, cap);
-                    debug!(
-                        "open: cap_open_grant success inode={} caps={:#b} epoch={} sn={}",
-                        inode, caps_bits, epoch, sn
-                    );
-                }
-                Err(e) => {
-                    debug!(
-                        "open: cap_open_grant failed for inode={} \
-                         (best-effort, legacy lease path active): {}",
-                        inode, e
-                    );
-                }
-            }
-        }
+        // See `acquire_cap_on_open` for details. Applies to ALL files
+        // (inline AND flat). Fast path skips RPC if cap already valid.
+        self.acquire_cap_on_open(inode, is_write_open);
 
         Ok((
             Some(inode),
