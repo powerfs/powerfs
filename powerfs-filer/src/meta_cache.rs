@@ -20,25 +20,28 @@
 //! Real persistence is Raft commit → ShardStore (RocksDB).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 
-use crate::shard_store::InodeInfo;
+use crate::shard_store::{InodeInfo, StoredFileChunk};
 
 /// Key for directory entry cache: (parent_inode, name).
 type DirEntryKey = (u64, String);
 
 /// Lifecycle state for a cached inode / dir entry.
 ///
-/// Mirrors the design-doc `CacheState` state machine (minus `Trimming` — we
-/// add DirFrag-level trim in a later phase).
+/// Mirrors the design-doc `CacheState` state machine.
+/// `Trimming` was added in Phase 2 to avoid a race where a `Clean` entry
+/// is picked up by `trim_pass()` and a concurrent read miss backfills it
+/// simultaneously; setting `Trimming` short-circuits both until the evictor
+/// drops it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CacheState {
     /// Persistent copy (RocksDB) is authoritative and in sync.
-    /// Can be returned directly; can be evicted by future trim logic.
+    /// Can be returned directly; can be evicted by trim logic.
     Clean,
     /// Newly created, waiting for Raft apply.
     /// Must NOT be evicted; reads return the staged value directly.
@@ -49,6 +52,10 @@ pub enum CacheState {
     /// Deleted locally, RemoveDirEntry/DeleteInode Raft command in flight.
     /// Must NOT be evicted; reads against this entry return ENOENT.
     Deleted,
+    /// Phase 2 transient state: picked up by `trim_pass()` and about to be
+    /// dropped. Reads treat it as a miss (fall through to RocksDB); a
+    /// concurrent `cache_put_clean()` will overwrite it atomically.
+    Trimming,
 }
 
 /// An inode cached in memory.
@@ -119,6 +126,164 @@ impl CachedDirEntry {
     }
 }
 
+// ========================================================================
+// Phase 2: TrimController
+// ========================================================================
+
+/// Memory bookkeeping and high/low watermark configuration for the
+/// per-shard MetaCache (Phase 2 single-entry trim; Phase 4 will upgrade
+/// this to DirFrag-granular eviction).
+///
+/// Memory usage is **estimated**, not precise (`malloc`/`HashMap` reallocs
+/// are out-of-band). It is accurate enough for coarse-grained trim
+/// thresholds that keep the Filer from ballooning to multi-GB under
+/// workloads that create 100k+ files.
+pub(crate) struct TrimController {
+    /// Hard upper bound, in bytes. Default: 2 GiB.
+    pub memory_limit_bytes: usize,
+    /// Start trimming when usage exceeds this fraction of the limit.
+    /// Default: 0.8.
+    pub high_watermark: f64,
+    /// Stop trimming once usage drops below this fraction of the limit.
+    /// Default: 0.6.
+    pub low_watermark: f64,
+    /// For inodes in state = Staging, evict them if the Raft apply
+    /// confirm hasn't arrived within this duration (proposal was likely
+    /// lost in a leader-change window). Default: 30 s.
+    pub staging_timeout_ms: u64,
+    /// For inodes/dentries in state = Deleted, evict the tombstone if
+    /// Raft confirm hasn't arrived within this duration. Default: 60 s.
+    /// (Already exists via `sweep_expired_deletions`; moved here so all
+    /// timeouts live in one place.)
+    pub deleted_timeout_ms: u64,
+
+    // --- runtime counters (exposed via MetaCacheStats / Prometheus) ---
+    pub current_usage_bytes: AtomicUsize,
+    pub trim_total: AtomicU64,
+    pub staging_timeout_total: AtomicU64,
+    pub deleted_timeout_total: AtomicU64,
+}
+
+impl TrimController {
+    /// Load configuration from env vars (same convention as
+    /// `InodeLeaseManager`) with safe defaults.
+    pub fn from_env_or_defaults() -> Self {
+        // 2 GiB default keeps MetaCache well below typical 8-16 GiB
+        // Filer boxes; operators can override per deployment.
+        let memory_limit_bytes = std::env::var("POWERFS_MC_MEMORY_LIMIT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2 * 1024 * 1024 * 1024);
+
+        let high_watermark = std::env::var("POWERFS_MC_HIGH_WATERMARK")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v.clamp(0.5, 1.0))
+            .unwrap_or(0.8);
+
+        let low_watermark = std::env::var("POWERFS_MC_LOW_WATERMARK")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v.clamp(0.3, high_watermark - 0.05))
+            .unwrap_or(0.6);
+
+        let staging_timeout_ms = std::env::var("POWERFS_MC_STAGING_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30_000);
+
+        let deleted_timeout_ms = std::env::var("POWERFS_MC_DELETED_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60_000);
+
+        Self {
+            memory_limit_bytes,
+            high_watermark,
+            low_watermark,
+            staging_timeout_ms,
+            deleted_timeout_ms,
+            current_usage_bytes: AtomicUsize::new(0),
+            trim_total: AtomicU64::new(0),
+            staging_timeout_total: AtomicU64::new(0),
+            deleted_timeout_total: AtomicU64::new(0),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn high_bytes(&self) -> usize {
+        (self.memory_limit_bytes as f64 * self.high_watermark) as usize
+    }
+
+    #[inline]
+    pub(crate) fn low_bytes(&self) -> usize {
+        (self.memory_limit_bytes as f64 * self.low_watermark) as usize
+    }
+
+    #[inline]
+    pub(crate) fn charge(&self, bytes: usize) {
+        self.current_usage_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn release(&self, bytes: usize) {
+        let _ = self.current_usage_bytes.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn over_high(&self) -> bool {
+        self.current_usage_bytes.load(Ordering::Relaxed) > self.high_bytes()
+    }
+}
+
+/// Estimate how many heap bytes a cached inode occupies (shallow +
+/// `InodeInfo` inline variable-length fields like `symlink_target` and
+/// chunks Vec). This is intentionally a loose upper bound: overcharging
+/// makes trim run earlier and safer, under-charging would cause OOMs.
+#[inline]
+fn estimate_inode_bytes(info: &InodeInfo) -> usize {
+    // Variable-length tail fields carried by InodeInfo. We deliberately
+    // estimate the heap-allocated parts conservatively (a little over is
+    // safer than under). The compiler-generated size_of::<CachedInode>()
+    // covers just the struct layout (Vec words, etc.); we separately add
+    // the heap-resident tail capacity for each vector/string/map.
+    let variable: usize = info
+        .symlink_target
+        .as_ref()
+        .map(|s| s.capacity())
+        .unwrap_or(0)
+        .saturating_add(
+            info.chunks
+                .capacity()
+                .saturating_mul(std::mem::size_of::<StoredFileChunk>()),
+        )
+        .saturating_add(
+            info.inline_data
+                .as_ref()
+                .map(|d| d.capacity())
+                .unwrap_or(0),
+        )
+        // "extended" = xattrs HashMap<String, Vec<u8>>; 128 bytes/entry is
+        // a rough upper bound of k + v + HashMap per-entry bookkeeping.
+        .saturating_add(info.extended.len().saturating_mul(128))
+        .saturating_add(info.name.capacity())
+        .saturating_add(info.fid.as_ref().map(|s| s.capacity()).unwrap_or(0))
+        .saturating_add(info.etag.as_ref().map(|s| s.capacity()).unwrap_or(0));
+    std::mem::size_of::<CachedInode>()
+        .saturating_add(variable)
+        .max(512)
+}
+
+#[inline]
+fn estimate_dentry_bytes(name: &str) -> usize {
+    // CachedDirEntry fixed (≈ 40B) + name string heap allocation
+    // (rounded up to next 8 + allocator bookkeeping ~16B per String).
+    std::mem::size_of::<CachedDirEntry>()
+        .saturating_add(name.len())
+        .saturating_add(16)
+        .max(96)
+}
+
 /// Filer meta cache (Phase 1 + Phase 2 foundations).
 pub struct MetaCache {
     /// Inode cache by inode number.
@@ -126,6 +291,9 @@ pub struct MetaCache {
 
     /// Directory entry cache by (parent_inode, name).
     direntry_table: RwLock<HashMap<DirEntryKey, CachedDirEntry>>,
+
+    // ----- Phase 2 trim controller (shared; per-shard MetaCache has one) -----
+    pub(crate) trim: TrimController,
 
     // ----- Prometheus-friendly cumulative counters -----
     //
@@ -159,6 +327,7 @@ impl MetaCache {
         Self {
             inode_table: RwLock::new(HashMap::new()),
             direntry_table: RwLock::new(HashMap::new()),
+            trim: TrimController::from_env_or_defaults(),
             inode_hit_total: AtomicU64::new(0),
             inode_miss_total: AtomicU64::new(0),
             inode_deleted_served_total: AtomicU64::new(0),
@@ -181,21 +350,36 @@ impl MetaCache {
     /// bridging the commit→apply gap.
     pub fn stage_create(&self, info: InodeInfo, parent_inode: u64, name: &str) {
         let ino = info.inode;
+        let ino_bytes = estimate_inode_bytes(&info);
+        let dentry_bytes = estimate_dentry_bytes(name);
         {
             let mut tbl = self.inode_table.write().unwrap();
-            tbl.insert(ino, CachedInode::new(info, CacheState::Staging));
+            if let Some(old) = tbl.insert(ino, CachedInode::new(info, CacheState::Staging)) {
+                self.trim.release(estimate_inode_bytes(&old.info));
+            }
+            self.trim.charge(ino_bytes);
         }
         {
             let mut tbl = self.direntry_table.write().unwrap();
             let key = (parent_inode, name.to_string());
-            tbl.insert(key, CachedDirEntry::new(ino, CacheState::Staging));
-            // Clean up any stale Deleted marker for the same entry (recreate).
+            if tbl
+                .insert(key, CachedDirEntry::new(ino, CacheState::Staging))
+                .is_some()
+            {
+                // Replacement: approximate released bytes using the same name
+                // length (estimate is loose upper bound anyway; small ±error
+                // vs bookkeeping perfection is acceptable).
+                self.trim.release(dentry_bytes);
+            }
+            self.trim.charge(dentry_bytes);
         }
         trace!(
-            "MetaCache::stage_create: inode={} parent={} name={}",
+            "MetaCache::stage_create: inode={} parent={} name={} bytes_ino={} bytes_de={}",
             ino,
             parent_inode,
-            name
+            name,
+            ino_bytes,
+            dentry_bytes
         );
     }
 
@@ -213,7 +397,14 @@ impl MetaCache {
         let mut tbl = self.inode_table.write().unwrap();
         let did_mark = match tbl.get_mut(&inode) {
             Some(existing) => {
+                let old_bytes = estimate_inode_bytes(&existing.info);
                 updater(&mut existing.info);
+                let new_bytes = estimate_inode_bytes(&existing.info);
+                if new_bytes >= old_bytes {
+                    self.trim.charge(new_bytes - old_bytes);
+                } else {
+                    self.trim.release(old_bytes - new_bytes);
+                }
                 existing.state = CacheState::Dirty;
                 existing.touch();
                 true
@@ -221,9 +412,11 @@ impl MetaCache {
             None => {
                 if let Some(mut info) = fallback_current {
                     updater(&mut info);
+                    let new_bytes = estimate_inode_bytes(&info);
                     let ci = CachedInode::new(info, CacheState::Dirty);
                     ci.touch();
                     tbl.insert(inode, ci);
+                    self.trim.charge(new_bytes);
                     true
                 } else {
                     false
@@ -252,9 +445,11 @@ impl MetaCache {
                 // Seed a Deleted tombstone so later reads hit ENOENT without
                 // checking ShardStore. info is unused (Deleted returns None).
                 let tomb = InodeInfo::tombstone(inode);
+                let tomb_bytes = estimate_inode_bytes(&tomb);
                 let ci = CachedInode::new(tomb, CacheState::Deleted);
                 ci.refcount.store(0, Ordering::Relaxed);
                 tbl.insert(inode, ci);
+                self.trim.charge(tomb_bytes);
             }
         }
         // 2. direntry table → state = Deleted
@@ -265,9 +460,11 @@ impl MetaCache {
                 de.state = CacheState::Deleted;
                 de.touch();
             } else {
+                let de_bytes = estimate_dentry_bytes(name);
                 let de = CachedDirEntry::new(inode, CacheState::Deleted);
                 de.touch();
                 tbl.insert(key, de);
+                self.trim.charge(de_bytes);
             }
         }
     }
@@ -297,6 +494,15 @@ impl MetaCache {
                     .fetch_add(1, Ordering::Relaxed);
                 Some(None)
             }
+            CacheState::Trimming => {
+                // Transient eviction-in-progress; treat as miss so caller
+                // goes to ShardStore. A concurrent `cache_put_clean` will
+                // overwrite our Trimming entry with a fresh Clean copy;
+                // that's safe because the trimmer will remove ours in the
+                // same pass (key already marked and won't double-release).
+                self.inode_miss_total.fetch_add(1, Ordering::Relaxed);
+                None
+            }
             _ => {
                 self.inode_hit_total.fetch_add(1, Ordering::Relaxed);
                 Some(Some(ci.info.clone()))
@@ -309,15 +515,33 @@ impl MetaCache {
     /// (i.e. it's Staging/Dirty/Deleted and being actively managed).
     pub fn cache_put_clean(&self, info: InodeInfo) {
         let ino = info.inode;
+        let new_bytes = estimate_inode_bytes(&info);
         let mut tbl = self.inode_table.write().unwrap();
-        let needs_insert = match tbl.get(&ino) {
-            None => true,
-            Some(existing) => existing.state == CacheState::Clean,
-        };
-        if needs_insert {
-            let ci = CachedInode::new(info, CacheState::Clean);
-            tbl.insert(ino, ci);
-            self.backfill_clean_total.fetch_add(1, Ordering::Relaxed);
+        match tbl.get(&ino) {
+            None => {
+                let ci = CachedInode::new(info, CacheState::Clean);
+                tbl.insert(ino, ci);
+                self.trim.charge(new_bytes);
+                self.backfill_clean_total.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(existing)
+                if existing.state == CacheState::Clean
+                    || existing.state == CacheState::Trimming =>
+            {
+                // Replace Clean (refresh) or overwrite Trimming (race where
+                // miss-read concurrently backfills during trim_pass).
+                let old_bytes = estimate_inode_bytes(&existing.info);
+                let ci = CachedInode::new(info, CacheState::Clean);
+                tbl.insert(ino, ci);
+                if new_bytes >= old_bytes {
+                    self.trim.charge(new_bytes - old_bytes);
+                } else {
+                    self.trim.release(old_bytes - new_bytes);
+                }
+                self.backfill_clean_total.fetch_add(1, Ordering::Relaxed);
+            }
+            // Staging/Dirty/Deleted: leave alone; in-flight Raft manages it.
+            _ => {}
         }
     }
 
@@ -341,6 +565,10 @@ impl MetaCache {
                     .fetch_add(1, Ordering::Relaxed);
                 Some(None)
             }
+            CacheState::Trimming => {
+                self.direntry_miss_total.fetch_add(1, Ordering::Relaxed);
+                None
+            }
             _ => {
                 self.direntry_hit_total.fetch_add(1, Ordering::Relaxed);
                 Some(Some(de.child_inode))
@@ -350,16 +578,28 @@ impl MetaCache {
 
     /// Populate a Clean directory entry mapping (read back from ShardStore).
     pub fn cache_put_clean_direntry(&self, parent_inode: u64, name: &str, child_inode: u64) {
+        let de_bytes = estimate_dentry_bytes(name);
         let key = (parent_inode, name.to_string());
         let mut tbl = self.direntry_table.write().unwrap();
-        let needs_insert = match tbl.get(&key) {
-            None => true,
-            Some(existing) => existing.state == CacheState::Clean,
-        };
-        if needs_insert {
-            let de = CachedDirEntry::new(child_inode, CacheState::Clean);
-            tbl.insert(key, de);
-            self.backfill_clean_total.fetch_add(1, Ordering::Relaxed);
+        match tbl.get(&key) {
+            None => {
+                let de = CachedDirEntry::new(child_inode, CacheState::Clean);
+                tbl.insert(key, de);
+                self.trim.charge(de_bytes);
+                self.backfill_clean_total.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(existing)
+                if existing.state == CacheState::Clean
+                    || existing.state == CacheState::Trimming =>
+            {
+                let de = CachedDirEntry::new(child_inode, CacheState::Clean);
+                tbl.insert(key, de);
+                // dentry size estimate is name + constant; we use the same
+                // name so old_bytes == new_bytes up to estimator rounding,
+                // which is acceptable (no-op charge/delta tiny).
+                self.backfill_clean_total.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
     }
 
@@ -403,14 +643,18 @@ impl MetaCache {
     /// Raft applied `DeleteInode` → drop inode cache entry entirely.
     pub fn confirm_delete_inode(&self, inode: u64) {
         let mut tbl = self.inode_table.write().unwrap();
-        tbl.remove(&inode);
+        if let Some(old) = tbl.remove(&inode) {
+            self.trim.release(estimate_inode_bytes(&old.info));
+        }
     }
 
     /// Raft applied `RemoveDirEntry` → drop dir-entry cache entry entirely.
     pub fn confirm_remove_direntry(&self, parent_inode: u64, name: &str) {
         let key = (parent_inode, name.to_string());
         let mut tbl = self.direntry_table.write().unwrap();
-        tbl.remove(&key);
+        if tbl.remove(&key).is_some() {
+            self.trim.release(estimate_dentry_bytes(name));
+        }
     }
 
     // ---------- bulk / recovery ops ----------
@@ -426,7 +670,9 @@ impl MetaCache {
                 .map(|ci| ci.state == CacheState::Staging)
                 .unwrap_or(false);
             if should_remove {
-                tbl.remove(&inode);
+                if let Some(old) = tbl.remove(&inode) {
+                    self.trim.release(estimate_inode_bytes(&old.info));
+                }
             }
         }
         // Clean up direntry: same rule.
@@ -438,7 +684,9 @@ impl MetaCache {
                 .map(|de| de.state == CacheState::Staging)
                 .unwrap_or(false);
             if should_remove {
-                tbl.remove(&key);
+                if tbl.remove(&key).is_some() {
+                    self.trim.release(estimate_dentry_bytes(name));
+                }
             }
         }
     }
@@ -459,7 +707,9 @@ impl MetaCache {
         };
         self.inode_table.write().unwrap().clear();
         self.direntry_table.write().unwrap().clear();
-
+        // HashMap 全部清掉，usage 直接置 0。（下次 put 会重新 charge，
+        // 下一轮 sweep 前有一点误差，无关紧要。）
+        self.trim.current_usage_bytes.store(0, Ordering::Relaxed);
         if inode_count > 0 || de_count > 0 {
             warn!(
                 "MetaCache::invalidate_all: dropped {} inodes + {} dir entries (leader change)",
@@ -475,52 +725,277 @@ impl MetaCache {
     pub fn sweep_expired_deletions(&self, max_age: Duration) {
         let now_ms = now_ms();
 
-        let removed_inodes = {
+        let (removed_inodes, ino_bytes_released) = {
             let mut tbl = self.inode_table.write().unwrap();
             let before = tbl.len();
+            let mut bytes = 0usize;
             tbl.retain(|ino, ci| {
                 if ci.state != CacheState::Deleted {
                     return true;
                 }
-                // Deleted entries don't carry an insert timestamp — reuse
-                // `last_access_ms` as a proxy (it was stamped at insert).
                 let age_ms = now_ms.saturating_sub(ci.last_access_ms.load(Ordering::Relaxed));
-                Duration::from_millis(age_ms) < max_age || {
-                    debug!(
-                        "MetaCache sweep: expired Deleted inode tombstone (ino={})",
-                        ino
-                    );
-                    false
+                if Duration::from_millis(age_ms) < max_age {
+                    return true;
                 }
+                debug!(
+                    "MetaCache sweep: expired Deleted inode tombstone (ino={})",
+                    ino
+                );
+                bytes = bytes.saturating_add(estimate_inode_bytes(&ci.info));
+                false
             });
-            before - tbl.len()
+            (before - tbl.len(), bytes)
         };
 
-        let removed_dirs = {
+        let (removed_dirs, de_bytes_released) = {
             let mut tbl = self.direntry_table.write().unwrap();
             let before = tbl.len();
+            let mut bytes = 0usize;
             tbl.retain(|(parent, name), de| {
                 if de.state != CacheState::Deleted {
                     return true;
                 }
                 let age_ms = now_ms.saturating_sub(de.last_access_ms.load(Ordering::Relaxed));
-                Duration::from_millis(age_ms) < max_age || {
-                    debug!(
-                        "MetaCache sweep: expired Deleted direntry tombstone (parent={}, name={})",
-                        parent, name
-                    );
-                    false
+                if Duration::from_millis(age_ms) < max_age {
+                    return true;
                 }
+                debug!(
+                    "MetaCache sweep: expired Deleted direntry tombstone (parent={}, name={})",
+                    parent, name
+                );
+                bytes = bytes.saturating_add(estimate_dentry_bytes(name));
+                false
             });
-            before - tbl.len()
+            (before - tbl.len(), bytes)
         };
 
-        if removed_inodes > 0 || removed_dirs > 0 {
+        let total_removed = removed_inodes.saturating_add(removed_dirs);
+        if total_removed > 0 {
+            self.trim
+                .deleted_timeout_total
+                .fetch_add(total_removed as u64, Ordering::Relaxed);
+            self.trim
+                .release(ino_bytes_released.saturating_add(de_bytes_released));
             debug!(
-                "MetaCache::sweep_expired_deletions: removed {} inode tombstones + {} direntry tombstones",
-                removed_inodes, removed_dirs
+                "MetaCache::sweep_expired_deletions: removed {} inode tombstones + {} direntry tombstones (freed ~{} bytes)",
+                removed_inodes,
+                removed_dirs,
+                ino_bytes_released.saturating_add(de_bytes_released)
             );
         }
+    }
+
+    // ---------- Phase 2: sweep staging + trim pass ----------
+
+    /// Sweep inode & dentry entries stuck in `Staging` state past
+    /// `TrimController::staging_timeout_ms`.
+    ///
+    /// Symmetric to `sweep_expired_deletions`: if a Raft proposal was made
+    /// but the leader changed before apply returned, the Staging copy may
+    /// never be confirmed; sweeping it out ensures the next read falls
+    /// through to ShardStore (which either has it if the Raft commit
+    /// propagated, or doesn't — the client retries).
+    pub fn sweep_expired_staging(&self) {
+        let now = now_ms();
+        let timeout_ms = self.trim.staging_timeout_ms;
+
+        let (removed_inodes, ino_bytes) = {
+            let mut tbl = self.inode_table.write().unwrap();
+            let before = tbl.len();
+            let mut bytes = 0usize;
+            tbl.retain(|ino, ci| {
+                if ci.state != CacheState::Staging {
+                    return true;
+                }
+                let age = now.saturating_sub(ci.last_access_ms.load(Ordering::Relaxed));
+                if age < timeout_ms {
+                    return true;
+                }
+                debug!(
+                    "MetaCache sweep: expired Staging inode (ino={} age={}ms)",
+                    ino, age
+                );
+                bytes = bytes.saturating_add(estimate_inode_bytes(&ci.info));
+                false
+            });
+            (before - tbl.len(), bytes)
+        };
+
+        let (removed_des, de_bytes) = {
+            let mut tbl = self.direntry_table.write().unwrap();
+            let before = tbl.len();
+            let mut bytes = 0usize;
+            tbl.retain(|(_parent, name), de| {
+                if de.state != CacheState::Staging {
+                    return true;
+                }
+                let age = now.saturating_sub(de.last_access_ms.load(Ordering::Relaxed));
+                if age < timeout_ms {
+                    return true;
+                }
+                bytes = bytes.saturating_add(estimate_dentry_bytes(name));
+                false
+            });
+            (before - tbl.len(), bytes)
+        };
+
+        let total = removed_inodes.saturating_add(removed_des);
+        if total > 0 {
+            self.trim
+                .staging_timeout_total
+                .fetch_add(total as u64, Ordering::Relaxed);
+            self.trim.release(ino_bytes.saturating_add(de_bytes));
+            info!(
+                "MetaCache::sweep_expired_staging: dropped {} inode staging + {} dentry staging (proposal lost? freed ~{} bytes)",
+                removed_inodes,
+                removed_des,
+                ino_bytes.saturating_add(de_bytes)
+            );
+        }
+    }
+
+    /// Single-pass trim: if memory usage is above `high_watermark`, evict
+    /// Clean, refcount == 0 inodes & dentries in LRU order until usage
+    /// falls under `low_watermark`.
+    ///
+    /// Phase 2 implementation: per-entry LRU (not DirFrag). See Phase 4
+    /// section of the design doc for the follow-up DirFrag-granular
+    /// upgrade path.
+    pub fn trim_pass(&self) -> usize {
+        if !self.trim.over_high() {
+            return 0;
+        }
+        let low = self.trim.low_bytes();
+        // ----- Step 1: collect Clean + refcount == 0 candidates, sorted by LRU -----
+        //
+        // We hold the write lock for the whole scan + remove phase. Inode
+        // table & direntry table are both under `RwLock<HashMap<...>>`;
+        // typical trim scans at ~1M entries/sec on modern CPUs, which is
+        // acceptable for a background thread that only runs after memory
+        // is already above 80 % of a 2 GiB ceiling.
+        let mut evicted_total = 0usize;
+        let mut bytes_freed_total = 0usize;
+
+        // Inodes: iterate, mark candidates = Trimming, collect (inode,
+        // last_access, est_bytes). `retain`-after-scan would miss bytes
+        // estimate, so do two passes.
+        let ino_candidates: Vec<(u64, u64, usize)> = {
+            let tbl = self.inode_table.read().unwrap();
+            let mut v = Vec::with_capacity(tbl.len().min(4096 * 16));
+            for (&ino, ci) in tbl.iter() {
+                if ci.state != CacheState::Clean {
+                    continue;
+                }
+                if ci.refcount.load(Ordering::Relaxed) != 0 {
+                    continue;
+                }
+                v.push((
+                    ino,
+                    ci.last_access_ms.load(Ordering::Relaxed),
+                    estimate_inode_bytes(&ci.info),
+                ));
+            }
+            v.sort_unstable_by_key(|(_, ts, _)| *ts); // oldest first (LRU)
+            v
+        };
+        {
+            let mut tbl = self.inode_table.write().unwrap();
+            for (ino, _ts, est_bytes) in ino_candidates.iter().copied() {
+                if self
+                    .trim
+                    .current_usage_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(bytes_freed_total)
+                    <= low
+                {
+                    break;
+                }
+                // Double-check state under write lock (could have become
+                // Dirty/Staging between the read snapshot and now).
+                let should_remove = tbl
+                    .get(&ino)
+                    .map(|ci| {
+                        ci.state == CacheState::Clean && ci.refcount.load(Ordering::Relaxed) == 0
+                    })
+                    .unwrap_or(false);
+                if !should_remove {
+                    continue;
+                }
+                // Atomically mark Trimming then drop. (Marking is optional
+                // here because we're already under write lock; but keeping
+                // the state transition explicit makes the semantics
+                // consistent with concurrent-reads-outside-lock reasoning.)
+                if let Some(entry) = tbl.get_mut(&ino) {
+                    entry.state = CacheState::Trimming;
+                }
+                if let Some(old) = tbl.remove(&ino) {
+                    bytes_freed_total = bytes_freed_total.saturating_add(est_bytes);
+                    evicted_total += 1;
+                    let _ = old; // bytes already accounted via est_bytes above
+                }
+            }
+        }
+
+        // Dentries: same pattern. We don't check a linked inode's refcount
+        // because dentries can outlive or predate their cached inode;
+        // the pair gets trimmed independently (reads handle miss → RocksDB
+        // backfill correctly either way).
+        let de_candidates: Vec<((u64, String), u64, usize)> = {
+            let tbl = self.direntry_table.read().unwrap();
+            let mut v = Vec::with_capacity(tbl.len().min(4096 * 16));
+            for (key, de) in tbl.iter() {
+                if de.state != CacheState::Clean {
+                    continue;
+                }
+                v.push((
+                    key.clone(),
+                    de.last_access_ms.load(Ordering::Relaxed),
+                    estimate_dentry_bytes(&key.1),
+                ));
+            }
+            v.sort_unstable_by_key(|(_, ts, _)| *ts);
+            v
+        };
+        {
+            let mut tbl = self.direntry_table.write().unwrap();
+            for (key, _ts, est_bytes) in de_candidates.into_iter() {
+                if self
+                    .trim
+                    .current_usage_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(bytes_freed_total)
+                    <= low
+                {
+                    break;
+                }
+                let should_remove = tbl
+                    .get(&key)
+                    .map(|de| de.state == CacheState::Clean)
+                    .unwrap_or(false);
+                if !should_remove {
+                    continue;
+                }
+                if tbl.remove(&key).is_some() {
+                    bytes_freed_total = bytes_freed_total.saturating_add(est_bytes);
+                    evicted_total += 1;
+                }
+            }
+        }
+
+        if evicted_total > 0 {
+            self.trim.release(bytes_freed_total);
+            self.trim
+                .trim_total
+                .fetch_add(evicted_total as u64, Ordering::Relaxed);
+            info!(
+                "MetaCache::trim_pass: evicted {} entries (~{} bytes freed; usage now ~{} bytes, low watermark ~{} bytes)",
+                evicted_total,
+                bytes_freed_total,
+                self.trim.current_usage_bytes.load(Ordering::Relaxed),
+                low
+            );
+        }
+        evicted_total
     }
 
     // ---------- stats ----------
@@ -583,13 +1058,23 @@ impl MetaCache {
             stage_delete_total: self.stage_delete_total.load(Relaxed),
             backfill_clean_total: self.backfill_clean_total.load(Relaxed),
             invalidate_all_total: self.invalidate_all_total.load(Relaxed),
+            trim_total: self.trim.trim_total.load(Relaxed),
+            staging_timeout_total: self.trim.staging_timeout_total.load(Relaxed),
+            deleted_timeout_total: self.trim.deleted_timeout_total.load(Relaxed),
+            memory_usage_bytes: self.trim.current_usage_bytes.load(Relaxed) as u64,
+            memory_limit_bytes: self.trim.memory_limit_bytes as u64,
+            memory_high_watermark_bytes: self.trim.high_bytes() as u64,
+            memory_low_watermark_bytes: self.trim.low_bytes() as u64,
             inode_clean_count: *state_counts.get(&CacheState::Clean).unwrap_or(&0),
             inode_staging_count: *state_counts.get(&CacheState::Staging).unwrap_or(&0),
             inode_dirty_count: *state_counts.get(&CacheState::Dirty).unwrap_or(&0),
             inode_deleted_count: *state_counts.get(&CacheState::Deleted).unwrap_or(&0),
+            inode_trimming_count: *state_counts.get(&CacheState::Trimming).unwrap_or(&0),
             direntry_clean_count: *de_counts.get(&CacheState::Clean).unwrap_or(&0),
             direntry_staging_count: *de_counts.get(&CacheState::Staging).unwrap_or(&0),
+            direntry_dirty_count: *de_counts.get(&CacheState::Dirty).unwrap_or(&0),
             direntry_deleted_count: *de_counts.get(&CacheState::Deleted).unwrap_or(&0),
+            direntry_trimming_count: *de_counts.get(&CacheState::Trimming).unwrap_or(&0),
         }
     }
 }
@@ -610,13 +1095,23 @@ pub struct MetaCacheStats {
     pub stage_delete_total: u64,
     pub backfill_clean_total: u64,
     pub invalidate_all_total: u64,
+    pub trim_total: u64,
+    pub staging_timeout_total: u64,
+    pub deleted_timeout_total: u64,
+    pub memory_usage_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub memory_high_watermark_bytes: u64,
+    pub memory_low_watermark_bytes: u64,
     pub inode_clean_count: usize,
     pub inode_staging_count: usize,
     pub inode_dirty_count: usize,
     pub inode_deleted_count: usize,
+    pub inode_trimming_count: usize,
     pub direntry_clean_count: usize,
     pub direntry_staging_count: usize,
+    pub direntry_dirty_count: usize,
     pub direntry_deleted_count: usize,
+    pub direntry_trimming_count: usize,
 }
 
 // ---------- helpers ----------

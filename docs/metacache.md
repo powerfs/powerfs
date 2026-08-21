@@ -1,9 +1,9 @@
 # PowerFS MetaCache 设计方案
 
 > 参考: Ceph MDCache (src/mds/MDCache.{h,cc})
-> 定位: 独立 crate `powerfs-meta-cache`
-> 状态: 规划中
-> 更新: 2026-08-20
+> 定位: `powerfs-filer` crate 内模块（`powerfs-filer/src/meta_cache.rs`）—— 不拆独立 crate，避免 ShardStore/MetaShardManager 反向 trait 依赖
+> 状态: Phase 1 已落地，Phase 2 实施中
+> 更新: 2026-08-21
 
 ## 目录
 
@@ -17,10 +17,10 @@
 - [客户端 Lease/Caps 联动](#客户端-leasecaps-联动)
 - [故障恢复](#故障恢复)
 - [大目录分片 DirFrag](#大目录分片-dirfrag)
-- [crate 结构](#crate-结构)
 - [与现有系统集成](#与现有系统集成)
 - [分阶段实施计划](#分阶段实施计划)
 - [与 Ceph MDCache 对比](#与-ceph-mdcache-对比)
+- [设计 vs 实际实现差异](#设计-vs-实际实现差异)
 
 ---
 
@@ -28,7 +28,9 @@
 
 ### 定位
 
-`powerfs-meta-cache` 是 Filer 端的**内存元数据缓存子系统**，参考 Ceph MDCache 设计，但适配 PowerFS 的 Raft + RocksDB 架构。
+MetaCache 是 Filer 端的**内存元数据缓存子系统**（实现文件：`powerfs-filer/src/meta_cache.rs`），参考 Ceph MDCache 设计，适配 PowerFS 的 Raft + RocksDB 架构。
+
+> ⚠️ 方案变更：设计初稿要求独立 crate `powerfs-meta-cache`，实际落地**不拆独立 crate**。原因：ShardStore 在 Raft apply 回调中需要调用 MetaCache 的 `confirm_*` 接口，MetaShardManager 在写路径中又需要调用 ShardStore；拆 crate 会引入 ShardStore 反向依赖 MetaCache trait 的循环耦合问题，得不偿失。直接同 crate 内模块可以双向调用，保持调用路径简单。
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -77,48 +79,42 @@
 
 ## 架构总览
 
+> ℹ️ 实际落地与下图略有出入：DashMap 改为 `RwLock<HashMap>`（并发场景足够，避免引入 dashmap 依赖），`dirfrag_table` / `staging_queue` / `deleted_markers` / `TrimController` 目前暂未实现（分别对应 Phase 4 / Phase 2），其职责已简化：
+> - staging/deleted 状态直接存在 `CachedInode.state` / `CachedDirEntry.state`，无需独立 markers。
+> - 淘汰以单个 inode/dentry 为单位（Phase 2A 先实现），DirFrag 粒度淘汰放到 Phase 4。
+> 参见文末 [设计 vs 实际实现差异](#设计-vs-实际实现差异)。
+
 ```
-                         powerfs-meta-cache crate
+                 MetaCache (powerfs-filer/src/meta_cache.rs)
                     ┌────────────────────────────────┐
                     │                                │
                     │  MetaCache                     │
                     │    │                           │
                     │    ├── inode_table             │
-                    │    │    DashMap<Inode, CachedInode>
+                    │    │    RwLock<HashMap<u64,    │
+                    │    │                  CachedInode>>
                     │    │                           │
-                    │    ├── dirfrag_table           │
-                    │    │    DashMap<DirFragId, DirFrag>
-                    │    │      DirFrag {            │
-                    │    │        dentries: BTreeMap<Name, Dentry>,
-                    │    │        state: Clean|Dirty|Staging|Trimming,
-                    │    │        lru_score: f64,    │
-                    │    │      }                    │
+                    │    ├── direntry_table          │
+                    │    │    RwLock<HashMap<(u64,String),
+                    │    │                     CachedDirEntry>>
                     │    │                           │
-                    │    ├── staging_queue            │
-                    │    │    VecDeque<(Inode, Instant)>
-                    │    │    待 Raft apply 的创建    │
+                    │    ├── 11 Atomic counters     │
+                    │    │    (hit/miss/dirty/delete/backfill/
+                    │    │     invalidate)           │
                     │    │                           │
-                    │    ├── deleted_markers          │
-                    │    │    DashMap<Inode, Instant> │
-                    │    │    待 Raft apply 的删除    │
-                    │    │                           │
-                    │    └── trim_controller           │
-                    │         memory_limit: usize,   │
-                    │         current_usage: AtomicUsize,
-                    │         reservation: usize,    │
-                    │         mid: f64,              │
-                    │                                │
-                    │  DirFragId = (ParentInode, FragId)
-                    │  FragId = u32 (0 = 完整目录, >0 = 分片)
+                    │    └── TrimController (Phase 2)│
+                    │         memory_limit,          │
+                    │         current_usage (Atomic) │
+                    │         high/low watermark     │
                     │                                │
                     └────────────┬───────────────────┘
                                  │
                     ┌────────────┼───────────────────┐
                     │            │                   │
                     ▼            ▼                   ▼
-              RaftGroupMgr   ShardStore        LeaseManager
-              (propose_ff    (RocksDB          (recall
-               propose)       get/put)          client lease)
+              RaftGroupMgr   ShardStore        InodeLeaseManager
+              (propose;        (RocksDB          (recall path Phase 3,
+               confirm_* cb)    get/put)          refcount 字段预埋)
 ```
 
 ---
@@ -923,54 +919,68 @@ use powerfs_meta_cache::MetaCache;
 
 ## 分阶段实施计划
 
-### 阶段 1: 基础缓存层 (MVP)
+### 阶段 1: 基础缓存层 (MVP) — ✅ 已落地（2026-08-21 代码已提交至 `private/lock-optimization`，E2E 14+17 项通过）
 
-**目标**: 替换现有简单 meta_cache.rs，提供 staging + 读加速
+**目标**: 替换简单 meta_cache 读直通，提供 staging + Dirty 追踪 + read-visible + 跨 shard 子目录信息 + 指标。
 
-- [ ] 创建 `powerfs-meta-cache` crate
-- [ ] 实现 `MetaCache` 基本结构（inode_table + dirfrag_table）
-- [ ] 实现 `stage_create()` / `get_inode()` / `get_direntry()`
-- [ ] 实现 `stage_delete()` / `deleted_markers`
-- [ ] 实现 `confirm_*()` 回调
-- [ ] 实现 `invalidate_all()` (leader 切换)
-- [ ] 集成到 `MetaShardManager`
-- [ ] 验证: 创建后立即可读 + leader 切换后 staging 清除
+> ℹ️ 方案调整：原"创建独立 crate `powerfs-meta-cache`"已**取消**，MetaCache 作为 `powerfs-filer/src/meta_cache.rs` 模块存在（避免 ShardStore 与 MetaCache 双向调用的 trait 耦合问题）。
 
-### 阶段 2: 缓存淘汰
+- [x] **四态状态机**：`CacheState { Clean, Staging, Dirty, Deleted }` 定义 + [CachedInode](file:///home/portion/powerfs/powerfs-filer/src/meta_cache.rs#L60-L77) + [CachedDirEntry](file:///home/portion/powerfs/powerfs-filer/src/meta_cache.rs#L101-L105)
+- [x] **创建 staging**: `stage_create_inode` / `stage_create_direntry` + `stage_delete` / `stage_delete_direntry` + `mark_dirty` + `mark_dirty_direntry` → MetaShardManager 写路径调用
+- [x] **读命中返回 + miss 回填**：`get_inode` ([meta_cache.rs:263-L310](file:///home/portion/powerfs/powerfs-filer/src/meta_cache.rs#L263-L310)) 三段式 (`Some(Some)` / `Some(None)` / `None` → 回填)，`cache_put_clean` / `cache_put_clean_direntry`
+- [x] **Deleted 墓碑**：`sweep_expired_deletions` ([meta_cache.rs:474-L523](file:///home/portion/powerfs/powerfs-filer/src/meta_cache.rs#L474-L523)) — propose 丢失超时清除
+- [x] **Raft apply 确认回调**：`confirm_create_inode/direntry`、`confirm_dirty_inode`、`confirm_delete_inode/direntry`、`confirm_remove_direntry` → ShardStore `apply_command` 回调
+- [x] **Leader 切换失效**：`invalidate_all` ([meta_cache.rs:419](file:///home/portion/powerfs/powerfs-filer/src/meta_cache.rs#L419-L443)) — cache_epoch bump 触发，移除 Staging/Dirty/Deleted，防止旧 leader 数据外泄
+- [x] **MetaShardManager 集成**：所有 CreateInode/AddDirEntry/SetAttr/Unlink/Rmdir/Rename 路径接入 stage/confirm + meta_cache getter
+- [x] **P3.1 SetAttr 消亡**：`ShardCommand::CreateInode` 内联 mode/uid/gid，不再额外 SetAttr Raft round（[verify_p31_setattr_elimination.sh](file:///home/portion/powerfs/scripts/tests/perf/verify_p31_setattr_elimination.sh) 14/14 PASS）
+- [x] **P4 Cache Trust Open**：Fuse `open()` 非 Stale + chunks 非空 → 跳过 Filer refresh（[fuse.rs:3588-L3615](file:///home/portion/powerfs/powerfs-fuse/src/fuse.rs#L3588-L3615)）
+- [x] **DirStatSummary 跨 shard 子目录信息**：`CF_CHILD_SUMMARIES` RocksDB 列族 + Raft `UpdateChildSummary` + cross-shard readdir 聚合（避免 `ls -l` 跨 shard getattr）
+- [x] **GC Orphan Inode 三保险**：年龄 / Parent Ownership / dentry+DirStatSummary 双不存在
+- [x] **NetHandler 非 Leader → REDIRECT(11)**：`build_err_redirect_or_server` + 12 条写 handler 接入，绝不服务间转发
+- [x] **Fuse 客户端配合**：TopologyUpdateListener 动态 shard_router 更新（无需重启）、Self-Redirect Guard（Learner 选举 x2 backoff）、readdir attrs → Stale 缓存
+- [x] **Prometheus 指标 + Admin JSON API**：11 累计 counters + 7 state counts → `/admin/meta-cache-stats` JSON + `/metrics` `powerfs_filer_mc_*` 前缀 IntGauges
+- [x] **验证脚本**：[verify_metacache_e2e.sh](file:///home/portion/powerfs/scripts/tests/perf/verify_metacache_e2e.sh) T1-T7 17/17 PASS；[verify_dynamic_shard_router.sh](file:///home/portion/powerfs/scripts/tests/perf/verify_dynamic_shard_router.sh) T1-T3 PASS
 
-**目标**: 内存可控，支持大容量缓存
+### 阶段 2: 缓存淘汰 — 🚧 实施中（本轮推进：内存计数 + Staging sweep + 定时 Trim）
 
-- [ ] 实现 `TrimController`（内存计数 + 水位）
-- [ ] 实现 DirFrag 粒度淘汰
-- [ ] 实现 staging/deleted 超时 sweep
-- [ ] 实现定时 trim 线程
-- [ ] 验证: 100万 inode 内存不爆 + trim 正确淘汰
+**目标**: 内存可控，支持大容量缓存（≤100 万 inode 不爆内存）
 
-### 阶段 3: 客户端 Lease Recall 联动
+- [ ] 实现 `TrimController`（内存计数 + 高/低水位）
+- [ ] 实现 **staging 超时 sweep**（与 deleted sweep 对称，propose 丢失超过 `staging_timeout` 清除）
+- [ ] 实现 **定时 trim 线程**：按 LRU 扫描，优先淘汰 Clean 条目，`refcount > 0` 不淘汰
+- [ ] 实现 **单条目粒度淘汰**（先不做 DirFrag，DirFrag 放 Phase 4）
+- [ ] 验证: 100万 inode 内存不爆 + trim 正确淘汰（RocksDB 备份）
 
-**目标**: 内存压力时 recall 客户端 lease
+> ℹ️ 方案调整：原计划首版即上 DirFrag 粒度淘汰，实际为保持 MVP 稳定，Phase 2 先做**单条目粒度**淘汰（Phase 4 再升级到 DirFrag 分片淘汰），避免 3 者联动改动过大。
 
-- [ ] 实现 lease recall 机制
-- [ ] FUSE 客户端处理 recall 消息
-- [ ] refcount 追踪
-- [ ] 验证: recall 后客户端丢弃缓存 + refcount 下降
+### 阶段 3: 客户端 Lease Recall 联动 — 📋 规划中（Phase 2 完成后启动）
 
-### 阶段 4: 大目录分片
+**目标**: 内存压力时主动 recall 客户端 FUSE lease，释放 `refcount` 以便 Filer 本地淘汰更多条目。
 
-**目标**: 支持百万级子项目录
+- [ ] TrimController 中水位 → 发送 lease recall 消息
+- [ ] FUSE 客户端处理 recall 消息（主动 invalidate 条目）
+- [ ] `CachedInode.refcount` 与 InodeLeaseManager 联动（字段已预埋）
+- [ ] 验证: recall 后客户端丢弃缓存 + refcount 下降 → Filer 可淘汰这些条目
 
-- [ ] 实现 DirFrag 分裂逻辑
-- [ ] 实现流式 readdir
-- [ ] 验证: 100万子项目录 readdir 不 OOM
+### 阶段 4: 大目录分片 DirFrag — 📋 规划中（Phase 3 完成后启动）
 
-### 阶段 5: Follower 缓存优化
+**目标**: 支持百万级子项目录的 readdir 流式返回 + DirFrag 粒度淘汰
 
-**目标**: Follower 服务读请求，优先淘汰非 Auth
+- [ ] `DirFragId = (ParentInode, FragId)` + `DirFrag { dentries: BTreeMap, state, lru_score }`
+- [ ] 子项数 ≥ `large_dir_threshold` 分裂 DirFrag
+- [ ] RocksDB CF: `CF_DIRFRAG` 存分片元数据
+- [ ] Trim 以 DirFrag 整体为单元卸载（卸载分片内所有 dentry）
+- [ ] 流式 readdir: 按分片迭代，避免加载整个目录到内存
+- [ ] 验证: 100万子项目录 readdir 不 OOM + DirFrag 粒度正确卸载
 
-- [ ] Follower 从 Raft apply 填充缓存
-- [ ] trim 优先淘汰非 Auth
-- [ ] 验证: Follower 读加速 + Auth/非Auth 淘汰优先级
+### 阶段 5: Follower 缓存优化 — 📋 规划中（Phase 4 完成后启动）
 
+**目标**: Follower 服务本地读请求（降低 Leader 压力），优先淘汰非 Auth 元数据
+
+- [ ] Follower Raft apply 回调同步填 MetaCache Clean（目前 confirm_* 只在 Leader 上有意义，需判定角色）
+- [ ] `TrimController` 中 `is_auth` 权重：非 Auth → 优先淘汰，Auth → 后淘汰
+- [ ] REDIRECT 机制允许 Follower 直接返回读缓存命中（需加"只读缓存命中"判断，写仍 REDIRECT）
+- [ ] 验证: Follower 读加速 + Auth/非Auth 淘汰优先级正确
 ---
 
 ## 与 Ceph MDCache 对比
@@ -994,12 +1004,13 @@ use powerfs_meta_cache::MetaCache;
 1. **Rust 内存安全**: 无 C++ 的手动内存管理风险
 2. **Raft 强一致**: leader lease 代替复杂分布式锁
 3. **RocksDB LSM-Tree**: range scan 高效，天然支持流式 readdir
-4. **DashMap 无锁读**: 高并发读性能
+4. **RwLock<HashMap>**: 保持 Rust std 依赖干净，并发读场景已足够，无额外第三方 dashmap 依赖
 
 ### PowerFS 的劣势
 
 1. **序列化开销**: miss 时需反序列化（Ceph 内存原生对象无此开销）
 2. **无实时 standby-replay**: Filer 故障切换依赖 Raft 重新选举，非热备
+3. **Phase 2-5 未全部实施**: 目前已落地 Phase 1 MVP + P3.1/P4/Topology 优化，Trim/Recall/DirFrag/Follower 优化后续迭代上线
 
 ---
 
@@ -1019,18 +1030,39 @@ deleted_timeout = "10s"       # deleted 标记超时
 trim_interval = "5s"          # trim 检查间隔
 ```
 
-### Prometheus 指标
+### Prometheus 指标（✅ 已落地：11 个累计 IntGauge + 7 个 state-count IntGauge）
+
+> 实际指标前缀：`powerfs_filer_mc_*`（通过共享 registry 暴露在 `/metrics`；`/admin/meta-cache-stats` 返回 JSON snapshot）。
 
 ```
-powerfs_metacache_inode_count{state="clean"}      # Clean inode 数
-powerfs_metacache_inode_count{state="staging"}    # Staging inode 数
-powerfs_metacache_inode_count{state="dirty"}      # Dirty inode 数
-powerfs_metacache_inode_count{state="deleted"}    # Deleted inode 数
-powerfs_metacache_dirfrag_count                   # DirFrag 数
-powerfs_metacache_memory_bytes                    # 当前内存使用
-powerfs_metacache_trim_total                      # trim 次数
-powerfs_metacache_recall_total                    # lease recall 次数
-powerfs_metacache_staging_timeout_total           # staging 超时次数
+# 累计计数器（counters, IntGauge 镜像 AtomicU64）
+powerfs_filer_mc_inode_hits                 # inode 读命中
+powerfs_filer_mc_inode_misses               # inode 读未命中 → 回填
+powerfs_filer_mc_inode_deleted_served       # inode Deleted 墓碑命中 → 返回 ENOENT
+powerfs_filer_mc_direntry_hits              # dentry 读命中
+powerfs_filer_mc_direntry_misses            # dentry 读未命中 → 回填
+powerfs_filer_mc_direntry_deleted_served    # dentry Deleted 墓碑命中 → 返回 ENOENT
+powerfs_filer_mc_dirty_marks                # 写入 dirty 标记次数
+powerfs_filer_mc_dirty_confirms             # Raft apply 后 dirty→clean 次数
+powerfs_filer_mc_stage_deletes              # 写入 Deleted 标记次数
+powerfs_filer_mc_backfill_clean             # RocksDB miss 后回填 clean 次数
+powerfs_filer_mc_invalidates                # invalidate_all（leader 切换）次数
+
+# 状态计数（state counts）
+powerfs_filer_mc_inode_states{state="clean"}     # Clean inode 数
+powerfs_filer_mc_inode_states{state="staging"}   # Staging inode 数
+powerfs_filer_mc_inode_states{state="dirty"}     # Dirty inode 数
+powerfs_filer_mc_inode_states{state="deleted"}   # Deleted inode 数
+powerfs_filer_mc_direntry_states{state="clean"}  # Clean dentry 数
+powerfs_filer_mc_direntry_states{state="staging"}# Staging dentry 数
+powerfs_filer_mc_direntry_states{state="dirty"}  # Dirty dentry 数
+# （Deleting dentry 数计入 inode deleted_states，由 sweep_expired_deletions 定期清理）
+
+# 规划中（Phase 2/3/5）
+# powerfs_filer_mc_memory_bytes                    # 当前内存使用
+# powerfs_filer_mc_trim_total                      # trim 次数
+# powerfs_filer_mc_recall_total                    # lease recall 次数
+# powerfs_filer_mc_staging_timeout_total           # staging 超时次数
 ```
 
 ### 相关文档
@@ -1039,3 +1071,22 @@ powerfs_metacache_staging_timeout_total           # staging 超时次数
 - [dir-lease-design.md](dir-lease-design.md) — 目录级 lease 设计
 - [shard-routing-no-forward-principle.md](shard-routing-no-forward-principle.md) — 分片路由原则
 - [lock-optimization-plan.md](lock-optimization-plan.md) — 锁优化方案
+
+---
+
+## 设计 vs 实际实现差异
+
+| 维度 | 设计初稿（2026-08-20） | 实际落地（2026-08-21，`private/lock-optimization`） |
+|------|----------------------|--------------------------------------------------|
+| **crate 结构** | 独立 `powerfs-meta-cache` crate，依赖反向 trait | ✅ **已取消独立 crate**，直接作为 `powerfs-filer/src/meta_cache.rs` 模块，避免 ShardStore ↔ MetaCache 双向 trait 耦合。见 [定位章节](#定位)。 |
+| **并发容器** | `DashMap<Inode, CachedInode>` + `DashMap<DirFragId, DirFrag>` | ✅ **改为 `parking_lot::RwLock<HashMap>`**：保持 std 依赖干净，Filer 读场景读锁竞争可接受；不引入 dashmap 依赖。 |
+| **DirFrag 表** | `dirfrag_table: DashMap<DirFragId, DirFrag>` 存在 | ⏳ **推迟到 Phase 4**：目前 dentry 直接存在 `direntry_table` 的 `(parent_inode, name)` → `CachedDirEntry`，Phase 2 先实现**单条目粒度 trim**，Phase 4 再上线 DirFrag 分片淘汰。 |
+| **Staging 队列** | `staging_queue: VecDeque<(Inode, Instant)>` 独立队列 | ✅ **合并到 state 字段**：`CachedInode.state = Staging` 即表示 staging；`last_access_ms` 用作过期估计，无需单独队列减少内存。 |
+| **Deleted markers** | `deleted_markers: DashMap<Inode, Instant>` 独立表 | ✅ **合并到 state 字段**：`CachedInode.state = Deleted` 即表示墓碑（读返回 ENOENT）；`sweep_expired_deletions` 定期清理超时墓碑。 |
+| **CacheState 枚举** | 5 态：`Clean / Staging / Dirty / Deleted / Trimming` | ✅ **当前 4 态**（不含 `Trimming`）：Phase 2 实现 trim 时再加 `Trimming` 临时态（避免淘汰中的条目重复被读回填而冲突）。 |
+| **CachedInode 字段** | 含 `dirfrag_id: DirFragId`、`is_auth: bool` | ✅ **已预埋 refcount/last_access_ms，未预埋 dirfrag_id/is_auth**：refcount 字段用于 Phase 3 recall 联动；dirfrag_id/is_auth 随 Phase 4/5 再追加。 |
+| **TrimController** | 设计中有完整结构 | ⏳ **Phase 2 正在实施**：本轮将上线 memory_limit/high_watermark/low_watermark、current_usage Atomic、trim_pass() 定时扫描。 |
+| **Prometheus 前缀** | `powerfs_metacache_*` | ✅ **改为 `powerfs_filer_mc_*`**：与现有 `powerfs_filer_*` 命名空间一致，方便 Grafana 面板聚合。 |
+| **跨 shard 子目录** | 未在 MetaCache 设计文档单列 | ✅ **补充实现（DirStatSummary）**：设计文档"大目录分片"原未提及，但 DirStatSummary 作为 Phase 1 跨 shard `ls -l` 优化核心组件已落地，避免 N 次 cross-shard getattr RPC。 |
+| **客户端路由** | 未在 MetaCache 设计文档单列 | ✅ **补充实现**：TopologyUpdateListener 动态更新 shard_router/shard_map（无需 Fuse 重启）+ Self-Redirect Guard 防重试耗尽。 |
+| **Docker 构建** | 未在 MetaCache 设计文档单列 | ✅ **补充实现**：`docker/Dockerfile` 支持 `BUILD_BINS=0` 默认构建，避免旧镜像 binary 污染，必须 volume mount 主机编译产物。 |
