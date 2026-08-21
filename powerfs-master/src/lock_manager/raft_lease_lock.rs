@@ -71,6 +71,7 @@ impl RaftLeaseLockManager {
         }
     }
 
+    #[allow(clippy::result_unit_err)]
     pub async fn acquire(&self, key: &str, ttl: Duration) -> Result<LeaseLockGuard, ()> {
         let holder = format!("{:?}:{}", std::thread::current().id(), uuid::Uuid::new_v4());
 
@@ -95,6 +96,7 @@ impl RaftLeaseLockManager {
         })
     }
 
+    #[allow(clippy::result_unit_err)]
     pub async fn renew(&self, key: &str, holder: &str) -> Result<(), ()> {
         if let Some(state) = self.active_locks.write().unwrap().get_mut(key) {
             if state.holder == holder {
@@ -109,6 +111,7 @@ impl RaftLeaseLockManager {
         }
     }
 
+    #[allow(clippy::result_unit_err)]
     pub async fn release(&self, key: &str, holder: &str) -> Result<(), ()> {
         let mut map = self.active_locks.write().unwrap();
         if let Some(state) = map.get(key) {

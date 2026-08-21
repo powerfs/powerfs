@@ -316,8 +316,10 @@ impl TlvMasterClient {
                         let shard_blob = dec.next_bytes(FieldId::ShardIdList).unwrap_or_default();
                         // shard_blob is a packed little-endian u64 array.
                         let shard_ids = shard_blob
-                            .chunks_exact(8)
-                            .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|c| u64::from_le_bytes(*c))
                             .collect();
                         filers.push(FilerRoute {
                             address,
@@ -338,11 +340,10 @@ impl TlvMasterClient {
             // from_shard_count(total_shards).
             let entries_blob = dec.next_bytes(FieldId::ShardMapEntries).unwrap_or_default();
             shard_map_entries = entries_blob
-                .chunks_exact(25)
+                .as_chunks::<25>()
+                .0
+                .iter()
                 .filter_map(|c| {
-                    if c.len() < 25 {
-                        return None;
-                    }
                     let range_start = u64::from_le_bytes(c[0..8].try_into().ok()?);
                     let range_end = u64::from_le_bytes(c[8..16].try_into().ok()?);
                     let shard_id = u64::from_le_bytes(c[16..24].try_into().ok()?);

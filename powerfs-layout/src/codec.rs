@@ -605,8 +605,10 @@ fn decode_volume_ids(bytes: &[u8]) -> LayoutResult<Vec<u64>> {
         )));
     }
     Ok(bytes
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect())
 }
 
@@ -622,8 +624,10 @@ fn decode_volume_ids_from(bytes: &[u8], offset: usize, count: usize) -> LayoutRe
         ))
     })?;
     Ok(slice
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect())
 }
 
@@ -650,7 +654,7 @@ fn decode_chunk_list(bytes: &[u8], offset: usize, count: usize) -> LayoutResult<
     })?;
 
     let mut chunks = Vec::with_capacity(count);
-    for chunk_bytes in slice.chunks_exact(CHUNK_REF_SIZE) {
+    for chunk_bytes in slice.as_chunks::<CHUNK_REF_SIZE>().0 {
         chunks.push(ChunkRef {
             offset: u64::from_le_bytes(chunk_bytes[0..8].try_into().unwrap()),
             size: u64::from_le_bytes(chunk_bytes[8..16].try_into().unwrap()),

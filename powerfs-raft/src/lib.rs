@@ -18,6 +18,7 @@
 
 // ---- 阶段 2：proto 生成 ----
 pub mod protobuf {
+    #![allow(clippy::result_large_err)]
     tonic::include_proto!("powerfs_raftpb");
 }
 

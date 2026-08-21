@@ -690,8 +690,10 @@ impl MasterNetHandler {
         // Only register if the filer provided discovery info (addr + shard_ids).
         if !filer_addr.is_empty() && !filer_id.is_empty() {
             let shard_ids: Vec<u64> = shard_ids_blob
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0u8; 8])))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
                 .collect();
 
             // ---- shard_count consistency check ----
