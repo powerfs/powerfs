@@ -677,6 +677,30 @@ pub enum MsgType {
     /// `powerfs_common::dynamic_log`.
     GetDebugConfig = 0x0089,
 
+    // ===== Capability (Cap) model — §13 Capability 模型 =====
+    // Client → Filer: request caps for an open() call. Always succeeds
+    // (open never blocks). Response carries granted caps + token + epoch.
+    // Request TLV: Ino + ClientId + IsWriteOpen(u8)
+    // Response TLV: Status + LeaseToken + CapSet(u8) + LeaseEpoch(u64) + SN(u64)
+    CapOpenGrant = 0x0091,
+    // Client → Filer: acknowledge a cap recall (flush done, caps released).
+    // Request TLV: Ino + ClientId + LeaseToken. Response: STATUS only.
+    CapRecallAck = 0x0092,
+    // Client → Filer: release caps on close(). Triggers upgrade detection.
+    // Request TLV: Ino + ClientId + LeaseToken. Response: STATUS +
+    // (optional) UpgradeTask if a surviving writer is upgraded.
+    CapRelease = 0x0093,
+    // Filer → Client (push): recall notification. Tells the client which
+    // caps to release and what to retain. Client must flush dirty data
+    // (if CAP_W recalled) then send CapRecallAck.
+    // Notification TLV: Ino + LeaseToken + CapSet(recall) + CapSet(retained) + LeaseEpoch
+    CapRecallNotify = 0x0094,
+    // Filer → Client (push): upgrade notification. Tells a SHARED_WRITE
+    // writer it's been promoted back to EXCLUSIVE_WRITE (can resume local
+    // caching). Carries new caps + epoch + SN.
+    // Notification TLV: Ino + LeaseToken + CapSet(granted) + LeaseEpoch + SN
+    CapUpgradeNotify = 0x0095,
+
     // Raft inter-node operations
     /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
     /// to the peer that leads the target shard group.
@@ -750,6 +774,11 @@ impl MsgType {
             0x0087 => Some(Self::RenewInodeLease),
             0x0088 => Some(Self::RevokeInodeLeaseAck),
             0x0089 => Some(Self::GetDebugConfig),
+            0x0091 => Some(Self::CapOpenGrant),
+            0x0092 => Some(Self::CapRecallAck),
+            0x0093 => Some(Self::CapRelease),
+            0x0094 => Some(Self::CapRecallNotify),
+            0x0095 => Some(Self::CapUpgradeNotify),
             0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
@@ -785,6 +814,12 @@ impl MsgType {
                 | MsgType::ReleaseInodeLease
                 | MsgType::RenewInodeLease
                 | MsgType::RevokeInodeLeaseAck
+                // §13 Cap model — same lock channel for priority routing
+                | MsgType::CapOpenGrant
+                | MsgType::CapRecallAck
+                | MsgType::CapRelease
+                | MsgType::CapRecallNotify
+                | MsgType::CapUpgradeNotify
         )
     }
 }
@@ -1079,6 +1114,26 @@ pub enum FieldId {
     FlagName = 0xC2,
     /// Flag enabled (u8, 0/1). GetDebugConfig 响应中每个开关的状态。
     FlagOn = 0xC3,
+
+    // ===== Capability (Cap) model fields (0xC4-0xC8) — §13 =====
+    /// CapSet bitfield (u8). CAP_R=0b001, CAP_W=0b010, CAP_X=0b100, EXCLUSIVE=0b111.
+    /// Used in CapOpenGrant response, CapRecallNotify, CapUpgradeNotify.
+    CapSet = 0xC4,
+    /// Fencer epoch (u64). Increments on every recall/force-reclaim so
+    /// stale IO from an unresponsive client is fenced off by the storage layer.
+    CapEpoch = 0xC5,
+    /// IsWriteOpen flag (u8, 0/1). CapOpenGrant request: 1 = O_WRONLY/O_RDWR,
+    /// 0 = O_RDONLY. Determines whether the server grants EXCLUSIVE caps
+    /// (single writer) or CAP_R (reader).
+    IsWriteOpen = 0xC6,
+    /// Global sequence number (u64). Allocated by the filer leader on every
+    /// cap grant. Orders IO across cap handoffs so a rolled-back grant's
+    /// IO is sequenced behind the new grant's IO (§5.2 / §13.6.1).
+    CapSn = 0xC7,
+    /// Has-upgrade flag (u8, 0/1). CapRelease response: 1 if a surviving
+    /// writer was upgraded to EXCLUSIVE_WRITE, followed by upgrade fields
+    /// (LeaseToken + CapSet + CapEpoch + CapSn). 0 = no upgrade.
+    HasUpgrade = 0xC8,
 }
 
 impl FieldId {
@@ -1189,6 +1244,11 @@ impl FieldId {
             0xC1 => Some(Self::TargetFilter),
             0xC2 => Some(Self::FlagName),
             0xC3 => Some(Self::FlagOn),
+            0xC4 => Some(Self::CapSet),
+            0xC5 => Some(Self::CapEpoch),
+            0xC6 => Some(Self::IsWriteOpen),
+            0xC7 => Some(Self::CapSn),
+            0xC8 => Some(Self::HasUpgrade),
             _ => None,
         }
     }

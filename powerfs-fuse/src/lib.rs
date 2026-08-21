@@ -1,5 +1,6 @@
 pub mod admin_server;
 pub mod cache;
+pub mod client_cap;
 pub mod fuse;
 pub mod invalidate_handler;
 pub mod lock_backend;

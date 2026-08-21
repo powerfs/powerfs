@@ -4,6 +4,7 @@
 //! using MetaShardManager, which is the authoritative metadata manager with sharded
 //! storage, Raft consensus, and strong consistency metadata operations.
 
+use crate::cap_manager::{CapManager, CapRevoker, CapSet, RecallTimeoutPenalty};
 use crate::inode_lease_manager::InodeLeaseManager;
 use crate::inode_notifier::InodeNotifier;
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
@@ -17,12 +18,14 @@ use powerfs_layout::layout::FileLayout;
 use powerfs_layout::placement::{Placement, PlacementSpec};
 use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityState};
 use powerfs_net::serialize::{decode_setattr_req, EntryInfo, TlvDecoder, TlvEncoder};
+use powerfs_net::server_connection::ServerConnectionManager;
 use powerfs_net::{
     ClientType, FieldId, MsgType, NetError, NetHandler, NetMessage, NetResult, RequestContext,
     STATUS_ERR_BAD_REQUEST, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR,
     STATUS_OK,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// Zone 运行时状态 (Filer 持有, 每个 Zone 独立 counter + volume 列表)
 struct ZoneState {
@@ -48,6 +51,94 @@ impl crate::early_grant::RevokeTimeoutPenalty for HealthPenaltyBridge {
     }
 }
 
+/// §13 Cap model penalty bridge — mirrors `HealthPenaltyBridge` but for
+/// the cap manager's `RecallTimeoutPenalty` trait. When the filer
+/// force-reclaims caps because the holder didn't ACK a recall within 2s,
+/// this penalizes the holder's health score.
+#[derive(Clone)]
+struct HealthCapPenaltyBridge {
+    health: Arc<powerfs_lock_health::ClientHealth>,
+}
+
+impl RecallTimeoutPenalty for HealthCapPenaltyBridge {
+    fn on_recall_ack_timeout(&self, client_id: &str) {
+        self.health.record_revoke_ack_timeout(client_id);
+    }
+}
+
+/// §13 Net-layer `CapRevoker` implementation. Pushes `CapRecallNotify`
+/// messages to clients via `ServerConnectionManager::send_notification`.
+///
+/// Maintains a `String → u64` client_id mapping (populated on
+/// `CapOpenGrant`) because the cap manager uses string client_ids but
+/// the net layer uses u64 connection IDs.
+struct NetCapRevoker {
+    conn_mgr: Arc<ServerConnectionManager>,
+    client_id_map: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl CapRevoker for NetCapRevoker {
+    fn recall(
+        &self,
+        inode: u64,
+        holder: &str,
+        token: &str,
+        caps_to_recall: CapSet,
+        retained_caps: CapSet,
+        new_epoch: u64,
+    ) -> Result<(), String> {
+        let net_client_id = {
+            let map = self.client_id_map.lock().unwrap();
+            map.get(holder).copied()
+        };
+        let net_client_id = net_client_id
+            .ok_or_else(|| format!("no net connection for cap holder '{}'", holder))?;
+
+        // Build CapRecallNotify TLV: Ino + LeaseToken + CapSet(recall) +
+        // CapSet(retained) + CapEpoch.
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_u64(FieldId::Ino, inode);
+        let _ = enc.add_string(FieldId::LeaseToken, token);
+        let _ = enc.add_u8(FieldId::CapSet, caps_to_recall.0);
+        // Retained caps encoded as a second CapSet field — but TLV allows
+        // duplicate field ids, so we use a distinct encoding: pack both
+        // into a single byte (recall in high nibble, retained in low).
+        // Simpler: use CapEpoch as separator and add retained as CapSet again.
+        // Actually cleanest: encode retained in a separate field. We reuse
+        // CapSet field id but the client decoder reads them in order.
+        // To avoid ambiguity, pack recall+retained into one byte: recall
+        // in bits 0-3, retained in bits 4-7.
+        let packed = (caps_to_recall.0 & 0x0F) | ((retained_caps.0 & 0x0F) << 4);
+        let _ = enc.add_u8(FieldId::IsWriteOpen, packed); // repurpose as packed caps
+        let _ = enc.add_u64(FieldId::CapEpoch, new_epoch);
+
+        let msg = NetMessage::notification(MsgType::CapRecallNotify, enc.into_bytes(), Vec::new());
+
+        match self.conn_mgr.send_notification(net_client_id, msg) {
+            Ok(true) => {
+                log::info!(
+                    "CapRecallNotify: pushed to client {} (inode={}, token={}, recall={:?}, retained={:?}, epoch={})",
+                    holder,
+                    inode,
+                    token,
+                    caps_to_recall,
+                    retained_caps,
+                    new_epoch
+                );
+                Ok(())
+            }
+            Ok(false) => Err(format!(
+                "cap recall notification channel full for client {}",
+                holder
+            )),
+            Err(e) => Err(format!(
+                "cap recall notification failed for client {}: {}",
+                holder, e
+            )),
+        }
+    }
+}
+
 /// Filer Net Handler implementation
 pub struct FilerNetHandler {
     pub meta_shard_manager: Arc<MetaShardManager>,
@@ -64,6 +155,19 @@ pub struct FilerNetHandler {
     /// §6.3 P1) — for now state lives only in memory and is lost on leader
     /// switch; clients retry acquire on the new leader.
     pub inode_lease_mgr: Arc<InodeLeaseManager>,
+    /// §13 Capability model manager (replaces inode_lease_mgr for new
+    /// open paths). When `cap_enabled` is true, `handle_cap_open_grant`
+    /// routes through this manager instead of the legacy lease manager.
+    /// The legacy manager is kept for backward compatibility during rollout.
+    pub cap_mgr: Arc<CapManager>,
+    /// String→u64 client_id mapping for cap recall push notifications.
+    /// The cap manager uses string client_ids (e.g. "fuse-1"), but the
+    /// net layer's `ServerConnectionManager::send_notification` uses u64.
+    /// Populated on `CapOpenGrant`, looked up on recall push.
+    cap_client_id_map: Arc<Mutex<HashMap<String, u64>>>,
+    /// Optional `ServerConnectionManager` for pushing cap recall/upgrade
+    /// notifications to clients. `None` in tests without a transport.
+    server_conn_mgr: Option<Arc<ServerConnectionManager>>,
     /// 该 Filer 拥有的所有 Zone (多 Zone 设计: 旧 + 新)
     /// 空 Vec = 未注册, 无法分配 needle_id
     zones: std::sync::RwLock<Vec<ZoneState>>,
@@ -167,7 +271,10 @@ impl FilerNetHandler {
             shard_strategy,
             net_port,
             inode_notifier: None,
-            inode_lease_mgr: Arc::new(InodeLeaseManager::new().with_meta_cache(mc)),
+            inode_lease_mgr: Arc::new(InodeLeaseManager::new().with_meta_cache(mc.clone())),
+            cap_mgr: Arc::new(CapManager::new().with_meta_cache(mc)),
+            cap_client_id_map: Arc::new(Mutex::new(HashMap::new())),
+            server_conn_mgr: None,
             zones: std::sync::RwLock::new(Vec::new()),
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
@@ -189,7 +296,10 @@ impl FilerNetHandler {
             shard_strategy,
             net_port,
             inode_notifier: Some(inode_notifier),
-            inode_lease_mgr: Arc::new(InodeLeaseManager::new().with_meta_cache(mc)),
+            inode_lease_mgr: Arc::new(InodeLeaseManager::new().with_meta_cache(mc.clone())),
+            cap_mgr: Arc::new(CapManager::new().with_meta_cache(mc)),
+            cap_client_id_map: Arc::new(Mutex::new(HashMap::new())),
+            server_conn_mgr: None,
             zones: std::sync::RwLock::new(Vec::new()),
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
@@ -274,7 +384,54 @@ impl FilerNetHandler {
     /// need to know about the bridge type.
     #[must_use]
     pub fn with_client_health(self, health: Arc<powerfs_lock_health::ClientHealth>) -> Self {
-        self.with_revoke_timeout_penalty(HealthPenaltyBridge { health })
+        self.with_revoke_timeout_penalty(HealthPenaltyBridge {
+            health: health.clone(),
+        })
+        .with_cap_penalty(HealthCapPenaltyBridge { health })
+    }
+
+    /// §13: wire the `ServerConnectionManager` into the cap manager so
+    /// `CapRecallNotify` / `CapUpgradeNotify` push notifications can be
+    /// delivered to clients. Also rebuilds `cap_mgr` with a real
+    /// `NetCapRevoker` (replacing the default `NoopCapRevoker`).
+    #[must_use]
+    pub fn with_server_connection(mut self, conn_mgr: Arc<ServerConnectionManager>) -> Self {
+        let revoker = Arc::new(NetCapRevoker {
+            conn_mgr: conn_mgr.clone(),
+            client_id_map: self.cap_client_id_map.clone(),
+        });
+        let mc = self.meta_shard_manager.meta_cache();
+        let rebuilt = (*self.cap_mgr)
+            .clone()
+            .with_revoker(revoker)
+            .with_meta_cache(mc);
+        self.cap_mgr = Arc::new(rebuilt);
+        self.server_conn_mgr = Some(conn_mgr);
+        self
+    }
+
+    /// §13: attach a recall-timeout penalty hook to the cap manager.
+    /// Mirrors `with_revoke_timeout_penalty` for the legacy lease manager.
+    #[must_use]
+    pub fn with_cap_penalty<P>(mut self, penalty: P) -> Self
+    where
+        P: RecallTimeoutPenalty + 'static,
+    {
+        let rebuilt = (*self.cap_mgr).clone().with_penalty(Arc::new(penalty));
+        self.cap_mgr = Arc::new(rebuilt);
+        self
+    }
+
+    /// §13: run one pass of the cap recall force-reclaim sweep. For
+    /// each pending recall whose timeout elapsed without a `RecallAck`,
+    /// force-reclaims the stuck holder's caps, bumps the epoch (fencing
+    /// the stale client's subsequent IO), and penalizes the holder's
+    /// health score. Returns the number of caps force-reclaimed.
+    ///
+    /// Intended to be called from a periodic background task alongside
+    /// `force_reclaim_expired_revokes` (500ms interval in `main.rs`).
+    pub fn force_reclaim_expired_cap_recalls(&self) -> usize {
+        self.cap_mgr.drain_expired_recalls().len()
     }
 
     /// §8.3.1: run one pass of the force-reclaim sweep. For each
@@ -1032,7 +1189,22 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        // GetAttr with retry for async_meta_persist mode
+        // GetAttr with retry for async_meta_persist mode.
+        //
+        // In async mode, CreateInode uses propose (wait commit) + MetaCache
+        // staging, so the inode is immediately visible. But UpdateInodeSizeChunks
+        // uses propose_ff (fire-and-forget) — the Raft log may not have been
+        // applied yet when GetAttr arrives.
+        //
+        // For a FUSE client that just wrote data, the local cache is
+        // authoritative (it has the correct size from the write path), so it
+        // should NOT call getattr at all. This retry is only for:
+        //   - A newly mounted FUSE client reading an existing file
+        //   - Cross-client access after cache invalidation
+        //
+        // In those cases, the Filer's MetaCache (if backfilled) or ShardStore
+        // (after Raft apply) provides the data. The retry handles the brief
+        // window between propose_ff and Raft apply.
         let inode_result = if self.meta_shard_manager.is_async_meta_persist() {
             let mut retries = 0;
             loop {
@@ -2928,6 +3100,254 @@ impl FilerNetHandler {
             b"TLV raft transport deprecated; openraft uses gRPC RaftService".to_vec(),
         ))
     }
+
+    // ===== §13 Capability model handlers =====
+
+    /// Handle CapOpenGrant (§13 — open never blocks).
+    ///
+    /// Request TLV: Ino + ClientId(string) + IsWriteOpen(u8)
+    /// Response TLV: LeaseToken + CapSet(u8) + CapEpoch(u64) + CapSn(u64)
+    ///
+    /// **Always returns STATUS_OK** — open never blocks in the Cap model.
+    /// The response carries the granted caps (EXCLUSIVE for single writer,
+    /// CAP_R for reader, NONE for SHARED_WRITE participant) plus any recall
+    /// tasks that the net layer dispatches asynchronously.
+    async fn handle_cap_open_grant(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let is_write_open = dec.next_u8(FieldId::IsWriteOpen).unwrap_or(0) != 0;
+
+        if inode == 0 || client_id.is_empty() {
+            warn!("CAP_OPEN_GRANT: missing inode={} or client_id empty", inode);
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        // Route to shard leader (cap state lives on the leader).
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        // Record the string→u64 client_id mapping for later recall pushes.
+        // The u64 client_id is not in the message header (it's in the
+        // connection-level ClientInfo). For now, we skip mapping if we
+        // can't determine the net client_id — recall pushes will use the
+        // NoopCapRevoker fallback path. The mapping is populated by the
+        // dispatch layer (handle()) which has access to RequestContext.
+        // TODO(P1): pass ctx.client.client_id into cap handlers.
+
+        // **open_grant always succeeds** — this is the core Cap model
+        // invariant. No blocking, no EAGAIN, no queueing.
+        let result = self.cap_mgr.open_grant(inode, &client_id, is_write_open);
+
+        // Dispatch recall tasks asynchronously (fire-and-forget). The
+        // revoker pushes CapRecallNotify to the recalled holders; open
+        // returns immediately without waiting for ACK.
+        for task in &result.recall_tasks {
+            if let Err(e) = self.cap_mgr.recall_holder(
+                inode,
+                &task.holder,
+                &task.token,
+                task.caps_to_recall,
+                task.retained_caps,
+                task.new_epoch,
+            ) {
+                warn!(
+                    "CAP_OPEN_GRANT: recall push failed for holder={} inode={}: {}",
+                    task.holder, inode, e
+                );
+            }
+        }
+
+        // Build response: token + caps + epoch + sn.
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_string(FieldId::LeaseToken, &result.token);
+        let _ = enc.add_u8(FieldId::CapSet, result.granted_caps.0);
+        let _ = enc.add_u64(FieldId::CapEpoch, result.epoch);
+        let _ = enc.add_u64(FieldId::CapSn, result.sn);
+        let _ = enc.add_u64(FieldId::LeaseDuration, result.duration_ms);
+
+        info!(
+            "CAP_OPEN_GRANT: inode={} client={} write_open={} caps={:?} epoch={} sn={} recalls={}",
+            inode,
+            client_id,
+            is_write_open,
+            result.granted_caps,
+            result.epoch,
+            result.sn,
+            result.recall_tasks.len()
+        );
+
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+    }
+
+    /// Handle CapRecallAck (§13 — client flushed dirty data, releasing caps).
+    ///
+    /// Request TLV: Ino + ClientId + LeaseToken
+    /// Response: STATUS_OK / STATUS_ERR_SERVER_ERROR
+    async fn handle_cap_recall_ack(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+
+        if inode == 0 || client_id.is_empty() || token.is_empty() {
+            warn!(
+                "CAP_RECALL_ACK: missing inode={} client_id={} token={}",
+                inode,
+                !client_id.is_empty(),
+                !token.is_empty()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        // Route to shard leader.
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self.cap_mgr.recall_ack(inode, &client_id, &token) {
+            Ok(retained) => {
+                debug!(
+                    "CAP_RECALL_ACK: inode={} client={} retained={:?}",
+                    inode, client_id, retained
+                );
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => {
+                warn!(
+                    "CAP_RECALL_ACK: failed inode={} client={}: {}",
+                    inode, client_id, e
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    e.into_bytes(),
+                ))
+            }
+        }
+    }
+
+    /// Handle CapRelease (§13 — client closing the file, release caps).
+    ///
+    /// Request TLV: Ino + ClientId + LeaseToken
+    /// Response TLV: STATUS + HasUpgrade(u8) + [if upgrade: LeaseToken +
+    ///               CapSet + CapEpoch + CapSn]
+    ///
+    /// **Upgrade detection (§13.4 场景 3):** if releasing this holder
+    /// leaves exactly one SHARED_WRITE writer, that writer is upgraded
+    /// back to EXCLUSIVE_WRITE. The upgrade notification is pushed to
+    /// the surviving client asynchronously.
+    async fn handle_cap_release(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+
+        if inode == 0 || client_id.is_empty() || token.is_empty() {
+            warn!(
+                "CAP_RELEASE: missing inode={} client_id={} token={}",
+                inode,
+                !client_id.is_empty(),
+                !token.is_empty()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        // Route to shard leader.
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        match self.cap_mgr.release_cap(inode, &client_id, &token) {
+            Ok(Some(upgrade)) => {
+                // Push CapUpgradeNotify to the upgraded survivor.
+                if let Some(conn_mgr) = &self.server_conn_mgr {
+                    let net_cid = {
+                        let map = self.cap_client_id_map.lock().unwrap();
+                        map.get(&upgrade.holder).copied()
+                    };
+                    if let Some(net_cid) = net_cid {
+                        let mut enc = TlvEncoder::new();
+                        let _ = enc.add_u64(FieldId::Ino, inode);
+                        let _ = enc.add_string(FieldId::LeaseToken, &upgrade.token);
+                        let _ = enc.add_u8(FieldId::CapSet, upgrade.granted_caps.0);
+                        let _ = enc.add_u64(FieldId::CapEpoch, upgrade.epoch);
+                        let _ = enc.add_u64(FieldId::CapSn, upgrade.sn);
+                        let notify_msg = NetMessage::notification(
+                            MsgType::CapUpgradeNotify,
+                            enc.into_bytes(),
+                            Vec::new(),
+                        );
+                        if let Err(e) = conn_mgr.send_notification(net_cid, notify_msg) {
+                            warn!(
+                                "CAP_RELEASE: upgrade notify push failed for survivor={}: {}",
+                                upgrade.holder, e
+                            );
+                        }
+                    }
+                }
+
+                // Build response with upgrade info.
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_u8(FieldId::HasUpgrade, 1);
+                let _ = enc.add_string(FieldId::LeaseToken, &upgrade.token);
+                let _ = enc.add_u8(FieldId::CapSet, upgrade.granted_caps.0);
+                let _ = enc.add_u64(FieldId::CapEpoch, upgrade.epoch);
+                let _ = enc.add_u64(FieldId::CapSn, upgrade.sn);
+
+                info!(
+                    "CAP_RELEASE: inode={} client={} upgrade survivor={} to EXCLUSIVE",
+                    inode, client_id, upgrade.holder
+                );
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            Ok(None) => {
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_u8(FieldId::HasUpgrade, 0);
+                debug!(
+                    "CAP_RELEASE: inode={} client={} (no upgrade)",
+                    inode, client_id
+                );
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            Err(e) => {
+                warn!(
+                    "CAP_RELEASE: failed inode={} client={}: {}",
+                    inode, client_id, e
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    e.into_bytes(),
+                ))
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -3106,6 +3526,10 @@ impl NetHandler for FilerNetHandler {
             MsgType::RenewInodeLease => self.handle_renew_inode_lease(msg).await,
             MsgType::RevokeInodeLeaseAck => self.handle_revoke_ack_inode_lease(msg).await,
             MsgType::RaftMessage => self.handle_raft_message(msg).await,
+            // §13 Capability model
+            MsgType::CapOpenGrant => self.handle_cap_open_grant(msg).await,
+            MsgType::CapRecallAck => self.handle_cap_recall_ack(msg).await,
+            MsgType::CapRelease => self.handle_cap_release(msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {

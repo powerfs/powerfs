@@ -180,6 +180,116 @@ impl crate::invalidate_handler::LeaseReleaser for FacadeLeaseReleaser {
     }
 }
 
+/// §13 Cap model: concrete `CapHandler` that wraps the
+/// `FuseClientFacade` + `CapFlusher` + a tokio runtime handle so the
+/// sync `InvalidateHandler` can spawn async `CapRecallAck` RPCs.
+///
+/// # Flush strategy
+///
+/// `flush_and_ack` is called when a `CapRecallNotify` arrives for a cap
+/// with dirty CAP_W. The handler:
+/// 1. Spawns a tokio task.
+/// 2. Calls `CapFlusher::flush_and_sync` — this drains dirty chunks,
+///    writes them to the Volume Server, and syncs metadata to the Filer
+///    via Raft. This is the **same** flush path used by `release()`,
+///    ensuring consistency.
+/// 3. On flush success: sends `cap_recall_ack` to the Filer, completing
+///    the recall.
+/// 4. On flush failure: does NOT send ACK. The server's 2s recall
+///    timeout will force-reclaim the cap (with a health penalty). The
+///    dirty data remains in the local cache for the background flusher
+///    to retry. This is the safest option — sending ACK without
+///    successful flush would lose dirty data.
+pub struct FacadeCapHandler {
+    facade: Arc<FuseClientFacade>,
+    flusher: Arc<dyn crate::invalidate_handler::CapFlusher>,
+    client_id: String,
+    handle: tokio::runtime::Handle,
+}
+
+impl FacadeCapHandler {
+    pub fn new(
+        facade: Arc<FuseClientFacade>,
+        flusher: Arc<dyn crate::invalidate_handler::CapFlusher>,
+        client_id: String,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            facade,
+            flusher,
+            client_id,
+            handle,
+        }
+    }
+}
+
+impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
+    fn flush_and_ack(&self, inode: u64, token: String, _epoch: u64) {
+        let facade = self.facade.clone();
+        let flusher = self.flusher.clone();
+        let client_id = self.client_id.clone();
+        let token_for_flush = token.clone();
+        self.handle.spawn(async move {
+            debug!(
+                "FacadeCapHandler: flush_and_ack inode={} token={} — flushing dirty data before ACK",
+                inode, token_for_flush
+            );
+            // Step 1: Flush dirty chunks + sync metadata. This uses the
+            // same path as release() (drain_dirty_for_inode →
+            // write_blob_batch_with_lease → sync_size_chunks_on_close),
+            // ensuring dirty data is safely persisted before we ACK.
+            let flush_result = flusher.flush_and_sync(inode, &token_for_flush);
+            match flush_result {
+                Ok(()) => {
+                    debug!(
+                        "FacadeCapHandler: flush succeeded for inode={}, sending CapRecallAck",
+                        inode
+                    );
+                    // Step 2: Send CapRecallAck — the server will complete
+                    // the recall and grant caps to the waiting client.
+                    if let Err(e) = facade.cap_recall_ack(inode, &client_id, &token).await {
+                        debug!(
+                            "FacadeCapHandler: cap_recall_ack inode={} failed: {} \
+                             (server will force-reclaim after 2s timeout)",
+                            inode, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Flush failed — do NOT send ACK. The server's 2s
+                    // recall timeout will force-reclaim the cap. Dirty
+                    // data remains in the local cache for the background
+                    // flusher to retry. Sending ACK without successful
+                    // flush would lose dirty data.
+                    debug!(
+                        "FacadeCapHandler: flush FAILED for inode={} err={:?} — NOT sending ACK \
+                         (server will force-reclaim after 2s timeout; dirty data retained for retry)",
+                        inode, e
+                    );
+                }
+            }
+        });
+    }
+
+    fn immediate_ack(&self, inode: u64, token: String, _epoch: u64) {
+        let facade = self.facade.clone();
+        let client_id = self.client_id.clone();
+        self.handle.spawn(async move {
+            debug!(
+                "FacadeCapHandler: immediate_ack inode={} token={}",
+                inode, token
+            );
+            if let Err(e) = facade.cap_recall_ack(inode, &client_id, &token).await {
+                debug!(
+                    "FacadeCapHandler: cap_recall_ack inode={} failed: {} \
+                     (server will force-reclaim after 2s timeout)",
+                    inode, e
+                );
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
