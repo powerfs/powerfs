@@ -163,7 +163,13 @@ fn main() {
     info!("Request timeout: {}s", request_timeout_secs);
     let admin_port = fuse_cfg.admin_port;
     if admin_port > 0 {
-        info!("Admin/debug server port: {}", admin_port);
+        info!(
+            "Legacy fuse.admin_port={} present in config, but the FUSE \
+             client no longer binds any HTTP endpoint. Stats are collected \
+             via the Master KeepConnected heartbeat; use \
+             `powerfs-cli -m <master> fuse-stats`.",
+            admin_port
+        );
     }
 
     let verbose = args.verbose || fuse_cfg.verbose;

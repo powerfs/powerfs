@@ -1,12 +1,6 @@
-use axum::extract::Query;
-use axum::response::IntoResponse;
-use axum::{routing::get, Json, Router, Server};
+use axum::{routing::get, Router, Server};
 use log::{error, info};
 use prometheus::{register_counter, register_gauge, Counter, Encoder, Gauge, TextEncoder};
-use serde_json::json;
-use std::collections::HashMap;
-
-use crate::debug_config::{DebugConfigStore, DebugConfigUpdate};
 
 lazy_static::lazy_static! {
     pub static ref RAFT_TERM: Gauge = register_gauge!(
@@ -50,20 +44,8 @@ lazy_static::lazy_static! {
     ).unwrap();
 }
 
-pub async fn start_metrics_server(addr: &str, debug_store: DebugConfigStore) -> Result<(), String> {
-    let app = Router::new()
-        .route("/metrics", get(metrics_handler))
-        .route(
-            "/admin/log-level",
-            get(get_log_level_handler).put(set_log_level_handler),
-        )
-        .route(
-            "/admin/debug",
-            get(get_debug_handler)
-                .put(put_debug_handler)
-                .delete(delete_debug_handler),
-        )
-        .with_state(debug_store);
+pub async fn start_metrics_server(addr: &str) -> Result<(), String> {
+    let app = Router::new().route("/metrics", get(metrics_handler));
 
     let addr = addr
         .parse()
@@ -86,84 +68,4 @@ async fn metrics_handler() -> String {
     let metrics = prometheus::gather();
     encoder.encode(&metrics, &mut buffer).unwrap();
     String::from_utf8(buffer).unwrap()
-}
-
-// ===== Dynamic log level control =====
-
-async fn get_log_level_handler() -> Json<serde_json::Value> {
-    Json(json!({ "level": powerfs_common::dynamic_log::get_log_level() }))
-}
-
-async fn set_log_level_handler(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
-    let level = match params.get("level") {
-        Some(l) => l.as_str(),
-        None => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "missing 'level' query parameter" })),
-            )
-        }
-    };
-    let prev = powerfs_common::dynamic_log::get_log_level().to_string();
-    match powerfs_common::dynamic_log::set_log_level(level) {
-        Ok(()) => {
-            info!("log level changed via HTTP: {} -> {}", prev, level);
-            (
-                axum::http::StatusCode::OK,
-                Json(json!({ "level": level, "prev": prev })),
-            )
-        }
-        Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e })),
-        ),
-    }
-}
-
-// ===== Centralized debug config control (PUT/GET/DELETE /admin/debug) =====
-
-use axum::extract::State;
-use axum::http::StatusCode;
-
-/// GET /admin/debug — 列出所有节点的调试配置
-async fn get_debug_handler(State(store): State<DebugConfigStore>) -> impl IntoResponse {
-    let all = store.list_all();
-    Json(json!({ "configs": all }))
-}
-
-/// PUT /admin/debug — 更新节点调试配置
-/// Body: {"node":"fuse-1","level":"debug","flag":"fuse_create_timing","on":true}
-async fn put_debug_handler(
-    State(store): State<DebugConfigStore>,
-    Json(update): Json<DebugConfigUpdate>,
-) -> impl IntoResponse {
-    if update.node.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "missing 'node' field" })),
-        );
-    }
-    let updated = store.apply_update(update);
-    (StatusCode::OK, Json(json!({ "updated": updated })))
-}
-
-/// DELETE /admin/debug?node=fuse-1 — 清除节点配置
-async fn delete_debug_handler(
-    State(store): State<DebugConfigStore>,
-    Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
-    let node = match params.get("node") {
-        Some(n) => n.as_str(),
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "missing 'node' query parameter" })),
-            )
-        }
-    };
-    let removed = store.clear(node);
-    (
-        StatusCode::OK,
-        Json(json!({ "node": node, "removed": removed })),
-    )
 }

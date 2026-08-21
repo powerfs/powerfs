@@ -3489,15 +3489,18 @@ impl MasterNode {
             }
         }
 
-        // Start HTTP metrics + debug config server.
-        // Port 从配置文件的 metrics_port 字段显式读取，不做任何端口加减推导。
-        // Exposes /metrics, /admin/log-level, /admin/debug.
+        // Start HTTP metrics server (Prometheus data collection only).
+        // Port is read explicitly from config metrics_port, no port arithmetic.
+        // Control-plane operations (log level, debug config) now go via MasterService gRPC.
+        // Exposes only: GET /metrics (Prometheus scrape endpoint).
         {
             let metrics_port = self.metrics_port;
             let metrics_addr = format!("{}:{}", self.address.ip(), metrics_port);
-            let debug_store = self.debug_config.clone();
-            info!("Starting metrics + debug config server on {}", metrics_addr);
-            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, debug_store).await {
+            info!(
+                "Starting metrics (Prometheus /metrics) server on {}",
+                metrics_addr
+            );
+            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr).await {
                 error!("Failed to start metrics server on {}: {}", metrics_addr, e);
             }
         }

@@ -76,11 +76,13 @@ pub fn http_get(addr: &str, path: &str) -> Result<String> {
 }
 
 /// Convenience: HTTP PUT with JSON body.
+#[allow(dead_code)]
 pub fn http_put(addr: &str, path: &str, body: &str) -> Result<String> {
     http_request(addr, "PUT", path, Some(body))
 }
 
 /// Convenience: HTTP DELETE.
+#[allow(dead_code)]
 pub fn http_delete(addr: &str, path: &str) -> Result<String> {
     http_request(addr, "DELETE", path, None)
 }
