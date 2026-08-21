@@ -187,6 +187,17 @@ pub struct MetaShardManager {
     /// On leader change (cache epoch mismatch), `invalidate_all()` clears
     /// all staging entries — the client retries on the new leader.
     meta_cache: std::sync::Arc<crate::meta_cache::MetaCache>,
+    /// Phase 3 Lease Recall: optional reference to the InodeNotifier
+    /// for pushing Invalidate notifications to lease holders when the
+    /// GC loop's trim_pass identifies recall_candidates. Set via
+    /// `set_recall_components` after both the notifier and lease
+    /// manager are constructed in main.rs.
+    inode_notifier: std::sync::RwLock<Option<std::sync::Arc<crate::inode_notifier::InodeNotifier>>>,
+    /// Phase 3 Lease Recall: optional reference to the InodeLeaseManager
+    /// for querying lease holders (`get_holder`) and running
+    /// `sweep_leaked_refcounts` in the GC loop.
+    lease_mgr:
+        std::sync::RwLock<Option<std::sync::Arc<crate::inode_lease_manager::InodeLeaseManager>>>,
 }
 
 /// Per-shard inode allocator.
@@ -245,6 +256,8 @@ impl MetaShardManager {
             orset_states: RwLock::new(HashMap::new()),
             async_meta_persist: std::sync::atomic::AtomicBool::new(async_default),
             meta_cache: std::sync::Arc::new(crate::meta_cache::MetaCache::new()),
+            inode_notifier: std::sync::RwLock::new(None),
+            lease_mgr: std::sync::RwLock::new(None),
         }
     }
 
@@ -260,6 +273,22 @@ impl MetaShardManager {
     /// `/admin/meta-cache-stats`. The Arc handle is cheap to clone.
     pub fn meta_cache(&self) -> std::sync::Arc<crate::meta_cache::MetaCache> {
         self.meta_cache.clone()
+    }
+
+    /// Phase 3 Lease Recall: wire the InodeNotifier and InodeLeaseManager
+    /// into the MetaShardManager so the GC loop can (1) look up lease
+    /// holders for recall candidates, (2) push Invalidate notifications
+    /// to them, and (3) periodically sweep leaked refcounts.
+    ///
+    /// Called from main.rs after both the FilerNetHandler (which owns
+    /// the lease manager) and the InodeNotifier are constructed.
+    pub fn set_recall_components(
+        &self,
+        notifier: std::sync::Arc<crate::inode_notifier::InodeNotifier>,
+        lease_mgr: std::sync::Arc<crate::inode_lease_manager::InodeLeaseManager>,
+    ) {
+        *self.inode_notifier.write().unwrap() = Some(notifier);
+        *self.lease_mgr.write().unwrap() = Some(lease_mgr);
     }
 
     /// Check if async_meta_persist is enabled.
@@ -4772,7 +4801,63 @@ impl MetaShardManager {
                 ));
                 // trim_pass only does work when usage > high_watermark; when
                 // under watermark it's a no-op (just an atomic read).
-                let _evicted = mc.trim_pass();
+                let trim_result = mc.trim_pass();
+
+                // ===== Phase 3: Lease Recall =====
+                //
+                // If trim_pass returned recall_candidates (inodes that are
+                // Clean but pinned by refcount > 0), push Invalidate
+                // notifications to the lease holders so they release their
+                // leases. The next trim_pass can then evict them.
+                //
+                // Also periodically sweep leaked refcounts (inodes where
+                // refcount > 0 but no active lease exists — e.g. client
+                // crashed before sending ReleaseInodeLease).
+                if !trim_result.recall_candidates.is_empty() {
+                    let notifier_opt = mgr.inode_notifier.read().unwrap().clone();
+                    let lease_mgr_opt = mgr.lease_mgr.read().unwrap().clone();
+                    if let (Some(notifier), Some(lease_mgr)) = (notifier_opt, lease_mgr_opt) {
+                        for inode in &trim_result.recall_candidates {
+                            // Look up the lease holder and push Invalidate.
+                            // The holder string is the client's numeric id
+                            // (e.g. "12345"); parse it to u64 for the
+                            // notifier's connection lookup.
+                            if let Some(holder) = lease_mgr.get_holder(*inode) {
+                                if let Ok(client_id) = holder.parse::<u64>() {
+                                    // Version 0 signals "recall" (not a
+                                    // content change); the client releases
+                                    // the lease and drops its cache.
+                                    notifier.notify_client(client_id, *inode, 0);
+                                    mc.mark_recalled(*inode);
+                                    debug!(
+                                        "Phase 3 recall: pushed Invalidate to \
+                                         client {} for inode {} (memory pressure)",
+                                        client_id, inode
+                                    );
+                                }
+                            } else {
+                                // No active lease but refcount > 0 — this
+                                // is a leak; sweep_leaked_refcounts below
+                                // will fix it.
+                                debug!(
+                                    "Phase 3 recall: inode {} has refcount > 0 \
+                                     but no active lease (leak, will sweep)",
+                                    inode
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Periodically sweep leaked refcounts (every GC cycle).
+                // Uses get_holder as the "is lease active" predicate:
+                // if get_holder returns None, the refcount should be 0.
+                {
+                    let lease_mgr_opt = mgr.lease_mgr.read().unwrap().clone();
+                    if let Some(lease_mgr) = lease_mgr_opt {
+                        mc.sweep_leaked_refcounts(|inode| lease_mgr.get_holder(inode).is_some());
+                    }
+                }
 
                 // Phase 5: 先重试上次失败的 pending_reclaims（WAL 崩溃恢复）
                 let retried = mgr

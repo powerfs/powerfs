@@ -40,6 +40,7 @@ use crate::early_grant::{
     AcquireOutcome, LeaseRevoker, NoopPenalty, NoopRevoker, RevokeState, RevokeTimeoutPenalty,
     SnAllocator, WaitQueue, Waiter,
 };
+use crate::meta_cache::MetaCache;
 use powerfs_lease::{
     LeaseError, LeaseKey, LeaseMode, LeasePersistence, LeaseStats, LeaseStore, MemoryLeaseStore,
 };
@@ -151,6 +152,12 @@ pub struct InodeLeaseManager {
     /// three-layer defense — quarantine / blacklist after repeated
     /// violations).
     penalty: Arc<dyn RevokeTimeoutPenalty>,
+    /// Phase 3 Lease Recall: optional reference to the filer's MetaCache.
+    /// When set, `acquire` bumps `refcount` on new grants (so trim_pass
+    /// won't evict lease-pinned inodes), and `release`/`disconnect`/
+    /// `force_reclaim` decrement it. `None` in unit tests and legacy
+    /// paths that don't need recall.
+    meta_cache: Option<Arc<MetaCache>>,
 }
 
 /// Result of an acquire attempt.
@@ -198,6 +205,7 @@ impl InodeLeaseManager {
             // layer wires a real ClientHealth bridge during startup).
             revoke_timeout_ms: DEFAULT_REVOKE_TIMEOUT_MS,
             penalty: Arc::new(NoopPenalty),
+            meta_cache: None,
         }
     }
 
@@ -223,6 +231,7 @@ impl InodeLeaseManager {
             adaptive_grace: self.adaptive_grace,
             revoke_timeout_ms: self.revoke_timeout_ms,
             penalty: self.penalty,
+            meta_cache: self.meta_cache,
         }
     }
 
@@ -281,6 +290,50 @@ impl InodeLeaseManager {
     #[must_use]
     pub fn with_sn_allocator(self, sn: Arc<SnAllocator>) -> Self {
         Self { sn, ..self }
+    }
+
+    /// Phase 3 Lease Recall: wire the filer's shared MetaCache so that
+    /// lease grant/release automatically bumps/decrements the inode's
+    /// `refcount` in MetaCache. When set, `trim_pass` will skip
+    /// inodes with active leases (refcount > 0) and instead collect
+    /// them as `recall_candidates` for the GC loop to push Invalidate
+    /// notifications to the holding clients.
+    ///
+    /// Must be called before any lease operation. Idempotent: calling
+    /// twice replaces the reference.
+    #[must_use]
+    pub fn with_meta_cache(self, mc: Arc<MetaCache>) -> Self {
+        Self {
+            meta_cache: Some(mc),
+            ..self
+        }
+    }
+
+    /// Phase 3: query the active lease holder for an inode.
+    ///
+    /// Returns the holder's client id if a non-expired lease exists,
+    /// `None` otherwise. Used by the GC loop's recall logic to look
+    /// up which client to push an Invalidate notification to, and by
+    /// `sweep_leaked_refcounts` to verify whether a refcount > 0
+    /// corresponds to a genuinely active lease.
+    pub fn get_holder(&self, inode: u64) -> Option<String> {
+        self.store
+            .get_entries_by_group(inode)
+            .into_iter()
+            .next()
+            .map(|e| e.holder)
+    }
+
+    /// Phase 3: list all active (non-expired) leases held by a client.
+    /// Used by `disconnect_holder` to decr_refcount for each inode
+    /// before the store evicts them (the store's `disconnect_holder`
+    /// only returns a count, not the inodes).
+    fn entries_by_holder(&self, holder: &str) -> Vec<u64> {
+        self.store
+            .get_entries_by_holder(holder)
+            .into_iter()
+            .map(|e| e.key.inode)
+            .collect()
     }
 
     /// Allocate the next SN (phase 4 §5.2). Wraps `SnAllocator::next_sn`
@@ -408,6 +461,11 @@ impl InodeLeaseManager {
                 // Phase-4 §5.2/§5.3: allocate SN on every new grant.
                 // Idempotent re-acquires (above) reuse the original SN.
                 let sn = self.sn.next_sn();
+                // Phase 3: bump MetaCache refcount so trim_pass won't
+                // evict this inode while the client holds an active lease.
+                if let Some(mc) = &self.meta_cache {
+                    mc.incr_refcount(inode);
+                }
                 log::debug!(
                     "InodeLease: acquired inode={} holder={} duration_ms={} sn={}",
                     inode,
@@ -711,12 +769,23 @@ impl InodeLeaseManager {
             }
             match self.store.release(token, client_id) {
                 Ok(()) => {
+                    // Phase 3: decr MetaCache refcount. Saturating to 0,
+                    // so safe even if sweep_leaked_refcounts already
+                    // reset it (TTL expiry path).
+                    if let Some(mc) = &self.meta_cache {
+                        mc.decr_refcount(inode);
+                    }
                     log::debug!("InodeLease: released inode={} holder={}", inode, client_id);
                     Ok(())
                 }
                 Err(LeaseError::NotFound) => {
                     // Race: entry was evicted between lookup and release —
-                    // treat as idempotent success.
+                    // treat as idempotent success. Still decr refcount:
+                    // the entry may have been TTL-evicted but the sweep
+                    // hasn't run yet, so refcount may still be > 0.
+                    if let Some(mc) = &self.meta_cache {
+                        mc.decr_refcount(inode);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(format!("inode {} lease release failed: {}", inode, e)),
@@ -834,7 +903,21 @@ impl InodeLeaseManager {
 
     /// Release all leases held by a client (used on client disconnect).
     pub fn disconnect_holder(&self, client_id: &str) -> usize {
+        // Phase 3: collect the inodes BEFORE disconnect so we can
+        // decr_refcount for each. The store's disconnect_holder only
+        // returns a count, not the affected inodes.
+        let inodes: Vec<u64> = if self.meta_cache.is_some() {
+            self.entries_by_holder(client_id)
+        } else {
+            Vec::new()
+        };
         let count = self.store.disconnect_holder(client_id);
+        // Phase 3: decr refcount for each released inode.
+        if let Some(mc) = &self.meta_cache {
+            for inode in &inodes {
+                mc.decr_refcount(*inode);
+            }
+        }
         if count > 0 {
             log::info!(
                 "InodeLease: released {} leases for disconnected client={}",

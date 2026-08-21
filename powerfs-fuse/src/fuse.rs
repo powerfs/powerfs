@@ -335,6 +335,17 @@ impl FuseApp {
         // Without this, has_valid_dir_lease() would return true for stale
         // leases after another client modifies the directory.
         invalidate_handler.set_lease_state(lock_manager.state().clone());
+        // Phase 3 Lease Recall: wire the async lease releaser so the
+        // InvalidateHandler can send ReleaseInodeLease RPCs when the
+        // server pushes an Invalidate (recall or content change). This
+        // ensures the server-side refcount is decremented promptly,
+        // allowing MetaCache trim_pass to evict the entry.
+        let releaser = Arc::new(crate::lock_backend::FacadeLeaseReleaser::new(
+            sync_client.facade().clone(),
+            sync_client.client_id(),
+            sync_client.runtime().handle().clone(),
+        ));
+        invalidate_handler.set_lease_releaser(releaser);
 
         // Clone the Arc before moving into `PowerFsFs` so the admin
         // server can keep a handle for `/lock-metrics` queries.

@@ -159,12 +159,15 @@ impl FilerNetHandler {
         shard_strategy: Arc<ShardStrategy>,
         net_port: u16,
     ) -> Self {
+        // Phase 3: wire MetaCache into the lease manager so grant/
+        // release automatically bumps/decrements inode refcounts.
+        let mc = meta_shard_manager.meta_cache();
         Self {
             meta_shard_manager,
             shard_strategy,
             net_port,
             inode_notifier: None,
-            inode_lease_mgr: Arc::new(InodeLeaseManager::new()),
+            inode_lease_mgr: Arc::new(InodeLeaseManager::new().with_meta_cache(mc)),
             zones: std::sync::RwLock::new(Vec::new()),
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
@@ -179,12 +182,14 @@ impl FilerNetHandler {
         net_port: u16,
         inode_notifier: Arc<InodeNotifier>,
     ) -> Self {
+        // Phase 3: wire MetaCache into the lease manager (same as new()).
+        let mc = meta_shard_manager.meta_cache();
         Self {
             meta_shard_manager,
             shard_strategy,
             net_port,
             inode_notifier: Some(inode_notifier),
-            inode_lease_mgr: Arc::new(InodeLeaseManager::new()),
+            inode_lease_mgr: Arc::new(InodeLeaseManager::new().with_meta_cache(mc)),
             zones: std::sync::RwLock::new(Vec::new()),
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),

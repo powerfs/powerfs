@@ -170,6 +170,49 @@ impl InodeNotifier {
         count
     }
 
+    /// Phase 3 Lease Recall: push an Invalidate notification to a
+    /// specific client, bypassing the subscription check.
+    ///
+    /// Used by the GC loop when `trim_pass` identifies recall_candidates:
+    /// the lease holder may not be subscribed to the inode (subscriptions
+    /// are for read-side cache invalidation), so we push directly to the
+    /// client identified by the lease holder string.
+    ///
+    /// Returns `true` if the notification was enqueued successfully.
+    pub fn notify_client(&self, client_id: u64, inode: u64, version: u64) -> bool {
+        match self
+            .connection_manager
+            .push_invalidate_notification(client_id, inode, version)
+        {
+            Ok(true) => {
+                log::debug!(
+                    "InodeNotifier: recall Invalidate(inode={}, v={}) sent to client {}",
+                    inode,
+                    version,
+                    client_id
+                );
+                true
+            }
+            Ok(false) => {
+                log::warn!(
+                    "InodeNotifier: recall notification channel full for client {} (inode={})",
+                    client_id,
+                    inode
+                );
+                false
+            }
+            Err(e) => {
+                log::warn!(
+                    "InodeNotifier: recall failed to notify client {}: {} (inode={})",
+                    client_id,
+                    e,
+                    inode
+                );
+                false
+            }
+        }
+    }
+
     /// Get the number of subscribers for an inode
     pub fn subscriber_count(&self, inode: u64) -> usize {
         let subs = self.subscribers.read().unwrap();

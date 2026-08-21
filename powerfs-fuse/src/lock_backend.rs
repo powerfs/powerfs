@@ -27,6 +27,7 @@
 
 use crate::cache::MetadataCache;
 use async_trait::async_trait;
+use log::debug;
 use powerfs_fuse_core::FuseClientFacade;
 use powerfs_lock_fuse::FuseLockBackend;
 use std::sync::Arc;
@@ -134,6 +135,48 @@ impl FuseLockBackend for FacadeLockBackend {
 
     async fn lookup_volume_id(&self, inode: u64) -> Result<u64, String> {
         volume_id_from_cache(&self.cache, inode)
+    }
+}
+
+/// Phase 3 Lease Recall: concrete `LeaseReleaser` that wraps the
+/// `FuseClientFacade` + a tokio runtime handle so the sync
+/// `InvalidateHandler` can spawn async `ReleaseInodeLease` RPCs.
+///
+/// Constructed in `PowerFsFs::new` after the sync client (which owns
+/// the runtime) is available.
+pub struct FacadeLeaseReleaser {
+    facade: Arc<FuseClientFacade>,
+    client_id: String,
+    handle: tokio::runtime::Handle,
+}
+
+impl FacadeLeaseReleaser {
+    pub fn new(
+        facade: Arc<FuseClientFacade>,
+        client_id: String,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            facade,
+            client_id,
+            handle,
+        }
+    }
+}
+
+impl crate::invalidate_handler::LeaseReleaser for FacadeLeaseReleaser {
+    fn release(&self, inode: u64, token: String) {
+        let facade = self.facade.clone();
+        let client_id = self.client_id.clone();
+        self.handle.spawn(async move {
+            if let Err(e) = facade.release_inode_lease(inode, &client_id, &token).await {
+                debug!(
+                    "FacadeLeaseReleaser: release_inode_lease inode={} failed: {} \
+                     (will TTL on server side)",
+                    inode, e
+                );
+            }
+        });
     }
 }
 
