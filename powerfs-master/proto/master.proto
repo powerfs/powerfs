@@ -74,6 +74,15 @@ service MasterService {
     rpc GetMasterStatus(MasterStatusRequest) returns (MasterStatusResponse);
     rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
 
+    // ===== Debug & Log Level Control (admin control plane via gRPC) =====
+    // Per-master local log level (not replicated, affects the connected master only)
+    rpc GetLogLevel(GetLogLevelRequest) returns (GetLogLevelResponse);
+    rpc SetLogLevel(SetLogLevelRequest) returns (SetLogLevelResponse);
+    // Cluster-wide centralized debug config, polled by all nodes (filer/fuse/volume)
+    rpc GetDebugConfigs(GetDebugConfigsRequest) returns (GetDebugConfigsResponse);
+    rpc UpdateDebugConfig(UpdateDebugConfigRequest) returns (UpdateDebugConfigResponse);
+    rpc ClearDebugConfig(ClearDebugConfigRequest) returns (ClearDebugConfigResponse);
+
     // Filer routing service
     rpc GetFilerForInode(GetFilerForInodeRequest) returns (GetFilerForInodeResponse);
     rpc ListFilers(ListFilersRequest) returns (ListFilersResponse);
@@ -735,6 +744,67 @@ message TransferLeaderRequest {
 message TransferLeaderResponse {
     bool success = 1;
     string error = 2;
+}
+
+// ===== Debug & Log Level Control messages =====
+message GetLogLevelRequest {}
+
+message GetLogLevelResponse {
+    string level = 1;
+}
+
+message SetLogLevelRequest {
+    string level = 1; // off|error|warn|info|debug|trace
+}
+
+message SetLogLevelResponse {
+    bool success = 1;
+    string level = 2;    // new level on success
+    string prev = 3;     // previous level
+    string error = 4;    // error message on failure
+}
+
+message DebugConfigEntry {
+    string node = 1;                           // "all" for global default, or node id
+    bool has_log_level = 2;                    // presence marker for log_level
+    string log_level = 3;                      // off|error|warn|info|debug|trace (valid iff has_log_level=true)
+    bool has_target_filter = 4;                // presence marker for target_filter
+    string target_filter = 5;                  // target filter ("" means explicit clear)
+    map<string, bool> flags = 6;               // flag name -> on/off
+}
+
+message GetDebugConfigsRequest {}
+
+message GetDebugConfigsResponse {
+    repeated DebugConfigEntry configs = 1;     // all stored node configs ("all" + per-node)
+}
+
+message UpdateDebugConfigRequest {
+    string node = 1;                           // target node: "all" or specific id
+    bool has_level = 2;                        // presence marker for level
+    string level = 3;                          // new log level (valid iff has_level=true)
+    bool has_target_filter = 4;                // presence marker for target_filter
+    string target_filter = 5;                  // new target filter (valid iff has_target_filter=true; "" clears)
+    bool has_flag = 6;                         // presence marker for flag+on pair
+    string flag = 7;                           // flag name (valid iff has_flag=true)
+    bool on = 8;                               // flag value (valid iff has_flag=true)
+}
+
+message UpdateDebugConfigResponse {
+    bool success = 1;
+    DebugConfigEntry updated = 2;              // resulting node config after update
+    string error = 3;
+}
+
+message ClearDebugConfigRequest {
+    string node = 1;                           // node id to reset, or "all"
+}
+
+message ClearDebugConfigResponse {
+    bool success = 1;
+    string node = 2;
+    bool removed = 3;                          // true if config existed and was removed
+    string error = 4;
 }
 
 // Filer routing messages

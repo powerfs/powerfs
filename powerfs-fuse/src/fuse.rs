@@ -357,23 +357,23 @@ impl FuseApp {
         // `PowerFsFs` is constructed, because it needs `PowerFsFs` as the
         // `CapFlusher`.
 
-        // Clone the Arc before moving into `PowerFsFs` so the admin
-        // server can keep a handle for `/lock-metrics` queries.
-        let lock_manager_for_admin = lock_manager.clone();
-
-        // Start admin/debug HTTP server if admin_port is configured.
-        // Exposes /stats (request statistics + in-flight tracking),
-        // /lock-metrics (FuseLockManager counters), and /health.
+        // NOTE: FUSE client does NOT expose any listening endpoints.
+        // Request statistics are reported to the Master via the periodic
+        // KeepConnected heartbeat (TLV protocol); operators query them
+        // through `powerfs-cli fuse-stats` which routes exclusively via
+        // the Master gRPC interface.
+        //
+        // The legacy admin_port config field is accepted but IGNORED
+        // (the HTTP /stats, /lock-metrics and /health endpoints are
+        // never bound) to enforce the design rule that "clients must
+        // not expose services".
         if self.admin_port > 0 {
-            let bind_addr = format!("0.0.0.0:{}", self.admin_port);
-            crate::admin_server::AdminServer::start(
-                bind_addr,
-                sync_client.stats().clone(),
-                Some(lock_manager_for_admin),
+            info!(
+                "Legacy admin_port={} ignored — FUSE client exposes no \
+                 listening endpoints. Stats are collected via the Master \
+                 (use `powerfs-cli fuse-stats` against the master address).",
+                self.admin_port
             );
-            info!("Admin/debug server enabled on port {}", self.admin_port);
-        } else {
-            info!("Admin/debug server disabled (admin_port=0)");
         }
 
         let fs = PowerFsFs {

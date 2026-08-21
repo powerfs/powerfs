@@ -1,7 +1,11 @@
-//! `powerfs-cli debug` — dynamic log level and debug config control.
+//! `powerfs-cli debug` — dynamic log level and debug config control via MasterService gRPC.
 //!
 //! Controls the Master's centralized debug configuration, which is polled by
 //! all nodes (filer/fuse/volume) every 2 seconds via `GetDebugConfig`.
+//!
+//! Admin-control traffic goes exclusively through MasterService gRPC (the
+//! same `-m` endpoint used for all other master APIs). Metrics port on the
+//! other hand is reserved for Prometheus data-collection only (`/metrics`).
 //!
 //! # Subcommands
 //!
@@ -19,72 +23,16 @@
 use clap::{Args, Subcommand};
 
 use crate::client::MasterClient;
-use crate::http;
 use powerfs_common::error::{PowerFsError, Result};
+use powerfs_master::proto::powerfs::{
+    ClearDebugConfigRequest, DebugConfigEntry, GetDebugConfigsRequest, GetLogLevelRequest,
+    UpdateDebugConfigRequest,
+};
 
 #[derive(Args, Debug)]
 pub struct DebugArgs {
-    /// Master metrics/admin server address (host:port).
-    /// If not provided, queries Master via GetMasterStatus to obtain the metrics_port.
-    #[arg(long, global = true)]
-    admin: Option<String>,
-
     #[command(subcommand)]
     command: DebugSubcommand,
-}
-
-/// Resolve admin address: use explicit --admin, or query Master's GetMasterStatus for leader's metrics_port.
-async fn resolve_admin_addr(mut client: MasterClient) -> Result<String> {
-    // Extract master IP from client address (format: "host:grpc_port")
-    let master_addr = client.address.clone();
-    let (master_ip, _) = master_addr.split_once(':').ok_or_else(|| {
-        PowerFsError::Internal(format!(
-            "invalid master address format (expected host:port): {}",
-            master_addr
-        ))
-    })?;
-
-    let mut service = client
-        .service()
-        .await
-        .map_err(|e| PowerFsError::Internal(format!("Failed to connect to master: {}", e)))?;
-
-    let resp = service
-        .get_master_status(tonic::Request::new(
-            powerfs_master::proto::MasterStatusRequest {},
-        ))
-        .await
-        .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?;
-
-    let status = resp.into_inner();
-    let leader_id = &status.leader_id;
-
-    // Find the leader node and use its metrics_port
-    let metrics_port = if !leader_id.is_empty() {
-        status
-            .nodes
-            .iter()
-            .find(|n| &n.node_id == leader_id)
-            .map(|n| n.metrics_port)
-    } else {
-        // If no leader_id set, fall back to first node that reports metrics_port
-        status.nodes.first().map(|n| n.metrics_port)
-    };
-
-    let metrics_port = metrics_port.ok_or_else(|| {
-        PowerFsError::Internal(
-            "GetMasterStatus returned no leader with metrics_port; cannot resolve admin address"
-                .into(),
-        )
-    })?;
-
-    if metrics_port == 0 {
-        return Err(PowerFsError::Internal(
-            "Master reports metrics_port=0; please check master configuration".into(),
-        ));
-    }
-
-    Ok(format!("{}:{}", master_ip, metrics_port))
 }
 
 #[derive(Subcommand, Debug)]
@@ -138,40 +86,56 @@ enum DebugSubcommand {
     },
 }
 
-pub async fn debug(client: MasterClient, args: DebugArgs) -> super::CommandResult {
-    let admin = match args.admin {
-        Some(addr) => addr,
-        None => resolve_admin_addr(client).await?,
-    };
+pub async fn debug(mut client: MasterClient, args: DebugArgs) -> super::CommandResult {
+    let mut svc = client
+        .service()
+        .await
+        .map_err(|e| PowerFsError::Internal(format!("Failed to connect: {}", e)))?;
 
     match args.command {
         DebugSubcommand::Get => {
-            let body = http::http_get(&admin, "/admin/debug")?;
-            print_config_list(&body)?;
+            let resp = svc
+                .get_debug_configs(tonic::Request::new(GetDebugConfigsRequest {}))
+                .await
+                .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?;
+            print_config_list(resp.into_inner().configs)?;
         }
         DebugSubcommand::Level { level, node } => {
             if let Some(lvl) = level {
                 validate_level(&lvl)?;
-                let req = serde_json::json!({
-                    "node": node,
-                    "level": lvl,
-                });
-                let resp = http::http_put(&admin, "/admin/debug", &req.to_string())?;
+                let req = UpdateDebugConfigRequest {
+                    node: node.clone(),
+                    has_level: true,
+                    level: lvl.clone(),
+                    has_target_filter: false,
+                    target_filter: String::new(),
+                    has_flag: false,
+                    flag: String::new(),
+                    on: false,
+                };
+                let resp = svc
+                    .update_debug_config(tonic::Request::new(req))
+                    .await
+                    .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?
+                    .into_inner();
+                if !resp.success {
+                    return Err(PowerFsError::Internal(if resp.error.is_empty() {
+                        "update_debug_config failed".into()
+                    } else {
+                        resp.error
+                    }));
+                }
                 println!("Set log level '{}' for node '{}'", lvl, node);
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
-                    if let Some(updated) = v.get("updated") {
-                        println!("  → {}", serde_json::to_string_pretty(updated)?);
-                    }
+                if let Some(updated) = resp.updated {
+                    println!("  → {}", format_entry(&updated));
                 }
             } else {
-                // Show current master log level (local to master process)
-                let body = http::http_get(&admin, "/admin/log-level")?;
-                let v: serde_json::Value = serde_json::from_str(&body)
-                    .map_err(|e| PowerFsError::Internal(format!("parse JSON: {}", e)))?;
-                println!(
-                    "Master log level: {}",
-                    v.get("level").and_then(|x| x.as_str()).unwrap_or("?")
-                );
+                // Show current master node's local log level (per-master, not cluster-wide)
+                let resp = svc
+                    .get_log_level(tonic::Request::new(GetLogLevelRequest {}))
+                    .await
+                    .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?;
+                println!("Master log level: {}", resp.into_inner().level);
             }
         }
         DebugSubcommand::Flag {
@@ -187,20 +151,53 @@ pub async fn debug(client: MasterClient, args: DebugArgs) -> super::CommandResul
             } else {
                 return Err(PowerFsError::Internal("must specify --on or --off".into()));
             };
-            let req = serde_json::json!({
-                "node": node,
-                "flag": name,
-                "on": val,
-            });
-            http::http_put(&admin, "/admin/debug", &req.to_string())?;
+            let req = UpdateDebugConfigRequest {
+                node: node.clone(),
+                has_level: false,
+                level: String::new(),
+                has_target_filter: false,
+                target_filter: String::new(),
+                has_flag: true,
+                flag: name.clone(),
+                on: val,
+            };
+            let resp = svc
+                .update_debug_config(tonic::Request::new(req))
+                .await
+                .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?
+                .into_inner();
+            if !resp.success {
+                return Err(PowerFsError::Internal(if resp.error.is_empty() {
+                    "update_debug_config failed".into()
+                } else {
+                    resp.error
+                }));
+            }
             println!("Flag '{}' = {} for node '{}'", name, val, node);
         }
         DebugSubcommand::Target { filter, node } => {
-            let req = serde_json::json!({
-                "node": node,
-                "target_filter": filter,
-            });
-            http::http_put(&admin, "/admin/debug", &req.to_string())?;
+            let req = UpdateDebugConfigRequest {
+                node: node.clone(),
+                has_level: false,
+                level: String::new(),
+                has_target_filter: true,
+                target_filter: filter.clone(),
+                has_flag: false,
+                flag: String::new(),
+                on: false,
+            };
+            let resp = svc
+                .update_debug_config(tonic::Request::new(req))
+                .await
+                .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?
+                .into_inner();
+            if !resp.success {
+                return Err(PowerFsError::Internal(if resp.error.is_empty() {
+                    "update_debug_config failed".into()
+                } else {
+                    resp.error
+                }));
+            }
             println!(
                 "Target filter '{}' set for node '{}'",
                 if filter.is_empty() {
@@ -212,14 +209,21 @@ pub async fn debug(client: MasterClient, args: DebugArgs) -> super::CommandResul
             );
         }
         DebugSubcommand::Clear { node } => {
-            let path = format!("/admin/debug?node={}", node);
-            let resp = http::http_delete(&admin, &path)?;
-            println!("Cleared debug config for node '{}'", node);
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp) {
-                if let Some(removed) = v.get("removed") {
-                    println!("  → removed: {}", removed);
-                }
+            let req = ClearDebugConfigRequest { node: node.clone() };
+            let resp = svc
+                .clear_debug_config(tonic::Request::new(req))
+                .await
+                .map_err(|e| PowerFsError::TonicStatus(Box::new(e)))?
+                .into_inner();
+            if !resp.success {
+                return Err(PowerFsError::Internal(if resp.error.is_empty() {
+                    "clear_debug_config failed".into()
+                } else {
+                    resp.error
+                }));
             }
+            println!("Cleared debug config for node '{}'", node);
+            println!("  → removed: {}", resp.removed);
         }
     }
     Ok(())
@@ -235,66 +239,76 @@ fn validate_level(level: &str) -> Result<()> {
     }
 }
 
-fn print_config_list(body: &str) -> Result<()> {
-    let v: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| PowerFsError::Internal(format!("parse JSON: {}", e)))?;
-
-    // API returns {"configs": [["node", {...}], ...]} (Vec of tuples)
-    let configs = v
-        .get("configs")
-        .ok_or_else(|| PowerFsError::Internal("missing 'configs' field".into()))?;
-
-    let entries: Vec<(String, &serde_json::Value)> = match configs {
-        serde_json::Value::Array(arr) => {
-            // Each item is [node_name, config_obj]
-            arr.iter()
-                .filter_map(|item| {
-                    if let serde_json::Value::Array(pair) = item {
-                        if pair.len() == 2 {
-                            let name = pair[0].as_str().unwrap_or("?").to_string();
-                            return Some((name, &pair[1]));
-                        }
-                    }
-                    None
-                })
-                .collect()
+fn format_entry(e: &DebugConfigEntry) -> String {
+    let flags = e
+        .flags
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let level = if e.has_log_level { &e.log_level } else { "-" };
+    let target = if e.has_target_filter {
+        if e.target_filter.is_empty() {
+            "(cleared)"
+        } else {
+            &e.target_filter
         }
-        serde_json::Value::Object(map) => map.iter().map(|(k, v)| (k.clone(), v)).collect(),
-        _ => {
-            println!("No debug configurations set (all nodes use defaults).");
-            return Ok(());
-        }
+    } else {
+        "-"
     };
+    format!(
+        "node={}, level={}, target={}, flags={{{}}}",
+        e.node, level, target, flags
+    )
+}
 
-    if entries.is_empty() {
-        println!("No debug configurations set (all nodes use defaults).");
-        return Ok(());
-    }
-
+fn print_config_list(entries: Vec<DebugConfigEntry>) -> Result<()> {
     println!("═══════════════════════════════════════════════════════════");
-    println!("  Debug Configurations");
+    println!("  Debug Configurations (via MasterService gRPC)");
     println!("═══════════════════════════════════════════════════════════");
     println!("  Node              Level    Target Filter             Flags");
     println!("  {}", "-".repeat(70));
 
-    for (node, cfg) in &entries {
-        let level = cfg.get("log_level").and_then(|x| x.as_str()).unwrap_or("-");
-        let filter = cfg
-            .get("target_filter")
-            .and_then(|x| x.as_str())
-            .unwrap_or("-");
-        let flags = cfg
-            .get("flags")
-            .and_then(|x| x.as_object())
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| format!("{}={}", k, v.as_bool().unwrap_or(false)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
-            .unwrap_or_default();
+    if entries.is_empty() {
+        println!("  (no configurations set — all nodes use defaults)");
+        println!();
+        return Ok(());
+    }
 
-        println!("  {:<15} {:<8} {:<25} {}", node, level, filter, flags);
+    // Sort: "all" first, then alphabetical
+    let mut sorted = entries;
+    sorted.sort_by(|a, b| {
+        if a.node == "all" {
+            std::cmp::Ordering::Less
+        } else if b.node == "all" {
+            std::cmp::Ordering::Greater
+        } else {
+            a.node.cmp(&b.node)
+        }
+    });
+
+    for entry in &sorted {
+        let level = if entry.has_log_level {
+            entry.log_level.as_str()
+        } else {
+            "-"
+        };
+        let filter = if entry.has_target_filter {
+            if entry.target_filter.is_empty() {
+                "(cleared)"
+            } else {
+                entry.target_filter.as_str()
+            }
+        } else {
+            "-"
+        };
+        let flags = entry
+            .flags
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  {:<15} {:<8} {:<25} {}", entry.node, level, filter, flags);
     }
     println!();
     Ok(())

@@ -1244,6 +1244,145 @@ impl MasterService for MasterGrpcServer {
         }
     }
 
+    // ===== Debug & Log Level Control gRPC handlers =====
+    // Per-master local log level (affects only the currently connected master node)
+    async fn get_log_level(
+        &self,
+        _request: Request<GetLogLevelRequest>,
+    ) -> Result<Response<GetLogLevelResponse>, Status> {
+        Ok(Response::new(GetLogLevelResponse {
+            level: powerfs_common::dynamic_log::get_log_level().to_string(),
+        }))
+    }
+
+    async fn set_log_level(
+        &self,
+        request: Request<SetLogLevelRequest>,
+    ) -> Result<Response<SetLogLevelResponse>, Status> {
+        let req = request.into_inner();
+        if req.level.is_empty() {
+            return Ok(Response::new(SetLogLevelResponse {
+                success: false,
+                level: String::new(),
+                prev: String::new(),
+                error: "missing 'level' field".into(),
+            }));
+        }
+        let prev = powerfs_common::dynamic_log::get_log_level().to_string();
+        match powerfs_common::dynamic_log::set_log_level(&req.level) {
+            Ok(()) => {
+                info!("log level changed via gRPC: {} -> {}", prev, req.level);
+                Ok(Response::new(SetLogLevelResponse {
+                    success: true,
+                    level: req.level,
+                    prev,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(SetLogLevelResponse {
+                success: false,
+                level: String::new(),
+                prev,
+                error: e,
+            })),
+        }
+    }
+
+    // Cluster-wide centralized debug config (shared across all nodes via polling)
+    async fn get_debug_configs(
+        &self,
+        _request: Request<GetDebugConfigsRequest>,
+    ) -> Result<Response<GetDebugConfigsResponse>, Status> {
+        let store = self.master.debug_config();
+        let configs = store
+            .list_all()
+            .into_iter()
+            .map(|(node, cfg)| {
+                let has_log_level = cfg.log_level.is_some();
+                let has_target_filter = cfg.target_filter.is_some();
+                DebugConfigEntry {
+                    node,
+                    has_log_level,
+                    log_level: cfg.log_level.unwrap_or_default(),
+                    has_target_filter,
+                    target_filter: cfg.target_filter.unwrap_or_default(),
+                    flags: cfg.flags,
+                }
+            })
+            .collect();
+        Ok(Response::new(GetDebugConfigsResponse { configs }))
+    }
+
+    async fn update_debug_config(
+        &self,
+        request: Request<UpdateDebugConfigRequest>,
+    ) -> Result<Response<UpdateDebugConfigResponse>, Status> {
+        let req = request.into_inner();
+        if req.node.is_empty() {
+            return Ok(Response::new(UpdateDebugConfigResponse {
+                success: false,
+                updated: None,
+                error: "missing 'node' field".into(),
+            }));
+        }
+        let level = if req.has_level { Some(req.level) } else { None };
+        let target_filter = if req.has_target_filter {
+            Some(req.target_filter)
+        } else {
+            None
+        };
+        let (flag, on) = if req.has_flag {
+            (Some(req.flag), Some(req.on))
+        } else {
+            (None, None)
+        };
+        let update = crate::debug_config::DebugConfigUpdate {
+            node: req.node.clone(),
+            level,
+            target_filter,
+            flag,
+            on,
+        };
+        let store = self.master.debug_config();
+        let updated = store.apply_update(update);
+        let entry = DebugConfigEntry {
+            node: req.node,
+            has_log_level: updated.log_level.is_some(),
+            log_level: updated.log_level.unwrap_or_default(),
+            has_target_filter: updated.target_filter.is_some(),
+            target_filter: updated.target_filter.unwrap_or_default(),
+            flags: updated.flags,
+        };
+        Ok(Response::new(UpdateDebugConfigResponse {
+            success: true,
+            updated: Some(entry),
+            error: String::new(),
+        }))
+    }
+
+    async fn clear_debug_config(
+        &self,
+        request: Request<ClearDebugConfigRequest>,
+    ) -> Result<Response<ClearDebugConfigResponse>, Status> {
+        let req = request.into_inner();
+        if req.node.is_empty() {
+            return Ok(Response::new(ClearDebugConfigResponse {
+                success: false,
+                node: req.node,
+                removed: false,
+                error: "missing 'node' field".into(),
+            }));
+        }
+        let store = self.master.debug_config();
+        let removed = store.clear(&req.node);
+        Ok(Response::new(ClearDebugConfigResponse {
+            success: true,
+            node: req.node,
+            removed,
+            error: String::new(),
+        }))
+    }
+
     async fn get_filer_for_inode(
         &self,
         request: Request<GetFilerForInodeRequest>,
