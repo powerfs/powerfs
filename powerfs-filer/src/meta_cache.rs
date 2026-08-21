@@ -162,6 +162,15 @@ pub(crate) struct TrimController {
     pub trim_total: AtomicU64,
     pub staging_timeout_total: AtomicU64,
     pub deleted_timeout_total: AtomicU64,
+    /// Phase 3: cumulative lease-recall notifications pushed to clients.
+    pub recall_total: AtomicU64,
+    /// Phase 3: cumulative times a recall was suppressed because the
+    /// inode was still in recall_cooldown (client hasn't had enough
+    /// time to release since the last recall).
+    pub recall_cooldown_skips: AtomicU64,
+    /// Phase 3: cumulative refcount leak fixes (refcount > 0 but no
+    /// active lease in InodeLeaseManager, force-reset to 0).
+    pub refcount_leak_fixes: AtomicU64,
 }
 
 impl TrimController {
@@ -207,6 +216,9 @@ impl TrimController {
             trim_total: AtomicU64::new(0),
             staging_timeout_total: AtomicU64::new(0),
             deleted_timeout_total: AtomicU64::new(0),
+            recall_total: AtomicU64::new(0),
+            recall_cooldown_skips: AtomicU64::new(0),
+            refcount_leak_fixes: AtomicU64::new(0),
         }
     }
 
@@ -257,12 +269,7 @@ fn estimate_inode_bytes(info: &InodeInfo) -> usize {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<StoredFileChunk>()),
         )
-        .saturating_add(
-            info.inline_data
-                .as_ref()
-                .map(|d| d.capacity())
-                .unwrap_or(0),
-        )
+        .saturating_add(info.inline_data.as_ref().map(|d| d.capacity()).unwrap_or(0))
         // "extended" = xattrs HashMap<String, Vec<u8>>; 128 bytes/entry is
         // a rough upper bound of k + v + HashMap per-entry bookkeeping.
         .saturating_add(info.extended.len().saturating_mul(128))
@@ -284,7 +291,7 @@ fn estimate_dentry_bytes(name: &str) -> usize {
         .max(96)
 }
 
-/// Filer meta cache (Phase 1 + Phase 2 foundations).
+/// Filer meta cache (Phase 1 + Phase 2 + Phase 3 recall).
 pub struct MetaCache {
     /// Inode cache by inode number.
     inode_table: RwLock<HashMap<u64, CachedInode>>,
@@ -294,6 +301,15 @@ pub struct MetaCache {
 
     // ----- Phase 2 trim controller (shared; per-shard MetaCache has one) -----
     pub(crate) trim: TrimController,
+
+    // ----- Phase 3: recall cooldown tracking -----
+    //
+    // When trim_pass identifies Clean entries with refcount > 0 as
+    // recall candidates, we push an Invalidate to the client and record
+    // the timestamp here. Subsequent trim passes skip inodes still in
+    // cooldown (default 5 s) to give the client time to release the
+    // lease before we recall again, avoiding recall→reacquire storms.
+    recall_cooldown: RwLock<HashMap<u64, u64 /* last_recall_ms */>>,
 
     // ----- Prometheus-friendly cumulative counters -----
     //
@@ -328,6 +344,7 @@ impl MetaCache {
             inode_table: RwLock::new(HashMap::new()),
             direntry_table: RwLock::new(HashMap::new()),
             trim: TrimController::from_env_or_defaults(),
+            recall_cooldown: RwLock::new(HashMap::new()),
             inode_hit_total: AtomicU64::new(0),
             inode_miss_total: AtomicU64::new(0),
             inode_deleted_served_total: AtomicU64::new(0),
@@ -683,10 +700,8 @@ impl MetaCache {
                 .get(&key)
                 .map(|de| de.state == CacheState::Staging)
                 .unwrap_or(false);
-            if should_remove {
-                if tbl.remove(&key).is_some() {
-                    self.trim.release(estimate_dentry_bytes(name));
-                }
+            if should_remove && tbl.remove(&key).is_some() {
+                self.trim.release(estimate_dentry_bytes(name));
             }
         }
     }
@@ -861,9 +876,15 @@ impl MetaCache {
     /// Phase 2 implementation: per-entry LRU (not DirFrag). See Phase 4
     /// section of the design doc for the follow-up DirFrag-granular
     /// upgrade path.
-    pub fn trim_pass(&self) -> usize {
+    ///
+    /// Phase 3: after evicting all refcount==0 candidates, if still
+    /// over high_watermark, collects Clean entries with refcount > 0
+    /// as `recall_candidates` so the caller can push Invalidate
+    /// notifications to the holding clients. Once clients release their
+    /// leases, refcount drops to 0 and the next trim_pass can evict.
+    pub fn trim_pass(&self) -> TrimResult {
         if !self.trim.over_high() {
-            return 0;
+            return TrimResult::default();
         }
         let low = self.trim.low_bytes();
         // ----- Step 1: collect Clean + refcount == 0 candidates, sorted by LRU -----
@@ -995,7 +1016,136 @@ impl MetaCache {
                 low
             );
         }
-        evicted_total
+
+        // ----- Phase 3: collect recall candidates if still over high -----
+        //
+        // If we evicted everything we could but usage is still above
+        // high_watermark, the remaining Clean entries with refcount > 0
+        // are blocking further eviction. Collect them (up to a batch
+        // limit) so the caller can push Invalidate to their lease
+        // holders; after clients release, the next trim_pass will
+        // actually evict them.
+        let mut recall_candidates = Vec::new();
+        if self.trim.over_high() {
+            let now = now_ms();
+            let cooldown_ms = 5_000u64; // 5 s recall cooldown
+            let batch_limit = 64usize; // max recalls per trim_pass
+
+            // Sweep expired cooldown entries (client had enough time).
+            {
+                let mut cd = self.recall_cooldown.write().unwrap();
+                cd.retain(|_, ts| now.saturating_sub(*ts) < cooldown_ms * 2);
+            }
+
+            let tbl = self.inode_table.read().unwrap();
+            let cd = self.recall_cooldown.read().unwrap();
+            for (&ino, ci) in tbl.iter() {
+                if recall_candidates.len() >= batch_limit {
+                    break;
+                }
+                if ci.state != CacheState::Clean {
+                    continue;
+                }
+                let rc = ci.refcount.load(Ordering::Relaxed);
+                if rc == 0 {
+                    continue;
+                }
+                // Skip if still in cooldown (client hasn't had time to
+                // release since last recall).
+                if let Some(&last_ts) = cd.get(&ino) {
+                    if now.saturating_sub(last_ts) < cooldown_ms {
+                        self.trim
+                            .recall_cooldown_skips
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+                recall_candidates.push(ino);
+            }
+        }
+
+        TrimResult {
+            evicted: evicted_total,
+            recall_candidates,
+        }
+    }
+
+    // ---------- Phase 3: refcount + recall ----------
+
+    /// Increment the lease refcount on a cached inode.
+    ///
+    /// Called by MetaShardManager when a client acquires / renews an
+    /// inode lease. trim_pass will NOT evict entries with refcount > 0.
+    #[inline]
+    pub fn incr_refcount(&self, inode: u64) {
+        let tbl = self.inode_table.read().unwrap();
+        if let Some(ci) = tbl.get(&inode) {
+            ci.refcount.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Decrement the lease refcount on a cached inode.
+    ///
+    /// Called by MetaShardManager when a client releases / loses (TTL
+    /// expiry, disconnect) an inode lease. Saturating to 0.
+    #[inline]
+    pub fn decr_refcount(&self, inode: u64) {
+        let tbl = self.inode_table.read().unwrap();
+        if let Some(ci) = tbl.get(&inode) {
+            let _ = ci
+                .refcount
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                });
+        }
+    }
+
+    /// Mark an inode as "recalled" — records the current timestamp in
+    /// the cooldown map so subsequent trim_passes skip it for 5 s.
+    ///
+    /// Called by MetaShardManager after pushing an Invalidate to the
+    /// client holding the lease.
+    pub fn mark_recalled(&self, inode: u64) {
+        let mut cd = self.recall_cooldown.write().unwrap();
+        cd.insert(inode, now_ms());
+        self.trim.recall_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Fix refcount leaks: for every Clean inode with refcount > 0,
+    /// the caller provides a `is_lease_active` predicate. If the
+    /// predicate returns false (no active lease in InodeLeaseManager),
+    /// the refcount is force-reset to 0 and the leak counter bumped.
+    ///
+    /// Called periodically from the GC loop to recover from edge cases
+    /// where a lease was expired/revoked but `decr_refcount` was missed
+    /// (e.g. client crash before sending ReleaseInodeLease).
+    pub fn sweep_leaked_refcounts<F>(&self, is_lease_active: F)
+    where
+        F: Fn(u64) -> bool,
+    {
+        let mut fixed = 0u64;
+        let tbl = self.inode_table.read().unwrap();
+        for (&ino, ci) in tbl.iter() {
+            if ci.state != CacheState::Clean {
+                continue;
+            }
+            if ci.refcount.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            if !is_lease_active(ino) {
+                ci.refcount.store(0, Ordering::Relaxed);
+                fixed += 1;
+            }
+        }
+        if fixed > 0 {
+            self.trim
+                .refcount_leak_fixes
+                .fetch_add(fixed, Ordering::Relaxed);
+            warn!(
+                "MetaCache::sweep_leaked_refcounts: fixed {} leaked refcounts",
+                fixed
+            );
+        }
     }
 
     // ---------- stats ----------
@@ -1061,6 +1211,9 @@ impl MetaCache {
             trim_total: self.trim.trim_total.load(Relaxed),
             staging_timeout_total: self.trim.staging_timeout_total.load(Relaxed),
             deleted_timeout_total: self.trim.deleted_timeout_total.load(Relaxed),
+            recall_total: self.trim.recall_total.load(Relaxed),
+            recall_cooldown_skips: self.trim.recall_cooldown_skips.load(Relaxed),
+            refcount_leak_fixes: self.trim.refcount_leak_fixes.load(Relaxed),
             memory_usage_bytes: self.trim.current_usage_bytes.load(Relaxed) as u64,
             memory_limit_bytes: self.trim.memory_limit_bytes as u64,
             memory_high_watermark_bytes: self.trim.high_bytes() as u64,
@@ -1098,6 +1251,12 @@ pub struct MetaCacheStats {
     pub trim_total: u64,
     pub staging_timeout_total: u64,
     pub deleted_timeout_total: u64,
+    /// Phase 3: cumulative lease-recall notifications pushed.
+    pub recall_total: u64,
+    /// Phase 3: recalls skipped due to cooldown.
+    pub recall_cooldown_skips: u64,
+    /// Phase 3: refcount leaks fixed by sweep_leaked_refcounts.
+    pub refcount_leak_fixes: u64,
     pub memory_usage_bytes: u64,
     pub memory_limit_bytes: u64,
     pub memory_high_watermark_bytes: u64,
@@ -1112,6 +1271,21 @@ pub struct MetaCacheStats {
     pub direntry_dirty_count: usize,
     pub direntry_deleted_count: usize,
     pub direntry_trimming_count: usize,
+}
+
+/// Result of a single `trim_pass()` invocation.
+///
+/// Phase 3 extends the plain `evicted: usize` with `recall_candidates`:
+/// inodes that are Clean but pinned by refcount > 0, preventing
+/// eviction. The GC loop pushes Invalidate to their lease holders so
+/// they release; the next trim_pass can then evict them.
+#[derive(Debug, Default)]
+pub struct TrimResult {
+    /// Number of entries actually evicted this pass.
+    pub evicted: usize,
+    /// Inodes that need lease recall (Clean + refcount > 0). The
+    /// caller should look up lease holders and push Invalidate.
+    pub recall_candidates: Vec<u64>,
 }
 
 // ---------- helpers ----------

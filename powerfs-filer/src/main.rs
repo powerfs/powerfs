@@ -432,6 +432,17 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         };
         let net_handler = Arc::new(net_handler);
 
+        // Phase 3 Lease Recall: wire the InodeNotifier + InodeLeaseManager
+        // into the MetaShardManager so the GC loop can push Invalidate
+        // notifications to lease holders when MetaCache memory pressure
+        // exceeds the high watermark. Both components are owned by the
+        // net_handler; we clone the Arcs before moving net_handler into
+        // the server.
+        if let Some(notifier) = &net_handler.inode_notifier {
+            meta_shard_manager
+                .set_recall_components(notifier.clone(), net_handler.inode_lease_mgr.clone());
+        }
+
         // Phase 5 §5.3: recover any leases persisted to CF_LEASES on a
         // previous run / previous leader. Best-effort — failures log
         // a warning and leave the in-memory store empty, matching the

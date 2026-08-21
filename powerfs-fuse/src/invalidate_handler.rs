@@ -15,6 +15,23 @@ use powerfs_net::{FieldId, MsgType, NetMessage, NotificationHandler};
 use crate::cache::{ChunkCache, MetadataCache};
 use crate::fuse::InlineBuffer;
 
+/// Phase 3 Lease Recall: async lease releaser for the notification handler.
+///
+/// Called from the sync `handle_notification` to release the client's
+/// inode lease when the server pushes an Invalidate (recall or content
+/// change). The implementation should spawn the release RPC on a
+/// tokio runtime so the notification thread is not blocked.
+///
+/// Without this, the client drops its local lease cache on Invalidate
+/// but the server still thinks the client holds the lease, pinning the
+/// MetaCache refcount and preventing trim_pass from evicting the entry.
+pub trait LeaseReleaser: Send + Sync {
+    /// Release the inode lease. `token` is the lease token from the
+    /// client's `ClientLeaseState`. Best-effort: failures are logged
+    /// and the lease will eventually expire on the server side.
+    fn release(&self, inode: u64, token: String);
+}
+
 /// Handler for server-pushed Invalidate notifications
 ///
 /// On receiving an Invalidate message, checks the cached inode's version
@@ -73,6 +90,11 @@ pub struct InvalidateHandler {
     /// Uses RwLock<Option<...>> so it can be set after construction (the
     /// lock_manager is created after the handler in PowerFsFs::new).
     lease_state: RwLock<Option<Arc<powerfs_lock_fuse::ClientLeaseState>>>,
+    /// Phase 3 Lease Recall: async lease releaser. When an Invalidate
+    /// arrives for an inode we hold a lease on, this spawns a
+    /// ReleaseInodeLease RPC so the server decrements our refcount,
+    /// allowing MetaCache trim_pass to evict the entry.
+    lease_releaser: RwLock<Option<Arc<dyn LeaseReleaser>>>,
 }
 
 impl InvalidateHandler {
@@ -90,6 +112,7 @@ impl InvalidateHandler {
             fuse_fd: Arc::new(AtomicI32::new(-1)),
             open_inodes: Arc::new(RwLock::new(HashMap::new())),
             lease_state: RwLock::new(None),
+            lease_releaser: RwLock::new(None),
         }
     }
 
@@ -109,6 +132,7 @@ impl InvalidateHandler {
             fuse_fd,
             open_inodes: Arc::new(RwLock::new(HashMap::new())),
             lease_state: RwLock::new(None),
+            lease_releaser: RwLock::new(None),
         }
     }
 
@@ -132,6 +156,7 @@ impl InvalidateHandler {
             fuse_fd,
             open_inodes,
             lease_state: RwLock::new(None),
+            lease_releaser: RwLock::new(None),
         }
     }
 
@@ -140,6 +165,15 @@ impl InvalidateHandler {
     /// Called after construction once the FuseLockManager is available.
     pub fn set_lease_state(&self, state: Arc<powerfs_lock_fuse::ClientLeaseState>) {
         *self.lease_state.write().unwrap() = Some(state);
+    }
+
+    /// Phase 3 Lease Recall: set the async lease releaser so the
+    /// handler can send `ReleaseInodeLease` RPCs when an Invalidate
+    /// arrives for an inode the client holds a lease on. Called
+    /// after construction once the FuseLockManager + runtime handle
+    /// are available.
+    pub fn set_lease_releaser(&self, releaser: Arc<dyn LeaseReleaser>) {
+        *self.lease_releaser.write().unwrap() = Some(releaser);
     }
 
     /// Set the FUSE file descriptor (called after the FUSE session is mounted)
@@ -548,7 +582,28 @@ impl NotificationHandler for InvalidateHandler {
                     // Shared lease is no longer valid. Without this,
                     // has_valid_dir_lease() would return true and cause
                     // lookup/create to bypass RPCs, reading stale dentry cache.
+                    //
+                    // Phase 3: BEFORE dropping the local lease cache entry,
+                    // check if we hold an active inode lease. If so, spawn
+                    // a ReleaseInodeLease RPC so the server decrements our
+                    // refcount — this is critical for lease recall: without
+                    // it, the server's MetaCache refcount stays > 0 and
+                    // trim_pass can never evict the entry.
                     if let Some(lease_state) = self.lease_state.read().unwrap().as_ref() {
+                        if let Some(entry) = lease_state.get_inode(inode) {
+                            // We hold a lease — spawn the release RPC.
+                            // The local cache entry is dropped below
+                            // regardless (invalidate_inode), so the
+                            // token must be captured now.
+                            if let Some(releaser) = self.lease_releaser.read().unwrap().as_ref() {
+                                debug!(
+                                    "InvalidateHandler: releasing inode lease \
+                                     for inode={} (token={}...) on Invalidate(v={})",
+                                    inode, entry.token, version
+                                );
+                                releaser.release(inode, entry.token.clone());
+                            }
+                        }
                         lease_state.invalidate_inode(inode);
                     }
                     // Also clear the inline buffer (if not dirty). The buffer

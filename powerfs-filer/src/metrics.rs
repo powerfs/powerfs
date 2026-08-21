@@ -199,6 +199,20 @@ lazy_static::lazy_static! {
         "powerfs_filer_mc_memory_low_watermark_bytes",
         "MetaCache Phase 2: trim_pass stops once usage drops below this many bytes"
     ).unwrap();
+
+    // ===== MetaCache Phase-3 counters (Lease Recall) =====
+    static ref MC_RECALL_TOTAL: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_recall_total",
+        "MetaCache Phase 3: cumulative lease-recall Invalidate notifications pushed to clients"
+    ).unwrap();
+    static ref MC_RECALL_COOLDOWN_SKIPS: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_recall_cooldown_skips",
+        "MetaCache Phase 3: recall candidates skipped because inode was in recall cooldown (5s)"
+    ).unwrap();
+    static ref MC_REFCOUNT_LEAK_FIXES: IntGauge = register_int_gauge!(
+        "powerfs_filer_mc_refcount_leak_fixes",
+        "MetaCache Phase 3: leaked refcounts (refcount > 0 but no active lease) reset to 0 by sweep"
+    ).unwrap();
 }
 
 /// Shared state passed into the axum Router: lease manager + meta cache.
@@ -259,6 +273,11 @@ pub fn refresh_prometheus(state: &MetricsAppState) {
     MC_MEMORY_LIMIT_BYTES.set(m.memory_limit_bytes as i64);
     MC_MEMORY_HIGH_BYTES.set(m.memory_high_watermark_bytes as i64);
     MC_MEMORY_LOW_BYTES.set(m.memory_low_watermark_bytes as i64);
+
+    // --- Phase 3: lease recall counters ---
+    MC_RECALL_TOTAL.set(m.recall_total as i64);
+    MC_RECALL_COOLDOWN_SKIPS.set(m.recall_cooldown_skips as i64);
+    MC_REFCOUNT_LEAK_FIXES.set(m.refcount_leak_fixes as i64);
 }
 
 /// Start the HTTP metrics server on the given address.
@@ -345,6 +364,9 @@ async fn meta_cache_stats_handler(
         "trim_total": m.trim_total,
         "staging_timeout_total": m.staging_timeout_total,
         "deleted_timeout_total": m.deleted_timeout_total,
+        "recall_total": m.recall_total,
+        "recall_cooldown_skips": m.recall_cooldown_skips,
+        "refcount_leak_fixes": m.refcount_leak_fixes,
         "memory": {
             "usage_bytes": m.memory_usage_bytes,
             "limit_bytes": m.memory_limit_bytes,
