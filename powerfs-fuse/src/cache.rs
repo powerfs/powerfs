@@ -877,9 +877,15 @@ impl MetadataCache {
                     // Rename: replace with the new entry's metadata.
                     // Preserve xattrs from the old entry — they are local-only
                     // (not stored in the Filer) and would be lost on replace.
+                    // Preserve cap — cap is inode-bound, not path-bound; a
+                    // rename/link must not cause the client to lose its cap
+                    // state (otherwise mark_dirty becomes no-op and recall
+                    // would lose dirty data).
                     let preserved_xattrs = std::mem::take(&mut existing.xattrs);
+                    let preserved_cap = existing.cap.take();
                     *existing = entry;
                     existing.xattrs = preserved_xattrs;
+                    existing.cap = preserved_cap;
                 }
             } else {
                 // Same name/parent: update metadata fields from the new entry.
