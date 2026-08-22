@@ -4133,7 +4133,15 @@ impl FileSystem for PowerFsFs {
         fuse_backend_rs::abi::fuse_abi::OpenOptions,
         Option<u32>,
     )> {
-        debug!("open: inode={}", inode);
+        debug!("open: inode={} flags={:#x}", inode, flags);
+
+        // T1.6 fix (preamble): Compute write flags and O_APPEND early so
+        // refresh + lease logic below can use them. These were previously
+        // computed in-line further down (after refresh + lease sections),
+        // causing the is_write_open calculation to be duplicated and the
+        // O_APPEND flag unavailable during the refresh decision block.
+        let is_write_open = (flags as i32 & libc::O_ACCMODE) != libc::O_RDONLY;
+        let is_append_open = (flags & FUSE_APPEND) != 0;
 
         if inode == ROOT_INODE {
             debug!("open: inode is root, returning EISDIR");
@@ -4229,7 +4237,8 @@ impl FileSystem for PowerFsFs {
                     "open: skipping filer refresh for inode={} (has dirty/unsynced chunks or inline buffer)",
                     inode
                 );
-            } else if entry.state != EntryState::Stale
+            } else if !is_append_open
+                && entry.state != EntryState::Stale
                 && (!entry.chunks.is_empty()
                     // Bug6a fix: Inline candidate MUST have empty chunks.
                     // Without this, Flat/Stripe files in transition state
@@ -4722,39 +4731,115 @@ impl FileSystem for PowerFsFs {
         // `write_blob_batch_with_lease`, bypassing `ensure_lease`'s
         // cache lookup + proactive-renew path on every flush.
         //
-        // Only applies to inode-lease mode AND files already on the
-        // volume server (fid present). Inline files (no fid) don't
-        // need a volume-server lease; newly-created files are
-        // handled by the Lockify fast path (phase 4 §5.1).
+        // T1.6 fix (A2+A3): This is now MANDATORY for write opens
+        // (O_WRONLY / O_RDWR) with retries, and covers INLINE files as
+        // well:
         //
-        // Best-effort: if the acquire fails (e.g. Filer temporarily
-        // unreachable), the write path's `ensure_lease` will retry on
-        // the first flush — correctness is preserved.
-        let is_write_open = (flags as i32 & libc::O_ACCMODE) != libc::O_RDONLY;
-        if self.client.is_inode_lease_mode() {
-            if let Some(entry) = self.cache.get_inode(inode) {
-                if entry.fid.is_some() {
-                    let client_id = self.client.client_id();
-                    let duration_ms = self.lease_duration_ms;
-                    match self
-                        .client
-                        .acquire_inode_lease(inode, &client_id, duration_ms)
-                    {
-                        Ok((token, _expire_ms)) => {
-                            let expire_at = std::time::Instant::now()
-                                + std::time::Duration::from_millis(duration_ms);
-                            self.open_file_leases.bind(inode, token.clone(), expire_at);
-                            debug!("open: pre-acquired inode lease for inode={}", inode);
-                        }
-                        Err(e) => {
+        //   A2 (lease required): Previously this was best-effort — a
+        //     lease-conflict error from the Filer was logged and the
+        //     open proceeded without a lease. The write path's
+        //     `ensure_lease` would then use the fast-path cached token
+        //     for the OTHER client (since the filer-level lease entry
+        //     was held by that client), creating a window where both
+        //     clients "held" a lease → concurrent writes at the same
+        //     offset on the Volume Server → cross-client overwrite /
+        //     data loss. Now we RETRY a few times with backoff; if the
+        //     lease is still held by another client after retries,
+        //     return EAGAIN so the application retries open (POSIX
+        //     semantics). This mirrors Ceph Client::open's cap acquire
+        //     which BLOCKS on MDS caps before granting the fd.
+        //
+        //   A3 (inline covered): Previously we only acquired a lease
+        //     for `entry.fid.is_some()` (Flat / Stripe files that had
+        //     already migrated to Volume Server). Inline-mode files
+        //     (fid=None) bypassed lease protection entirely, so two
+        //     clients concurrently O_APPEND-ing the same small file
+        //     would both go through the inline fast path — one
+        //     client's delta would silently overwrite the other's.
+        //     Now INLINE files also go through the same Filer-level
+        //     inode lease gate (Volume-level range lease doesn't apply
+        //     for inline, but Filer-level inode lease still provides
+        //     exclusive access for write opens).
+        //
+        // Lease duration + retry budget. The Filer's inode-lease
+        // default is 60s; our retry budget of 3 × 100ms = 300ms is
+        // long enough to absorb a transient conflict (another client
+        // in the middle of release → lease_release_remote RPC) and
+        // short enough to not hang applications.
+        if self.client.is_inode_lease_mode() && is_write_open {
+            const LEASE_ACQUIRE_RETRIES: u32 = 3;
+            const LEASE_RETRY_DELAY_MS: u64 = 100;
+            let client_id = self.client.client_id();
+            let duration_ms = self.lease_duration_ms;
+            let mut last_err: Option<String> = None;
+            for attempt in 0..=LEASE_ACQUIRE_RETRIES {
+                match self
+                    .client
+                    .acquire_inode_lease(inode, &client_id, duration_ms)
+                {
+                    Ok((token, _expire_ms)) => {
+                        let expire_at = std::time::Instant::now()
+                            + std::time::Duration::from_millis(duration_ms);
+                        self.open_file_leases.bind(inode, token.clone(), expire_at);
+                        debug!(
+                            "open: pre-acquired inode lease for inode={} \
+                             (write_open={}, inline_fid_missing={}, attempt={})",
+                            inode,
+                            is_write_open,
+                            self.cache
+                                .get_inode(inode)
+                                .map(|e| e.fid.is_none())
+                                .unwrap_or(true),
+                            attempt,
+                        );
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(format!("{}", e));
+                        if attempt < LEASE_ACQUIRE_RETRIES {
                             debug!(
-                                "open: inode lease pre-acquire failed for inode={} \
-                                 (best-effort, ensure_lease will retry): {}",
-                                inode, e
+                                "open: inode lease acquire attempt {}/{} for inode={} \
+                                 failed ({}); sleeping {}ms before retry",
+                                attempt + 1,
+                                LEASE_ACQUIRE_RETRIES,
+                                inode,
+                                e,
+                                LEASE_RETRY_DELAY_MS * (attempt as u64 + 1),
                             );
+                            // Simple linear backoff: 100ms, 200ms, 300ms
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                LEASE_RETRY_DELAY_MS * (attempt as u64 + 1),
+                            ));
                         }
                     }
                 }
+            }
+            if let Some(err) = last_err {
+                // All retries exhausted. Return EAGAIN so user-space
+                // retries the open. This matches POSIX O_NONBLOCK
+                // semantics for file locks; without O_NONBLOCK the
+                // kernel/libc typically retries the syscall
+                // automatically.
+                warn!(
+                    "open: inode lease pre-acquire FAILED for inode={} \
+                     after {} retries (last_err: {}); returning EAGAIN",
+                    inode, LEASE_ACQUIRE_RETRIES, err,
+                );
+                // Undo the open_inodes + pin we did at the top of open()
+                {
+                    let mut open_inodes = self.open_inodes.write().unwrap();
+                    if let Some(count) = open_inodes.get_mut(&inode) {
+                        if *count > 0 {
+                            *count -= 1;
+                            if *count == 0 {
+                                open_inodes.remove(&inode);
+                            }
+                        }
+                    }
+                    self.cache.unpin_inode(inode);
+                }
+                return Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
             }
         }
 
