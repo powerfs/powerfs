@@ -635,11 +635,33 @@ impl MetaCache {
                 // should already be None (post-migrate), but leave as-is.
             }
         } else {
-            // Overwrite mode: size and inline_data are authoritative as-is.
-            existing.info.size = size;
-            existing.info.chunks = chunks;
+            // Overwrite mode: size + inline_data are authoritative AS-IS for
+            // inline files (explicit overwrite of inline content). For
+            // Flat/Stripe files (inline_data=None in request), we are in the
+            // "close sync stale cache" race window — another client may have
+            // already committed a larger size. Protect by using max(size)
+            // semantics (mirrors ShardStore L2945-2969).
             if let Some(data) = inline_data {
+                // Inline overwrite (explicit): caller wants full replacement.
+                existing.info.size = size;
+                existing.info.chunks = chunks;
                 existing.info.inline_data = Some(data);
+            } else {
+                // Flat sync (A7 fix): never allow size regression. If this
+                // projection is from a stale client cache, max() preserves
+                // the existing larger size that another client already
+                // advanced via Raft-appended append.
+                let clamped = std::cmp::max(existing.info.size, size);
+                if clamped != size {
+                    log::warn!(
+                        "MetaCache Overwrite-Flat CLAMP: inode {} existing={} requested={} → clamped={} \
+                         (stale projection blocked)",
+                        inode, existing.info.size, size, clamped
+                    );
+                }
+                existing.info.size = clamped;
+                existing.info.chunks = chunks;
+                // inline_data left as-is (should be None for flat files)
             }
         }
 

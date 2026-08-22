@@ -2736,10 +2736,54 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        // best-effort: 校验 inode 存在且为 Inline 模式 (有 inline_data).
-        // 不强制失败 — 若已被其他客户端迁移, 仍分配 (容错).
+        // A6 FIX: 幂等化迁移分配。
+        // 如果 inode 已经有 chunks（已被另一客户端迁移过，且 release sync 成功写回），
+        // 或已经设置了 fid，则直接返回现有 (volume_id, needle_id)，绝不重新分配。
+        // 否则双客户端并发 migrate 会得到两套不同的 fid → 数据写到两个独立 Volume 文件，
+        // 后 sync 的那个覆盖前一个的 chunks 元数据 → 先写的客户端数据永久丢失。
         if let Some(info) = self.meta_shard_manager.get_inode(inode) {
-            if info.inline_data.is_none() && info.chunks.is_empty() {
+            // Case 1: chunks 非空 → 已完成一次迁移并 sync，复用首个 chunk 的位置
+            if let Some(first) = info.chunks.first() {
+                info!(
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE — \
+                     chunks already exist, returning volume_id={} needle_id={:#x} \
+                     (chunks={}, fid={:?})",
+                    inode, first.volume_id, first.needle_id,
+                    info.chunks.len(), info.fid
+                );
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::VolumeId, first.volume_id);
+                enc.add_u64(FieldId::FileKey, first.needle_id);
+                return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+            }
+            // Case 2: fid 已设置（但 chunks 还空，罕见边界） → 从 fid 解析
+            if let Some(fid) = &info.fid {
+                let parts: Vec<&str> = fid.split(',').collect();
+                if parts.len() >= 3 {
+                    if let (Ok(vid), Ok(nid)) = (parts[0].parse::<u64>(), parts[2].parse::<u64>()) {
+                        info!(
+                            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE — \
+                             fid already set, returning volume_id={} needle_id={:#x}",
+                            inode, vid, nid
+                        );
+                        let mut enc = TlvEncoder::new();
+                        enc.add_u64(FieldId::VolumeId, vid);
+                        enc.add_u64(FieldId::FileKey, nid);
+                        return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+                    }
+                }
+            }
+            // Case 3: info.volume_id 存在但 fid 为空的极端边界
+            if let (Some(vid), true) = (info.volume_id, info.chunks.is_empty()) {
+                // volume_id 已知但 fid 字符串未设置，这种情况不应发生；
+                // 为安全起见仍分配新值（极端退化场景）
+                warn!(
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} has volume_id={} but no chunks/fid string — \
+                     falling back to fresh allocation", inode, vid
+                );
+            }
+            // 无 inline_data 且无 chunks/fid：通常是新建空文件，正常分配即可
+            if info.inline_data.is_none() && info.chunks.is_empty() && info.fid.is_none() {
                 warn!(
                     "FILER_NET_MIGRATE_INLINE_ALLOC: inode {} has no inline_data and no chunks — \
                      may already be migrated or never written, allocating anyway",
@@ -2776,7 +2820,7 @@ impl FilerNetHandler {
         };
 
         info!(
-            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} allocated volume_id={}, needle_id={:#x} \
+            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} FRESH allocation volume_id={}, needle_id={:#x} \
              (inode NOT modified, inline_data preserved for crash safety)",
             inode, volume_id, needle_id
         );

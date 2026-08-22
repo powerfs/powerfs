@@ -1361,6 +1361,30 @@ impl MetadataCache {
             if entry.cap.take().is_some() {
                 caps_cleared += 1;
             }
+            // T1.6 Step3 fix: clear dentry_lease on EVERY entry during
+            // invalidate_all (cache_epoch bump = Filer leader change).
+            //
+            // Root cause of "dentry lease valid, negative" false ENOENT:
+            //   1. invalidate_all marks entries Stale but preserves
+            //      dentry_lease (old code path cleared ONLY cap).
+            //   2. get_inode_by_name() filters OUT Stale entries → returns None.
+            //   3. check_dentry_lease() returns LeaseValid because the
+            //      Filer-issued 30s TTL hasn't expired yet.
+            //   4. lookup's Layer-1 branch sees LeaseValid + None entry
+            //      → wrongly concludes it's a NEGATIVE dentry → returns
+            //      inode=0 to VFS → all userspace ops get ENOENT even
+            //      though the directory/file still exists on the Filer.
+            //
+            // After leader change, the NEW Filer leader has zero memory
+            // of dentry leases granted by the OLD leader (the lease table
+            // is in-memory, not in RocksDB Raft state). Keeping stale
+            // leases is unsafe — the new leader would never send us
+            // Invalidate notifications for them either. Clearing ALL
+            // dentry leases forces every subsequent lookup through
+            // Layer-3 (Filer RPC), which is the safe, correct behaviour.
+            if entry.dentry_lease.take().is_some() {
+                // counted indirectly via `invalidated` below; no separate counter
+            }
             // Dirty/Flushing entries have local authoritative data that
             // must not be invalidated — they will be synced via flusher.
             if entry.state == EntryState::Dirty || entry.state == EntryState::Flushing {

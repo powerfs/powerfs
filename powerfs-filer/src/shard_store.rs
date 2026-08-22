@@ -2893,8 +2893,31 @@ impl ShardStore {
                     info.size
                 );
             } else {
-                // is_append without inline_data — no-op
-                return Ok(());
+                // A7 fix (2026-08-22): is_append=true + inline_data=None
+                // means Flat/Stripe close-sync (not no-op). Previously this
+                // branch returned Ok(()) immediately, discarding chunks/size
+                // updates sent by FUSE sync_size_chunks_on_close when
+                // is_append=true. Now apply the same max(size) semantics as
+                // MetaCache project_update_size_chunks L628-635, plus update
+                // chunks and (via code below) backfill fid/volume_id.
+                //
+                // This prevents size regression when two clients race:
+                //   Client A (read-only reopen flush) sends stale size=102900
+                //   → max(205800, 102900) = 205800 preserved.
+                let new_size = std::cmp::max(info.size, size);
+                info.size = new_size;
+                info.blocks = new_size.div_ceil(512);
+                info.chunks = chunks;
+                // inline_data stays as-is (should be None for flat files)
+                log::debug!(
+                    "Shard {} IsAppend-Flat: inode {} size clamp existing={} requested={} → new={} chunks.len={}",
+                    self.shard_id.0,
+                    inode,
+                    info.size - (new_size - info.size), // approximate "before" (ok, informational)
+                    size,
+                    new_size,
+                    info.chunks.len(),
+                );
             }
         } else {
             // Overwrite mode: log when inline_data is being replaced, to
@@ -2913,15 +2936,83 @@ impl ShardStore {
                     inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
                     info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
                 );
+                // Inline overwrite: size + inline_data are authoritative as-is
+                // (caller explicitly wants to replace inline content).
+                info.size = size;
+                info.blocks = size.div_ceil(512);
+                info.chunks = chunks;
+                info.inline_data = inline_data;
+            } else {
+                // A7 fix (2026-08-22): Overwrite + inline_data=None = Flat
+                // sync. Protect against size regression: a stale sync from a
+                // read-only reopen flush MUST NOT truncate a size that was
+                // already advanced by another client's committed append.
+                // Use `max(existing, requested)` — mirrors MetaCache's append
+                // semantics. Chunks are still updated (to pick up any new fid
+                // or layout changes) but the authoritative size never shrinks.
+                let new_size = std::cmp::max(info.size, size);
+                if new_size != size {
+                    log::warn!(
+                        "Shard {} Overwrite-Flat: inode {} size CLAMP existing={} requested={} → new={} \
+                         (stale client sync blocked — cross-client append preserved)",
+                        self.shard_id.0,
+                        inode,
+                        info.size,
+                        size,
+                        new_size,
+                    );
+                }
+                info.size = new_size;
+                info.blocks = new_size.div_ceil(512);
+                info.chunks = chunks;
+                info.inline_data = None; // redundant, explicit
             }
-            info.size = size;
-            info.blocks = size.div_ceil(512);
-            // P4: 只在 chunks 实际变化时才重置 reliability_state,
-            // 避免 read-only open/close (FUSE release 回调 re-sync 相同 chunks)
-            // 不必要地清空 replica_chunks.
-            info.chunks = chunks;
-            info.inline_data = inline_data;
         }
+
+        // A6 FIX: 从 chunks[0] 回填 info.fid / info.volume_id。
+        //
+        // Root cause (T1.6 cross-client concurrent append data loss):
+        //   Client A migrate → (vid_A, nid_A) → write data → sync chunks
+        //   (but info.fid/volume_id left None).
+        //   Client B open() → Filer GetAttr returns chunks with (vid_A,nid_A)
+        //   via encode_chunks_fields, so B's cache.entry.fid is correctly
+        //   reconstructed. BUT if B also triggers migrate BEFORE A syncs
+        //   (critical section), handle_migrate_inline_alloc must return
+        //   the SAME (vid_A,nid_A), which relies on info.chunks being set.
+        //   As defense-in-depth, we also persist info.fid/volume_id so
+        //   the S3 provider path (inode_info_to_entry) and any future
+        //   code that uses these fields instead of iterating chunks will
+        //   see the correct location.
+        //
+        // Format: fid = "{volume_id},{cookie},{file_key}"
+        //   cookie = 0 (not used for data ops, see FUSE fuse.rs:2107-2112)
+        //   file_key = chunks[0].needle_id (base needle for Flat, first
+        //              stripe-unit needle for Stripe — both compatible)
+        if let Some(first) = info.chunks.first() {
+            let vid = first.volume_id;
+            let file_key = first.needle_id;
+            let fid_str = format!("{},0,{}", vid, file_key);
+            let fid_changed = info.fid.as_deref() != Some(fid_str.as_str());
+            let vid_changed = info.volume_id != Some(vid);
+            if fid_changed || vid_changed {
+                log::info!(
+                    "Shard {} A6-SYNC-FID: inode {} setting fid={:?} volume_id={} \
+                     (from chunks[0] vid={} needle_id={:#x}) — \
+                     prev_fid={:?} prev_vid={:?}",
+                    self.shard_id.0, inode,
+                    fid_str, vid,
+                    vid, file_key,
+                    info.fid, info.volume_id
+                );
+                info.fid = Some(fid_str);
+                info.volume_id = Some(vid);
+            }
+        } else {
+            // chunks 清空了 (回到 Inline 模式或文件被截断为空)
+            // 保守起见：保留 fid/volume_id 字段不清除，防止极端竞态
+            // 下下一次 sync 时重建。下次 chunks 非空时会再次覆盖更新。
+        }
+
         // P4/P6: 如果文件已 Replicated 或 EC 但数据更新了 (追加写/截断),
         // 重置为 PendingReplicated 让 scrubber 重新走完整管线 (复制 → EC 编码).
         // 同时清空旧的 replica_chunks. EC shards 成为孤儿, 由 Volume GC 回收.
