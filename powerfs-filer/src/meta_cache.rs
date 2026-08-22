@@ -565,6 +565,61 @@ impl MetaCache {
         }
     }
 
+    /// Project UpdateInodeSizeChunks into MetaCache (Ceph MDS projected state model).
+    ///
+    /// Updates size/chunks/inline_data on a cached inode so subsequent
+    /// `get_inode` calls return the new values immediately — before Raft
+    /// apply completes on ShardStore. This closes the T1.3 visibility gap:
+    ///
+    ///   1. `create` stages an inode in MetaCache (state=Staging, size=0,
+    ///      chunks=[])
+    ///   2. `update_inode_size_chunks` proposes Raft log but (in async mode)
+    ///      does NOT wait for apply
+    ///   3. Cross-client `getattr` → `get_inode` → MetaCache hit → returns
+    ///      stale size=0, chunks=[] → reader EIO
+    ///
+    /// With this method, step 2 also updates MetaCache so step 3 sees the
+    /// new size/chunks. This mirrors Ceph MDS's projected state: memory
+    /// updates precede journal apply.
+    ///
+    /// If the inode is not in MetaCache, do nothing — `get_inode` will
+    /// fetch from ShardStore after Raft apply. Only Staging/Clean/Dirty
+    /// entries are updated; Deleted/Trimming are left alone.
+    pub fn project_update_size_chunks(
+        &self,
+        inode: u64,
+        size: u64,
+        chunks: Vec<crate::shard_store::StoredFileChunk>,
+        inline_data: Option<Vec<u8>>,
+        is_append: bool,
+    ) {
+        let mut tbl = self.inode_table.write().unwrap();
+        let Some(existing) = tbl.get_mut(&inode) else {
+            return;
+        };
+        match existing.state {
+            CacheState::Deleted | CacheState::Trimming => return,
+            CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
+        }
+        let old_bytes = estimate_inode_bytes(&existing.info);
+        if is_append {
+            existing.info.size = std::cmp::max(existing.info.size, size);
+        } else {
+            existing.info.size = size;
+        }
+        existing.info.chunks = chunks;
+        if let Some(data) = inline_data {
+            existing.info.inline_data = Some(data);
+        }
+        let new_bytes = estimate_inode_bytes(&existing.info);
+        if new_bytes >= old_bytes {
+            self.trim.charge(new_bytes - old_bytes);
+        } else {
+            self.trim.release(old_bytes - new_bytes);
+        }
+        existing.touch();
+    }
+
     // ---------- delete staging ----------
 
     /// Mark an inode and its directory entry as `Deleted` (pending Raft).

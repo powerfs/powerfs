@@ -1047,6 +1047,17 @@ impl MetaShardManager {
             );
         }
 
+        // MetaCache.stage_delete was called before propose, so the dir
+        // entry is already marked Deleted in the Filer's in-memory cache.
+        // Any client that receives an Invalidate and re-queries the Filer
+        // will get ENOENT from MetaCache without waiting for Raft apply.
+        // This is sufficient for cross-client visibility: notify_inode_change
+        // broadcasts Invalidate immediately after this function returns.
+        //
+        // Do NOT wait_for_entry_removed here — that would add Raft apply
+        // latency (1-3ms) to every unlink. The MetaCache deleted marker
+        // is the authoritative fast-path, matching Ceph's projected state
+        // (MDS projects the unlink before journaling).
         if !self.is_async_meta_persist() {
             self.wait_for_entry_removed(shard_dir, parent_inode, name)
                 .await;
@@ -1194,6 +1205,13 @@ impl MetaShardManager {
                     resolved.len(),
                     shard_dir.0
                 );
+                // MetaCache.stage_delete was called for all entries before
+                // propose_many, so all dir entries are already marked Deleted
+                // in the Filer's in-memory cache. Clients that receive
+                // Invalidate and re-query the Filer will get ENOENT from
+                // MetaCache without waiting for Raft apply.
+                // notify_inode_change broadcasts Invalidate after this function
+                // returns — no need to wait_for_entry_removed here.
             }
             Err(e) => {
                 // If not leader, fail entire batch — caller should redirect.
@@ -3624,6 +3642,18 @@ impl MetaShardManager {
         is_append: bool,
     ) -> Result<(), String> {
         let target_chunk_count = chunks.len();
+
+        // T1.3 fix (2026-08-22): Clone chunks/inline_data BEFORE moving into
+        // ShardCommand so we can project them into MetaCache after propose.
+        // Without this, async mode returns immediately after propose_meta,
+        // but MetaCache still holds the create-time staged value (size=0,
+        // chunks=[]). Cross-client getattr → get_inode → MetaCache hit →
+        // returns stale size=0 → reader EIO after READ_LAG timeout.
+        // The projection mirrors Ceph MDS projected state: memory updates
+        // precede journal apply.
+        let chunks_for_projection = chunks.clone();
+        let inline_for_projection = inline_data.clone();
+
         let cmd = ShardCommand::UpdateInodeSizeChunks {
             inode,
             size,
@@ -3632,6 +3662,17 @@ impl MetaShardManager {
             is_append,
         };
         self.propose_meta(shard_id, cmd.serialize()).await?;
+
+        // Project the update into MetaCache so subsequent get_inode calls
+        // (e.g., from cross-client getattr) return the new size/chunks
+        // immediately, without waiting for Raft apply.
+        self.meta_cache.project_update_size_chunks(
+            inode,
+            size,
+            chunks_for_projection,
+            inline_for_projection,
+            is_append,
+        );
 
         // Strict mode only: Wait for the apply to complete on this (leader)
         // node so that notify_inode_change and subsequent reads see the

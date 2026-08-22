@@ -555,15 +555,24 @@ impl FuseClientFacade {
             );
         }
 
-        // 优先使用 master 拓扑下发的 filer 列表（健康节点的 leader_addr），
-        // 回退到配置中的 filer_addrs/filer_addr（force_mount 场景或拓扑为空时）。
+        // 优先使用 master 拓扑下发的 filer 列表。
+        //
+        // 用 `all_filer_addresses`（所有 healthy filer）而非 `shards.values()`
+        // （每个 shard 只保留第一个 filer），否则 rotation 列表会退化为
+        // 单个地址，单点故障时无法 failover 到其他 filer。
+        // 回退到 `shards.values()` 仅在旧 Master 不下发 `all_filer_addresses`
+        // 时（兼容性），再回退到配置中的 filer_addrs/filer_addr。
         // 必须在 update_topology 之前从本地 topology 取，避免再 clone 一次。
-        let topology_filer_endpoints: Vec<String> = topology
-            .shards
-            .values()
-            .map(|s| s.leader_addr.clone())
-            .filter(|a| !a.is_empty())
-            .collect();
+        let topology_filer_endpoints: Vec<String> = if !topology.all_filer_addresses.is_empty() {
+            topology.all_filer_addresses.clone()
+        } else {
+            topology
+                .shards
+                .values()
+                .map(|s| s.leader_addr.clone())
+                .filter(|a| !a.is_empty())
+                .collect()
+        };
         // 同样从拓扑提取 volume 地址列表（host:port），供 volume_addrs 为空时使用。
         // master GetTopology 下发 volumes[].addr，fetch_topology 已转成 VolumeInfo.addr。
         let topology_volume_endpoints: Vec<String> = topology

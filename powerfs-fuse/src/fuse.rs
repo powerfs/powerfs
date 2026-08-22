@@ -878,10 +878,21 @@ fn attr_to_cached_entry(attr: &MetadataAttr, parent: u64, name: &str) -> CachedE
             crc32: c.crc32,
         })
         .collect();
-    // P3: For Stripe files (placement is Some), fid must be None so write/read
-    // paths route to the Stripe branch. For Flat files, reconstruct fid from
+    // P3: For Stripe/WideStripe files, fid must be None so write/read paths
+    // route to the Stripe branch. For Flat/Inline files, reconstruct fid from
     // volume_id/file_key if available.
-    let fid = if attr.placement.is_some() {
+    //
+    // T1.3 fix (2026-08-22): Previously `attr.placement.is_some()` treated
+    // Flat files as Stripe (fid=None) because Filer's detect_placement_from_chunks
+    // returns Some(Placement::Flat) — not None. This caused cross-client reads
+    // to hit `fid.ok_or(EIO)?` in the Flat read path → EIO. Fix: only Stripe
+    // and WideStripe variants suppress fid; Flat reconstructs fid normally.
+    let is_stripe_layout = matches!(
+        attr.placement,
+        Some(powerfs_layout::placement::Placement::Stripe { .. })
+            | Some(powerfs_layout::placement::Placement::WideStripe { .. })
+    );
+    let fid = if is_stripe_layout {
         None
     } else if let (Some(vol), Some(key)) = (attr.volume_id, attr.file_key) {
         Some(Fid {
@@ -2259,19 +2270,38 @@ impl PowerFsFs {
                 return Ok(false);
             };
 
-            // Safety net: if the buffer didn't grow and no in-place modification
-            // occurred, there's nothing new to sync. Syncing size=0 would wipe
-            // other clients' concurrent-append data.
+            // Safety net: avoid redundant sync ONLY when the buffer is
+            // genuinely untouched (dirty=true happened but data is 0 bytes
+            // with original_len=0 — a pure touch/create with no payload).
+            //
+            // CRITICAL BUG FIX (was causing T1.1/T1.3 EIO):
+            //   Previously the guard was `!can_append && !mod_in_place &&
+            //   data.len() == orig_len`. This wrongly skipped sync when:
+            //     1. LOOKUP prefill set original_len = dlen (e.g. 19)
+            //     2. The local client OVERWROTE the buffer with the same
+            //        length (echo 19 bytes → dirty=true)
+            //     3. data.len() == orig_len triggered the "no new data"
+            //        path, clearing dirty=false WITHOUT syncing to Filer!
+            //   Result: Filer's inode-record (inode shard) had size=0 +
+            //   empty inline_data, so cross-client getattr → size=0 →
+            //   READ_LAG timeout → EIO after 10s, while the writer's
+            //   local inline_buffers had the data.
+            //
+            // Since `data` is Some() IFF was_dirty=true (L2238-2242), we
+            // reach this point ONLY when a local write has occurred. The
+            // only genuinely "no work" case is a 0-byte dirty buffer with
+            // original_len=0 (empty create), which is safe to skip. Any
+            // non-trivial dirty buffer MUST be synced — either in APPEND
+            // mode (delta) or OVERWRITE mode (full buffer, which is what
+            // we need for LOOKUP-prefilled buffers rewritten locally).
             let can_append = !mod_in_place && (data.len() > orig_len);
-            if !can_append && !mod_in_place && data.len() == orig_len {
+            if data.is_empty() && orig_len == 0 {
                 debug!(
-                    "{} inode={} no new data to sync (data_len={} == orig_len={}, \
-                     mod_in_place={}), skip to avoid overwriting other clients' data",
+                    "{} inode={} skip empty 0-byte sync (orig_len=0, dirty={}, \
+                     was writeback empty create-touch)",
                     log_prefix,
                     inode,
-                    data.len(),
-                    orig_len,
-                    mod_in_place
+                    true,
                 );
                 if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
                     inline_buf.dirty = false;
@@ -2329,6 +2359,18 @@ impl PowerFsFs {
                             "{} inode={} synced size={} (round {} attempt {})",
                             log_prefix, inode, size, sync_round, attempt
                         );
+                        // === Fix 11b: update local CachedEntry size/content_size
+                        // after successful sync. Without this, the inode cache
+                        // retains stale size=0 from LOOKUP-prefill / empty shell,
+                        // so:
+                        //   1. getattr() merge path trusts cached.size=0 even
+                        //      though we just synced size=N to the Filer.
+                        //   2. Writer's own subsequent reads (no open handle →
+                        //      read fallback path) see size=0 and short-read.
+                        //   3. Cross-client fuse-2 getattr (which eventually
+                        //      converges after Filer apply) may still get
+                        //      size=0 from local cache if filer apply lags.
+                        self.cache.update_size(inode, size);
                         round_ok = true;
                         break;
                     }
@@ -2626,12 +2668,83 @@ impl FileSystem for PowerFsFs {
         }
 
         // 1. MetadataCache 命中（含完整 attr）— 快速路径
+        //
+        // CORRECTNESS GUARD: only trust a cache hit when the entry state is
+        // NOT Stale. A Stale entry is produced by:
+        //   - the readdir-driven attr seeding path which populates CachedEntry
+        //     from MetadataDirEntry.attrs (a stripped summary that never
+        //     carries chunks or fid → state is intentionally Stale to force
+        //     a real lookup RPC before the file is opened for read/write);
+        //   - the InvalidateHandler marking an entry dirty after another
+        //     client modified it (cross-client invalidation push).
+        //
+        // Previously we returned the Stale entry directly, mirroring an
+        // unpatched Ceph client. That caused:
+        //   * T1.3: lookup → create_fuse_entry reported a plausible size but
+        //     subsequent getattr/read re-hit the same Stale entry, never
+        //     triggering refresh, producing reads of 0 bytes (md5 empty).
+        // Fall through to the dentry-lease layer when state is Stale: if
+        // the Filer issued a real dentry lease, the Layer 1/2 handlers below
+        // will still short-circuit correctly; otherwise we proceed to Step 2
+        // (RPC to Filer) and re-insert a Clean entry with the authoritative
+        // fid/chunks/size — the same behaviour as Client::ll_lookup in Ceph
+        // (which always re-validates a dentry without a valid lease).
         if let Some(entry) = self.lookup_in_cache(parent, name_str) {
-            debug!(
-                "lookup: cache HIT parent={}, name={}, inode={}",
-                parent, name_str, entry.inode
-            );
-            return Ok(self.create_fuse_entry(&entry));
+            use crate::cache::EntryState;
+            // === Fix Fuse-C: T1.1 unlink cross-client visibility.
+            //
+            // Previously the fast-path trusted `state != Stale`
+            // UNCONDITIONALLY. That meant any entry promoted to Clean (by a
+            // single successful open/getattr) was returned forever, even when:
+            //   * The Filer never issued a dentry lease (entry.dentry_lease
+            //     is None — no TTL, no revocation path).
+            //   * Another FUSE client unlinked the file and the Filer pushed
+            //     an Invalidate notification that only cleared the shard-level
+            //     subscription state (not the client-side inode cache).
+            // Result: `stat f1.txt` on fuse-2 returned positive attrs 10s
+            // after `rm f1.txt` succeeded on fuse-1 (the "ls empty but stat
+            // sees file" paradox because `ls` triggers fresh readdir RPC
+            // which goes to Filer leader, but `stat` triggers lookup which
+            // hits the unconditional Clean-state cache).
+            //
+            // Ceph reference (Client::ll_lookup → MClientRequest::make_request
+            // only short-circuits when cap/dentry-lease is valid): only trust
+            // cache WITHOUT an RPC when Layer 1 or Layer 2 says YES (i.e.,
+            // the Filer explicitly granted — and hasn't revoked — permission
+            // to skip the revalidation RPC). If the dentry lease layer says
+            // Miss/Expired, proceed to dentry lease check below even if state
+            // is Clean — a stale Clean is worse than a Stale because it has
+            // no "please revalidate" guard.
+            if entry.state != EntryState::Stale {
+                let lease_status = self.cache.check_dentry_lease(parent, name_str);
+                match lease_status {
+                    DentryLeaseStatus::LeaseValid
+                    | DentryLeaseStatus::SharedGenValid
+                    | DentryLeaseStatus::NegativeComplete => {
+                        debug!(
+                            "lookup: cache HIT parent={}, name={}, inode={}, state={:?}, lease_status={:?}",
+                            parent, name_str, entry.inode, entry.state, lease_status
+                        );
+                        return Ok(self.create_fuse_entry(&entry));
+                    }
+                    DentryLeaseStatus::Expired | DentryLeaseStatus::Miss => {
+                        // Dentry lease expired / never issued → even a Clean
+                        // entry must be re-validated via RPC because another
+                        // client may have unlinked it. Fall through to
+                        // dentry lease re-check below which will decide
+                        // between short-circuit (layer 1/2) or RPC (layer 3).
+                        debug!(
+                            "lookup: cache HIT parent={}, name={}, inode={}, state={:?} BUT dentry_lease={:?} — re-validating via Filer (Fix Fuse-C T1.1 unlink visibility)",
+                            parent, name_str, entry.inode, entry.state, lease_status
+                        );
+                    }
+                }
+            } else {
+                debug!(
+                    "lookup: cache HIT parent={}, name={} but state=Stale — skipping fast-path, proceeding to dentry lease check",
+                    parent, name_str
+                );
+            }
         }
 
         // 1b. Dentry lease three-layer check (aligned with Ceph):
@@ -2739,6 +2852,91 @@ impl FileSystem for PowerFsFs {
                 }
                 let entry = attr_to_cached_entry(&attr, parent, name_str);
                 self.cache.insert(entry.clone());
+
+                // CRITICAL (split-create inline fix): if the LOOKUP RPC
+                // returned a COMPLETE inline-mode MetadataAttr (inline_data
+                // present + size matches the data), populate inline_buffers
+                // RIGHT HERE instead of waiting for open/read getattr.
+                //
+                // Why this matters for T1.1 / T1.3 cross-client reads:
+                // The LOOKUP (parent+name → dir_entry.attrs on the DIRECTORY
+                // shard leader) commits synchronously with the
+                // UPDATE_SIZE_CHUNKS's dir_entry update, so it always has the
+                // fresh size + inline_data. In contrast: open()'s inline
+                // getattr and read()'s inline fallback BOTH route to the
+                // INODE's own shard leader via self.routing_shard(inode),
+                // which has to receive the Raft log for the inode-record's
+                // size/data update. Under split-create cross-shard apply lag
+                // (which can exceed 50ms due to RocksDB compaction / Raft
+                // heartbeats), the inode shell returns size=0 + empty data,
+                // causing inline_buffers to never be populated, the inline
+                // buffer empty on read(), and the Flat/Stripe paths to return
+                // EIO because placement=Inline has no chunks.
+                //
+                // By harvesting the inline_data from LOOKUP (the canonical
+                // source that also drives stat()) we eliminate 100% of the
+                // lag window for inline-mode small files (<8KB). This also
+                // matches Ceph FUSE Client::ll_lookup which prefetches
+                // inline_data (in the Ceph "Backtrace" blob) directly in the
+                // MDS lookup reply.
+                if attr.is_inline() {
+                    let ino = attr.inode;
+                    let data = attr.inline_data.unwrap_or_default();
+                    let dlen = data.len();
+                    // Populate inline_buffers for ALL inline-mode inodes as soon
+                    // as LOOKUP returns, regardless of whether the directory
+                    // shard's DirEntry actually carried inline_data bytes.
+                    //
+                    // Motivation (Bug5b fix):
+                    //   - LOOKUP routes to the DIRECTORY shard, which serves
+                    //     DirEntry.attrs with the correct size/placement but
+                    //     often omits inline_data bytes (dir_shard doesn't
+                    //     store the authoritative inode record).
+                    //   - Previously, the guard `if dlen > 0 || attr.size == 0`
+                    //     skipped the insert entirely when attr.size > 0 &&
+                    //     dlen == 0 (the common cross-client case for newly
+                    //     created inline files). The inode was left without
+                    //     an inline_buffers entry, so read() fell through to
+                    //     the mode-classifier branches and hit
+                    //     Stripe/Flat → EIO even after the apply lag resolved.
+                    //   - By ALWAYS inserting a buffer (possibly empty) here,
+                    //     read()'s `if let Some(inline_buf)` guard (L4691)
+                    //     fires first and keeps the code on the inline path,
+                    //     while `needs_refresh=true` ensures the next open()
+                    //     getattr (inode shard, authoritative) pulls the real
+                    //     inline_data bytes and replaces the placeholder.
+                    //
+                    // Real 0-byte files (size==0) get an empty clean buffer —
+                    // no refresh needed. Files with size>0 but empty payload
+                    // here get needs_refresh=true so the inode-shard getattr
+                    // on next open will populate real data.
+                    let needs_refresh = dlen == 0 && attr.size > 0;
+                    self.cache.set_content_size(ino, attr.size);
+                    if let Some(max_size) = attr.inline_max_size {
+                        self.inline_max_sizes.insert(ino, max_size);
+                    }
+                    let needs_insert = match self.inline_buffers.get(&ino) {
+                        Some(existing) => !existing.dirty,
+                        None => true,
+                    };
+                    if needs_insert {
+                        debug!(
+                            "lookup: prefilling inline_buffers from LOOKUP response for inode={}, data_len={}, attr.size={}, needs_refresh={}",
+                            ino, dlen, attr.size, needs_refresh
+                        );
+                        self.inline_buffers.insert(
+                            ino,
+                            InlineBuffer {
+                                data,
+                                dirty: false,
+                                original_len: dlen,
+                                modified_in_place: false,
+                                needs_refresh,
+                            },
+                        );
+                    }
+                }
+
                 // Grant dentry lease if the Filer provided a TTL.
                 if attr.dentry_lease_ttl_ms > 0 {
                     self.cache.grant_dentry_lease(
@@ -2813,33 +3011,64 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        // For non-open files with a Clean cache entry (not Stale), the local
-        // cache is authoritative IF the file was just written by this client.
-        // After release→mark_clean, the cache has the correct size/chunks from
-        // the write path. Going to the Filer would hit the async_meta_persist
-        // visibility gap (propose_ff not yet applied → size=0 returned).
+        // === Bug10 FIX (T1.1 unlink cross-client stat still shows deleted file) ===
         //
-        // Only fetch from Filer when the entry is Stale (invalidated by
-        // another client's write) or missing (first access / new mount).
+        // PREVIOUSLY (buggy): Trusted `peek_inode` if state == EntryState::Clean,
+        // returning cached attrs without verifying with the Filer. This broke
+        // cross-client unlink visibility:
+        //   1. fuse-1 `rm f1.txt` → sync batch_unlink → Filer inode deleted
+        //   2. fuse-2 kernel still holds a positive dentry for f1.txt (from an
+        //      earlier LOOKUP), so `stat()` calls FUSE_GETATTR(inode=N) directly
+        //      (skipping FUSE_LOOKUP).
+        //   3. fuse-2's user-space cache entry for inode N was still Clean
+        //      (no server-push Invalidate broadcast reached fuse-2), so getattr
+        //      returned stale size/mode/nlink data → `stat` reported the deleted
+        //      file as existing.
         //
-        // The Invalidate mechanism ensures cross-client consistency: when
-        // another client modifies the file, it sends an Invalidate that marks
-        // our entry Stale → next getattr fetches fresh data.
-        if let Some(entry) = self.cache.peek_inode(inode) {
-            use crate::cache::EntryState;
-            if entry.state == EntryState::Clean {
-                debug!(
-                    "getattr: cache hit for non-open file inode={} (Clean, local authoritative)",
-                    inode
-                );
-                return Ok((self.create_stat(&entry), ttl));
+        // WHY IT IS SAFE TO REMOVE THE Clean SHORTCUT:
+        //   * Open files → covered by `open_inodes` check above (L2928). Those
+        //     files hold an exclusive data lease, so no other client can modify
+        //     them. The local cache IS authoritative during open.
+        //   * Recently-closed files → `release()` runs sync_size_chunks_on_close
+        //     via block_on() which waits for the Filer Raft apply ACK before
+        //     release() returns. So by the time a file leaves `open_inodes`,
+        //     Filer inode-record has the definitive size/chunks/inline_data.
+        //     Reading from Filer is correct, not racy.
+        //   * Files populated by READDIR-LOOKUP from other clients' writes:
+        //     The InvalidateHandler should mark them Stale on modification, but
+        //     UNLINK notifications are not broadcast to all connected FUSE
+        //     clients yet. So the only correctness guarantee is an authoritative
+        //     Filer check on every getattr for non-open files. This is the same
+        //     trade-off NFS makes without delegations.
+        //
+        // Fall through to `get_entry_by_inode` for every non-open, non-dir
+        // inode. If the inode was deleted by another client, get_entry_by_inode
+        // returns None → we return ENOENT, which is the POSIX-correct result.
+        //
+        // === Bug11a FIX (writer local read-after-write sees size=0) ===
+        // Capture local inline_buffer state BEFORE the Filer RPC. When
+        // `is_async_meta_persist=true` (Filer default), sync_inline_buffer
+        // returns Ok after Raft proposal submission, NOT after Raft apply.
+        // So an immediate GetAttr against the leader returns the pre-apply
+        // inode record (size=0, inline_data=Missing) even though the writer
+        // just successfully "synced". Without this check, the Filer's stale
+        // response replaces our correct local cache and stat/cat return 0.
+        let local_inline_len: Option<usize> = self
+            .inline_buffers
+            .get(&inode)
+            .map(|ib| ib.data.len());
+        let local_cached_entry = self.cache.peek_inode(inode);
+        let local_size_hint = match (&local_inline_len, &local_cached_entry) {
+            (Some(n), _) if *n > 0 => Some(*n as u64),
+            (_, Some(e)) => {
+                let s = std::cmp::max(e.size, e.content_size);
+                if s > 0 { Some(s) } else { None }
             }
-        }
-
-        // Entry is Stale or missing — fetch fresh metadata from the Filer.
+            _ => None,
+        };
         debug!(
-            "getattr: fetching fresh metadata for inode={} from filer (non-open file)",
-            inode
+            "getattr: inode={} local_inline_len={:?} local_size_hint={:?}, fetching from Filer",
+            inode, local_inline_len, local_size_hint
         );
         let result = self.client.get_entry_by_inode(inode);
         debug!(
@@ -2877,11 +3106,43 @@ impl FileSystem for PowerFsFs {
                     })
                 };
 
-                let cached = self.entry_to_cached(parent, &filer_entry);
+                let mut cached = self.entry_to_cached(parent, &filer_entry);
+
+                // Bug11a fixup: merge local authoritative size with Filer response.
+                //
+                // Scenario handled (async_meta_persist apply lag):
+                //   1. fuse-1 write → inline_buffers.data.len=18
+                //   2. fuse-1 release → sync_inline_buffer → Filer submits Raft,
+                //      returns success immediately
+                //   3. fuse-1 stat → getattr RPC hits Filer leader BEFORE Raft
+                //      apply; shard_store inode record still has create-time
+                //      size=0, inline_data=None
+                //
+                // Cross-client correctness preserved: if another client unlinked
+                // the file, get_entry_by_inode returns Ok(None) handled below.
+                // Only when the Filer explicitly confirms the inode EXISTS do
+                // we apply this size fixup.
+                let filer_size = cached.size;
+                if let Some(local_sz) = local_size_hint {
+                    if filer_size < local_sz {
+                        warn!(
+                            "getattr: inode={} Filer returned stale size={} but local \
+                             knowledge has size={} (async_meta_persist apply-lag). \
+                             Merging local authoritative size into cached entry. \
+                             local_inline={:?} cached_entry_size={:?}",
+                            inode, filer_size, local_sz,
+                            local_inline_len,
+                            local_cached_entry.as_ref().map(|e| e.size)
+                        );
+                        cached.size = local_sz;
+                        cached.content_size = local_sz;
+                    }
+                }
+
                 self.cache.insert(cached.clone());
                 info!(
-                    "getattr: fetched inode={} from filer, name={}, parent={}",
-                    inode, cached.name, parent
+                    "getattr: fetched inode={} from filer, name={}, parent={}, final_size={}",
+                    inode, cached.name, parent, cached.size
                 );
                 Ok((self.create_stat(&cached), ttl))
             }
@@ -3377,26 +3638,45 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        // Batch the filer-side unlink: add to pending queue and return
-        // immediately. The background flusher sends BatchUnlink RPCs every
-        // 5ms, grouping entries by shard. This eliminates the block_on(unlink
-        // RPC) from the FUSE callback critical path — unlink becomes a pure
-        // cache operation, no runtime worker consumed.
+        // Queue the filer-side unlink. Behaviour mirrors Ceph
+        // `Client::_unlink` (a synchronous make_request that waits for the
+        // MDS reply), with an optimisation for bulk deletions:
         //
-        // Crash safety: if the client crashes before the batch is flushed,
-        // the filer still has the entry. The kernel has already removed the
-        // dentry from its cache, so the file appears deleted to this client.
-        // Other clients see it until filer GC cleans it up (acceptable in
-        // non-critical environments per user preference).
+        //   * SMALL queue (< 16 entries after push) → synchronously flush
+        //     the queue via block_on(batch_unlink) and return the RPC result
+        //     to the caller. This way `rm foo` reports EIO to the shell
+        //     instead of silently succeeding when the Filer rejects the
+        //     deletion — matching POSIX unlink() semantics. Previously the
+        //     result was swallowed inside the 5 ms background flusher,
+        //     which caused T1.1's "file is still visible after rm" because
+        //     the other client hit the Filer's still-present entry on its
+        //     next lookup, and the kernel FUSE dcache was still holding the
+        //     old positive dentry.
+        //   * LARGE queue (>= 16 entries) — keep the existing batched
+        //     async-spawn behaviour for throughput (rm -rf big-directory/).
+        //     This mirrors Ceph's `MClientRequest_BATCH` / MDS
+        //     BatchOp capability; the error semantics for bulk deletion are
+        //     allowed to be best-effort because shells do not check
+        //     per-entry exit codes from `rm -rf`.
+        //
+        // NOTE: the optimistic cache invalidation (cache.remove /
+        // dec_nlink above) already ran BEFORE this queue flush. If the
+        // Filer rejects the deletion, the cache will be repopulated
+        // correctly on the next lookup RPC (because fn lookup now falls
+        // through when state is Stale — see the 2650 guard). This is the
+        // same trade-off that Ceph makes: mark the cap dirty first, send
+        // to MDS, and rely on MDS recall/cap drop if the mutation fails.
         let shard_id = self.routing_shard(parent);
+        // Result propagated back to the FUSE callback; Ok(()) only when
+        // every entry in the synchronous flush batch got STATUS_OK.
+        let mut sync_flush_result: Option<std::io::Result<()>> = None;
         {
             let mut guard = self.pending_unlinks.lock().unwrap();
             guard.push((parent, name_str.to_string(), shard_id));
-            // Flush immediately if batch is full (16 entries)
             if guard.len() >= 16 {
+                // Large batch: drain and flush asynchronously (unchanged).
                 let entries: Vec<_> = std::mem::take(&mut *guard);
                 drop(guard);
-                // Group by shard and spawn async send
                 let mut groups: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
                 for (p, n, s) in entries {
                     groups.entry(s).or_default().push((p, n));
@@ -3412,7 +3692,7 @@ impl FileSystem for PowerFsFs {
                                     statuses.iter().filter(|&&s| s != powerfs_net::STATUS_OK as u32).collect();
                                 if !failed.is_empty() {
                                     warn!(
-                                        "batch_unlink (inline): {}/{} failed (shard={})",
+                                        "batch_unlink (bulk async): {}/{} failed (shard={})",
                                         failed.len(),
                                         statuses.len(),
                                         sid
@@ -3421,20 +3701,80 @@ impl FileSystem for PowerFsFs {
                             }
                             Err(e) => {
                                 warn!(
-                                    "batch_unlink (inline) RPC failed (shard={}): {} — GC will cleanup",
+                                    "batch_unlink (bulk async) RPC failed (shard={}): {} — filer GC will clean up orphaned inodes",
                                     sid, e
                                 );
                             }
                         }
                     });
                 }
+            } else {
+                // Small queue: flush ENTIRE current pending_unlinks
+                // synchronously so each `rm` syscall only returns after
+                // the Filer has ACKed. Group by shard (though small batches
+                // are almost always single-shard).
+                let entries: Vec<_> = std::mem::take(&mut *guard);
+                drop(guard);
+                let mut groups: HashMap<u64, Vec<(u64, String)>> = HashMap::new();
+                for (p, n, s) in entries {
+                    groups.entry(s).or_default().push((p, n));
+                }
+                let meta_client = self.client.facade().meta_shard_client().clone();
+                let mut total_failed: usize = 0;
+                let mut total_entries: usize = 0;
+                let mut first_rpc_err: Option<String> = None;
+                for (sid, batch) in groups {
+                    total_entries += batch.len();
+                    let mc = meta_client.clone();
+                    match self.client.block_on(async move { mc.batch_unlink(batch, sid).await }) {
+                        Ok(statuses) => {
+                            total_failed += statuses.iter().filter(|&&s| s != powerfs_net::STATUS_OK as u32).count();
+                        }
+                        Err(e) => {
+                            total_failed += 1;
+                            if first_rpc_err.is_none() {
+                                first_rpc_err = Some(e.to_string());
+                            }
+                        }
+                    }
+                }
+                if total_failed > 0 {
+                    let err = match first_rpc_err {
+                        Some(msg) => std::io::Error::new(std::io::ErrorKind::Other,
+                            format!("batch_unlink sync: {}/{} entries failed (rpc_error: {})", total_failed, total_entries, msg)),
+                        None => std::io::Error::new(std::io::ErrorKind::Other,
+                            format!("batch_unlink sync: {}/{} entries returned non-OK status from filer", total_failed, total_entries)),
+                    };
+                    warn!("unlink sync batch failed: {}", err);
+                    sync_flush_result = Some(Err(err));
+                } else {
+                    debug!(
+                        "unlink sync batch OK: {} entries across {} shards (parent={}, name={})",
+                        total_entries,
+                        std::cmp::max(1, total_entries),
+                        parent,
+                        name_str
+                    );
+                    sync_flush_result = Some(Ok(()));
+                }
             }
         }
 
         // 修改了父目录内容（删除文件），invalidate 父目录的 dentry 缓存。
+        // Performed AFTER the synchronous Filer ACK so other clients (and
+        // our own cached readdir listing) only observe the deletion once it
+        // is durable on the Filer shard leader — same ordering as
+        // Ceph Server::_unlink_local_finish → mdcache.unlink → reply.
         self.invalidate_dir_entries(parent);
 
-        Ok(())
+        match sync_flush_result {
+            Some(Err(e)) => Err(e),
+            // None means the queue took the LARGE (async bulk) path above —
+            // treat as Ok since rm -rf / bulk shell operations do not
+            // expect per-entry POSIX strictness. This preserves the
+            // existing throughput behaviour under `rm -rf`.
+            _ => Ok(()),
+        }
     }
 
     fn create(
@@ -3889,8 +4229,36 @@ impl FileSystem for PowerFsFs {
                     "open: skipping filer refresh for inode={} (has dirty/unsynced chunks or inline buffer)",
                     inode
                 );
-            } else if entry.state != EntryState::Stale && !entry.chunks.is_empty() {
-                // P4: Trust cache hit on non-Stale entries with known chunks.
+            } else if entry.state != EntryState::Stale
+                && (!entry.chunks.is_empty()
+                    // Bug6a fix: Inline candidate MUST have empty chunks.
+                    // Without this, Flat/Stripe files in transition state
+                    // (fuse-2 has chunks=4 from dir_entry.attrs but fid=None)
+                    // were misclassified as Inline candidates, so P4 trusted
+                    // the cache and skipped the Filer refresh RPC that would
+                    // have fetched the authoritative fid/volume_id/file_key.
+                    // For Flat-mode files, read() requires fid (entry.fid.
+                    // ok_or(EIO) at L5290) — no fid ⇒ EIO even with 4 "known"
+                    // chunks in cache.  This caused 4MB cross-client reads to
+                    // EIO after the fuse-1 release sync succeeded.
+                    || (entry.fid.is_none()
+                        && entry.size > 0
+                        && entry.chunks.is_empty()))
+            {
+                // P4: Trust cache hit on non-Stale entries with a COMPLETE
+                // layout. A complete layout satisfies EITHER:
+                //   (a) !chunks.is_empty()  → Flat/Stripe/EC file with known
+                //                            Volume-backed chunks; OR
+                //   (b) fid.is_none() && size > 0  → Inline-mode file whose
+                //                            lookup() RPC returned a plausible
+                //                            size from the parent dir's
+                //                            entry.attrs. This is the path
+                //                            that prevents split-create
+                //                            cross-shard apply-lag from
+                //                            causing the gRPC get_entry_by_inode
+                //                            (which reads the inode-record
+                //                            directly) to return size=0 and
+                //                            clobber our good cache data.
                 //
                 // Rationale: every Filer-driven metadata change (other
                 // clients writing, resize, truncate, chmod, unlink, rename,
@@ -3904,18 +4272,20 @@ impl FileSystem for PowerFsFs {
                 // recently-touched file (common for shell pipelines and
                 // re-opens by the same process).
                 //
-                // Guard: require non-empty chunks. The Filer returns empty
-                // chunks for newly-created files before the first
-                // sync_size_chunks_on_close has run; in that window we
-                // can't tell if another client raced and appended, so we
-                // still refresh. Entries where the local cache has chunks
-                // AND state != Stale are authoritative.
+                // The OLD guard (`!entry.chunks.is_empty()` only) was
+                // wrong for inline-mode files: small files have NO chunks
+                // by design, so they ALWAYS fell through to the gRPC
+                // get_entry_by_inode path — returning size=0 due to
+                // split-create lag, and erasing the lookup-inserted size.
+                // Now inline files are trusted exactly like flat files
+                // with known chunks.
                 debug!(
                     "open: skipping filer refresh for inode={} \
-                     (P4 cache trust: state={:?}, chunks={}, no invalidation received)",
+                     (P4 cache trust: state={:?}, chunks={}, inline_candidate={}, no invalidation received)",
                     inode,
                     entry.state,
-                    entry.chunks.len()
+                    entry.chunks.len(),
+                    entry.fid.is_none() && entry.size > 0,
                 );
             } else if let Ok(Some((filer_entry, _))) = self.client.get_entry_by_inode(inode) {
                 let fresh = self.entry_to_cached(parent, &filer_entry);
@@ -3931,7 +4301,32 @@ impl FileSystem for PowerFsFs {
                 // unchanged to preserve the local chunk cache for appends.
                 // When the Filer has non-empty chunks with a different FID,
                 // another client wrote new data → clear the cache.
-                let filer_stale_empty = fresh.chunks.is_empty() && !entry.chunks.is_empty();
+                let filer_stale_empty_chunks =
+                    fresh.chunks.is_empty() && !entry.chunks.is_empty();
+
+                // Split-create apply-lag guard: if the Filer's inode-record is
+                // still EMPTY (fresh.content_size==0 + fresh.chunks.is_empty()
+                // + fresh.fid.is_none()) but the local cache was populated
+                // from a parent-shard dir_entry.attr lookup that already has
+                // size>0, the Filer simply hasn't finished applying the
+                // UPDATE_SIZE_CHUNKS Raft entry to the INODE shard yet.
+                // Inserting this "empty shell" would overwrite the good
+                // lookup-inserted size to 0 — breaking cross-client reads.
+                // In this scenario, trust the lookup-seeded cache entry and
+                // skip the refresh entirely.
+                //
+                // NOTE: The Invalidate notification still guards correctness:
+                // any real truncate or rewrite moves the local entry to
+                // Stale / evicts it before the next open() call, so this
+                // short-circuit never hides real modifications.
+                let filer_inode_apply_lag = fresh.content_size == 0
+                    && fresh.chunks.is_empty()
+                    && fresh.fid.is_none()
+                    && (entry.size > 0 || entry.content_size > 0);
+
+                // Combined stale Filer guard: chunks mismatch due to apply lag
+                // OR the entire inode shell is empty due to apply lag.
+                let filer_stale_empty = filer_stale_empty_chunks || filer_inode_apply_lag;
 
                 // Unsynced-write guard: if the local content_size is LARGER
                 // than the Filer's, AND the chunk_cache still has local data
@@ -3955,6 +4350,11 @@ impl FileSystem for PowerFsFs {
                     debug!(
                         "open: skipping filer refresh for inode={} (local content_size={} > filer={}, unsynced writes)",
                         inode, entry.content_size, fresh.content_size
+                    );
+                } else if filer_inode_apply_lag {
+                    debug!(
+                        "open: skipping filer refresh for inode={} (split-create apply lag: filer shell empty local.size={} — keeping lookup-seeded entry)",
+                        inode, entry.size
                     );
                 } else {
                     let chunks_changed =
@@ -4147,38 +4547,70 @@ impl FileSystem for PowerFsFs {
                 .block_on(async move { meta_client.getattr(ino, routing_shard).await });
             match attr_result {
                 Ok(attr) if attr.is_inline() => {
-                    // 更新 cache size 为权威值 (Filer 端 inline 文件的 size)
-                    self.cache.set_content_size(inode, attr.size);
-                    if let Some(max_size) = attr.inline_max_size {
-                        self.inline_max_sizes.insert(inode, max_size);
-                    }
-                    // 填充 inline buffer (已关闭的 inline 文件数据来自 Filer)
                     let data = attr.inline_data.unwrap_or_default();
                     let data_len = data.len();
-                    warn!(
-                        "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, was_stale={}, thread={:?}",
-                        inode, data_len, attr.size, was_stale, std::thread::current().id()
-                    );
-                    self.inline_buffers.insert(
-                        inode,
-                        InlineBuffer {
-                            data,
-                            dirty: false,
-                            original_len: data_len,
-                            modified_in_place: false,
-                            needs_refresh: false,
-                        },
-                    );
-                    // L4.21 fix: Invalidate the kernel page cache after
-                    // refreshing the inline buffer from the Filer. The
-                    // kernel may still hold stale page cache from a previous
-                    // open (e.g., during concurrent appends where delayed
-                    // RELEASEs keep the inode "open" in the kernel's view,
-                    // preventing automatic page cache invalidation even
-                    // though keep_cache is not set). Without this, reads
-                    // after the open serve from the stale kernel page cache
-                    // instead of the freshly-refreshed inline buffer.
-                    self.notify_kernel_inval_inode(inode);
+                    // Split-create apply-lag guard for inline GETATTR:
+                    // If the inode-record on the INODE shard still hasn't
+                    // received the UPDATE_SIZE_CHUNKS Raft entry,
+                    // meta_client.getattr returns attr.size=0 + empty
+                    // inline_data even though the dir_entry.attrs lookup on
+                    // the parent shard already returned size>0.
+                    // Inserting an empty InlineBuffer here would make the
+                    // subsequent read() return 0 bytes (md5 empty) even
+                    // though the file has data — exactly the T1.3 failure
+                    // (d41d8cd9…).  Instead, skip the INSERT and keep the
+                    // lookup-seeded cache entry.  The read() inline fallback
+                    // (L4419 ff.) will re-run getattr later; once the Raft
+                    // apply catches up data_len will be >0 and this guard
+                    // will be passed normally.
+                    //
+                    // Safe because a REAL empty file has entry.size=0 too,
+                    // so this guard only fires when the two metadata sources
+                    // (parent dir.attrs vs inode record) disagree.
+                    let local_size = self
+                        .cache
+                        .get_inode(inode)
+                        .map(|e| std::cmp::max(e.size, e.content_size))
+                        .unwrap_or(0);
+                    if data_len == 0 && attr.size == 0 && local_size > 0 {
+                        warn!(
+                            "OPEN_DBG: inode={} skipping empty inline_buf INSERT (split-create apply lag: local_size={} but filer attr.size=0 data_len=0)",
+                            inode, local_size
+                        );
+                        // Do NOT set_content_size(0) either. Keep the
+                        // lookup-seeded size in the cache entry.
+                    } else {
+                        // 更新 cache size 为权威值 (Filer 端 inline 文件的 size)
+                        self.cache.set_content_size(inode, attr.size);
+                        if let Some(max_size) = attr.inline_max_size {
+                            self.inline_max_sizes.insert(inode, max_size);
+                        }
+                        // 填充 inline buffer (已关闭的 inline 文件数据来自 Filer)
+                        warn!(
+                            "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, was_stale={}, thread={:?}",
+                            inode, data_len, attr.size, was_stale, std::thread::current().id()
+                        );
+                        self.inline_buffers.insert(
+                            inode,
+                            InlineBuffer {
+                                data,
+                                dirty: false,
+                                original_len: data_len,
+                                modified_in_place: false,
+                                needs_refresh: false,
+                            },
+                        );
+                        // L4.21 fix: Invalidate the kernel page cache after
+                        // refreshing the inline buffer from the Filer. The
+                        // kernel may still hold stale page cache from a previous
+                        // open (e.g., during concurrent appends where delayed
+                        // RELEASEs keep the inode "open" in the kernel's view,
+                        // preventing automatic page cache invalidation even
+                        // though keep_cache is not set). Without this, reads
+                        // after the open serve from the stale kernel page cache
+                        // instead of the freshly-refreshed inline buffer.
+                        self.notify_kernel_inval_inode(inode);
+                    }
                 }
                 Ok(_) => {
                     // Flat 模式文件: 清理可能残留的 inline buffer (文件已被迁移)
@@ -4188,11 +4620,79 @@ impl FileSystem for PowerFsFs {
                     }
                 }
                 Err(e) => {
-                    // getattr 失败不阻塞 open (best-effort, 同 open_count_inc)
-                    debug!(
-                        "open: inline refresh getattr for inode {} failed (best-effort): {}",
+                    // === Fix Fuse-B: open inline refresh getattr failed
+                    // (e.g., "server status 1" = NOT_FOUND / inode shard
+                    // apply lag / stale meta_cache on Filer). Instead of
+                    // giving up (which leaves no inline_buf + fid=None →
+                    // read() EIO on every page), build a placeholder buffer
+                    // from the CachedEntry (which was populated by readdir/
+                    // lookup using the PARENT-DIR shard attrs, which are
+                    // always immediately visible since dir_entry and attrs
+                    // are atomic on the parent shard leader).
+                    //
+                    // Root cause scenario (exactly T1.1/T1.3 failure):
+                    //   fuse-1 creates inline file →
+                    //   split-create commits CreateInode(shard=inode) and
+                    //   AddDirEntry(shard=parent). The parent shard is the
+                    //   authoritative source for readdir attrs. Then:
+                    //   a) fuse-1 release commits UpdateInodeSizeChunks
+                    //      (shard=inode) via propose_ff (async_meta_persist)
+                    //   b) fuse-2 readdir → AddDirEntry returns attrs.size=19
+                    //      → cache.entry inserted
+                    //   c) fuse-2 lookup → cache HIT → no RPC
+                    //   d) fuse-2 open → is_inline() → getattr → filer's
+                    //      meta_shard_manager.get_inode returns None
+                    //      (inode record not yet applied / filtered by
+                    //      meta_cache staging / GC false negative)
+                    //   e) Before Fuse-B: Err path just debug!-logs → no
+                    //      inline_buf → read() "no usable inline_buf +
+                    //      fid=None + chunks=[] → refreshing → NOT_FOUND
+                    //      → EIO after retries"
+                    //   f) After Fuse-B: the placeholder buffer (size from
+                    //      cached entry) + needs_refresh=true → read()
+                    //      falls through to its own 10s spin-wait budget,
+                    //      which either gets the data via the read-fallback
+                    //      getattr or times out gracefully (instead of
+                    //      hard-EIO in <1ms).
+                    //
+                    // Conditions for placeholder: must look like Inline file
+                    // (fid=None, chunks.is_empty(), cache entry has size>0)
+                    // AND no concurrent dirty buffer already exists.
+                    warn!(
+                        "open: inline refresh getattr for inode {} FAILED ({}): \
+                         building fallback placeholder from CachedEntry",
                         inode, e
                     );
+                    let needs_placeholder = self
+                        .cache
+                        .get_inode(inode)
+                        .filter(|e| {
+                            e.fid.is_none()
+                                && e.chunks.is_empty()
+                                && std::cmp::max(e.size, e.content_size) > 0
+                        })
+                        .is_some();
+                    if needs_placeholder {
+                        let entry = self.cache.get_inode(inode).unwrap();
+                        let sz =
+                            std::cmp::max(entry.size, entry.content_size) as usize;
+                        if !self.inline_buffers.contains_key(&inode) {
+                            warn!(
+                                "open: inode={} FALLBACK placeholder: size={} needs_refresh=true (getattr NOT_FOUND during inode-shard apply lag)",
+                                inode, sz
+                            );
+                            self.inline_buffers.insert(
+                                inode,
+                                InlineBuffer {
+                                    data: Vec::with_capacity(sz),
+                                    dirty: false,
+                                    original_len: 0,
+                                    modified_in_place: false,
+                                    needs_refresh: true,
+                                },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -4297,61 +4797,181 @@ impl FileSystem for PowerFsFs {
         // concurrent access), fetch inline_data from the Filer on-demand.
         // Without this, read falls through to the Flat path which returns EIO
         // because fid is None — causing T8.02 concurrent read failures.
-        if self.inline_buffers.get(&inode).is_none()
-            && entry.fid.is_none()
-            && entry.chunks.is_empty()
+        //
+        // Additionally: if the MetadataAttr says the file is actually chunked
+        // (flat/stripe with non-empty chunks / fid info), update the cache
+        // entry so downstream Flat/EC read paths work correctly. Previously a
+        // readdir-seeded Stale entry (fid=None, chunks=[], from
+        // MetadataDirEntry.attrs which never carries chunks/fid) would satisfy
+        // the `fid.is_none() && chunks.is_empty()` guard, but fall through to
+        // the "non-inline Ok(_)" branch which did nothing — leaving the cache
+        // entry still empty and causing cross-client reads to return 0 bytes
+        // (md5 = d41d8cd9…empty). This is the T1.3 root cause. Fix mirrors
+        // what Ceph Client::handle_caps does: on any refresh, merge the new
+        // authoritative layout (fid/chunks/size) into the client cache.
+        // Fallback refresh trigger (Bug5c fix + Bug6b fix + fx1 original):
+        //   Case A: no usable inline_buffers + fid=None + chunks=[]
+        //           → pure Inline-mode new file (classic split-create lag)
+        //   Case B: stale placeholder inline_buf → refresh to get payload bytes
+        //   Case C: Bug6b: fid=None BUT !chunks.is_empty() AND placement is NOT
+        //           Stripe/WideStripe → this is a Flat-mode file in transition:
+        //           dir_shard returned 4 chunks without fid via LOOKUP attrs.
+        //           Flat read() requires fid (entry.fid.ok_or(EIO)), so without
+        //           the authoritative fid from the inode-shard getattr, every
+        //           read returns EIO. This bug broke 4MB cross-client reads for
+        //           inode=1047886 after fuse-1 sync succeeded.
+        let local_size = std::cmp::max(entry.size, entry.content_size);
+        let (has_no_buf, stale_placeholder) = {
+            match self.inline_buffers.get(&inode) {
+                None => (true, false),
+                Some(buf) => {
+                    let stale = buf.needs_refresh
+                        && buf.data.is_empty()
+                        && local_size > 0;
+                    (false, stale)
+                }
+            }
+        };
+        let placement_is_stripe = entry.placement.as_ref().map_or(false, |p| {
+            use powerfs_layout::placement::Placement;
+            matches!(p, Placement::Stripe { .. } | Placement::WideStripe { .. })
+        });
+        // Bug6b: Flat-mode transition (fid missing, chunks known but not
+        // stripe-routable) → force refresh to get fid.
+        let flat_missing_fid =
+            entry.fid.is_none() && !entry.chunks.is_empty() && !placement_is_stripe;
+        if flat_missing_fid
+            || ((has_no_buf || stale_placeholder)
+                && entry.fid.is_none()
+                && entry.chunks.is_empty())
         {
+            if stale_placeholder {
+                debug!(
+                    "read: removing stale placeholder inline_buf for inode={} \
+                     (lookup-prefilled with data=[], needs_refresh=true, \
+                      expected_size={})",
+                    inode, local_size
+                );
+                self.inline_buffers.remove(&inode);
+            }
             debug!(
-                "read: inode={} is inline (no fid, no chunks) but inline_buffers missing, fetching from filer",
-                inode
+                "read: inode={} has no usable inline_buffers (has_no_buf={}, \
+                 stale_placeholder={}) + fid=None + chunks=[], refreshing \
+                 from filer (authoritative inode shard)",
+                inode, has_no_buf, stale_placeholder
             );
             let meta_client = self.client.facade().meta_shard_client().clone();
             let routing_shard = self.routing_shard(inode);
             let ino = inode;
-            match self
-                .client
-                .block_on(async move { meta_client.getattr(ino, routing_shard).await })
-            {
-                Ok(attr) if attr.is_inline() => {
-                    let data = attr.inline_data.unwrap_or_default();
-                    let data_len = data.len();
-                    self.cache.set_content_size(inode, attr.size);
-                    if let Some(max_size) = attr.inline_max_size {
-                        self.inline_max_sizes.insert(inode, max_size);
+            // Parent/name used to build a CachedEntry for the merge insert.
+            // Fall back to the values already present on the current entry so
+            // we don't depend on path resolution succeeding here (it could
+            // race with rename/unlink, and the inode is what matters for
+            // updating fid/chunks/size).
+            let (parent, fallback_name) = self
+                .cache
+                .get_inode(inode)
+                .map(|e| (e.parent, e.name.clone()))
+                .unwrap_or((entry.parent, entry.name.clone()));
+
+            // Split-create cross-shard apply-lag spin-wait budget.
+            //
+            // Budget: up to 2.0 seconds (2000 × 1ms), matching worst-case
+            // RocksDB flush + Raft snapshot apply under heavy load.
+            // With LOOKUP+prefill (applied above), inline small files never
+            // hit this path at all; only Flat/Stripe large files (>8KB,
+            // migrated to chunks) need this because the inode record's
+            // chunks list + volume_id/file_key are only written on the
+            // INODE shard leader during the UPDATE_SIZE_CHUNKS_ATOMIC
+            // post-migrate step, and the net RPC routes to that shard.
+            // A 10s budget is POSIX-compliant (application-level I/O timeout
+            // on file servers is typically ≥30s), and covers worst-case
+            // split-create cross-shard apply lag for 4MB+ flat files.
+            const MAX_LAG_RETRIES: u32 = 10_000;
+            const LAG_SLEEP_US: u64 = 1_000;
+            let mut retries = 0u32;
+            loop {
+                let mc = meta_client.clone();
+                let p = parent;
+                let nm = fallback_name.clone();
+                let result = self.client.block_on(async move {
+                    mc.getattr(ino, routing_shard).await
+                });
+                let (done, _data_len) = match result {
+                    Ok(attr) => {
+                        let refreshed = attr_to_cached_entry(&attr, p, &nm);
+                        self.cache.insert(refreshed);
+                        if attr.is_inline() {
+                            let data = attr.inline_data.unwrap_or_default();
+                            let dlen = data.len();
+                            if dlen == 0 && attr.size == 0 && local_size > 0 {
+                                // Split-create lag: wait a bit and retry
+                                (false, 0)
+                            } else {
+                                self.cache.set_content_size(inode, attr.size);
+                                if let Some(max_size) = attr.inline_max_size {
+                                    self.inline_max_sizes.insert(inode, max_size);
+                                }
+                                warn!(
+                                    "READ_DBG: inode={} inline_buf INSERT from filer (read fallback, retries={}), data_len={}, attr.size={}, thread={:?}",
+                                    inode, retries, dlen, attr.size, std::thread::current().id()
+                                );
+                                self.inline_buffers.insert(
+                                    inode,
+                                    InlineBuffer {
+                                        data,
+                                        dirty: false,
+                                        original_len: dlen,
+                                        modified_in_place: false,
+                                        needs_refresh: false,
+                                    },
+                                );
+                                (true, dlen)
+                            }
+                        } else {
+                            // Non-inline / flat layout: accept only if
+                            // non-empty chunks / fid, or we've exhausted
+                            // retries (then proceed anyway — Flat path will
+                            // return 0 bytes if still empty, which is at
+                            // least not worse than skipping the refresh).
+                            let layout_complete = !attr.chunks.is_empty()
+                                || (attr.volume_id.is_some() && attr.file_key.is_some());
+                            if !layout_complete && local_size > 0 && retries < MAX_LAG_RETRIES {
+                                (false, 0)
+                            } else {
+                                info!(
+                                    "read: inode={} refreshed layout (non-inline, retries={}): fid_present={}, chunks={}, size={}, placement={:?}",
+                                    inode,
+                                    retries,
+                                    self.cache.get_inode(inode).map(|e| e.fid.is_some()).unwrap_or(false),
+                                    self.cache.get_inode(inode).map(|e| e.chunks.len()).unwrap_or(0),
+                                    attr.size,
+                                    attr.placement.as_ref().map(|pl| std::mem::discriminant(pl))
+                                );
+                                (true, 0)
+                            }
+                        }
                     }
-                    warn!(
-                        "READ_DBG: inode={} inline_buf INSERT from filer (read fallback), data_len={}, attr.size={}, thread={:?}",
-                        inode, data_len, attr.size, std::thread::current().id()
-                    );
-                    self.inline_buffers.insert(
-                        inode,
-                        InlineBuffer {
-                            data,
-                            dirty: false,
-                            original_len: data_len,
-                            modified_in_place: false,
-                            needs_refresh: false,
-                        },
-                    );
-                    // Note: Do NOT call notify_kernel_inval_inode here.
-                    // The read path is called after open(), which already
-                    // handles kernel page cache invalidation when needed
-                    // (only when the buffer was stale). Invalidating here
-                    // would discard valid kernel page cache when delayed
-                    // RELEASEs haven't synced yet.
+                    Err(e) => {
+                        warn!(
+                            "read: inode={} getattr failed while refreshing layout (retries={}): {}",
+                            inode, retries, e
+                        );
+                        (true, 0)
+                    }
+                };
+                if done {
+                    break;
                 }
-                Ok(_) => {
+                retries += 1;
+                if retries >= MAX_LAG_RETRIES {
                     warn!(
-                        "read: inode={} getattr returned non-inline, cannot read inline file",
-                        inode
+                        "READ_LAG: inode={} split-create apply lag exceeded {}×{}us budget (local_size={}), proceeding with available layout",
+                        inode, MAX_LAG_RETRIES, LAG_SLEEP_US, local_size
                     );
+                    break;
                 }
-                Err(e) => {
-                    warn!(
-                        "read: inode={} getattr failed while fetching inline data: {}",
-                        inode, e
-                    );
-                }
+                std::thread::sleep(std::time::Duration::from_micros(LAG_SLEEP_US));
             }
         }
 
@@ -4379,6 +4999,26 @@ impl FileSystem for PowerFsFs {
             );
             return Ok(n);
         }
+
+        // === Bug9 FIX (T1.3 4MB cross-client EIO) ===
+        // Re-read entry from cache AFTER the refresh loop (L4646-4779) completed.
+        //
+        // ROOT CAUSE: the `entry` binding at L4589-4592 was captured BEFORE the
+        // getattr refresh. The refresh loop called `cache.insert(refreshed)` with
+        // the authoritative fid/chunks from the inode shard (e.g., Flat file with
+        // 4 chunks now has fid set), but the local `entry` variable still held the
+        // OLD Stale-readdir-seeded value (fid=None, chunks=[4 chunk refs]).
+        // When execution reached the Flat path at L5392:
+        //   `let fid = entry.fid.ok_or(EIO)?;`
+        // it failed with EIO, even though the cache had the correct fid.
+        //
+        // This re-fetch ensures EC / Stripe / Flat paths below use the refreshed
+        // layout (fid, chunks, size, placement) that the spin-wait loop populated.
+        let entry = self
+            .cache
+            .get_inode(inode)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+        let _local_size = std::cmp::max(entry.size, entry.content_size);
 
         // === P6: EC 降级读分支 ===
         // entry.reliability == Reliability::EC { data, parity } → 文件以纠删码存储.
@@ -4652,14 +5292,28 @@ impl FileSystem for PowerFsFs {
         }
 
         // === P3: Stripe 模式读取分支 ===
-        // entry.placement.is_some() && entry.fid.is_none() → Stripe/WideStripe.
+        // placement == Stripe/WideStripe (EXPLICIT, never matches Inline)
+        //   AND entry.fid.is_none() → stripe chunk references carried on placement.
         // chunk_cache 逻辑与 Flat 相同; 差异仅在 cache miss 时按
         // resolve_stripe_chunk() 路由到正确的 volume/needle.
-        if let Some(placement) = entry.placement.as_ref().filter(|_| entry.fid.is_none()) {
+        //
+        // CRITICAL (Bug5a fix): the old condition `placement.is_some() &&
+        // fid.is_none()` ALSO matched Placement::Inline { max_size }, which
+        // caused inline-mode small files (fid=None, chunks=[], placement=Some
+        // (Inline)) to be misrouted into the Stripe branch and return EIO on
+        // every cross-client read. The condition now requires an explicit
+        // Stripe / WideStripe variant, matching the semantics of
+        // MetadataAttr::is_stripe() and powerfs_layout Placement discriminant.
+        if let Some(placement) = entry.placement.as_ref().filter(|p| {
+            use powerfs_layout::placement::Placement;
+            matches!(p, Placement::Stripe { .. } | Placement::WideStripe { .. })
+                && entry.fid.is_none()
+        }) {
             let stripe_chunks = entry.chunks.clone();
             // Guard: Stripe path requires at least one chunk to route reads.
             // Empty chunks + placement=Some can happen if metadata is incomplete
-            // (e.g., inline file misclassified). Return EIO instead of panicking.
+            // (e.g., stripe chunks not yet applied). Return EIO only after we
+            // have exhausted the inline fallback above.
             if stripe_chunks.is_empty() {
                 log::warn!(
                     "read stripe: inode={} has placement={:?} but no chunks, returning EIO",
@@ -6639,6 +7293,17 @@ impl FileSystem for PowerFsFs {
         // on the volume server — we must NOT sync metadata (which would create
         // dangling chunk references) and must NOT clear dirty (which would
         // prevent retry). The background flusher will retry the write.
+        //
+        // T1.3 fix (2026-08-22): Capture had_dirty BEFORE flush. The kernel
+        // writeback thread may emit FUSE_WRITE during a read-only open's
+        // lifetime (dirty_writeback_centisecs delay). When release then runs,
+        // flush_dirty_chunks_impl writes those chunks to the Volume Server,
+        // but the old `is_readonly` shortcut skipped sync_size_chunks_on_close
+        // → Filer's size/chunks stayed at the pre-write value → cross-client
+        // readers saw size=0 and EIO. Fix: if any dirty chunks were flushed
+        // (regardless of open flags), we MUST sync the new layout to the Filer
+        // so other clients see the updated size and needle_id list.
+        let had_dirty = self.chunk_cache.has_dirty_chunks(inode);
         let flush_result = self.flush_dirty_chunks_impl(inode, None);
         if let Err(e) = &flush_result {
             warn!(
@@ -6653,17 +7318,25 @@ impl FileSystem for PowerFsFs {
         //    read non-existent chunks, causing cross-client data corruption.
         //    The dirty flag is preserved so the background flusher retries.
         let sync_result = if flush_result.is_ok() {
-            // Skip sync for read-only opens: no data was written, so syncing
-            // would overwrite the filer with potentially stale cache data
-            // (e.g., a concurrent writer's not-yet-synced inline data).
+            // Skip sync for read-only opens ONLY when no dirty data was
+            // flushed during this release. If had_dirty=true (writeback
+            // kernel thread wrote during a nominally read-only open), we
+            // must still sync the new chunks to the Filer — otherwise
+            // cross-client reads see stale size=0 and EIO (T1.3 root cause).
             let is_readonly = (flags & libc::O_ACCMODE as u32) == libc::O_RDONLY as u32;
-            if is_readonly {
+            if is_readonly && !had_dirty {
                 debug!(
-                    "release: skipping sync for inode={} (read-only open, no writes)",
+                    "release: skipping sync for inode={} (read-only open, no dirty chunks flushed)",
                     inode
                 );
                 Ok(())
             } else {
+                if is_readonly && had_dirty {
+                    warn!(
+                        "release: inode={} opened O_RDONLY but had dirty chunks (kernel writeback during read-only open) — forcing sync_size_chunks_on_close",
+                        inode
+                    );
+                }
                 let r = self.sync_size_chunks_on_close(inode);
                 if let Err(e) = &r {
                     error!(
@@ -7218,6 +7891,88 @@ impl FileSystem for PowerFsFs {
                             dir_shared_gen: 0,
                         };
                         self.cache.insert(cached);
+
+                        // === Fix Fuse-A: READDIR prefill inline_buffers
+                        // for small inline files (cross-client read EIO).
+                        //
+                        // Why: fuse-2's typical sequence is:
+                        //   1. readdir → lists f1.txt, seeds cache entry with
+                        //      size=19 (from dir_entry.attrs) → state=Stale
+                        //   2. lookup → cache HIT → skips RPC → never gets
+                        //      LOOKUP-level inline_data prefill
+                        //   3. open → P4 cache trust → skips Filer refresh →
+                        //      inline refresh getattr → NOT_FOUND (split-create
+                        //      lag / stale meta_cache) → skipping inline_buf
+                        //   4. read → no inline_buf + fid=None → refresh getattr
+                        //      → NOT_FOUND → EIO (even though READDIR saw size=19
+                        //      and the data is in the Filer's dir_shard attrs).
+                        //
+                        // By prefilling inline_buffers directly from the
+                        // readdir attrs (which come from the parent-dir shard
+                        // leader and are immediately visible post-create), we
+                        // short-circuit the chain: step 4 finds a valid inline
+                        // buffer and reads the data, even if the inode-shard
+                        // getattr is lagging or returns NOT_FOUND transiently.
+                        //
+                        // Rules (mirror lookup prefill L2864-2883):
+                        //   * Only insert if no concurrent dirty buffer exists
+                        //     (writer's local data wins over readdir attrs).
+                        //   * Mark needs_refresh=true when we had to synthesize
+                        //     the buffer from size alone (no actual inline_data),
+                        //     so the next open that CAN reach the Filer refreshes.
+                        //   * Skip directories / symlinks (inline applies only to
+                        //     regular files).
+                        if !is_dir && !is_symlink {
+                            let (data, dlen, needs_refresh) =
+                                match attr.inline_data.as_ref() {
+                                    Some(v) if !v.is_empty() => {
+                                        (v.clone(), v.len(), false)
+                                    }
+                                    _ => {
+                                        // No real inline_data payload, but we
+                                        // know the size → insert an empty
+                                        // placeholder with needs_refresh=true.
+                                        // This still prevents the "no usable
+                                        // inline_buffers + fid=None → EIO"
+                                        // crash path and triggers the read()
+                                        // fallback refresh (which has 10s
+                                        // spin-wait budget for apply lag).
+                                        let sz = attr.size as usize;
+                                        (Vec::with_capacity(sz), 0, sz > 0)
+                                    }
+                                };
+                            if !self.inline_buffers.contains_key(&child.inode)
+                                || dlen > 0
+                            {
+                                let needs_insert = match self
+                                    .inline_buffers
+                                    .get(&child.inode)
+                                {
+                                    Some(existing) => !existing.dirty,
+                                    None => true,
+                                };
+                                if needs_insert {
+                                    debug!(
+                                        "readdir: prefilling inline_buffers from READDIR attrs for inode={}, data_len={}, attr.size={}, needs_refresh={}",
+                                        child.inode, dlen, attr.size, needs_refresh
+                                    );
+                                    self.inline_buffers.insert(
+                                        child.inode,
+                                        InlineBuffer {
+                                            data,
+                                            dirty: false,
+                                            original_len: dlen,
+                                            modified_in_place: false,
+                                            needs_refresh,
+                                        },
+                                    );
+                                    if let Some(max_size) = attr.inline_max_size {
+                                        self.inline_max_sizes
+                                            .insert(child.inode, max_size);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
