@@ -602,15 +602,47 @@ impl MetaCache {
             CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
         }
         let old_bytes = estimate_inode_bytes(&existing.info);
+
+        // T1.6 fix: Append-mode projection must mirror ShardStore semantics
+        // exactly (see shard_store.rs L2877-2894). Previously the append
+        // branch did max(size, 0) + replaced inline_data instead of
+        // concatenating, leaving MetaCache with staging size=0 + empty
+        // inline_data after a sync. Cross-client getattr hit MetaCache
+        // (fast path, L1818) and returned size=0, even though ShardStore
+        // had already applied the append (new_size=12). Visibility gap
+        // caused O_APPEND write → stat → size=0 short reads.
         if is_append {
-            existing.info.size = std::cmp::max(existing.info.size, size);
+            if let Some(delta) = inline_data {
+                // Inline append: concatenate delta to existing inline_data,
+                // then derive size from the combined buffer (matches
+                // ShardStore's combined.len()). Do NOT use the `size`
+                // parameter, which is 0 in append mode (client sends only
+                // the delta, per sync_size_chunks_on_close semantics).
+                let mut combined = existing.info.inline_data.clone().unwrap_or_default();
+                combined.extend_from_slice(&delta);
+                let new_size = combined.len() as u64;
+                existing.info.inline_data = Some(combined);
+                existing.info.size = new_size;
+                existing.info.blocks = new_size.div_ceil(512);
+                existing.info.chunks = chunks; // empty for inline
+            } else {
+                // Chunk-level append (flat/stripe): size parameter carries
+                // the new total file size (not 0). Clamp up so racing
+                // projections can't regress size.
+                existing.info.size = std::cmp::max(existing.info.size, size);
+                existing.info.chunks = chunks;
+                // inline_data is None for chunk files; existing inline_data
+                // should already be None (post-migrate), but leave as-is.
+            }
         } else {
+            // Overwrite mode: size and inline_data are authoritative as-is.
             existing.info.size = size;
+            existing.info.chunks = chunks;
+            if let Some(data) = inline_data {
+                existing.info.inline_data = Some(data);
+            }
         }
-        existing.info.chunks = chunks;
-        if let Some(data) = inline_data {
-            existing.info.inline_data = Some(data);
-        }
+
         let new_bytes = estimate_inode_bytes(&existing.info);
         if new_bytes >= old_bytes {
             self.trim.charge(new_bytes - old_bytes);
