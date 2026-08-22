@@ -3,7 +3,7 @@
 > 参考: Ceph MDCache (src/mds/MDCache.{h,cc})
 > 定位: `powerfs-filer` crate 内模块（`powerfs-filer/src/meta_cache.rs`）—— 不拆独立 crate，避免 ShardStore/MetaShardManager 反向 trait 依赖
 > 状态: Phase 1 已落地，Phase 2 实施中
-> 更新: 2026-08-21
+> 更新: 2026-08-22（补充 Unlink async + projected state 可见性章节）
 
 ## 目录
 
@@ -491,24 +491,125 @@ setattr(inode, mode, uid, gid):
      → raft_version = current_version
 ```
 
-### 写路径 — Unlink（同步 Raft）
+### 写路径 — Unlink（异步 Raft + MetaCache projected state）
+
+> ⚠️ 设计初稿写"同步等 Raft commit/apply"，**实际落地已改为 async 模式**：
+> `stage_delete` 在 propose 之前先把内存 MetaCache 标记为 `Deleted`，随后
+> `propose_meta` 走 `propose_ff`（fire-and-forget）立即返回，**不等 commit/apply**。
+> 跨客户端可见性由 [MetaCache projected state](#跨客户端可见性metacache-projected-state--无条件广播-invalidate) + 无条件广播
+> `Invalidate` 保证，不依赖 Raft apply 时序。详见对应小节。
 
 ```
 unlink(parent, name, ino):
   1. MetaCache.stage_delete(parent, name, ino)
-     → inode_table.get(ino).state = Deleted
-     → dirfrag.dentries.remove(name)
-     → deleted_markers.insert(ino, now)
+     → inode_table[inode].state = Deleted
+        (即使 inode 不在缓存，也 seed 一个 Deleted 墓碑:
+         CachedInode::new(tombstone(ino), state=Deleted))
+     → direntry_table[(parent, name)].state = Deleted
+        (同样 seed Deleted 墓碑, 不查 ShardStore)
+     → 后续 get_inode/get_direntry 命中 Deleted → 返回 Some(None) → ENOENT
 
-  2. RaftGroupManager.propose(RemoveDirEntry + DeleteInode)
-     → 等待 quorum commit
+  2. propose_meta(RemoveDirEntry + DeleteChildSummary)   [async: propose_ff]
+     → 提交到 RaftCore 队列立即返回, 不等 quorum commit, 不等 apply
 
-  3. 等待 apply
+  3. [async 模式跳过 wait_for_entry_removed — 由 Deleted 墓碑保证可见性]
 
-  4. MetaCache.confirm_delete(ino)
-     → inode_table.remove(ino)
-     → deleted_markers.remove(ino)
+  4. propose_meta(DecrementNlink | DeleteInode)           [Phase B, async: propose_ff]
+
+  5. return Ok(())   ← delete_file 返回, **此时 Raft 尚未 apply**
+
+  6. NetHandler.handle_unlink 收到 Ok 后:
+     notify_inode_change(parent_ino, v)   ← 无条件 broadcast Invalidate
+     notify_inode_change(ino, v)          ← 给所有连上的 FUSE 客户端
+
+(后台, ~1-5ms)
+  7. Raft apply → ShardStore 真正删除 dir_entry/inode
+  8. on_raft_apply(DeleteInode) → MetaCache.confirm_delete(inode)
+     → inode_table.remove(inode) + 释放墓碑内存
+  9. on_raft_apply(RemoveDirEntry) → MetaCache.confirm_remove_direntry(parent, name)
+     → direntry_table.remove((parent, name))
 ```
+
+### 跨客户端可见性：MetaCache projected state + 无条件广播 Invalidate
+
+> **设计原则**（来自用户明确指导）：Invalidate 广播**不依赖 Raft apply 完成**，
+> 只要元数据已到达 MetaCache（即 `stage_delete` 已在内存标记 Deleted）就
+> **无条件广播**。这对应 Ceph MDS 的 projected state 模型 —— MDS 在 journaling
+> 之前先 project unlink（更新内存 dentry linkage），客户端重新查询时立即
+> 看到 projected state。
+
+#### 为什么不等 Raft apply 也能保证可见性
+
+`stage_delete` 在 propose 之前做了两件关键事（[meta_cache.rs:574-617](file:///home/portion/powerfs/powerfs-filer/src/meta_cache.rs#L574-L617)）：
+
+1. **inode 表 seed Deleted 墓碑**：即使 inode 不在缓存里，也插入一个
+   `CachedInode::new(tombstone(ino), state=Deleted)`。后续
+   `get_inode(inode)` 命中 Deleted 状态直接返回 `Some(None)` → ENOENT，
+   **不回退 ShardStore**。
+
+2. **direntry 表 seed Deleted 墓碑**：同理，`get_direntry(parent, name)`
+   命中 Deleted → 返回 `Some(None)` → ENOENT。
+
+也就是说：**删除一旦执行到 `stage_delete`，本 Filer 对该 inode/dentry 的
+所有后续读都会立即返回 ENOENT**，无论 Raft 是否已 apply 到 ShardStore。
+
+#### Invalidate 广播时序
+
+```
+Filer (NetHandler.handle_unlink)            FUSE 客户端 (fuse-2)
+─────────────────────────────────           ──────────────────────
+1. await delete_file(parent, name)
+   ├─ stage_delete(...)         ← MetaCache 立即标记 Deleted
+   └─ propose_meta(...)         ← fire-and-forget, 立即返回
+2. delete_file 返回 Ok
+3. notify_inode_change(parent_ino, v)
+   └─ tokio::spawn:
+      notifier.broadcast(inode, v)  ───────► 收到 Invalidate(parent_ino)
+                                                → 内核 dcache invalidate
+                                                → 重新 stat → lookup RPC
+4. notify_inode_change(ino, v)
+   └─ 同上                      ───────────► 收到 Invalidate(ino)
+                                                → 本地 inode cache 失效
+
+5. (fuse-2 重新 lookup)
+   lookup(parent, name) RPC      ◄──────────  Filer 收到查询
+   ├─ MetaCache.get_direntry(parent, name)
+   │  → 命中 Deleted 墓碑 → 返回 Some(None) → ENOENT   ← 不查 ShardStore
+   └─ 返回 ENOENT                ───────────► fuse-2 看到 rm 已生效
+```
+
+#### 关键不变量
+
+| 不变量 | 说明 |
+|------|------|
+| **stage_delete 必须在 propose 之前** | `delete_file` 第一行就调 `stage_delete`，保证 propose 提交时 MetaCache 已是 Deleted。`propose_meta` async 路径 fire-and-forget 立即返回，但 Deleted 标记已就位。 |
+| **notify 不检查 async_meta_persist** | `notify_inode_change` 无条件执行（[net_handler.rs:781-802](file:///home/portion/powerfs/powerfs-filer/src/net_handler.rs#L781-L802)），早期版本在 async 模式下早退导致跨端不可见，已修复。 |
+| **broadcast 而非 notify(定向)** | 用 `notifier.broadcast` 而非 `notify(subscribers)`：曾经 `readdir` 缓存了 dentry 的客户端不一定在订阅集里，broadcast 保证所有连上的客户端都收到。对应 Ceph `send_dentry_unlink` 通知所有 replica MDS。 |
+| **Deleted 墓碑是 fast-path，ShardStore 是持久化真相** | 墓碑是内存加速；Raft apply 完成后 `confirm_delete` 把墓碑从 `inode_table` 移除，但此时 ShardStore 已删除，读 miss → ShardStore 查询同样返回 ENOENT。两条路径一致。 |
+| **Leader 切换：invalidate_all 清墓碑** | 旧 leader 的 Deleted 墓碑在 `invalidate_all()` 后清空；客户端读 miss → 新 leader ShardStore。若 Raft 未 apply，新 leader 的 ShardStore 还有该条目 → 读到 stale 数据。**因此 Raft propose 在 `propose_ff` 失败时必须返回 Err**，`handle_unlink` 不发 notify 而是返回错误让客户端重试到新 leader。 |
+
+#### 与 Ceph MDS projected state 的对应
+
+| Ceph MDS | PowerFS Filer |
+|----------|---------------|
+| `MDCache::project_inode_state` 更新内存 dentry linkage | `MetaCache::stage_delete` 标记 inode/direntry 为 `Deleted` |
+| project 后立即向客户端发 `MClientSession`/cap recall | `notify_inode_change` broadcast `Invalidate` 给 FUSE |
+| journal（MDLog）提交后才算持久化 | Raft log commit 后才持久化 |
+| apply 后内存状态与 journal 一致 | Raft apply 后 `confirm_delete` 清墓碑，ShardStore 接管 |
+
+#### 不等 apply 的代价与边界
+
+- **leader 在 commit 前故障**：`propose_ff` 未 commit 的 log 被新 leader 截断，
+  客户端收到 `STATUS_ERR_REDIRECT` → 重试到新 leader。新 leader 的
+  ShardStore 没有该次删除 → 文件仍在 → 客户端重试 unlink 成功。
+  这是可接受的：删除幂等，客户端重试是安全路径。
+- **leader 在 commit 后 apply 前故障**：新 leader 重放 Raft log → apply 到
+  ShardStore → 文件确实被删。旧 leader 的 Deleted 墓碑随
+  `invalidate_all` 清空，但读 miss → 新 leader ShardStore 也返回 ENOENT。
+  一致。
+- **极端场景：commit 后 apply 前，旧 leader 仍在服务**：旧 leader 的
+  MetaCache 墓碑仍然有效（`invalidate_all` 未触发），读命中墓碑 → ENOENT，
+  与"Raft 已 commit 但未 apply"一致。无脏读。
 
 ### Raft Apply 回调
 
@@ -1096,3 +1197,4 @@ powerfs_filer_mc_direntry_states{state="dirty"}  # Dirty dentry 数
 | **跨 shard 子目录** | 未在 MetaCache 设计文档单列 | ✅ **补充实现（DirStatSummary）**：设计文档"大目录分片"原未提及，但 DirStatSummary 作为 Phase 1 跨 shard `ls -l` 优化核心组件已落地，避免 N 次 cross-shard getattr RPC。 |
 | **客户端路由** | 未在 MetaCache 设计文档单列 | ✅ **补充实现**：TopologyUpdateListener 动态更新 shard_router/shard_map（无需 Fuse 重启）+ Self-Redirect Guard 防重试耗尽。 |
 | **Docker 构建** | 未在 MetaCache 设计文档单列 | ✅ **补充实现**：`docker/Dockerfile` 支持 `BUILD_BINS=0` 默认构建，避免旧镜像 binary 污染，必须 volume mount 主机编译产物。 |
+| **Unlink 写路径** | 设计初稿为"同步等 Raft commit/apply"（方案 A 风格） | ✅ **改为 async + projected state（2026-08-22 修订）**：实际落地为 `stage_delete` 先 seed Deleted 墓碑 + `propose_ff` fire-and-forget。跨客户端可见性由 [MetaCache projected state + 无条件广播 Invalidate](#跨客户端可见性metacache-projected-state--无条件广播-invalidate) 保证，**不依赖 Raft apply 时序**。对应 Ceph MDS 在 journal 前 project unlink 的模型。早期 `notify_inode_change` 在 `async_meta_persist=true` 时早退导致 T1.1 跨端不可见，已修复为无条件 `broadcast`。 |

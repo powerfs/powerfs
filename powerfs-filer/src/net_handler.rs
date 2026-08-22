@@ -744,26 +744,58 @@ impl FilerNetHandler {
     /// them to re-fetch stale (pre-apply) data and cache it. Instead, let
     /// the natural TTL/lookup cycle handle cache invalidation after apply
     /// completes. This avoids useless RPC round-trips to subscribers.
+    /// Notify connected FUSE clients that an inode's metadata has changed.
+    ///
+    /// Modeled after Ceph MDS `MDCache::send_dentry_unlink` (Server.cc
+    /// `_unlink_local_finish`), which **unconditionally** broadcasts to
+    /// all clients holding the dentry after the journal entry is applied.
+    ///
+    /// # CRITICAL: do NOT skip in async_meta_persist mode
+    ///
+    /// Previously, this function returned early when async_meta_persist was
+    /// true (the default). This caused T1.1's cross-client unlink
+    /// invisibility: fuse-1 deletes the file, but fuse-2 never receives an
+    /// Invalidate, so its userspace cache and kernel dcache continue to
+    /// report the file as existing.
+    ///
+    /// # Why broadcast before Raft apply is safe
+    ///
+    /// `delete_file` / `batch_delete_files` calls `meta_cache.stage_delete()`
+    /// BEFORE the Raft propose. This means the Filer's in-memory MetaCache
+    /// already marks the dir entry as Deleted when the propose is submitted.
+    /// Any client that receives the Invalidate and re-queries the Filer will
+    /// hit the MetaCache Deleted marker and get ENOENT — without needing
+    /// the Raft log to be applied to shard_store yet.
+    ///
+    /// This matches Ceph's projected state model: the MDS projects the
+    /// unlink (updates in-memory dentry linkage) before journaling, so
+    /// client re-queries see the projected state immediately.
+    ///
+    /// # Broadcast vs notify
+    ///
+    /// Uses `broadcast` (not `notify`) because the Filer's subscriber set
+    /// only includes clients that explicitly subscribed via a prior
+    /// lookup/readdir. A client that cached a dentry from a previous
+    /// readdir may not be in the subscriber list for the parent inode.
+    /// Broadcast ensures all connected clients receive the invalidation.
     fn notify_inode_change(&self, inode: u64, version: u64) {
-        if self.meta_shard_manager.is_async_meta_persist() {
-            debug!(
-                "FILER_NET_NOTIFY: skipping in async mode: inode={}, version={}",
-                inode, version
-            );
-            return;
-        }
         if let Some(ref notifier) = self.inode_notifier {
             let notifier = notifier.clone();
-            let sub_count = notifier.subscriber_count(inode);
             info!(
-                "FILER_NET_NOTIFY: inode={}, version={}, subscribers={}",
-                inode, version, sub_count
+                "FILER_NET_NOTIFY: inode={}, version={}, async={}",
+                inode,
+                version,
+                self.meta_shard_manager.is_async_meta_persist()
             );
             tokio::spawn(async move {
-                let count = notifier.notify(inode, version);
+                // broadcast: push to ALL connected clients, not just
+                // subscribers. This matches Ceph's send_dentry_unlink
+                // which notifies all replica MDS nodes regardless of
+                // explicit subscription.
+                let count = notifier.broadcast(inode, version);
                 info!(
-                    "FILER_NET_NOTIFY: notified {} clients about inode {} change (v={})",
-                    count, inode, version
+                    "FILER_NET_NOTIFY: broadcast Invalidate(inode={}, v={}) to {} clients",
+                    inode, version, count
                 );
             });
         }
@@ -2549,27 +2581,36 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks, inline_data, is_append)
+            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks, inline_data.clone(), is_append)
             .await
         {
             Ok(_) => {
-                // Phase 2: notify subscribers that this inode's content
-                // (size/chunks) changed so they can evict stale cache
-                // entries. Without this, a second client that previously
-                // looked up the file would keep serving the old content
-                // until the 30s TTL expires.
+                // Invalidate 策略（T1.3 修复, 2026-08-22）:
                 //
-                // L4.21 fix: use next_version() instead of SystemTime seconds
-                // to ensure each notification has a unique, monotonically
-                // increasing version. This prevents the client's is_duplicate
-                // check from suppressing concurrent append notifications that
-                // would otherwise share the same second-resolution timestamp.
+                // 区分 inline 小文件和 chunk 大文件:
                 //
-                // Note: notify_inode_change is a no-op in async mode (see
-                // method doc). In async mode, the apply hasn't completed yet,
-                // so notifying would cause subscribers to re-fetch stale
-                // (pre-apply) data and cache it.
-                self.notify_inode_change(inode, self.next_version());
+                // 1. inline 小文件 (inline_data.is_some()):
+                //    数据存在 Filer 元数据中 (inline_data)，必须广播
+                //    Invalidate，否则其他客户端的 inline_buffer 会 stale
+                //    （读到旧数据）。这和 T1.1 unlink 的无条件广播一致。
+                //
+                // 2. chunk 大文件 (inline_data.is_none()):
+                //    数据在 Volume Server，Filer 只存 chunks 列表 (needle_id
+                //    列表)。不广播 Invalidate，因为:
+                //    a) 写入者自己 (fuse-1) 收到 Invalidate 会清除
+                //       chunk_cache，导致后续读取需重新从 Volume Server
+                //       拉 (T1.3 bug: md5sum 读到空数据/EIO);
+                //    b) 其他客户端 (fuse-2) 通过 getattr (dentry_lease
+                //       过期后, ~30s) 刷新 chunks 列表，新的 needle_id
+                //       不会命中旧 chunk_cache → 自然从 Volume Server 读
+                //       新数据。
+                //
+                // 这与 Ceph MDS 的 cap recall 模型对齐：写入者 close 后
+                // 不主动驱逐自己的 page cache，其他客户端通过 cap recall
+                // 机制延迟刷新。
+                if inline_data.is_some() {
+                    self.notify_inode_change(inode, self.next_version());
+                }
                 // 成功: STATUS_OK + 空 body
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }

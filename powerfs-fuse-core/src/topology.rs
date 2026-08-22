@@ -94,6 +94,20 @@ pub struct ClusterTopology {
     /// map, including post-split ranges). When empty, falls back to
     /// `ShardMap::from_shard_count(shard_count)`.
     pub shard_map_entries: Vec<(u64, u64, u64, u8)>,
+    /// All healthy filer addresses from Master topology.
+    ///
+    /// Unlike `shards` (which only keeps the first healthy filer per shard
+    /// via `entry().or_insert_with()`), this list contains **every** healthy
+    /// filer returned by Master. Used to populate MetaShardClient's rotation
+    /// candidates so `send_coherence_msg` can failover to another filer when
+    /// the current leader is unreachable (e.g., filer process crash, network
+    /// partition, or docker container stop).
+    ///
+    /// Without this, the rotation list degenerates to a single address
+    /// (the first filer in Master's response), and a single-node failure
+    /// blocks ALL shard requests — even though other filers are healthy.
+    /// See `docs/fuse-client-comparison.md` "Filer 单点故障 failover 缺陷".
+    pub all_filer_addresses: Vec<String>,
 }
 
 impl ClusterTopology {
@@ -105,6 +119,7 @@ impl ClusterTopology {
             updated_at: None,
             shard_count: 0,
             shard_map_entries: Vec::new(),
+            all_filer_addresses: Vec::new(),
         }
     }
 
@@ -474,6 +489,13 @@ impl MasterClient {
                     if !filer.is_healthy || filer.address.is_empty() {
                         continue;
                     }
+                    // Collect ALL healthy filer addresses for rotation candidates.
+                    // This is critical for failover: `send_coherence_msg` uses
+                    // `filer_addresses` as the rotation list when the current
+                    // leader is unreachable. Without this, the list degenerates
+                    // to a single address (the first filer), and a single-node
+                    // failure blocks ALL shard requests.
+                    topology.all_filer_addresses.push(filer.address.clone());
                     for sid in &filer.shard_ids {
                         topology
                             .shards
