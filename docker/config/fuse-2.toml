@@ -27,6 +27,6 @@ request_timeout_secs = 10
 admin_port = 9998
 
 [fuse.lease]
-mode = "range"
+mode = "inode"                          # 方案A: Filer inode metadata lease，强制write串行化
 lease_duration_ms = 30000
 renew_interval_ms = 10000

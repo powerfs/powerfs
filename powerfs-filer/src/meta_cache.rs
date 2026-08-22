@@ -565,6 +565,148 @@ impl MetaCache {
         }
     }
 
+    /// Project UpdateInodeSizeChunks into MetaCache (Ceph MDS projected state model).
+    ///
+    /// Updates size/chunks/inline_data on a cached inode so subsequent
+    /// `get_inode` calls return the new values immediately — before Raft
+    /// apply completes on ShardStore. This closes the T1.3 visibility gap:
+    ///
+    ///   1. `create` stages an inode in MetaCache (state=Staging, size=0,
+    ///      chunks=[])
+    ///   2. `update_inode_size_chunks` proposes Raft log but (in async mode)
+    ///      does NOT wait for apply
+    ///   3. Cross-client `getattr` → `get_inode` → MetaCache hit → returns
+    ///      stale size=0, chunks=[] → reader EIO
+    ///
+    /// With this method, step 2 also updates MetaCache so step 3 sees the
+    /// new size/chunks. This mirrors Ceph MDS's projected state: memory
+    /// updates precede journal apply.
+    ///
+    /// If the inode is not in MetaCache, do nothing — `get_inode` will
+    /// fetch from ShardStore after Raft apply. Only Staging/Clean/Dirty
+    /// entries are updated; Deleted/Trimming are left alone.
+    pub fn project_update_size_chunks(
+        &self,
+        inode: u64,
+        size: u64,
+        chunks: Vec<crate::shard_store::StoredFileChunk>,
+        inline_data: Option<Vec<u8>>,
+        is_append: bool,
+    ) {
+        let mut tbl = self.inode_table.write().unwrap();
+        let Some(existing) = tbl.get_mut(&inode) else {
+            return;
+        };
+        match existing.state {
+            CacheState::Deleted | CacheState::Trimming => return,
+            CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
+        }
+        let old_bytes = estimate_inode_bytes(&existing.info);
+
+        // T1.6 fix: Append-mode projection must mirror ShardStore semantics
+        // exactly (see shard_store.rs L2877-2894). Previously the append
+        // branch did max(size, 0) + replaced inline_data instead of
+        // concatenating, leaving MetaCache with staging size=0 + empty
+        // inline_data after a sync. Cross-client getattr hit MetaCache
+        // (fast path, L1818) and returned size=0, even though ShardStore
+        // had already applied the append (new_size=12). Visibility gap
+        // caused O_APPEND write → stat → size=0 short reads.
+        if is_append {
+            if let Some(delta) = inline_data {
+                // Inline append: concatenate delta to existing inline_data,
+                // then derive size from the combined buffer (matches
+                // ShardStore's combined.len()). Do NOT use the `size`
+                // parameter, which is 0 in append mode (client sends only
+                // the delta, per sync_size_chunks_on_close semantics).
+                let mut combined = existing.info.inline_data.clone().unwrap_or_default();
+                combined.extend_from_slice(&delta);
+                let new_size = combined.len() as u64;
+                existing.info.inline_data = Some(combined);
+                existing.info.size = new_size;
+                existing.info.blocks = new_size.div_ceil(512);
+                existing.info.chunks = chunks; // empty for inline
+            } else {
+                // Chunk-level append (flat/stripe): size parameter carries
+                // the new total file size (not 0). Clamp up so racing
+                // projections can't regress size.
+                existing.info.size = std::cmp::max(existing.info.size, size);
+                existing.info.chunks = chunks;
+                // inline_data is None for chunk files; existing inline_data
+                // should already be None (post-migrate), but leave as-is.
+            }
+        } else {
+            // Overwrite mode: size + inline_data are authoritative AS-IS for
+            // inline files (explicit overwrite of inline content). For
+            // Flat/Stripe files (inline_data=None in request), we are in the
+            // "close sync stale cache" race window — another client may have
+            // already committed a larger size. Protect by using max(size)
+            // semantics (mirrors ShardStore L2945-2969).
+            if let Some(data) = inline_data {
+                // Inline overwrite (explicit): caller wants full replacement.
+                existing.info.size = size;
+                existing.info.chunks = chunks;
+                existing.info.inline_data = Some(data);
+            } else {
+                // Flat sync (A7 fix): never allow size regression. If this
+                // projection is from a stale client cache, max() preserves
+                // the existing larger size that another client already
+                // advanced via Raft-appended append.
+                let clamped = std::cmp::max(existing.info.size, size);
+                if clamped != size {
+                    log::warn!(
+                        "MetaCache Overwrite-Flat CLAMP: inode {} existing={} requested={} → clamped={} \
+                         (stale projection blocked)",
+                        inode, existing.info.size, size, clamped
+                    );
+                }
+                existing.info.size = clamped;
+                existing.info.chunks = chunks;
+                // inline_data left as-is (should be None for flat files)
+            }
+        }
+
+        let new_bytes = estimate_inode_bytes(&existing.info);
+        if new_bytes >= old_bytes {
+            self.trim.charge(new_bytes - old_bytes);
+        } else {
+            self.trim.release(old_bytes - new_bytes);
+        }
+        existing.touch();
+    }
+
+    /// Project setattr_meta (CRDT-merged) into MetaCache (Ceph MDS projected state model).
+    ///
+    /// Updates mode/uid/gid/mtime/atime/version on a cached inode so
+    /// cross-client `getattr` returns the new values immediately.
+    /// If the inode is not in MetaCache, inserts it as Dirty.
+    pub fn project_setattr_meta(&self, inode: u64, info: crate::shard_store::InodeInfo) {
+        let mut tbl = self.inode_table.write().unwrap();
+        let old_bytes = if let Some(existing) = tbl.get_mut(&inode) {
+            match existing.state {
+                CacheState::Deleted | CacheState::Trimming => return,
+                CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
+            }
+            let old = estimate_inode_bytes(&existing.info);
+            existing.info = info;
+            existing.state = CacheState::Dirty;
+            existing.touch();
+            old
+        } else {
+            let new_bytes = estimate_inode_bytes(&info);
+            let ci = CachedInode::new(info, CacheState::Dirty);
+            ci.touch();
+            tbl.insert(inode, ci);
+            self.trim.charge(new_bytes);
+            return;
+        };
+        let new_bytes = estimate_inode_bytes(&tbl.get(&inode).unwrap().info);
+        if new_bytes >= old_bytes {
+            self.trim.charge(new_bytes - old_bytes);
+        } else {
+            self.trim.release(old_bytes - new_bytes);
+        }
+    }
+
     // ---------- delete staging ----------
 
     /// Mark an inode and its directory entry as `Deleted` (pending Raft).

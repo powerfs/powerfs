@@ -744,26 +744,58 @@ impl FilerNetHandler {
     /// them to re-fetch stale (pre-apply) data and cache it. Instead, let
     /// the natural TTL/lookup cycle handle cache invalidation after apply
     /// completes. This avoids useless RPC round-trips to subscribers.
+    /// Notify connected FUSE clients that an inode's metadata has changed.
+    ///
+    /// Modeled after Ceph MDS `MDCache::send_dentry_unlink` (Server.cc
+    /// `_unlink_local_finish`), which **unconditionally** broadcasts to
+    /// all clients holding the dentry after the journal entry is applied.
+    ///
+    /// # CRITICAL: do NOT skip in async_meta_persist mode
+    ///
+    /// Previously, this function returned early when async_meta_persist was
+    /// true (the default). This caused T1.1's cross-client unlink
+    /// invisibility: fuse-1 deletes the file, but fuse-2 never receives an
+    /// Invalidate, so its userspace cache and kernel dcache continue to
+    /// report the file as existing.
+    ///
+    /// # Why broadcast before Raft apply is safe
+    ///
+    /// `delete_file` / `batch_delete_files` calls `meta_cache.stage_delete()`
+    /// BEFORE the Raft propose. This means the Filer's in-memory MetaCache
+    /// already marks the dir entry as Deleted when the propose is submitted.
+    /// Any client that receives the Invalidate and re-queries the Filer will
+    /// hit the MetaCache Deleted marker and get ENOENT — without needing
+    /// the Raft log to be applied to shard_store yet.
+    ///
+    /// This matches Ceph's projected state model: the MDS projects the
+    /// unlink (updates in-memory dentry linkage) before journaling, so
+    /// client re-queries see the projected state immediately.
+    ///
+    /// # Broadcast vs notify
+    ///
+    /// Uses `broadcast` (not `notify`) because the Filer's subscriber set
+    /// only includes clients that explicitly subscribed via a prior
+    /// lookup/readdir. A client that cached a dentry from a previous
+    /// readdir may not be in the subscriber list for the parent inode.
+    /// Broadcast ensures all connected clients receive the invalidation.
     fn notify_inode_change(&self, inode: u64, version: u64) {
-        if self.meta_shard_manager.is_async_meta_persist() {
-            debug!(
-                "FILER_NET_NOTIFY: skipping in async mode: inode={}, version={}",
-                inode, version
-            );
-            return;
-        }
         if let Some(ref notifier) = self.inode_notifier {
             let notifier = notifier.clone();
-            let sub_count = notifier.subscriber_count(inode);
             info!(
-                "FILER_NET_NOTIFY: inode={}, version={}, subscribers={}",
-                inode, version, sub_count
+                "FILER_NET_NOTIFY: inode={}, version={}, async={}",
+                inode,
+                version,
+                self.meta_shard_manager.is_async_meta_persist()
             );
             tokio::spawn(async move {
-                let count = notifier.notify(inode, version);
+                // broadcast: push to ALL connected clients, not just
+                // subscribers. This matches Ceph's send_dentry_unlink
+                // which notifies all replica MDS nodes regardless of
+                // explicit subscription.
+                let count = notifier.broadcast(inode, version);
                 info!(
-                    "FILER_NET_NOTIFY: notified {} clients about inode {} change (v={})",
-                    count, inode, version
+                    "FILER_NET_NOTIFY: broadcast Invalidate(inode={}, v={}) to {} clients",
+                    inode, version, count
                 );
             });
         }
@@ -1273,6 +1305,26 @@ impl FilerNetHandler {
                 // 导致 fuse 端 get_entry_by_inode 拿到的 chunks 恒为空，
                 // open() 时无法刷新账本，跨客户端读文件触发 I/O error。
                 Self::encode_chunks_fields(&mut enc, &info)?;
+
+                // ===== P1-5: 目录 rstat (递归累计统计) =====
+                // 字段定义对齐内核 powerfs_net.h 0xCD-0xD1。
+                // 当前先编码 0 占位，待 Filer 写路径 UpdateChildSummary
+                // 做祖先链增量聚合 (rbytes/rfiles/rsubdirs 持久化到 inode) 后，
+                // 直接改成从 info.rbytes 等字段读取即可，客户端无需改动。
+                // 对非目录 inode 不编码这些字段 (内核解析侧 S_ISDIR 才回填).
+                // S_IFDIR = 0o040000 (POSIX 标准), 避免引入额外 libc 依赖.
+                const S_IFDIR: u32 = 0o040000;
+                if (entry_info.mode & 0xF000) == S_IFDIR {
+                    let rctime = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    enc.add_u64(FieldId::RBytes, 0);
+                    enc.add_u64(FieldId::RFiles, 0);
+                    enc.add_u64(FieldId::RSubdirs, 0);
+                    enc.add_u64(FieldId::RCtimeSec, rctime.as_secs());
+                    enc.add_u32(FieldId::RCtimeNsec, rctime.subsec_nanos());
+                }
+
                 info!(
                     "FILER_NET_GETATTR: returned info for ino={}, name={}, size={}, chunks={}",
                     ino,
@@ -2529,27 +2581,36 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks, inline_data, is_append)
+            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks, inline_data.clone(), is_append)
             .await
         {
             Ok(_) => {
-                // Phase 2: notify subscribers that this inode's content
-                // (size/chunks) changed so they can evict stale cache
-                // entries. Without this, a second client that previously
-                // looked up the file would keep serving the old content
-                // until the 30s TTL expires.
+                // Invalidate 策略（T1.3 修复, 2026-08-22）:
                 //
-                // L4.21 fix: use next_version() instead of SystemTime seconds
-                // to ensure each notification has a unique, monotonically
-                // increasing version. This prevents the client's is_duplicate
-                // check from suppressing concurrent append notifications that
-                // would otherwise share the same second-resolution timestamp.
+                // 区分 inline 小文件和 chunk 大文件:
                 //
-                // Note: notify_inode_change is a no-op in async mode (see
-                // method doc). In async mode, the apply hasn't completed yet,
-                // so notifying would cause subscribers to re-fetch stale
-                // (pre-apply) data and cache it.
-                self.notify_inode_change(inode, self.next_version());
+                // 1. inline 小文件 (inline_data.is_some()):
+                //    数据存在 Filer 元数据中 (inline_data)，必须广播
+                //    Invalidate，否则其他客户端的 inline_buffer 会 stale
+                //    （读到旧数据）。这和 T1.1 unlink 的无条件广播一致。
+                //
+                // 2. chunk 大文件 (inline_data.is_none()):
+                //    数据在 Volume Server，Filer 只存 chunks 列表 (needle_id
+                //    列表)。不广播 Invalidate，因为:
+                //    a) 写入者自己 (fuse-1) 收到 Invalidate 会清除
+                //       chunk_cache，导致后续读取需重新从 Volume Server
+                //       拉 (T1.3 bug: md5sum 读到空数据/EIO);
+                //    b) 其他客户端 (fuse-2) 通过 getattr (dentry_lease
+                //       过期后, ~30s) 刷新 chunks 列表，新的 needle_id
+                //       不会命中旧 chunk_cache → 自然从 Volume Server 读
+                //       新数据。
+                //
+                // 这与 Ceph MDS 的 cap recall 模型对齐：写入者 close 后
+                // 不主动驱逐自己的 page cache，其他客户端通过 cap recall
+                // 机制延迟刷新。
+                if inline_data.is_some() {
+                    self.notify_inode_change(inode, self.next_version());
+                }
                 // 成功: STATUS_OK + 空 body
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
@@ -2675,10 +2736,54 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        // best-effort: 校验 inode 存在且为 Inline 模式 (有 inline_data).
-        // 不强制失败 — 若已被其他客户端迁移, 仍分配 (容错).
+        // A6 FIX: 幂等化迁移分配。
+        // 如果 inode 已经有 chunks（已被另一客户端迁移过，且 release sync 成功写回），
+        // 或已经设置了 fid，则直接返回现有 (volume_id, needle_id)，绝不重新分配。
+        // 否则双客户端并发 migrate 会得到两套不同的 fid → 数据写到两个独立 Volume 文件，
+        // 后 sync 的那个覆盖前一个的 chunks 元数据 → 先写的客户端数据永久丢失。
         if let Some(info) = self.meta_shard_manager.get_inode(inode) {
-            if info.inline_data.is_none() && info.chunks.is_empty() {
+            // Case 1: chunks 非空 → 已完成一次迁移并 sync，复用首个 chunk 的位置
+            if let Some(first) = info.chunks.first() {
+                info!(
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE — \
+                     chunks already exist, returning volume_id={} needle_id={:#x} \
+                     (chunks={}, fid={:?})",
+                    inode, first.volume_id, first.needle_id,
+                    info.chunks.len(), info.fid
+                );
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::VolumeId, first.volume_id);
+                enc.add_u64(FieldId::FileKey, first.needle_id);
+                return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+            }
+            // Case 2: fid 已设置（但 chunks 还空，罕见边界） → 从 fid 解析
+            if let Some(fid) = &info.fid {
+                let parts: Vec<&str> = fid.split(',').collect();
+                if parts.len() >= 3 {
+                    if let (Ok(vid), Ok(nid)) = (parts[0].parse::<u64>(), parts[2].parse::<u64>()) {
+                        info!(
+                            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE — \
+                             fid already set, returning volume_id={} needle_id={:#x}",
+                            inode, vid, nid
+                        );
+                        let mut enc = TlvEncoder::new();
+                        enc.add_u64(FieldId::VolumeId, vid);
+                        enc.add_u64(FieldId::FileKey, nid);
+                        return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+                    }
+                }
+            }
+            // Case 3: info.volume_id 存在但 fid 为空的极端边界
+            if let (Some(vid), true) = (info.volume_id, info.chunks.is_empty()) {
+                // volume_id 已知但 fid 字符串未设置，这种情况不应发生；
+                // 为安全起见仍分配新值（极端退化场景）
+                warn!(
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} has volume_id={} but no chunks/fid string — \
+                     falling back to fresh allocation", inode, vid
+                );
+            }
+            // 无 inline_data 且无 chunks/fid：通常是新建空文件，正常分配即可
+            if info.inline_data.is_none() && info.chunks.is_empty() && info.fid.is_none() {
                 warn!(
                     "FILER_NET_MIGRATE_INLINE_ALLOC: inode {} has no inline_data and no chunks — \
                      may already be migrated or never written, allocating anyway",
@@ -2715,7 +2820,7 @@ impl FilerNetHandler {
         };
 
         info!(
-            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} allocated volume_id={}, needle_id={:#x} \
+            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} FRESH allocation volume_id={}, needle_id={:#x} \
              (inode NOT modified, inline_data preserved for crash safety)",
             inode, volume_id, needle_id
         );

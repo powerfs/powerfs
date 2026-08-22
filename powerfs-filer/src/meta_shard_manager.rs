@@ -1047,6 +1047,17 @@ impl MetaShardManager {
             );
         }
 
+        // MetaCache.stage_delete was called before propose, so the dir
+        // entry is already marked Deleted in the Filer's in-memory cache.
+        // Any client that receives an Invalidate and re-queries the Filer
+        // will get ENOENT from MetaCache without waiting for Raft apply.
+        // This is sufficient for cross-client visibility: notify_inode_change
+        // broadcasts Invalidate immediately after this function returns.
+        //
+        // Do NOT wait_for_entry_removed here — that would add Raft apply
+        // latency (1-3ms) to every unlink. The MetaCache deleted marker
+        // is the authoritative fast-path, matching Ceph's projected state
+        // (MDS projects the unlink before journaling).
         if !self.is_async_meta_persist() {
             self.wait_for_entry_removed(shard_dir, parent_inode, name)
                 .await;
@@ -1194,6 +1205,13 @@ impl MetaShardManager {
                     resolved.len(),
                     shard_dir.0
                 );
+                // MetaCache.stage_delete was called for all entries before
+                // propose_many, so all dir entries are already marked Deleted
+                // in the Filer's in-memory cache. Clients that receive
+                // Invalidate and re-query the Filer will get ENOENT from
+                // MetaCache without waiting for Raft apply.
+                // notify_inode_change broadcasts Invalidate after this function
+                // returns — no need to wait_for_entry_removed here.
             }
             Err(e) => {
                 // If not leader, fail entire batch — caller should redirect.
@@ -2687,14 +2705,61 @@ impl MetaShardManager {
         }
         inode_info.version = timestamp;
 
-        // MetaCache Dirty write-through for setattr_meta: the CRDT merged
+        // MetaCache projected state for setattr_meta: the CRDT merged
         // value is what we intend; Raft apply confirms it via SetAttrMeta
         // handler.
+        //
+        // CRITICAL: Must update MetaCache with the merged values, not just
+        // mark Dirty. Otherwise cross-client getattr hits MetaCache and
+        // returns stale mode/mtime/atime. This was the root cause of T1.3
+        // "utimes cross-client not synced" and "directory chmod not visible".
         let merged_copy = inode_info.clone();
         store.update_inode(inode_info)?;
-        self.meta_cache.mark_dirty(inode, Some(merged_copy), |_| {
-            // merged_copy already reflects the final state; no further change.
-        });
+        self.meta_cache.project_setattr_meta(inode, merged_copy);
+
+        // Propagate SetAttrMeta to all filers via Raft (fire-and-forget in
+        // async mode, propose_meta_commit in strict mode). Without this,
+        // leader-only update leaves followers with stale mode/uid/gid,
+        // causing cross-client getattr to return old values.
+        //
+        // CRITICAL: This was the root cause of T1.3 "chmod cross-client not
+        // synced": the leader's shard_store was updated, but followers never
+        // received the change because no Raft propose was made.
+        //
+        // Design principle: MetaCache is updated first (immediate local
+        // visibility), then propose_ff propagates to followers asynchronously.
+        // If propose_ff is dropped (e.g. leader lost lease), the local update
+        // remains — followers will catch up via future proposals or remain
+        // stale until anti-entropy reconciliation (future work).
+        let cmd = ShardCommand::SetAttrMeta {
+            inode,
+            mode,
+            uid,
+            gid,
+            mtime,
+            atime,
+            client_id: client_id.to_string(),
+            timestamp,
+        };
+        let async_mode = self.is_async_meta_persist();
+        info!(
+            "setattr_meta: proposing SetAttrMeta for inode={} shard={} async={}",
+            inode, shard_id.0, async_mode
+        );
+        if let Err(e) = self.propose_meta(shard_id, cmd.serialize()).await {
+            warn!(
+                "setattr_meta: propose failed (may be dropped in async mode): {}",
+                e
+            );
+            // Don't fail the request: leader already updated local store +
+            // MetaCache. propose_ff is best-effort; lost entries are
+            // acceptable per design principle.
+        } else {
+            info!(
+                "setattr_meta: propose succeeded for inode={} shard={}",
+                inode, shard_id.0
+            );
+        }
 
         debug!(
             "setattr_meta CRDT merged: inode={}, mode={:?}, uid={:?}, gid={:?}, client={}, ts={}",
@@ -3624,6 +3689,18 @@ impl MetaShardManager {
         is_append: bool,
     ) -> Result<(), String> {
         let target_chunk_count = chunks.len();
+
+        // T1.3 fix (2026-08-22): Clone chunks/inline_data BEFORE moving into
+        // ShardCommand so we can project them into MetaCache after propose.
+        // Without this, async mode returns immediately after propose_meta,
+        // but MetaCache still holds the create-time staged value (size=0,
+        // chunks=[]). Cross-client getattr → get_inode → MetaCache hit →
+        // returns stale size=0 → reader EIO after READ_LAG timeout.
+        // The projection mirrors Ceph MDS projected state: memory updates
+        // precede journal apply.
+        let chunks_for_projection = chunks.clone();
+        let inline_for_projection = inline_data.clone();
+
         let cmd = ShardCommand::UpdateInodeSizeChunks {
             inode,
             size,
@@ -3632,6 +3709,17 @@ impl MetaShardManager {
             is_append,
         };
         self.propose_meta(shard_id, cmd.serialize()).await?;
+
+        // Project the update into MetaCache so subsequent get_inode calls
+        // (e.g., from cross-client getattr) return the new size/chunks
+        // immediately, without waiting for Raft apply.
+        self.meta_cache.project_update_size_chunks(
+            inode,
+            size,
+            chunks_for_projection,
+            inline_for_projection,
+            is_append,
+        );
 
         // Strict mode only: Wait for the apply to complete on this (leader)
         // node so that notify_inode_change and subsequent reads see the

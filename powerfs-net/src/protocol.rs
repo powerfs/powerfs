@@ -1154,6 +1154,24 @@ pub enum FieldId {
     /// so the Master can proxy `/admin/meta-cache-stats` and
     /// `/admin/lease-stats` when serving the new `GetFilerStats` gRPC.
     FilerMetricsPort = 0xCC,
+
+    // ===== Recursive directory stat (rstat) fields (0xCD-0xD1) =====
+    /// Recursive total bytes under a directory (u64). Computed by the Filer
+    /// as sum over all descendants (files + sub-dirs) of each inode's
+    /// `size`, maintained incrementally via UpdateChildSummary on every
+    /// write/namespace mutation. Absent on non-directory inodes.
+    RBytes = 0xCD,
+    /// Recursive total regular-file count under a directory (u64).
+    RFiles = 0xCE,
+    /// Recursive total sub-directory count under a directory (u64), i.e.
+    /// count of descendant inodes with S_IFDIR type.
+    RSubdirs = 0xCF,
+    /// Last rstat refresh timestamp, seconds part (u64). Used by clients to
+    /// detect staleness when comparing rstat vs live children state (used
+    /// together with DirVersion for cache invalidation decisions).
+    RCtimeSec = 0xD0,
+    /// Last rstat refresh timestamp, nanoseconds part (u32).
+    RCtimeNsec = 0xD1,
 }
 
 impl FieldId {
@@ -1273,6 +1291,11 @@ impl FieldId {
             0xCA => Some(Self::DentryLeaseTtl),
             0xCB => Some(Self::FilerHttpPort),
             0xCC => Some(Self::FilerMetricsPort),
+            0xCD => Some(Self::RBytes),
+            0xCE => Some(Self::RFiles),
+            0xCF => Some(Self::RSubdirs),
+            0xD0 => Some(Self::RCtimeSec),
+            0xD1 => Some(Self::RCtimeNsec),
             _ => None,
         }
     }

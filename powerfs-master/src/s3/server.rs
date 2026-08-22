@@ -320,6 +320,13 @@ pub mod handlers {
             .map(|e| e.name)
             .collect();
 
+        // 批量预热 bucket_cache
+        state
+            .cache
+            .bucket_cache
+            .set_many(bucket_names.iter().map(|n| (n, true)))
+            .await;
+
         let body = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -358,7 +365,11 @@ pub mod handlers {
         }
 
         match state.directory_tree.create_directory(&bucket_path).await {
-            Ok(_) => (StatusCode::CREATED, "".to_string()),
+            Ok(_) => {
+                // 写穿缓存：bucket 已真实创建，立即刷新缓存为 true
+                state.cache.bucket_cache.set(&bucket, true).await;
+                (StatusCode::CREATED, "".to_string())
+            }
             Err(e) => {
                 eprintln!("Failed to create bucket: {}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "".to_string())
@@ -379,6 +390,8 @@ pub mod handlers {
             .await;
 
         if state.directory_tree.get_entry(&bucket_path).await.is_none() {
+            // bucket 不存在：写穿缓存为 false
+            state.cache.bucket_cache.set(&bucket, false).await;
             return s3_error(
                 StatusCode::NOT_FOUND,
                 "NoSuchBucket",
@@ -396,12 +409,20 @@ pub mod handlers {
         }
 
         match state.directory_tree.delete_entry(&bucket_path).await {
-            Ok(true) => (StatusCode::NO_CONTENT, "".to_string()),
-            Ok(false) => s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchBucket",
-                "The specified bucket does not exist",
-            ),
+            Ok(true) => {
+                // bucket 删除成功：写穿 bucket_cache=false, 并清理该 bucket 下所有 entry_cache
+                state.cache.bucket_cache.set(&bucket, false).await;
+                state.cache.entry_cache.clear_prefix(&format!("/{}/", bucket)).await;
+                (StatusCode::NO_CONTENT, "".to_string())
+            }
+            Ok(false) => {
+                state.cache.bucket_cache.set(&bucket, false).await;
+                s3_error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchBucket",
+                    "The specified bucket does not exist",
+                )
+            }
             Err(e) => {
                 eprintln!("Failed to delete bucket: {}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, "".to_string())
@@ -415,7 +436,17 @@ pub mod handlers {
     ) -> impl IntoResponse {
         let bucket_path = format!("/{}", bucket);
 
-        if state.directory_tree.get_entry(&bucket_path).await.is_some() {
+        // 使用缓存检查bucket是否存在
+        let bucket_exists = match state.cache.bucket_cache.get(&bucket).await {
+            Some(exists) => exists,
+            None => {
+                let exists = state.directory_tree.get_entry(&bucket_path).await.is_some();
+                state.cache.bucket_cache.set(&bucket, exists).await;
+                exists
+            }
+        };
+
+        if bucket_exists {
             (StatusCode::OK, "")
         } else {
             (StatusCode::NOT_FOUND, "")
@@ -451,6 +482,16 @@ pub mod handlers {
         let entries = state
             .directory_tree
             .list_entries(&bucket_path, 1000, "")
+            .await;
+
+        // 批量预热 entry_cache
+        state
+            .cache
+            .entry_cache
+            .set_many(entries.iter().map(|e| {
+                let object_path = format!("/{}/{}", bucket, e.name);
+                (object_path, e.clone())
+            }))
             .await;
 
         let object_list: Vec<String> = entries
@@ -627,8 +668,10 @@ pub mod handlers {
             replica_chunks: Vec::new(),
         };
 
-        match state.directory_tree.create_entry(entry).await {
+        let object_path = format!("/{}/{}", bucket, key);
+        match state.directory_tree.create_entry(entry.clone()).await {
             Ok(_) => {
+                state.cache.entry_cache.set(&object_path, entry).await;
                 let mut response = (StatusCode::OK, "").into_response();
                 response
                     .headers_mut()
@@ -764,13 +807,30 @@ pub mod handlers {
         let bucket_path = format!("/{}", bucket);
         let object_path = format!("/{}/{}", bucket, key);
 
-        if state.directory_tree.get_entry(&bucket_path).await.is_none() {
+        // 使用缓存检查bucket是否存在
+        let bucket_exists = match state.cache.bucket_cache.get(&bucket).await {
+            Some(exists) => exists,
+            None => {
+                let exists = state.directory_tree.get_entry(&bucket_path).await.is_some();
+                state.cache.bucket_cache.set(&bucket, exists).await;
+                exists
+            }
+        };
+
+        if !bucket_exists {
             return build_error_response(StatusCode::NOT_FOUND, "Bucket not found");
         }
 
-        let entry = match state.directory_tree.get_entry(&object_path).await {
+        // 使用缓存获取entry
+        let entry = match state.cache.entry_cache.get(&object_path).await {
             Some(e) => e,
-            None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
+            None => match state.directory_tree.get_entry(&object_path).await {
+                Some(e) => {
+                    state.cache.entry_cache.set(&object_path, e.clone()).await;
+                    e
+                }
+                None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
+            },
         };
 
         let etag = entry
@@ -829,7 +889,10 @@ pub mod handlers {
         }
 
         match state.directory_tree.delete_entry(&object_path).await {
-            Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
+            Ok(true) => {
+                state.cache.entry_cache.remove(&object_path).await;
+                (StatusCode::NO_CONTENT, "").into_response()
+            }
             Ok(false) => build_error_response(StatusCode::NOT_FOUND, "Object not found"),
             Err(e) => {
                 eprintln!("Failed to delete object: {}", e);
@@ -1117,8 +1180,10 @@ pub mod handlers {
             replica_chunks: Vec::new(),
         };
 
-        match state.directory_tree.create_entry(entry).await {
+        let object_path = format!("/{}/{}", bucket, key);
+        match state.directory_tree.create_entry(entry.clone()).await {
             Ok(_) => {
+                state.cache.entry_cache.set(&object_path, entry).await;
                 let response_body = format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
