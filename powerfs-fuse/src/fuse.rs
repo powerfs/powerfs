@@ -2879,7 +2879,14 @@ impl FileSystem for PowerFsFs {
                 // matches Ceph FUSE Client::ll_lookup which prefetches
                 // inline_data (in the Ceph "Backtrace" blob) directly in the
                 // MDS lookup reply.
-                if attr.is_inline() {
+                // P2.5 T1.6 Step3 fix: Flat模式文件因Raft apply lag/MetaCache投影
+                // 时序差，LOOKUP响应可能出现 placement=Inline(stale) + chunks非空。
+                // 若chunks非空，说明文件实际已迁移到Flat/Stripe模式，绝不能prefill
+                // inline_buffers，否则会错误进入inline→Flat迁移逻辑，
+                // merged_data缺少Volume上真实数据，用0填充覆盖已有内容。
+                let has_chunks = !attr.chunks.is_empty() || !attr.replica_chunks.is_empty();
+                let truly_inline = attr.is_inline() && !has_chunks;
+                if truly_inline {
                     let ino = attr.inode;
                     let data = attr.inline_data.unwrap_or_default();
                     let dlen = data.len();
@@ -2934,6 +2941,18 @@ impl FileSystem for PowerFsFs {
                                 needs_refresh,
                             },
                         );
+                    }
+                } else if has_chunks {
+                    // Flat/Stripe模式：清除stale的inline_buffers残留，
+                    // 防止write()误判为inline模式
+                    let ino = attr.inode;
+                    self.cache.set_content_size(ino, attr.size);
+                    if self.inline_buffers.contains_key(&ino) {
+                        debug!(
+                            "lookup: removing stale inline_buffers for Flat/Stripe inode={}, chunks={}, replica_chunks={}, placement={:?}",
+                            ino, attr.chunks.len(), attr.replica_chunks.len(), attr.placement
+                        );
+                        self.inline_buffers.remove(&ino);
                     }
                 }
 
@@ -6313,12 +6332,326 @@ impl FileSystem for PowerFsFs {
         );
 
         if is_append {
-            let latest_entry = self
-                .cache
-                .get_inode(inode)
-                .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
-            offset = latest_entry.size;
+            // A4: O_APPEND 每次 write 前计算 offset 必须基于权威 size。
+            // 约束: O_APPEND writes must bypass local cache and fetch authoritative
+            // size from Filer to prevent using stale offset.
+            //
+            // CORE PRINCIPLE (复用 open() 刷新 guard，正确性已验证):
+            //   每次 O_APPEND 都从 Filer 拉取最新 entry (get_entry_by_inode RPC)
+            //   → 1 次额外 RPC / write，正确性优先，后续可按 inode_lease 窗口优化。
+            //
+            //   TRUST_LOCAL ⇔ 本地有 chunk_cache 数据 AND 本地 content_size > Filer content_size
+            //     ↳ 本地有已 flush 到 Volume、但 release 尚未 sync_size_chunks_on_close 到 Filer 的数据
+            //     ↳ 此时 Filer 的 size 是 stale 的，offset 必须信任本地
+            //
+            //   TRUST_FILER ⇔ 其他所有情况
+            //     ↳ 跨端场景: 另一 writer 完成 release sync → Filer size > 本地 size
+            //     ↳ Invalidate + 重新 acquire lease → 本地 size stale (如之前的 0)
+            //     ↳ 本地 chunk_cache 被驱逐, 但 Filer 上已有累积 append
+            let local_entry = self.cache.get_inode(inode).clone();
+            let parent = entry.parent;
+            let local_cs = local_entry.as_ref().map(|e| e.content_size).unwrap_or(0);
+            let local_size = local_entry.as_ref().map(|e| e.size).unwrap_or(0);
+            let has_local_chunks = self.chunk_cache.has_chunks(inode);
+            let has_dirty_inline = self
+                .inline_buffers
+                .get(&inode)
+                .map(|b| b.dirty)
+                .unwrap_or(false);
+
+            let (authoritative_size, _authoritative_cs, _fresh_chunks, _fresh_fid) =
+                match self.client.get_entry_by_inode(inode) {
+                    Ok(Some((filer_entry, _path))) => {
+                        let fresh = self.entry_to_cached(parent, &filer_entry);
+                        let filer_cs = fresh.content_size;
+                        let filer_size = fresh.size.max(filer_cs);
+                        let local_ahead = local_cs > filer_cs;
+                        // TRUST_LOCAL ⇔
+                        //   (Flat: 本地 chunks + local_cs > filer_cs)
+                        //   OR (inline: inline_buffers dirty, 未提交 Filer 时
+                        //       inline_buffers.data 的末尾不是 Filer 上的 stale 数据)
+                        //     ↳ inline 模式 release 才一次性 sync, 在此之前
+                        //       Filer 的 inline_data.size 始终是旧值
+                        let trust_local = (local_ahead && has_local_chunks) || has_dirty_inline;
+                        if trust_local {
+                            // TRUST_LOCAL
+                            debug!(
+                                "write append: inode={} TRUST_LOCAL local_cs={} filer_cs={} ahead={} has_chunks={} dirty_inline={} → size={}",
+                                inode, local_cs, filer_cs, local_ahead, has_local_chunks,
+                                has_dirty_inline, local_size
+                            );
+                            (local_size, local_cs, None, None)
+                        } else {
+                            // TRUST_FILER: Filer 权威 (含跨端写入)，更新本地 cache
+                            debug!(
+                                "write append: inode={} TRUST_FILER: filer_size={} filer_cs={} (local_size={} local_cs={} ahead={} has_chunks={} dirty_inline={})",
+                                inode, filer_size, filer_cs, local_size, local_cs,
+                                local_ahead, has_local_chunks, has_dirty_inline
+                            );
+                            if let Some(mut cached) = local_entry.clone() {
+                                let need_update = cached.size < filer_size
+                                    || cached.content_size < filer_cs;
+                                if need_update {
+                                    cached.size = cached.size.max(filer_size);
+                                    cached.content_size = cached.content_size.max(filer_cs);
+                                    if !fresh.chunks.is_empty() {
+                                        cached.chunks = fresh.chunks.clone();
+                                    }
+                                    if cached.fid.is_none() && fresh.fid.is_some() {
+                                        cached.fid = fresh.fid.clone();
+                                    }
+                                    self.cache.insert(cached);
+                                }
+                            }
+                            // === A4 v5 FIX: Inline-mode cross-client append data loss ===
+                            // When TRUST_FILER fires for an INLINE file (fid=None +
+                            // no chunks) and Filer has authoritative_cs>0, we MUST
+                            // also refresh the local inline_buffers from the Filer.
+                            // Otherwise:
+                            //   1. `offset = authoritative_size` is set correctly
+                            //      from the Filer (e.g. 4900 after Writer A synced).
+                            //   2. But the local inline_buf.data is only Writer B's
+                            //      partial writes (or empty) with original_len=0.
+                            //   3. `inline_buf.data.resize(offset, 0)` fills the gap
+                            //      with 4900 zero bytes (silent corruption).
+                            //   4. sync_inline_buffer computes can_append via
+                            //      original_len=0 and sends a delta that includes
+                            //      those zeros → Filer appends zeros, corrupting the
+                            //      file. Or (worse) if original_len is stale and
+                            //      mod_in_place flips to true on a later write,
+                            //      can_append=false OVERWRITE replaces Writer A's
+                            //      entire content with Writer B's partial view.
+                            //
+                            // Guard conditions:
+                            //   - Must be INLINE layout: no fid, no chunks
+                            //   - Filer-side has data: authoritative_cs > 0
+                            //   - has_dirty_inline=false: we already went to
+                            //     TRUST_LOCAL when dirty, so here the buffer is
+                            //     either absent or clean (safe to replace).
+                            let is_inline_layout =
+                                fresh.fid.is_none() && fresh.chunks.is_empty();
+                            if is_inline_layout && filer_cs > 0 {
+                                let inline_buf_current =
+                                    self.inline_buffers.get(&inode);
+                                let buf_absent_or_clean = inline_buf_current
+                                    .as_ref()
+                                    .map(|b| !b.dirty)
+                                    .unwrap_or(true);
+                                if buf_absent_or_clean {
+                                    drop(inline_buf_current);
+                                    // Fetch inline data via getattr (same path
+                                    // used by open() refresh) —
+                                    // get_entry_by_inode's entry_to_cached does
+                                    // NOT carry inline_data (CachedEntry drops
+                                    // it), so an explicit getattr round-trip is
+                                    // required. Cost: +1 RPC / O_APPEND write
+                                    // that crosses into TRUST_FILER for an
+                                    // inline file; correctness is non-negotiable.
+                                    let routing_shard = self.routing_shard(inode);
+                                    let ino = inode;
+                                    let meta_client =
+                                        self.client.facade().meta_shard_client().clone();
+                                    let getattr_res = self.client.block_on(
+                                        async move {
+                                            meta_client.getattr(ino, routing_shard).await
+                                        },
+                                    );
+                                    match getattr_res {
+                                        Ok(attr) if attr.is_inline() => {
+                                            let filer_inline_data =
+                                                attr.inline_data.unwrap_or_default();
+                                            let dlen = filer_inline_data.len();
+                                            if dlen > 0 {
+                                                warn!(
+                                                    "write append TRUST_FILER inline refresh: \
+                                                     inode={} replacing local inline_buf \
+                                                     (clean/absent) with filer data_len={} \
+                                                     (filer_cs={}, was_buf={}, \
+                                                     thread={:?})",
+                                                    inode, dlen, filer_cs,
+                                                    self.inline_buffers.contains_key(&inode),
+                                                    std::thread::current().id(),
+                                                );
+                                                self.inline_buffers.insert(
+                                                    inode,
+                                                    InlineBuffer {
+                                                        data: filer_inline_data,
+                                                        dirty: false,
+                                                        original_len: dlen,
+                                                        modified_in_place: false,
+                                                        needs_refresh: false,
+                                                    },
+                                                );
+                                                if let Some(max_size) = attr.inline_max_size {
+                                                    self.inline_max_sizes
+                                                        .insert(inode, max_size);
+                                                }
+                                            }
+                                        }
+                                        Ok(_) => {
+                                            // Non-inline layout on Filer despite
+                                            // fid==None/empty-chunks locally:
+                                            // remove stale inline buf if any.
+                                            if self.inline_buffers.remove(&inode).is_some() {
+                                                self.inline_max_sizes.remove(&inode);
+                                                warn!(
+                                                    "write append TRUST_FILER: inode={} \
+                                                     non-inline on filer, removed stale buf",
+                                                    inode,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "write append TRUST_FILER inline getattr \
+                                                 failed inode={}: {} — proceeding with \
+                                                 current inline_buf (may have stale gap)",
+                                                inode, e,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // === A8 FIX (2026-08-22): Cross-client append overwrites
+                            // Writer A's data due to stale inline_buffers on Writer B. ===
+                            //
+                            // Root cause (T1.6 Step1 data loss, reproduced in c1_inline):
+                            //   1. Both clients open the same newly-created empty file.
+                            //      LOOKUP prefills BOTH clients' inline_buffers with a
+                            //      0-byte clean buffer (open() → inline_buffers_contains=true).
+                            //   2. Writer A appends data, crosses the 8KB inline→Flat
+                            //      migration threshold, migrates to Volume Server, and
+                            //      syncs. Filer now has Flat layout: size=9800, chunks=[..],
+                            //      fid set, inline_data=None.
+                            //   3. Writer B wakes up and does O_APPEND write(). A4 fix
+                            //      hits TRUST_FILER, correctly pulls filer_size=9800
+                            //      from the Filer, sets offset=9800. GOOD.
+                            //   4. BUT write() then checks inline_buffers.contains_key()
+                            //      → YES (stale prefill from step-1 create). Enters INLINE
+                            //      write path.
+                            //   5. inline_buf.data.len()=0 < offset=9800 → resize(9800, 0)
+                            //      fills the buffer with 9800 ZEROES, destroying any
+                            //      trace of Writer A's content.
+                            //   6. Writer B's 49 bytes appended at 9800. Later writes
+                            //      push total over migrate_threshold. Migration builds
+                            //      merged_data = zeros(9800) + B's bytes, writes the
+                            //      whole thing to the SAME (reused via A6) Volume
+                            //      needle_id → OVERWRITES Writer A's data.
+                            //   Result: file ends at 19600 bytes, full of Writer B
+                            //   (first 9800 are B's, because B's migrated Flat write
+                            //   spans the full needle; A's original 9800 bytes are
+                            //   replaced by the zeros-then-B-content blob).
+                            //
+                            // Fix: in TRUST_FILER branch, AFTER computing
+                            // authoritative_size / fid / chunks, detect the
+                            // "stale inline_buf, Filer-side Flat" mismatch and
+                            // EVICT the stale buffer BEFORE write() chooses its
+                            // path. Conditions:
+                            //   - Filer reports Flat layout (fid.is_some() OR
+                            //     !fresh.chunks.is_empty()) — means the file has
+                            //     been migrated by another client, data lives on
+                            //     Volume Server, not in Filer inline_data.
+                            //   - Locally we still carry an inline_buffer (stale
+                            //     prefill from create/lookup time). The buffer is
+                            //     clean (otherwise TRUST_LOCAL would have fired,
+                            //     since dirty_inline forces trust_local=true —
+                            //     verified at L6375 trust_local = (... dirty_inline)).
+                            // When both hold, drop the stale inline_buf so the
+                            // subsequent `if let Some(inline_buf)` guard (L6547)
+                            //     → FALSE, and write() falls through to the
+                            //     Flat/Stripe path, which correctly uses the
+                            //     fid/chunks from the Filer (via the cache insert
+                            //     at L6391-6403 above) and writes only the
+                            //     intended byte range (no zero-filled gap).
+                            let filer_is_flat = fresh.fid.is_some() || !fresh.chunks.is_empty();
+                            if filer_is_flat && self.inline_buffers.contains_key(&inode) {
+                                // Sanity: buffer MUST be clean here. If it were
+                                // dirty, TRUST_LOCAL (L6375) would've fired, and
+                                // we'd have taken the trust_local=true branch.
+                                let still_dirty = self
+                                    .inline_buffers
+                                    .get(&inode)
+                                    .map(|b| b.dirty)
+                                    .unwrap_or(false);
+                                if !still_dirty {
+                                    warn!(
+                                        "write append A8-STALE-INLINE: inode={} \
+                                         Filer is Flat (fid={:?} chunks={}) but \
+                                         local has stale clean inline_buf. \
+                                         Evicting buffer to force Flat write path \
+                                         (prevents zero-filled gap overwrite of \
+                                         cross-client append data). thread={:?}",
+                                        inode,
+                                        fresh.fid.as_ref().map(|f| f.to_string()),
+                                        fresh.chunks.len(),
+                                        std::thread::current().id(),
+                                    );
+                                    self.inline_buffers.remove(&inode);
+                                    self.inline_max_sizes.remove(&inode);
+                                } else {
+                                    // Dirty inline_buf on a Flat Filer file?
+                                    // Shouldn't happen (dirty → TRUST_LOCAL),
+                                    // but leave it in place rather than silently
+                                    // discarding user data. Warn loudly.
+                                    error!(
+                                        "write append A8-CONFLICT: inode={} \
+                                         Filer is Flat but local inline_buf is \
+                                         dirty! Keeping dirty buf (data loss risk \
+                                         if migrate runs). thread={:?}",
+                                        inode,
+                                        std::thread::current().id(),
+                                    );
+                                }
+                            }
+                            (filer_size, filer_cs, Some(fresh.chunks), fresh.fid)
+                        }
+                    }
+                    other => {
+                        warn!(
+                            "write append: inode={} get_entry_by_inode failed ({:?}), fallback to local cache",
+                            inode, other.err()
+                        );
+                        (local_size, local_cs, None, None)
+                    }
+                };
+            offset = authoritative_size;
         }
+
+        // === A8 FIX PART 2 (2026-08-22): Re-acquire cached entry AFTER the
+        // O_APPEND setup block completes. ===
+        //
+        // The `entry` binding above was snapshotted BEFORE `if is_append` ran.
+        // Inside that block:
+        //   (a) TRUST_FILER branch backfilled fresh.fid/fresh.chunks into the
+        //       cache via self.cache.insert (L6391-6403).
+        //   (b) A8 PART 1 evicted a stale clean inline_buf when the Filer is
+        //       already Flat.
+        // If we keep the OLD entry (fid=None, chunks=[] since pre-create time),
+        //   the Flat-path guard `entry.fid.is_some()` is FALSE → we fall into
+        //   the L7319 "evicted inline buffer" recovery migrate, which builds
+        //   a BLANK merged_data, resize(9800, 0) zero-fills the cross-client
+        //   gap, and OVERWRITES Writer A's Volume needle with zeros+B's data.
+        //
+        // Solution: refresh `entry` from the cache so the Flat guard sees the
+        // newly-inserted fid from step (a), and we do a targeted pwrite at
+        // exactly the authoritiative offset (no gap, no full-file rewrite).
+        // `parent` is used later by read-before-write log lines — it survives
+        // the refresh unchanged (parent inode is immutable after create).
+        let entry = self
+            .cache
+            .get_inode(inode)
+            .ok_or_else(|| {
+                let is_pinned = self.cache.is_pinned(inode);
+                let has_chunks = self.chunk_cache.has_chunks(inode);
+                let has_dirty = self.chunk_cache.has_dirty_chunks(inode);
+                let is_open = self.open_inodes.read().unwrap().contains_key(&inode);
+                error!(
+                    "write ENOENT post-append-refresh: inode={} offset={} size={} is_pinned={} has_chunks={} has_dirty={} is_open={} thread={:?}",
+                    inode, offset, size, is_pinned, has_chunks, has_dirty, is_open,
+                    std::thread::current().id()
+                );
+                std::io::Error::from_raw_os_error(libc::ENOENT)
+            })?;
 
         // P2.5: Inline 模式写入分支. 文件数据缓存在 inline_buffers 中,
         // write 直接覆盖/追加到 buffer, 完全绕过 Volume Server + chunk_cache.
@@ -6596,11 +6929,32 @@ impl FileSystem for PowerFsFs {
             })
             .filter(|_| entry.fid.is_none())
         {
-            let stripe_chunks = entry.chunks.clone();
+            let _stripe_chunks_before_refresh = entry.chunks.clone();
 
             // chunk_size == stripe_size (both 1MB by default).
-
-            let content_size_before_write = entry.content_size;
+            //
+            // A5 REFRESH GUARD: 函数开头的 `entry` 是不可变引用，在 A4 (O_APPEND
+            // offset 计算) 分支中 self.cache.insert() 可能更新了 cache，
+            // 但旧变量 `entry.content_size` 仍然 stale (如跨端 append 场景 B 的
+            // entry.content_size=0 而 cache 中已是 14700)。若用 stale 值判断
+            // read-before-write → `existing_end_in_chunk=0` → no_data_before=true →
+            // 跳过 Volume read → 用 0 填充 prefix → flush 时覆盖 A 在 Volume 的真实数据。
+            // FIX: 写前从 cache 重新拿最新 entry 的 content_size/chunks，保证
+            // read-before-write 决策反映 Filer 权威 size。
+            let (content_size_before_write, latest_chunks) = {
+                if let Some(fresh) = self.cache.get_inode(inode) {
+                    if fresh.content_size > entry.content_size
+                        || fresh.chunks.len() > entry.chunks.len()
+                    {
+                        (fresh.content_size, fresh.chunks.clone())
+                    } else {
+                        (entry.content_size, entry.chunks.clone())
+                    }
+                } else {
+                    (entry.content_size, entry.chunks.clone())
+                }
+            };
+            let stripe_chunks = latest_chunks;
             let end_offset = offset + read_len as u64;
             let start_chunk = self.chunk_cache.get_chunk_index(offset);
             let end_chunk = if end_offset == 0 {
@@ -6802,13 +7156,34 @@ impl FileSystem for PowerFsFs {
             // on the volume server and must be read back before partial modification
             // (otherwise we'd flush a chunk with zero-padded holes, corrupting
             // cross-client appends).
-            let content_size_before_write = entry.content_size;
+            //
+            // A5 REFRESH GUARD (同 Stripe 分支): 函数开头的 `entry` 可能 stale
+            // (A4 在 TRUST_FILER 中 self.cache.insert() 更新了最新 content_size
+            // 和 chunks，但旧变量未反映)。必须从 cache 重新取最新 entry，否则
+            // - stale content_size=0 → existing_end_in_chunk=0 → 跳过 read-before-write
+            //   → vec![0u8; 14700] 0填充前缀 → flush覆盖 A 的真实 Volume 数据
+            // - stale chunks=[] → chunk_map 空 → rbw_needle_id 回退 fid+chunk_idx
+            //   (虽work但volume_id可能错，最新chunks有Filer权威路由更安全)
+            let (content_size_before_write, latest_chunks) = {
+                if let Some(fresh) = self.cache.get_inode(inode) {
+                    if fresh.content_size > entry.content_size
+                        || fresh.chunks.len() > entry.chunks.len()
+                    {
+                        (fresh.content_size, fresh.chunks.clone())
+                    } else {
+                        (entry.content_size, entry.chunks.clone())
+                    }
+                } else {
+                    (entry.content_size, entry.chunks.clone())
+                }
+            };
             let volume_id = fid.volume_id.0;
             let file_key = fid.file_key;
 
             // Build chunk_map for O(1) needle_id lookup (read-before-write + read path)
-            let chunk_map: HashMap<u64, (u64, u64)> = entry
-                .chunks
+            // Use REFRESHED latest_chunks，包含 Filer 最新的 chunk 路由
+            // （跨端 append 场景下旧 entry.chunks 可能为空）。
+            let chunk_map: HashMap<u64, (u64, u64)> = latest_chunks
                 .iter()
                 .map(|c| (c.offset, (c.needle_id, c.volume_id)))
                 .collect();
@@ -6853,34 +7228,34 @@ impl FileSystem for PowerFsFs {
                     // needed by checking whether existing data exists outside
                     // the write region within this chunk.
                     //
-                    // Read-before-write is required only when there is existing
-                    // data BEFORE or AFTER the write region that must be
-                    // preserved. If the write covers all existing data (or
-                    // there is no existing data), the read can be skipped
-                    // entirely — a significant optimization for sequential
-                    // writes (full chunk overwrites) and appends.
+                    // Read-before-write is ONLY skippable in TWO cases:
+                    //   1. Chunk has NO historical data at all (content_size
+                    //      is before this chunk starts) — brand new chunk.
+                    //   2. Write FULLY COVERS all historical data within the
+                    //      chunk (starts at offset 0 AND writes past the end
+                    //      of existing data in this chunk).
+                    //
+                    // The previous bug: when appending to existing data
+                    // (existing_end == write_start), both `no_data_before`
+                    // and `no_data_after` evaluated to true, causing a SKIP
+                    // that zeroed out the entire prefix region (0..existing
+                    // _end) — losing Writer A's data entirely.
                     let existing_end_in_chunk =
                         content_size_before_write.saturating_sub(chunk_start_offset);
                     let write_end_in_chunk = (in_chunk_start + bytes_to_write) as u64;
 
-                    // No data before our write: write starts at chunk start, or
-                    // existing data doesn't reach our write position.
-                    let no_data_before =
-                        in_chunk_start == 0 || existing_end_in_chunk <= in_chunk_start as u64;
-                    // No data after our write: write fills to chunk end, or
-                    // existing data doesn't extend beyond our write end.
-                    let no_data_after = write_end_in_chunk >= chunk_size
-                        || existing_end_in_chunk <= write_end_in_chunk;
+                    // Case 1: chunk is entirely beyond current file size
+                    let chunk_is_empty = content_size_before_write <= chunk_start_offset;
+                    // Case 2: write covers every byte of existing data in this chunk
+                    let write_covers_all_existing =
+                        in_chunk_start == 0 && write_end_in_chunk >= existing_end_in_chunk;
 
-                    let mut new_data: Vec<u8> = if no_data_before && no_data_after {
-                        // Optimization: no existing data to preserve — skip
-                        // read-before-write entirely. This covers:
-                        // - Full chunk overwrite (e.g., 1M sequential write)
-                        // - Append beyond existing file size
-                        // - Write to a new/empty chunk
+                    let can_skip_rbw = chunk_is_empty || write_covers_all_existing;
+
+                    let mut new_data: Vec<u8> = if can_skip_rbw {
                         debug!(
-                            "write: skip read-before-write inode={} chunk_offset={} (no existing data to preserve)",
-                            inode, chunk_start_offset
+                            "write: skip read-before-write inode={} chunk_offset={} cs_before={} existing_end_in_chunk={} in_chunk_start={} write_end={} (chunk_empty={} cover_all={})",
+                            inode, chunk_start_offset, content_size_before_write, existing_end_in_chunk, in_chunk_start, write_end_in_chunk, chunk_is_empty, write_covers_all_existing
                         );
                         vec![0u8; in_chunk_start + bytes_to_write]
                     } else if content_size_before_write > chunk_start_offset {
@@ -8452,9 +8827,28 @@ impl FileSystem for PowerFsFs {
         // Flat/Stripe: flush data to Volume Server, then sync metadata to Filer.
         // This is the same logic as fsync, ensuring the Filer has up-to-date
         // size/chunks before close() returns to the application.
-        match self.flush_dirty_chunks(inode, None) {
+        //
+        // A7 fix (2026-08-22): Capture had_dirty BEFORE flush (same logic as
+        // release, line ~7620). If flush returns OK but had_dirty was false,
+        // we are a read-only (or already-flushed) open: calling
+        // sync_size_chunks_on_close would send STALE local entry.content_size
+        // to the Filer, overwriting a larger size already committed by another
+        // client. This caused T1.6 Step3 data loss: after writer B synced
+        // size=205800, a verification read-only open on fuse-1 triggered flush
+        // which re-synced A's stale size=102900 — silently truncating the file.
+        // Guard: only sync if we actually flushed dirty chunks (had_dirty=true).
+        let had_dirty = self.chunk_cache.has_dirty_chunks(inode);
+        let flush_result = self.flush_dirty_chunks(inode, None);
+        match flush_result {
             Ok(()) => {
-                if !self.has_dirty_for_inode(inode) {
+                // Sync metadata only if:
+                //   1. had_dirty was true (this open actually produced dirty
+                //      chunks that were just flushed to the Volume Server), AND
+                //   2. no dirty chunks remain after flush (fully completed)
+                // If either condition fails, skip sync — another client may
+                // have already pushed a larger size, and our stale cache would
+                // overwrite it.
+                if had_dirty && !self.has_dirty_for_inode(inode) {
                     match self.sync_size_chunks_on_close(inode) {
                         Ok(()) => {
                             debug!("flush: inode={} data + metadata synced", inode);
@@ -8476,11 +8870,14 @@ impl FileSystem for PowerFsFs {
                         }
                     }
                 } else {
-                    // Still has dirty chunks (flush didn't fully succeed).
-                    // Don't sync metadata — release will retry.
+                    // No dirty chunks flushed (read-only open, or all chunks
+                    // already flushed by a prior flush/release). Skip sync
+                    // to avoid clobbering another client's larger size.
                     debug!(
-                        "flush: inode={} still has dirty chunks after flush, skipping metadata sync",
-                        inode
+                        "flush: inode={} skipping metadata sync (had_dirty={}, dirty_after={})",
+                        inode,
+                        had_dirty,
+                        self.has_dirty_for_inode(inode)
                     );
                     Ok(())
                 }
@@ -8518,11 +8915,19 @@ impl FileSystem for PowerFsFs {
         // Flat/Stripe: flush 数据到 Volume Server, 然后 sync 元数据到 Filer.
         // fsync 必须保证元数据持久化, 否则 FUSE RELEASE (异步) 可能晚于
         // 进程退出/重启, 导致元数据丢失 (P2-2 修复).
+        //
+        // A7 fix (2026-08-22): Capture had_dirty BEFORE flush (same logic as
+        // flush/release). If had_dirty is false, the file is already clean
+        // and calling sync_size_chunks_on_close would sync STALE local size
+        // to the Filer, overwriting a larger size that another client already
+        // committed (identical race to the flush fix).
+        let had_dirty = self.chunk_cache.has_dirty_chunks(inode);
         match self.flush_dirty_chunks(inode, None) {
             Ok(()) => {
                 // 数据已持久化到 Volume Server, 现在 sync 元数据到 Filer (Raft).
-                // 仅当有 dirty chunks 被 flush 时才需要 sync.
-                if !self.has_dirty_for_inode(inode) {
+                // Only sync if had_dirty was true (we actually flushed dirty
+                // chunks) AND no dirty chunks remain (fully clean).
+                if had_dirty && !self.has_dirty_for_inode(inode) {
                     match self.sync_size_chunks_on_close(inode) {
                         Ok(()) => {
                             debug!("fsync: inode={} data + metadata synced", inode);
@@ -8538,11 +8943,21 @@ impl FileSystem for PowerFsFs {
                         }
                     }
                 } else {
-                    // 仍有 dirty chunks (flush 未完全成功), 不 sync 元数据
+                    // Either: no dirty chunks going in (read-only or already
+                    // clean fsync), OR residual dirty chunks after flush.
+                    // Skip metadata sync to avoid clobbering another client's
+                    // larger size on the Filer.
                     debug!(
-                        "fsync: inode={} still has dirty chunks after flush, skipping metadata sync",
-                        inode
+                        "fsync: inode={} skipping metadata sync (had_dirty={}, dirty_after={})",
+                        inode,
+                        had_dirty,
+                        self.has_dirty_for_inode(inode)
                     );
+                    // Still clear dirty if fully clean (idempotent) — caller
+                    // invoked fsync and expects the fd to be in a clean state.
+                    if !self.has_dirty_for_inode(inode) {
+                        self.chunk_cache.clear_dirty(inode);
+                    }
                     Ok(())
                 }
             }
