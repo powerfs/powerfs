@@ -8,18 +8,25 @@ use tokio::sync::RwLock;
 struct CacheEntry<T> {
     value: T,
     expires_at: Instant,
+    last_accessed: Instant,
 }
 
 impl<T> CacheEntry<T> {
     fn new(value: T, ttl: Duration) -> Self {
+        let now = Instant::now();
         Self {
             value,
-            expires_at: Instant::now() + ttl,
+            expires_at: now + ttl,
+            last_accessed: now,
         }
     }
 
     fn is_expired(&self) -> bool {
         Instant::now() > self.expires_at
+    }
+
+    fn touch(&mut self) {
+        self.last_accessed = Instant::now();
     }
 }
 
@@ -39,11 +46,12 @@ impl BucketCache {
     }
 
     pub async fn get(&self, bucket: &str) -> Option<bool> {
-        let cache = self.cache.read().await;
-        cache.get(bucket).and_then(|entry| {
+        let mut cache = self.cache.write().await;
+        cache.get_mut(bucket).and_then(|entry| {
             if entry.is_expired() {
                 None
             } else {
+                entry.touch();
                 Some(entry.value)
             }
         })
@@ -52,6 +60,17 @@ impl BucketCache {
     pub async fn set(&self, bucket: &str, exists: bool) {
         let mut cache = self.cache.write().await;
         cache.insert(bucket.to_string(), CacheEntry::new(exists, self.ttl));
+    }
+
+    pub async fn set_many<I, S>(&self, items: I)
+    where
+        I: IntoIterator<Item = (S, bool)>,
+        S: AsRef<str>,
+    {
+        let mut cache = self.cache.write().await;
+        for (bucket, exists) in items {
+            cache.insert(bucket.as_ref().to_string(), CacheEntry::new(exists, self.ttl));
+        }
     }
 
     pub async fn remove(&self, bucket: &str) {
@@ -87,11 +106,12 @@ impl VolumeLocationCache {
     }
 
     pub async fn get(&self, volume_id: u64) -> Option<String> {
-        let cache = self.cache.read().await;
-        cache.get(&volume_id).and_then(|entry| {
+        let mut cache = self.cache.write().await;
+        cache.get_mut(&volume_id).and_then(|entry| {
             if entry.is_expired() {
                 None
             } else {
+                entry.touch();
                 Some(entry.value.clone())
             }
         })
@@ -137,11 +157,12 @@ impl EntryCache {
     }
 
     pub async fn get(&self, path: &str) -> Option<Entry> {
-        let cache = self.cache.read().await;
-        cache.get(path).and_then(|entry| {
+        let mut cache = self.cache.write().await;
+        cache.get_mut(path).and_then(|entry| {
             if entry.is_expired() {
                 None
             } else {
+                entry.touch();
                 Some(entry.value.clone())
             }
         })
@@ -150,8 +171,8 @@ impl EntryCache {
     pub async fn set(&self, path: &str, entry: Entry) {
         let mut cache = self.cache.write().await;
 
-        // LRU淘汰：如果超过最大大小，删除过期的条目
         if cache.len() >= self.max_size {
+            // Step 1: 清理所有过期的条目
             let expired_keys: Vec<String> = cache
                 .iter()
                 .filter(|(_, e)| e.is_expired())
@@ -161,12 +182,18 @@ impl EntryCache {
                 cache.remove(&key);
             }
 
-            // 如果还是太大，删除最旧的条目
+            // Step 2: 如果仍然超过 max_size，按 last_accessed 排序淘汰最旧的 25%
             if cache.len() >= self.max_size {
-                // 简单策略：随机删除一半
-                let keys: Vec<String> = cache.keys().take(self.max_size / 2).cloned().collect();
-                for key in keys {
-                    cache.remove(&key);
+                let mut access_times: Vec<(String, Instant)> = cache
+                    .iter()
+                    .map(|(k, e)| (k.clone(), e.last_accessed))
+                    .collect();
+                // 按 last_accessed 升序排列（最旧的在前）
+                access_times.sort_by_key(|(_, t)| *t);
+
+                let evict_count = (self.max_size / 4).max(1);
+                for (key, _) in access_times.iter().take(evict_count) {
+                    cache.remove(key);
                 }
             }
         }
@@ -174,9 +201,68 @@ impl EntryCache {
         cache.insert(path.to_string(), CacheEntry::new(entry, self.ttl));
     }
 
+    pub async fn set_many<I, S>(&self, items: I)
+    where
+        I: IntoIterator<Item = (S, Entry)>,
+        S: AsRef<str>,
+    {
+        let collected: Vec<(String, Entry)> = items
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v))
+            .collect();
+        if collected.is_empty() {
+            return;
+        }
+
+        let mut cache = self.cache.write().await;
+        let incoming = collected.len();
+
+        if cache.len() + incoming > self.max_size {
+            // Step 1: 清理过期条目
+            let expired_keys: Vec<String> = cache
+                .iter()
+                .filter(|(_, e)| e.is_expired())
+                .map(|(k, _)| k.clone())
+                .collect();
+            for key in expired_keys {
+                cache.remove(&key);
+            }
+
+            // Step 2: 仍超限，按 last_accessed 升序淘汰足够容纳 incoming 的量
+            while cache.len() + incoming > self.max_size && !cache.is_empty() {
+                let evict_count = ((self.max_size / 4).max(1)).min(cache.len());
+                let mut access_times: Vec<(String, Instant)> = cache
+                    .iter()
+                    .map(|(k, e)| (k.clone(), e.last_accessed))
+                    .collect();
+                access_times.sort_by_key(|(_, t)| *t);
+                for (key, _) in access_times.iter().take(evict_count) {
+                    cache.remove(key);
+                }
+            }
+        }
+
+        let ttl = self.ttl;
+        for (path, entry) in collected {
+            cache.insert(path, CacheEntry::new(entry, ttl));
+        }
+    }
+
     pub async fn remove(&self, path: &str) {
         let mut cache = self.cache.write().await;
         cache.remove(path);
+    }
+
+    pub async fn clear_prefix(&self, prefix: &str) {
+        let mut cache = self.cache.write().await;
+        let matching_keys: Vec<String> = cache
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        for key in matching_keys {
+            cache.remove(&key);
+        }
     }
 
     pub async fn clear(&self) {

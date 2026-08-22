@@ -1273,6 +1273,26 @@ impl FilerNetHandler {
                 // 导致 fuse 端 get_entry_by_inode 拿到的 chunks 恒为空，
                 // open() 时无法刷新账本，跨客户端读文件触发 I/O error。
                 Self::encode_chunks_fields(&mut enc, &info)?;
+
+                // ===== P1-5: 目录 rstat (递归累计统计) =====
+                // 字段定义对齐内核 powerfs_net.h 0xCD-0xD1。
+                // 当前先编码 0 占位，待 Filer 写路径 UpdateChildSummary
+                // 做祖先链增量聚合 (rbytes/rfiles/rsubdirs 持久化到 inode) 后，
+                // 直接改成从 info.rbytes 等字段读取即可，客户端无需改动。
+                // 对非目录 inode 不编码这些字段 (内核解析侧 S_ISDIR 才回填).
+                // S_IFDIR = 0o040000 (POSIX 标准), 避免引入额外 libc 依赖.
+                const S_IFDIR: u32 = 0o040000;
+                if (entry_info.mode & 0xF000) == S_IFDIR {
+                    let rctime = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    enc.add_u64(FieldId::RBytes, 0);
+                    enc.add_u64(FieldId::RFiles, 0);
+                    enc.add_u64(FieldId::RSubdirs, 0);
+                    enc.add_u64(FieldId::RCtimeSec, rctime.as_secs());
+                    enc.add_u32(FieldId::RCtimeNsec, rctime.subsec_nanos());
+                }
+
                 info!(
                     "FILER_NET_GETATTR: returned info for ino={}, name={}, size={}, chunks={}",
                     ino,
