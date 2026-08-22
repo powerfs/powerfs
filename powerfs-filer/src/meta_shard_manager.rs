@@ -2705,14 +2705,61 @@ impl MetaShardManager {
         }
         inode_info.version = timestamp;
 
-        // MetaCache Dirty write-through for setattr_meta: the CRDT merged
+        // MetaCache projected state for setattr_meta: the CRDT merged
         // value is what we intend; Raft apply confirms it via SetAttrMeta
         // handler.
+        //
+        // CRITICAL: Must update MetaCache with the merged values, not just
+        // mark Dirty. Otherwise cross-client getattr hits MetaCache and
+        // returns stale mode/mtime/atime. This was the root cause of T1.3
+        // "utimes cross-client not synced" and "directory chmod not visible".
         let merged_copy = inode_info.clone();
         store.update_inode(inode_info)?;
-        self.meta_cache.mark_dirty(inode, Some(merged_copy), |_| {
-            // merged_copy already reflects the final state; no further change.
-        });
+        self.meta_cache.project_setattr_meta(inode, merged_copy);
+
+        // Propagate SetAttrMeta to all filers via Raft (fire-and-forget in
+        // async mode, propose_meta_commit in strict mode). Without this,
+        // leader-only update leaves followers with stale mode/uid/gid,
+        // causing cross-client getattr to return old values.
+        //
+        // CRITICAL: This was the root cause of T1.3 "chmod cross-client not
+        // synced": the leader's shard_store was updated, but followers never
+        // received the change because no Raft propose was made.
+        //
+        // Design principle: MetaCache is updated first (immediate local
+        // visibility), then propose_ff propagates to followers asynchronously.
+        // If propose_ff is dropped (e.g. leader lost lease), the local update
+        // remains — followers will catch up via future proposals or remain
+        // stale until anti-entropy reconciliation (future work).
+        let cmd = ShardCommand::SetAttrMeta {
+            inode,
+            mode,
+            uid,
+            gid,
+            mtime,
+            atime,
+            client_id: client_id.to_string(),
+            timestamp,
+        };
+        let async_mode = self.is_async_meta_persist();
+        info!(
+            "setattr_meta: proposing SetAttrMeta for inode={} shard={} async={}",
+            inode, shard_id.0, async_mode
+        );
+        if let Err(e) = self.propose_meta(shard_id, cmd.serialize()).await {
+            warn!(
+                "setattr_meta: propose failed (may be dropped in async mode): {}",
+                e
+            );
+            // Don't fail the request: leader already updated local store +
+            // MetaCache. propose_ff is best-effort; lost entries are
+            // acceptable per design principle.
+        } else {
+            info!(
+                "setattr_meta: propose succeeded for inode={} shard={}",
+                inode, shard_id.0
+            );
+        }
 
         debug!(
             "setattr_meta CRDT merged: inode={}, mode={:?}, uid={:?}, gid={:?}, client={}, ts={}",

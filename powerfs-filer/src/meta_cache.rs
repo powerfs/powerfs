@@ -620,6 +620,39 @@ impl MetaCache {
         existing.touch();
     }
 
+    /// Project setattr_meta (CRDT-merged) into MetaCache (Ceph MDS projected state model).
+    ///
+    /// Updates mode/uid/gid/mtime/atime/version on a cached inode so
+    /// cross-client `getattr` returns the new values immediately.
+    /// If the inode is not in MetaCache, inserts it as Dirty.
+    pub fn project_setattr_meta(&self, inode: u64, info: crate::shard_store::InodeInfo) {
+        let mut tbl = self.inode_table.write().unwrap();
+        let old_bytes = if let Some(existing) = tbl.get_mut(&inode) {
+            match existing.state {
+                CacheState::Deleted | CacheState::Trimming => return,
+                CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
+            }
+            let old = estimate_inode_bytes(&existing.info);
+            existing.info = info;
+            existing.state = CacheState::Dirty;
+            existing.touch();
+            old
+        } else {
+            let new_bytes = estimate_inode_bytes(&info);
+            let ci = CachedInode::new(info, CacheState::Dirty);
+            ci.touch();
+            tbl.insert(inode, ci);
+            self.trim.charge(new_bytes);
+            return;
+        };
+        let new_bytes = estimate_inode_bytes(&tbl.get(&inode).unwrap().info);
+        if new_bytes >= old_bytes {
+            self.trim.charge(new_bytes - old_bytes);
+        } else {
+            self.trim.release(old_bytes - new_bytes);
+        }
+    }
+
     // ---------- delete staging ----------
 
     /// Mark an inode and its directory entry as `Deleted` (pending Raft).

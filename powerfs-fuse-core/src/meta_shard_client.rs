@@ -2910,6 +2910,12 @@ pub(crate) async fn process_request_internal(
         }
     };
 
+    // REDIRECT 后下次 attempt 优先用新 leader_addr（已被 REDIRECT
+    // 更新到 shard_router）。没有这个标记，REDIRECT 会陷入循环：
+    // filer-A → REDIRECT 更新 shard_router → 但 attempt 2+ 用
+    // rotation[idx]（可能是 filer-A 本身）→ 再次 REDIRECT → 循环。
+    let mut use_leader_next: bool = false;
+
     loop {
         attempt += 1;
 
@@ -2923,13 +2929,18 @@ pub(crate) async fn process_request_internal(
             return Err(ClientError::NoShardLeader(shard_id));
         }
 
-        // 选择本次尝试的目标地址：首次用 leader_addr，后续重试轮换候选
-        let target_addr = if attempt == 1 || rotation.len() <= 1 {
+        // 选择本次尝试的目标地址：
+        // - attempt 1: 用 leader_addr（shard_router 中的地址）
+        // - REDIRECT 后 (use_leader_next=true): 优先用新 leader_addr
+        // - 其他重试: 轮换 rotation 候选地址
+        let target_addr = if attempt == 1 || use_leader_next || rotation.len() <= 1 {
             leader_addr.clone()
         } else {
             let idx = ((attempt - 1) as usize) % rotation.len();
             rotation[idx].clone()
         };
+        // 消费 use_leader_next：只对下一次 attempt 生效
+        use_leader_next = false;
 
         if target_addr.is_empty() {
             return Err(ClientError::NoShardLeader(shard_id));
@@ -3050,6 +3061,9 @@ pub(crate) async fn process_request_internal(
 
                         // 更新分片路由表
                         shard_router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
+
+                        // 下次 attempt 优先用新 leader_addr（已被 REDIRECT 更新）
+                        use_leader_next = true;
 
                         // Minimal backoff for local cluster: 5ms instead of 50ms.
                         let delay_ms = (5u64) << (attempt - 1).min(3);

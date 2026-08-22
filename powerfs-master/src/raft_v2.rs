@@ -297,6 +297,80 @@ impl RaftNodeV2 {
                         "RaftNodeV2: initialize returned (likely already initialized): {}",
                         e
                     );
+
+                    // RocksDB 中已有 membership，检查地址是否与当前配置不同。
+                    // 如果不同，打印警告，并启动后台任务在成为 leader 后通过
+                    // add_learner 更新 RocksDB 中的地址。
+                    let metrics_recv = raft.metrics();
+                    let membership = metrics_recv.borrow_watched().membership_config.membership().clone();
+                    drop(metrics_recv);
+
+                    let mut addr_mismatches: Vec<(String, String, String)> = Vec::new();
+
+                    // 检查本节点地址
+                    if let Some((_, node)) = membership.nodes().find(|(k, _)| k.as_str() == node_id.as_str()) {
+                        if node.addr != address {
+                            warn!(
+                                "RaftNodeV2: node {} address mismatch: RocksDB='{}', current='{}'. \
+                                 Will use new address and update via Raft when leader is elected.",
+                                node_id, node.addr, address
+                            );
+                            addr_mismatches.push((node_id.clone(), node.addr.clone(), address.clone()));
+                        }
+                    }
+
+                    // 检查 peer 地址
+                    for peer in &peers {
+                        let peer_id = peer.id.to_string();
+                        if let Some((_, node)) = membership.nodes().find(|(k, _)| k.as_str() == peer_id.as_str()) {
+                            if node.addr != peer.address {
+                                warn!(
+                                    "RaftNodeV2: peer {} address mismatch: RocksDB='{}', config='{}'. \
+                                     Will update to new address.",
+                                    peer_id, node.addr, peer.address
+                                );
+                                addr_mismatches.push((peer_id, node.addr.clone(), peer.address.clone()));
+                            }
+                        }
+                    }
+
+                    // 启动后台任务更新地址（等待成为 leader 后执行）
+                    if !addr_mismatches.is_empty() {
+                        let raft_clone = raft.clone();
+                        MasterTypeConfig::spawn(async move {
+                            // 最多等待 60 秒（30 次 × 2 秒）
+                            for _ in 0..30 {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                let state = raft_clone.metrics().borrow_watched().state.clone();
+                                if state == ServerState::Leader {
+                                    for (nid, old_addr, new_addr) in &addr_mismatches {
+                                        match raft_clone
+                                            .add_learner(nid.clone(), BasicNode { addr: new_addr.clone() }, true)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                info!(
+                                                    "RaftNodeV2: updated node {} address: '{}' -> '{}'",
+                                                    nid, old_addr, new_addr
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "RaftNodeV2: failed to update node {} address: {}",
+                                                    nid, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                            warn!(
+                                "RaftNodeV2: timed out waiting for leader to update addresses: {:?}",
+                                addr_mismatches
+                            );
+                        });
+                    }
                 }
             }
         }
