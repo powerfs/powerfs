@@ -16,3 +16,4 @@ node_id = "volume-server-4"
 max_volume_size = 107374182400
 initial_volume_count = 4
 advertise_addr = "172.30.0.24"
+lease_enabled = false            # 方案A: 使用inode metadata lease，Volume跳过range lease验证

@@ -1119,6 +1119,14 @@ impl MetaShardClient {
         let mut last_err: String = String::new();
         // 轮换候选地址列表（仅在发生网络错误/熔断时使用）
         let rotation = self.rotation_candidates();
+        // REDIRECT 后下次 attempt 优先用新 leader_addr（已被 REDIRECT
+        // 更新到 shard_router），而不是 rotation[idx]。
+        //
+        // 没有这个标记，REDIRECT 会陷入循环：filer-A → REDIRECT 到
+        // filer-Leader，但 attempt=2 用 rotation[B]（不是 filer-Leader），
+        // filer-B 也 REDIRECT 到 filer-Leader，循环在 filer-A 和 filer-B
+        // 之间交替，永远不直接尝试 filer-Leader。
+        let mut use_leader_next: bool = false;
 
         loop {
             attempt += 1;
@@ -1137,7 +1145,15 @@ impl MetaShardClient {
             }
 
             // 选择本次尝试的目标地址：首次用 leader_addr，后续重试轮换候选
-            let target_addr = if attempt == 1 || rotation.len() <= 1 {
+            //
+            // 特殊情况：`use_leader_next` — 上次 REDIRECT 更新了 shard_router
+            // 到新 leader，本次 attempt 应该直接用新 leader_addr，而不是
+            // rotation[idx]。这避免 REDIRECT 循环（filer-A/B 互相指向
+            // filer-Leader，但 rotation 永远不选 filer-Leader）。
+            //
+            // 如果新 leader_addr 连接失败，`use_leader_next` 会被重置为
+            // false，下次 attempt 退回到 rotation 轮换。
+            let target_addr = if attempt == 1 || rotation.len() <= 1 || use_leader_next {
                 leader_addr.clone()
             } else {
                 // 轮换：attempt=2 -> rotation[1], attempt=3 -> rotation[2], ...
@@ -1145,6 +1161,7 @@ impl MetaShardClient {
                 let idx = ((attempt - 1) as usize) % rotation.len();
                 rotation[idx].clone()
             };
+            use_leader_next = false;
 
             if target_addr.is_empty() {
                 self.stats
@@ -1279,8 +1296,41 @@ impl MetaShardClient {
                                 attempt,
                                 MAX_ATTEMPTS
                             );
+                            // Check if the Raft leader actually changed before
+                            // updating shard_router. A REDIRECT to the same
+                            // addr we already have means no real change (e.g.,
+                            // the filer is still in Learner election and keeps
+                            // pointing to the same target).
+                            let old_leader = self
+                                .shard_router
+                                .get(&shard_id)
+                                .map(|s| s.leader_addr.clone());
                             self.shard_router
-                                .insert(shard_id, ShardInfo::new(shard_id, new_addr));
+                                .insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
+                            // Bump cache_epoch if the leader actually changed.
+                            // This triggers FUSE-layer invalidate_all on the
+                            // next access, clearing stale caps and metadata
+                            // from the old leader's epoch.
+                            //
+                            // Without this, a Raft leader change detected
+                            // via REDIRECT would update shard_router but
+                            // leave the client's MetadataCache and cap tokens
+                            // stale — the Filer's cap_manager has reset on
+                            // the new leader, so the old cap tokens are
+                            // invalid. invalidate_all (triggered by cache_epoch
+                            // bump) clears them via #4's fix.
+                            if old_leader.as_deref() != Some(new_addr.as_str()) {
+                                log::warn!(
+                                    "MetaShardClient: shard {} leader changed via REDIRECT: {} -> {}, bumping cache_epoch",
+                                    shard_id,
+                                    old_leader.as_deref().unwrap_or("(none)"),
+                                    new_addr
+                                );
+                                self.bump_cache_epoch();
+                            }
+                            // 下次 attempt 优先用 REDIRECT 指向的新地址，
+                            // 而不是 rotation[idx]（避免 REDIRECT 循环）。
+                            use_leader_next = true;
                             // Minimal backoff for local cluster: 5ms instead of 50ms.
                             let delay_ms = 5u64 << (attempt - 1).min(3);
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -2860,6 +2910,12 @@ pub(crate) async fn process_request_internal(
         }
     };
 
+    // REDIRECT 后下次 attempt 优先用新 leader_addr（已被 REDIRECT
+    // 更新到 shard_router）。没有这个标记，REDIRECT 会陷入循环：
+    // filer-A → REDIRECT 更新 shard_router → 但 attempt 2+ 用
+    // rotation[idx]（可能是 filer-A 本身）→ 再次 REDIRECT → 循环。
+    let mut use_leader_next: bool = false;
+
     loop {
         attempt += 1;
 
@@ -2873,13 +2929,18 @@ pub(crate) async fn process_request_internal(
             return Err(ClientError::NoShardLeader(shard_id));
         }
 
-        // 选择本次尝试的目标地址：首次用 leader_addr，后续重试轮换候选
-        let target_addr = if attempt == 1 || rotation.len() <= 1 {
+        // 选择本次尝试的目标地址：
+        // - attempt 1: 用 leader_addr（shard_router 中的地址）
+        // - REDIRECT 后 (use_leader_next=true): 优先用新 leader_addr
+        // - 其他重试: 轮换 rotation 候选地址
+        let target_addr = if attempt == 1 || use_leader_next || rotation.len() <= 1 {
             leader_addr.clone()
         } else {
             let idx = ((attempt - 1) as usize) % rotation.len();
             rotation[idx].clone()
         };
+        // 消费 use_leader_next：只对下一次 attempt 生效
+        use_leader_next = false;
 
         if target_addr.is_empty() {
             return Err(ClientError::NoShardLeader(shard_id));
@@ -3001,6 +3062,9 @@ pub(crate) async fn process_request_internal(
                         // 更新分片路由表
                         shard_router.insert(shard_id, ShardInfo::new(shard_id, new_addr.clone()));
 
+                        // 下次 attempt 优先用新 leader_addr（已被 REDIRECT 更新）
+                        use_leader_next = true;
+
                         // Minimal backoff for local cluster: 5ms instead of 50ms.
                         let delay_ms = (5u64) << (attempt - 1).min(3);
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -3115,6 +3179,24 @@ impl crate::topology::TopologyUpdateListener for MetaShardClient {
 
         // Re-sync shard_map (ShardMap from Master entries or shard_count)
         self.sync_shard_map();
+
+        // Update filer_addresses (rotation candidates) from new topology.
+        //
+        // Without this, the rotation list stays stale after a topology
+        // update — e.g., if a new filer joins the cluster, `send_coherence_msg`
+        // won't know about it and can't failover to it. This also ensures
+        // that unhealthy filers (removed from `all_filer_addresses`) are
+        // pruned from the rotation list.
+        if !new.all_filer_addresses.is_empty() {
+            let mut addrs = self.filer_addresses.lock().unwrap();
+            let old_addrs = addrs.clone();
+            *addrs = new.all_filer_addresses.clone();
+            log::info!(
+                "MetaShardClient: topology update — filer_addresses updated: {:?} -> {:?}",
+                old_addrs,
+                new.all_filer_addresses
+            );
+        }
 
         // If any leader changed, bump cache_epoch so FUSE invalidates its
         // MetadataCache on the next access (handles missed Invalidate

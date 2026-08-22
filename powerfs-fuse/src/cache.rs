@@ -1339,7 +1339,52 @@ impl MetadataCache {
         let mut cache = self.inode_cache.write().unwrap();
         let mut invalidated = 0u32;
         let mut preserved = 0u32;
+        let mut caps_cleared = 0u32;
         for (_, entry) in cache.iter_mut() {
+            // §13 Cap model: clear cap on EVERY entry, including Dirty/Flushing.
+            //
+            // The Filer-side cap_manager resets on leader switch (new leader
+            // has no record of the old leader's cap holders), so any retained
+            // cap token is stale — a subsequent `take_cap()` would return a
+            // cap whose token the new Filer doesn't recognize, causing
+            // `cap_release` RPCs to silently fail (best-effort, but stale).
+            //
+            // Clearing cap does NOT lose data: dirty data lives in
+            // `ChunkCache` / `inline_buffers` (not in the cap field), and
+            // release's `sync_size_chunks_on_close` re-syncs it to the new
+            // Filer. After clearing, the next `open()` re-grants a fresh cap
+            // via `grant_cap` from the new leader's response.
+            //
+            // `mark_dirty_cap_w` / `mark_dirty_cap_x` are no-ops when cap is
+            // None, but `mark_dirty(inode)` (ChunkCache dirty tracking) still
+            // works, so the flusher path is unaffected.
+            if entry.cap.take().is_some() {
+                caps_cleared += 1;
+            }
+            // T1.6 Step3 fix: clear dentry_lease on EVERY entry during
+            // invalidate_all (cache_epoch bump = Filer leader change).
+            //
+            // Root cause of "dentry lease valid, negative" false ENOENT:
+            //   1. invalidate_all marks entries Stale but preserves
+            //      dentry_lease (old code path cleared ONLY cap).
+            //   2. get_inode_by_name() filters OUT Stale entries → returns None.
+            //   3. check_dentry_lease() returns LeaseValid because the
+            //      Filer-issued 30s TTL hasn't expired yet.
+            //   4. lookup's Layer-1 branch sees LeaseValid + None entry
+            //      → wrongly concludes it's a NEGATIVE dentry → returns
+            //      inode=0 to VFS → all userspace ops get ENOENT even
+            //      though the directory/file still exists on the Filer.
+            //
+            // After leader change, the NEW Filer leader has zero memory
+            // of dentry leases granted by the OLD leader (the lease table
+            // is in-memory, not in RocksDB Raft state). Keeping stale
+            // leases is unsafe — the new leader would never send us
+            // Invalidate notifications for them either. Clearing ALL
+            // dentry leases forces every subsequent lookup through
+            // Layer-3 (Filer RPC), which is the safe, correct behaviour.
+            if entry.dentry_lease.take().is_some() {
+                // counted indirectly via `invalidated` below; no separate counter
+            }
             // Dirty/Flushing entries have local authoritative data that
             // must not be invalidated — they will be synced via flusher.
             if entry.state == EntryState::Dirty || entry.state == EntryState::Flushing {
@@ -1359,9 +1404,10 @@ impl MetadataCache {
         self.dir_cache.write().unwrap().clear();
 
         log::warn!(
-            "MetadataCache: invalidate_all — {} entries marked Stale, {} Dirty/Flushing preserved, {} dir_cache entries cleared",
+            "MetadataCache: invalidate_all — {} entries marked Stale, {} Dirty/Flushing preserved, {} caps cleared, {} dir_cache entries cleared",
             invalidated,
             preserved,
+            caps_cleared,
             dir_count
         );
     }
@@ -3306,6 +3352,223 @@ mod cap_tests {
         let got = cache.get_cap(inode).unwrap();
         assert!(!got.can_cache_writes());
         assert!(got.can_cache_reads());
+    }
+
+    /// Helper: build a CachedEntry with the given inode, name, and state.
+    fn make_entry_with_state(inode: u64, name: &str, state: EntryState) -> CachedEntry {
+        let now = chrono::Utc::now().timestamp();
+        CachedEntry {
+            inode,
+            parent: 1,
+            name: name.to_string(),
+            is_dir: false,
+            is_symlink: false,
+            symlink_target: None,
+            nlink: 1,
+            fid: None,
+            size: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            xattrs: HashMap::new(),
+            chunks: Vec::new(),
+            hard_link_id: String::new(),
+            hard_link_counter: 0,
+            content_size: 0,
+            disk_size: 0,
+            generation: 0,
+            placement: None,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            replica_chunks: Vec::new(),
+            shard_id: None,
+            cached_at: Instant::now(),
+            state,
+            hold: HoldState::default(),
+            cap: None,
+            dentry_lease: None,
+            dir_shared_gen: 0,
+        }
+    }
+
+    /// Helper: grant an EXCLUSIVE cap on `inode` with token `tok`.
+    fn grant_exclusive_cap(cache: &MetadataCache, inode: u64, tok: &str) {
+        let cap = crate::client_cap::ClientCap::new(
+            1,
+            tok.into(),
+            crate::client_cap::CapSet::EXCLUSIVE,
+            1,
+            true,
+            100,
+        );
+        cache.grant_cap(inode, cap);
+    }
+
+    /// #4 重连 cap 恢复 — invalidate_all 必须清除 Clean entry 的 cap 字段。
+    ///
+    /// 场景：客户端持有 cap，Filer leader 切换 → cache_epoch 变化 →
+    /// `check_cache_epoch` 调用 `invalidate_all`。Clean entry 的 cap 字段
+    /// 必须被清，否则后续 `take_cap` 返回 stale token，cap_release RPC
+    /// 在新 Filer 上失败。
+    #[test]
+    fn test_invalidate_all_clears_cap_on_clean_entry() {
+        let cache = MetadataCache::new();
+        let inode = 600u64;
+        cache.insert(make_entry_with_state(inode, "clean.txt", EntryState::Clean));
+        grant_exclusive_cap(&cache, inode, "tok-clean");
+
+        // Pre-condition: cap is present.
+        assert!(cache.get_cap(inode).is_some());
+
+        cache.invalidate_all();
+
+        // Cap must be cleared — take_cap returns None (no stale RPC).
+        assert!(
+            cache.take_cap(inode).is_none(),
+            "invalidate_all must clear cap on Clean entry to avoid stale cap_release"
+        );
+        // And get_cap also returns None.
+        assert!(cache.get_cap(inode).is_none());
+    }
+
+    /// #4 重连 cap 恢复 — invalidate_all 必须清除 Dirty entry 的 cap 字段。
+    ///
+    /// 场景：写者持 EXCLUSIVE cap，write 后 mark_dirty_cap_w（state=Dirty），
+    /// 此时 Filer leader 切换 → invalidate_all。Dirty 状态的 entry 本身
+    /// 保留（数据待 sync），但 cap 字段必须清：Filer 端 cap_manager
+    /// 已 reset，stale token 100% 无效。dirty 数据在 ChunkCache，不受
+    /// 影响；下次 release 走 sync_size_chunks_on_close 重写到新 Filer。
+    #[test]
+    fn test_invalidate_all_clears_cap_on_dirty_entry() {
+        let cache = MetadataCache::new();
+        let inode = 601u64;
+        // Insert as Clean, then grant cap, then mark dirty via write path.
+        cache.insert(make_entry_with_state(inode, "dirty.txt", EntryState::Clean));
+        grant_exclusive_cap(&cache, inode, "tok-dirty");
+        cache.mark_dirty_cap_w(inode);
+
+        // Pre-conditions: cap present, entry is Dirty, CAP_W is dirty.
+        assert!(cache.get_cap(inode).is_some());
+        assert_eq!(
+            cache.peek_inode(inode).map(|e| e.state).unwrap(),
+            EntryState::Dirty
+        );
+        let cap_before = cache.get_cap(inode).unwrap();
+        assert!(cap_before.dirty_caps.contains(crate::client_cap::CapSet::CAP_W));
+
+        cache.invalidate_all();
+
+        // Cap must be cleared even on Dirty entry.
+        assert!(
+            cache.take_cap(inode).is_none(),
+            "invalidate_all must clear cap on Dirty entry — Filer cap_manager reset on leader switch"
+        );
+
+        // Dirty entry itself is preserved (local authoritative data).
+        let entry = cache.peek_inode(inode).expect("Dirty entry must be preserved");
+        assert_eq!(entry.state, EntryState::Dirty);
+    }
+
+    /// #4 重连 cap 恢复 — invalidate_all 必须清除 Flushing entry 的 cap 字段。
+    ///
+    /// 场景：写者 flush 中（state=Flushing，flushing_caps 非空），Filer
+    /// leader 切换。Flushing entry 保留，但 cap 必须清：之前发的 flush
+    /// RPC 不会收到新 Filer 的 ACK，stale flushing_caps 字段没有意义。
+    #[test]
+    fn test_invalidate_all_clears_cap_on_flushing_entry() {
+        let cache = MetadataCache::new();
+        let inode = 602u64;
+        cache.insert(make_entry_with_state(inode, "flushing.txt", EntryState::Clean));
+        grant_exclusive_cap(&cache, inode, "tok-flush");
+        // mark_dirty_cap_w sets Dirty + CAP_W dirty, then mark_flushing
+        // transitions to Flushing.
+        cache.mark_dirty_cap_w(inode);
+        cache.mark_flushing(inode);
+
+        // Pre-condition: entry is Flushing with cap present.
+        assert_eq!(
+            cache.peek_inode(inode).map(|e| e.state).unwrap(),
+            EntryState::Flushing
+        );
+        assert!(cache.get_cap(inode).is_some());
+
+        cache.invalidate_all();
+
+        // Cap cleared on Flushing entry.
+        assert!(
+            cache.take_cap(inode).is_none(),
+            "invalidate_all must clear cap on Flushing entry"
+        );
+
+        // Flushing entry itself is preserved.
+        let entry = cache.peek_inode(inode).expect("Flushing entry must be preserved");
+        assert_eq!(entry.state, EntryState::Flushing);
+    }
+
+    /// #4 重连 cap 恢复 — invalidate_all 清除多个 inode 的 cap。
+    ///
+    /// 覆盖混合场景：3 个 inode（Clean/Dirty/Flushing）+ 1 个无 cap 的
+    /// Clean inode。验证所有有 cap 的 entry 都被清，无 cap 的 entry
+    /// 不出错。
+    #[test]
+    fn test_invalidate_all_clears_caps_across_mixed_entries() {
+        let cache = MetadataCache::new();
+
+        // Inode 700: Clean with cap.
+        cache.insert(make_entry_with_state(700, "a.txt", EntryState::Clean));
+        grant_exclusive_cap(&cache, 700, "tok-a");
+
+        // Inode 701: Dirty with cap.
+        cache.insert(make_entry_with_state(701, "b.txt", EntryState::Clean));
+        grant_exclusive_cap(&cache, 701, "tok-b");
+        cache.mark_dirty_cap_w(701);
+
+        // Inode 702: Clean WITHOUT cap (cap was never granted).
+        cache.insert(make_entry_with_state(702, "c.txt", EntryState::Clean));
+
+        // Inode 703: Flushing with cap.
+        cache.insert(make_entry_with_state(703, "d.txt", EntryState::Clean));
+        grant_exclusive_cap(&cache, 703, "tok-d");
+        cache.mark_dirty_cap_w(703);
+        cache.mark_flushing(703);
+
+        // Pre-conditions.
+        assert!(cache.get_cap(700).is_some());
+        assert!(cache.get_cap(701).is_some());
+        assert!(cache.get_cap(702).is_none());
+        assert!(cache.get_cap(703).is_some());
+
+        cache.invalidate_all();
+
+        // All caps cleared.
+        assert!(cache.take_cap(700).is_none(), "inode 700 cap must be cleared");
+        assert!(cache.take_cap(701).is_none(), "inode 701 cap must be cleared");
+        assert!(cache.take_cap(702).is_none(), "inode 702 had no cap, still None");
+        assert!(cache.take_cap(703).is_none(), "inode 703 cap must be cleared");
+
+        // Dirty/Flushing entries preserved; Clean entries' state is now Stale.
+        assert_eq!(
+            cache.peek_inode(700).map(|e| e.state).unwrap(),
+            EntryState::Stale,
+            "Clean entry → Stale after invalidate_all"
+        );
+        assert_eq!(
+            cache.peek_inode(701).map(|e| e.state).unwrap(),
+            EntryState::Dirty,
+            "Dirty entry preserved"
+        );
+        assert_eq!(
+            cache.peek_inode(702).map(|e| e.state).unwrap(),
+            EntryState::Stale,
+            "Clean entry without cap → Stale"
+        );
+        assert_eq!(
+            cache.peek_inode(703).map(|e| e.state).unwrap(),
+            EntryState::Flushing,
+            "Flushing entry preserved"
+        );
     }
 }
 
