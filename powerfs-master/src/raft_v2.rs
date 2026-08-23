@@ -341,7 +341,7 @@ impl RaftNodeV2 {
                             // 最多等待 60 秒（30 次 × 2 秒）
                             for _ in 0..30 {
                                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                                let state = raft_clone.metrics().borrow_watched().state.clone();
+                                let state = raft_clone.metrics().borrow_watched().state;
                                 if state == ServerState::Leader {
                                     for (nid, old_addr, new_addr) in &addr_mismatches {
                                         match raft_clone
