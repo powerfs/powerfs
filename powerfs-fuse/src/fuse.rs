@@ -1092,21 +1092,40 @@ impl PowerFsFs {
             .runtime()
             .block_on(facade.cap_open_grant(inode, &cid, is_write_open))
         {
-            Ok((cap_token, caps_bits, epoch, sn, _duration_ms)) => {
+            Ok((cap_token, caps_bits, epoch, sn, duration_ms)) => {
                 let caps = crate::client_cap::CapSet(caps_bits);
                 let cap_id = sn;
                 let cap = crate::client_cap::ClientCap::new(
                     cap_id,
-                    cap_token,
+                    cap_token.clone(),
                     caps,
                     epoch,
                     is_write_open,
                     sn,
                 );
                 self.cache.grant_cap(inode, cap);
+                // §13 Fix (L4.17): Bind the cap token to the open-file
+                // lease registry. The release() path's flush_dirty_chunks
+                // consults this registry BEFORE falling through to
+                // ensure_lease. Without this binding, a chunk-mode file's
+                // release() has no token for the write RPC → ensure_lease
+                // runs the Volume Server's range-lease acquire → A and B
+                // race on the same stripe 0 exclusive lease → one gets
+                // STATUS_ERR_SERVER_ERROR=10 → write fails with EIO.
+                //
+                // Note: we deliberately reuse the existing
+                // OpenFileLeaseRegistry even though this is a *cap* token,
+                // not a legacy inode/range lease: Volume Server's
+                // lease_enabled=false (方案A config) skips token
+                // validation, so any non-empty string satisfies the
+                // write_blob code path that expects *some* token to
+                // forward. No sense building a parallel registry.
+                let expire_at = std::time::Instant::now()
+                    + std::time::Duration::from_millis(duration_ms);
+                self.open_file_leases.bind(inode, cap_token, expire_at);
                 debug!(
-                    "acquire_cap_on_open: cap_open_grant success inode={} caps={:#b} epoch={} sn={}",
-                    inode, caps_bits, epoch, sn
+                    "acquire_cap_on_open: cap_open_grant success inode={} caps={:#b} epoch={} sn={} bound_token={}ms",
+                    inode, caps_bits, epoch, sn, duration_ms
                 );
             }
             Err(e) => {
@@ -1227,10 +1246,28 @@ impl PowerFsFs {
         // token, try the open-file-lease registry (bound at open
         // time). Falls through to `None` → `ensure_lease` if no
         // lease is bound or it's expired — graceful degradation.
+        //
+        // §13 Fix (L4.17, layer 2/3): Add a SECONDARY fallback to the
+        // inode's cached cap token. Covers callers that flush without
+        // going through release() — e.g. the background dirty-chunk
+        // flusher (flush_all_dirty_chunks calls flush_dirty_chunks(…,
+        // None)), or a read path that flushes a dirty chunk before
+        // reading. The open_file_lease entry may have been removed by
+        // a concurrent release() on a different fd of the same inode,
+        // but the cache entry's cap survives until the entry is
+        // evicted. Using the cap token here avoids falling through to
+        // ensure_lease → Volume range-lease acquire → stripe 0 conflict
+        // → STATUS_ERR_SERVER_ERROR=10.
         let bound_token = if lease_token.is_some() {
             lease_token.map(|s| s.to_string())
         } else {
-            self.open_file_leases.get_valid_token(inode)
+            self.open_file_leases
+                .get_valid_token(inode)
+                .or_else(|| {
+                    self.cache
+                        .get_cap(inode)
+                        .map(|cap| cap.token.clone())
+                })
         };
         self.flush_dirty_chunks_impl(inode, bound_token.as_deref())
     }
