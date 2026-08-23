@@ -509,6 +509,30 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             });
         }
 
+        // §13 Stage 4: cap 模型 sweep loop — 周期性调
+        // `force_reclaim_expired_cap_recalls` 处理 GATHER 超时
+        // force-reclaim + Loner 升级 (下发 CapUpgradeNotify).
+        // 与 legacy lease sweep 同 500ms 间隔, 保证 cap 模型下
+        // GATHER 超时 (recall_timeout 2s) 后 stuck holder 被强制回收,
+        // 等待的 writer/xlock 请求者被唤醒.
+        {
+            let sweep_handler = Arc::clone(&net_handler);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                tick.tick().await; // skip immediate first tick
+                loop {
+                    tick.tick().await;
+                    let promoted = sweep_handler.force_reclaim_expired_cap_recalls();
+                    if promoted > 0 {
+                        info!(
+                            "§13 Stage 4 cap sweep: {} promote task(s) dispatched",
+                            promoted
+                        );
+                    }
+                }
+            });
+        }
+
         // P2.5: 启用 Inline 小文件优化 (config.inline_max_size, 默认 0 = 禁用).
         // 启用后 handle_create 对新文件返回 Placement::Inline, 数据直接存 Filer
         // 元数据 (Raft 复制), 绕过 Volume Server. 适合 IO500 mdtest 微小文件场景.

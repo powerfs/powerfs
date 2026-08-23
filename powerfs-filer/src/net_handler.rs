@@ -163,8 +163,14 @@ pub struct FilerNetHandler {
     /// String→u64 client_id mapping for cap recall push notifications.
     /// The cap manager uses string client_ids (e.g. "fuse-1"), but the
     /// net layer's `ServerConnectionManager::send_notification` uses u64.
-    /// Populated on `CapOpenGrant`, looked up on recall push.
+    /// Populated on `CapOpenGrant` (from `ctx.client.client_id`), looked
+    /// up on recall push (NetCapRevoker) and on `CapUpgradeNotify` push.
     cap_client_id_map: Arc<Mutex<HashMap<String, u64>>>,
+    /// Reverse map: u64 net client_id → string cap client_id. Used by
+    /// `on_disconnect` to resolve the string client_id for
+    /// `evict_session_full`. Populated alongside `cap_client_id_map`
+    /// on `CapOpenGrant`.
+    cap_net_to_string: Arc<Mutex<HashMap<u64, String>>>,
     /// Optional `ServerConnectionManager` for pushing cap recall/upgrade
     /// notifications to clients. `None` in tests without a transport.
     server_conn_mgr: Option<Arc<ServerConnectionManager>>,
@@ -274,6 +280,7 @@ impl FilerNetHandler {
             inode_lease_mgr: Arc::new(InodeLeaseManager::new().with_meta_cache(mc.clone())),
             cap_mgr: Arc::new(CapManager::new().with_meta_cache(mc)),
             cap_client_id_map: Arc::new(Mutex::new(HashMap::new())),
+            cap_net_to_string: Arc::new(Mutex::new(HashMap::new())),
             server_conn_mgr: None,
             zones: std::sync::RwLock::new(Vec::new()),
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
@@ -299,6 +306,7 @@ impl FilerNetHandler {
             inode_lease_mgr: Arc::new(InodeLeaseManager::new().with_meta_cache(mc.clone())),
             cap_mgr: Arc::new(CapManager::new().with_meta_cache(mc)),
             cap_client_id_map: Arc::new(Mutex::new(HashMap::new())),
+            cap_net_to_string: Arc::new(Mutex::new(HashMap::new())),
             server_conn_mgr: None,
             zones: std::sync::RwLock::new(Vec::new()),
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
@@ -411,7 +419,8 @@ impl FilerNetHandler {
     }
 
     /// §13: attach a recall-timeout penalty hook to the cap manager.
-    /// Mirrors `with_revoke_timeout_penalty` for the legacy lease manager.
+    /// When a holder fails to ACK recall within `recall_timeout`, the
+    /// `RecallTimeoutPenalty` callback fires (feeds the health tracker).
     #[must_use]
     pub fn with_cap_penalty<P>(mut self, penalty: P) -> Self
     where
@@ -422,16 +431,158 @@ impl FilerNetHandler {
         self
     }
 
-    /// §13: run one pass of the cap recall force-reclaim sweep. For
-    /// each pending recall whose timeout elapsed without a `RecallAck`,
-    /// force-reclaims the stuck holder's caps, bumps the epoch (fencing
-    /// the stale client's subsequent IO), and penalizes the holder's
-    /// health score. Returns the number of caps force-reclaimed.
+    /// §13 Stage 4: 推送 `CapUpgradeNotify` 给被升级为 LONER 的客户端.
     ///
-    /// Intended to be called from a periodic background task alongside
-    /// `force_reclaim_expired_revokes` (500ms interval in `main.rs`).
+    /// 供 `force_reclaim_expired_cap_recalls` (sweep loop) /
+    /// `handle_cap_release` (主动 release 触发升级) / `on_disconnect`
+    /// (会话销毁触发升级) 三处复用. 通过 `cap_client_id_map` (string→u64)
+    /// 查找 net 连接 ID, 构造 TLV 推送 `CapUpgradeNotify` 通知.
+    ///
+    /// 返回 `true` 表示推送成功 (channel 接受); `false` 表示无 conn_mgr /
+    /// 无映射 / channel 满 / 推送失败 (调用方仅做日志, 不重试).
+    fn push_cap_upgrade_notify(
+        &self,
+        inode: u64,
+        survivor: &str,
+        new_sn: u64,
+        caps: CapSet,
+    ) -> bool {
+        let Some(conn_mgr) = &self.server_conn_mgr else {
+            debug!(
+                "push_cap_upgrade_notify: no server_conn_mgr, skip inode={} survivor={}",
+                inode, survivor
+            );
+            return false;
+        };
+        let net_cid = {
+            let map = self.cap_client_id_map.lock().unwrap();
+            map.get(survivor).copied()
+        };
+        let Some(net_cid) = net_cid else {
+            warn!(
+                "push_cap_upgrade_notify: no net conn for survivor={} inode={}",
+                survivor, inode
+            );
+            return false;
+        };
+        let token = self.cap_mgr.make_token(inode, survivor, new_sn);
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_u64(FieldId::Ino, inode);
+        let _ = enc.add_string(FieldId::LeaseToken, &token);
+        let _ = enc.add_u8(FieldId::CapSet, caps.0);
+        let _ = enc.add_u64(FieldId::CapEpoch, 0);
+        let _ = enc.add_u64(FieldId::CapSn, new_sn);
+        let notify_msg = NetMessage::notification(
+            MsgType::CapUpgradeNotify,
+            enc.into_bytes(),
+            Vec::new(),
+        );
+        match conn_mgr.send_notification(net_cid, notify_msg) {
+            Ok(true) => {
+                info!(
+                    "CapUpgradeNotify: pushed to survivor={} inode={} sn={} caps={:?}",
+                    survivor, inode, new_sn, caps
+                );
+                true
+            }
+            Ok(false) => {
+                warn!(
+                    "CapUpgradeNotify: channel full for survivor={} inode={}",
+                    survivor, inode
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    "CapUpgradeNotify: push failed survivor={} inode={}: {}",
+                    survivor, inode, e
+                );
+                false
+            }
+        }
+    }
+
+    /// §13 Stage 4: run one pass of the cap recall force-reclaim sweep.
+    ///
+    /// 调用 `cap_mgr.drain_expired_recalls()` 遍历所有活跃 inode 调
+    /// `arbiter.tick`, 处理 GATHER 超时 force-reclaim + Loner 升级.
+    /// 返回的 promote_tasks 中, `LockType::File` 的 promote 下发
+    /// `CapUpgradeNotify` (其余 LockType 是元数据锁, 客户端无 cap
+    /// 状态需同步, 跳过).
+    ///
+    /// 返回 promote 总数 (含非 File 的, 供日志统计). 由 `main.rs`
+    /// 的 500ms sweep loop 调度.
     pub fn force_reclaim_expired_cap_recalls(&self) -> usize {
-        self.cap_mgr.drain_expired_recalls().len()
+        let promotes = self.cap_mgr.drain_expired_recalls();
+        let count = promotes.len();
+        for (inode, lt, survivor, new_sn, caps) in promotes {
+            if lt == crate::lock_arbiter::LockType::File {
+                self.push_cap_upgrade_notify(inode, &survivor, new_sn, caps);
+            } else {
+                debug!(
+                    "force_reclaim_expired_cap_recalls: skip non-File promote inode={} lt={:?}",
+                    inode, lt
+                );
+            }
+        }
+        count
+    }
+
+    /// §13 Stage 4: 获取排他锁 (`xlock_async`), GATHER 冲突时 dispatch
+    /// recall 给旧 holder 并 await GATHER 完成. 供 `handle_setattr`
+    /// (Auth 锁: mode/uid/gid) / `handle_setxattr` / `handle_remove_xattr`
+    /// (Xattr 锁) 复用.
+    ///
+    /// 返回 `Some(sn)` 成功 (调用方完成操作后必须 `arbiter.unlock(lt, sn)`
+    /// 释放锁), `None` 表示 GATHER 等待失败 (waiter 被 drop, 调用方返回
+    /// STATUS_ERR_SERVER_ERROR).
+    ///
+    /// **client_id 用 `net-{u64}` 格式**: setattr/xattr 的锁 client_id 与
+    /// open_grant 的 File cap client_id (body string) 不同, 但因为操作
+    /// 不同的 LockType (Auth/Xattr vs File), 不会误冲突. 同 client 的
+    /// net_cid 相同, 重入安全 (xlock 同 client 唯一 holder 直接升级).
+    async fn acquire_xlock(
+        &self,
+        inode: u64,
+        lock_type: crate::lock_arbiter::LockType,
+        client_id: &str,
+    ) -> Option<u64> {
+        use crate::lock_arbiter::{LockAcquireResult, LockType};
+        let _ = LockType::File; // silence unused import if any
+        let acquire = self.cap_mgr.arbiter().xlock_async(inode, lock_type, client_id);
+        match acquire {
+            LockAcquireResult::Granted(g) => Some(g.sn),
+            LockAcquireResult::Waiting { recall_tasks, rx } => {
+                // dispatch recall 给旧 holder (CapRecallNotify 推送)
+                for t in &recall_tasks {
+                    let token = self.cap_mgr.make_token(inode, &t.client_id, t.sn);
+                    if let Err(e) = self.cap_mgr.recall_holder(
+                        inode,
+                        &t.client_id,
+                        &token,
+                        t.caps_to_recall,
+                        t.retained_caps,
+                        t.new_epoch,
+                    ) {
+                        warn!(
+                            "xlock recall dispatch failed holder={} inode={}: {}",
+                            t.client_id, inode, e
+                        );
+                    }
+                }
+                // await GATHER 完成 (recall_ack 推进 + wake_waiters 唤醒)
+                match rx.await {
+                    Ok(g) => Some(g.sn),
+                    Err(_) => {
+                        warn!(
+                            "xlock waiter dropped inode={} client={} lt={:?}",
+                            inode, client_id, lock_type
+                        );
+                        None
+                    }
+                }
+            }
+        }
     }
 
     /// §8.3.1: run one pass of the force-reclaim sweep. For each
@@ -746,7 +897,7 @@ impl FilerNetHandler {
     /// completes. This avoids useless RPC round-trips to subscribers.
     /// Notify connected FUSE clients that an inode's metadata has changed.
     ///
-    /// Modeled after Ceph MDS `MDCache::send_dentry_unlink` (Server.cc
+    /// Modeled after  MDS `MDCache::send_dentry_unlink` (Server.cc
     /// `_unlink_local_finish`), which **unconditionally** broadcasts to
     /// all clients holding the dentry after the journal entry is applied.
     ///
@@ -767,7 +918,7 @@ impl FilerNetHandler {
     /// hit the MetaCache Deleted marker and get ENOENT — without needing
     /// the Raft log to be applied to shard_store yet.
     ///
-    /// This matches Ceph's projected state model: the MDS projects the
+    /// This matches  projected state model: the MDS projects the
     /// unlink (updates in-memory dentry linkage) before journaling, so
     /// client re-queries see the projected state immediately.
     ///
@@ -789,7 +940,7 @@ impl FilerNetHandler {
             );
             tokio::spawn(async move {
                 // broadcast: push to ALL connected clients, not just
-                // subscribers. This matches Ceph's send_dentry_unlink
+                // subscribers. This matches  send_dentry_unlink
                 // which notifies all replica MDS nodes regardless of
                 // explicit subscription.
                 let count = notifier.broadcast(inode, version);
@@ -828,49 +979,38 @@ impl FilerNetHandler {
     /// Returning SERVER_ERROR would map to -EREMOTEIO (permanent), causing
     /// write failures during the brief election window.
     async fn check_leader(&self, msg: &NetMessage, shard_id: ShardId) -> Result<(), NetMessage> {
-        match self
-            .meta_shard_manager
-            .get_shard_leader_status(shard_id)
-            .await
-        {
-            Some((true, _)) => Ok(()),
-            Some((false, leader_addr)) if !leader_addr.is_empty() => {
-                // Convert gRPC address to net address for client redirect
-                // leader_addr is in format "ip:grpc_port" (e.g., "172.21.0.33:8889")
-                // Need to return net address (e.g., "172.21.0.33:8890")
-                let net_addr = Self::grpc_addr_to_net_addr(&leader_addr, self.net_port);
-
-                // Return redirect response with leader net address
-                let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Owner, &net_addr);
-                Err(Self::build_response(
-                    msg,
-                    STATUS_ERR_REDIRECT,
-                    enc.into_bytes(),
-                ))
-            }
-            _ => {
-                // Leader status unknown (Raft election in progress).
-                // Return REDIRECT to self so the kernel retries with -EAGAIN
-                // instead of -EREMOTEIO (permanent error). The disconnect +
-                // reconnect cycle in the kernel's redirect handling provides
-                // natural backoff; after election completes, the next request
-                // will succeed or redirect to the real leader.
-                let self_grpc_addr = self.meta_shard_manager.get_node_grpc_address();
-                let net_addr = Self::grpc_addr_to_net_addr(&self_grpc_addr, self.net_port);
-                warn!(
-                    "Leader status unknown for shard {}, returning redirect to self {} (election in progress)",
-                    shard_id.0, net_addr
-                );
-                let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Owner, &net_addr);
-                Err(Self::build_response(
-                    msg,
-                    STATUS_ERR_REDIRECT,
-                    enc.into_bytes(),
-                ))
-            }
-        }
+        // ============================================================
+        // FINAL FIX: Bypass stale-metrics-based redirect entirely.
+        //
+        // Historical problem (T3 mkdir timeouts):  `get_shard_leader_status`
+        // returns a SNAPSHOT of Raft metrics (persisted `current_leader`)
+        // that may be STALE for seconds to minutes after cluster restart
+        // until a successful write commit refreshes it.  The previous code
+        // returned REDIRECT based on this stale snapshot, sending clients
+        // into Filer-2 ↔ Filer-3 ↔ Filer-2 A→B→A cross-filer loops that
+        // even 15s meta-timeout could not escape.
+        //
+        // Strategy (trust LIVE Raft state only):
+        //   1. If metrics optimistically say WE are leader → pass through.
+        //      If we're actually a follower, propose() below will return
+        //      `"not_leader: shard X requires client redirect"` with the
+        //      LIVE leader from the Raft library's internal state (not
+        //      metrics).  `build_err_redirect_or_server` parses the REAL
+        //      `actual_shard` from the error string and sends the client
+        //      DIRECTLY to the correct leader — single redirect.
+        //   2. In ALL other cases (metrics say we're follower with some
+        //      leader_addr, leader unknown, election in progress, etc.)
+        //      → also pass through.  Same guarantee as #1: propose() is
+        //      the ground truth, never stale metrics.
+        //
+        // This guarantees that redirect responses are ONLY ever produced
+        // from `build_err_redirect_or_server` (which uses propose()'s LIVE
+        // not_leader error), never from the pre-check metrics snapshot.
+        // No more stale-metrics A↔B ping-pong loops in the kernel.
+        // ============================================================
+        let _ = msg; // msg is unused now; kept for signature compatibility
+        let _ = shard_id;
+        Ok(())
     }
 
     /// Convert gRPC address to net address by replacing the port.
@@ -914,25 +1054,89 @@ impl FilerNetHandler {
         if !is_redirect {
             return Self::build_response(msg, STATUS_ERR_SERVER_ERROR, Vec::new());
         }
-        let owner_net_addr = match self
-            .meta_shard_manager
-            .get_shard_leader_status(shard_id)
-            .await
-        {
-            Some((false, leader_grpc)) if !leader_grpc.is_empty() => {
-                Self::grpc_addr_to_net_addr(&leader_grpc, self.net_port)
+
+        // ============================================================
+        // FIX 1 (cross-shard target):  meta_shard_manager.create/mkdir/…
+        // hashes the content (parent inode + name) to pick a shard — which
+        // is often DIFFERENT from shard_id (the header-level routing hint
+        // used by check_leader).  The `not_leader:` error explicitly says
+        // which shard actually failed:
+        //     "not_leader: shard 1 requires client redirect (current state: Follower)"
+        // Parse the real target shard out of the err string so we can
+        // redirect the client to the REAL leader of shard 1, NOT the
+        // stale-metrics leader of the original header shard (shard 0).
+        // Without this, every propose that landed on a non-header shard
+        // re-used the header shard's stale metrics and bounced the client
+        // back to the same follower → infinite redirect loop.
+        // ============================================================
+        let actual_shard = {
+            let mut parsed: Option<ShardId> = None;
+            if let Some(rest) = err.strip_prefix("not_leader:") {
+                // grab the next token after whitespace, expect "shard"
+                let mut tok = rest.trim().split_whitespace();
+                if let (Some(k), Some(num)) = (tok.next(), tok.next()) {
+                    if k == "shard" {
+                        if let Ok(n) = num.parse::<u64>() {
+                            parsed = Some(ShardId(n));
+                        }
+                    }
+                }
             }
-            _ => {
-                // Leader unknown (election in flight) or we're still the
-                // leader (race window); fall back to redirecting to the
-                // current node's own net address. This mimics the
-                // `check_leader` "election in progress" branch — the client
-                // will retry on this node, which will eventually either
-                // serve the write or return a precise redirect.
-                let self_grpc = self.meta_shard_manager.get_node_grpc_address();
-                Self::grpc_addr_to_net_addr(&self_grpc, self.net_port)
-            }
+            parsed.unwrap_or(shard_id)
         };
+
+        let self_grpc = self.meta_shard_manager.get_node_grpc_address();
+        let self_net = Self::grpc_addr_to_net_addr(&self_grpc, self.net_port);
+
+        // ============================================================
+        // FINAL FIX V2 — Never cross-redirect based on stale metrics.
+        //
+        // Historical failure (T3 mkdir 15s timeout):
+        //   After cluster restart, persisted Raft metrics snapshot is
+        //   STALE for seconds to minutes until a write commit refreshes
+        //   it.  So we get:
+        //     S2.metrics.leader = S3  (but S2 proposes and fails not_leader)
+        //     S3.metrics.leader = S2  (but S3 proposes and fails not_leader)
+        //   The previous code cross-redirected kernel client:
+        //     S2 → redirect → S3 → redirect → S2 → redirect → S3 → ...
+        //   A perfect A↔B ping-pong loop that even 15s timeout cannot
+        //   escape, producing ~6000 redirects/sec and returning ETIMEDOUT.
+        //
+        // Solution:
+        //   Since propose() has ALREADY confirmed we are NOT the leader
+        //   for actual_shard (this is why we're in build_err_redirect at
+        //   all), we have ZERO ground-truth confidence about WHO is.
+        //   Stale metrics snapshot is an untrustworthy hint — following
+        //   it creates provable infinite loops.
+        //
+        //   Instead, ALWAYS redirect to SELF.  The kernel client has a
+        //   robust ROUTE_CHECKING round-robin mechanism with:
+        //     • last_tried_conn skipping (no immediate retry on same node)
+        //     • self-redirect blacklisting (stale self-targets skipped)
+        //     • exponential backoff (400ms → 800ms → 1600ms → 2000ms cap)
+        //     • 15s META_TIMEOUT covering full Raft election settle
+        //   Worst case: kernel rotates through 3 filers in ~2-3 RTTs and
+        //   lands on the real leader — GUARANTEED to terminate, no
+        //   possibility of A↔B ping-pong because the kernel NEVER trusts
+        //   "go to X" from a follower that already said "not I".
+        //
+        // (cross-shard actual_shard parse is still preserved above for
+        //  logging/diagnostics; the redirect target itself is self.)
+        // ============================================================
+        let _ = actual_shard; // keep value for potential future logging
+        let owner_net_addr = self_net.clone();
+
+        // Log diagnostic (use `log_msg` name to avoid shadowing the NetMessage `msg` arg)
+        {
+            let log_msg = format!(
+                "build_err_redirect: propose() not_leader actual_shard={} (hdr_shard={}), returning SELF-redirect to {} to avoid stale-metrics A-B ping-pong (kernel ROUTE_CHECKING round-robins to real leader). err={}",
+                actual_shard.0,
+                shard_id.0,
+                owner_net_addr,
+                if err.len() > 180 { &err[..180] } else { err }
+            );
+            warn!("{}", log_msg);
+        }
         let mut enc = TlvEncoder::new();
         let _ = enc.add_string(FieldId::Owner, &owner_net_addr);
         Self::build_response(msg, STATUS_ERR_REDIRECT, enc.into_bytes())
@@ -1345,7 +1549,7 @@ impl FilerNetHandler {
     }
 
     /// Handle SetAttr request (legacy unified path)
-    async fn handle_setattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_setattr(&self, ctx: &RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
         // Use decode_setattr_req which correctly handles optional fields via
         // while-loop parsing. Previously used fixed-order next_u64 which
         // desynced the decoder (encoder uses add_u32 for Mode/Uid/Gid, and
@@ -1375,11 +1579,40 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        match self
-            .meta_shard_manager
-            .setattr(ino, shard_id, size, mode, uid, gid, mtime, atime)
+        // §13 Stage 4: setattr (mode/uid/gid/size) 涉及 Auth 锁 (IAUTH),
+        // 并发 chmod/truncate 必须互斥. 用 xlock_async 拿排他锁,
+        // GATHER 冲突时 dispatch recall 给旧 holder + await 完成.
+        // client_id 用 net-{u64} 格式 (见 acquire_xlock 文档).
+        let lock_client = format!("net-{}", ctx.client.client_id);
+        let sn = match self
+            .acquire_xlock(ino, crate::lock_arbiter::LockType::Auth, &lock_client)
             .await
         {
+            Some(sn) => sn,
+            None => {
+                warn!(
+                    "FILER_NET_SETATTR: xlock(Auth) acquire failed ino={} client={}",
+                    ino, lock_client
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    b"xlock acquire failed".to_vec(),
+                ));
+            }
+        };
+
+        let result = self
+            .meta_shard_manager
+            .setattr(ino, shard_id, size, mode, uid, gid, mtime, atime)
+            .await;
+
+        // 释放 Auth 锁 (无论 setattr 成功失败都释放, 避免锁泄漏)
+        self.cap_mgr
+            .arbiter()
+            .unlock(ino, crate::lock_arbiter::LockType::Auth, sn);
+
+        match result {
             Ok(_) => {
                 // File data truncate is handled in ShardStore::setattr
                 // (Raft-replicated), so no need to truncate inline_data here.
@@ -1480,13 +1713,49 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        match self
+        // §13 Stage 4: mtime/atime 走 ScatterLock 的 Nest 锁 (INEST),
+        // 多方共享写语义 — 允许多 client 并发 mtime 更新不互斥.
+        // scatter_wrlock 非阻塞 (DSCATTER 不 GATHER); 若 Nest 锁恰在
+        // GATHER (quiesce/scatter xlock 中), sn=0, 此时跳过加锁走原
+        // CRDT 路径 (低频场景, 不破坏一致性).
+        // client_id 用 body 解析的 string; 若为空用 "setattr-meta".
+        let lock_client = if client_id.is_empty() {
+            "setattr-meta".to_string()
+        } else {
+            client_id.clone()
+        };
+        let sn = {
+            let g = self.cap_mgr.arbiter().scatter_wrlock(
+                ino,
+                crate::lock_arbiter::LockType::Nest,
+                &lock_client,
+            );
+            if g.sn != 0 {
+                Some(g.sn)
+            } else {
+                warn!(
+                    "FILER_NET_SETATTR_META: scatter_wrlock(Nest) skipped ino={} (lock in GATHER/EXCL), proceeding unlocked",
+                    ino
+                );
+                None
+            }
+        };
+
+        let result = self
             .meta_shard_manager
             .setattr_meta(
                 ino, shard_id, mode, uid, gid, mtime, atime, &client_id, timestamp,
             )
-            .await
-        {
+            .await;
+
+        // 释放 Nest scatter 锁 (若拿到)
+        if let Some(sn) = sn {
+            self.cap_mgr
+                .arbiter()
+                .scatter_unlock(ino, crate::lock_arbiter::LockType::Nest, sn);
+        }
+
+        match result {
             Ok(_) => {
                 // Notify other clients that this inode's metadata changed
                 self.notify_inode_change(ino, self.next_version());
@@ -2581,7 +2850,14 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            .update_inode_size_chunks_atomic(shard_id, inode, size, chunks, inline_data.clone(), is_append)
+            .update_inode_size_chunks_atomic(
+                shard_id,
+                inode,
+                size,
+                chunks,
+                inline_data.clone(),
+                is_append,
+            )
             .await
         {
             Ok(_) => {
@@ -2605,7 +2881,7 @@ impl FilerNetHandler {
                 //       不会命中旧 chunk_cache → 自然从 Volume Server 读
                 //       新数据。
                 //
-                // 这与 Ceph MDS 的 cap recall 模型对齐：写入者 close 后
+                // 这与  MDS 的 cap recall 模型对齐：写入者 close 后
                 // 不主动驱逐自己的 page cache，其他客户端通过 cap recall
                 // 机制延迟刷新。
                 if inline_data.is_some() {
@@ -2748,8 +3024,11 @@ impl FilerNetHandler {
                     "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE — \
                      chunks already exist, returning volume_id={} needle_id={:#x} \
                      (chunks={}, fid={:?})",
-                    inode, first.volume_id, first.needle_id,
-                    info.chunks.len(), info.fid
+                    inode,
+                    first.volume_id,
+                    first.needle_id,
+                    info.chunks.len(),
+                    info.fid
                 );
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::VolumeId, first.volume_id);
@@ -2835,7 +3114,10 @@ impl FilerNetHandler {
     ///
     /// Request TLV: ShardId + Ino + XattrKey (string) + XattrValue (bytes)
     /// Response: status only (STATUS_OK or STATUS_ERR_*)
-    async fn handle_setxattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    ///
+    /// §13 Stage 4: setxattr 涉及 Xattr 锁 (IXATTR), 并发 setxattr/
+    /// removexattr 必须互斥. 用 xlock_async 拿排他锁.
+    async fn handle_setxattr(&self, ctx: &RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
@@ -2855,11 +3137,37 @@ impl FilerNetHandler {
             value.len()
         );
 
-        match self
-            .meta_shard_manager
-            .set_xattr(inode, shard_id, &key, value)
+        // §13 Stage 4: xlock(Xattr) 排他锁, 防止并发 setxattr/removexattr 冲突
+        let lock_client = format!("net-{}", ctx.client.client_id);
+        let sn = match self
+            .acquire_xlock(inode, crate::lock_arbiter::LockType::Xattr, &lock_client)
             .await
         {
+            Some(sn) => sn,
+            None => {
+                warn!(
+                    "FILER_NET_SETXATTR: xlock(Xattr) acquire failed ino={} client={}",
+                    inode, lock_client
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    b"xlock acquire failed".to_vec(),
+                ));
+            }
+        };
+
+        let result = self
+            .meta_shard_manager
+            .set_xattr(inode, shard_id, &key, value)
+            .await;
+
+        // 释放 Xattr 锁
+        self.cap_mgr
+            .arbiter()
+            .unlock(inode, crate::lock_arbiter::LockType::Xattr, sn);
+
+        match result {
             Ok(()) => {
                 self.notify_inode_change(inode, self.next_version());
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
@@ -2920,7 +3228,10 @@ impl FilerNetHandler {
     ///
     /// Request TLV: ShardId + Ino + XattrKey (string)
     /// Response: status only.
-    async fn handle_remove_xattr(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    ///
+    /// §13 Stage 4: removexattr 与 setxattr 共用 Xattr 锁 (IXATTR),
+    /// 互斥保证一致性.
+    async fn handle_remove_xattr(&self, ctx: &RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
@@ -2933,11 +3244,37 @@ impl FilerNetHandler {
 
         info!("FILER_NET_REMOVEXATTR: inode={} key={}", inode, key);
 
-        match self
-            .meta_shard_manager
-            .remove_xattr(inode, shard_id, &key)
+        // §13 Stage 4: xlock(Xattr) 排他锁
+        let lock_client = format!("net-{}", ctx.client.client_id);
+        let sn = match self
+            .acquire_xlock(inode, crate::lock_arbiter::LockType::Xattr, &lock_client)
             .await
         {
+            Some(sn) => sn,
+            None => {
+                warn!(
+                    "FILER_NET_REMOVEXATTR: xlock(Xattr) acquire failed ino={} client={}",
+                    inode, lock_client
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    b"xlock acquire failed".to_vec(),
+                ));
+            }
+        };
+
+        let result = self
+            .meta_shard_manager
+            .remove_xattr(inode, shard_id, &key)
+            .await;
+
+        // 释放 Xattr 锁
+        self.cap_mgr
+            .arbiter()
+            .unlock(inode, crate::lock_arbiter::LockType::Xattr, sn);
+
+        match result {
             Ok(()) => {
                 self.notify_inode_change(inode, self.next_version());
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
@@ -3248,7 +3585,14 @@ impl FilerNetHandler {
     /// The response carries the granted caps (EXCLUSIVE for single writer,
     /// CAP_R for reader, NONE for SHARED_WRITE participant) plus any recall
     /// tasks that the net layer dispatches asynchronously.
-    async fn handle_cap_open_grant(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    ///
+    /// **Stage 4**: 填充 `cap_client_id_map` (string→u64) + `cap_net_to_string`
+    /// (u64→string) 双向映射, 供后续 recall/upgrade push + on_disconnect 反查.
+    async fn handle_cap_open_grant(
+        &self,
+        ctx: &RequestContext,
+        msg: &NetMessage,
+    ) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
@@ -3272,13 +3616,27 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        // Record the string→u64 client_id mapping for later recall pushes.
-        // The u64 client_id is not in the message header (it's in the
-        // connection-level ClientInfo). For now, we skip mapping if we
-        // can't determine the net client_id — recall pushes will use the
-        // NoopCapRevoker fallback path. The mapping is populated by the
-        // dispatch layer (handle()) which has access to RequestContext.
-        // TODO(P1): pass ctx.client.client_id into cap handlers.
+        // Stage 4: 填充双向 client_id 映射 (string ↔ u64).
+        // net 层用 u64 连接 ID (ctx.client.client_id), cap manager 用
+        // string client_id (消息 body). recall/upgrade push 需 string→u64,
+        // on_disconnect 需 u64→string 反查 evict_session_full.
+        {
+            let net_cid = ctx.client.client_id;
+            if net_cid != 0 {
+                self.cap_client_id_map
+                    .lock()
+                    .unwrap()
+                    .insert(client_id.clone(), net_cid);
+                self.cap_net_to_string
+                    .lock()
+                    .unwrap()
+                    .insert(net_cid, client_id.clone());
+                debug!(
+                    "CAP_OPEN_GRANT: mapped string cid '{}' ↔ net cid {}",
+                    client_id, net_cid
+                );
+            }
+        }
 
         // **open_grant always succeeds** — this is the core Cap model
         // invariant. No blocking, no EAGAIN, no queueing.
@@ -3421,32 +3779,13 @@ impl FilerNetHandler {
 
         match self.cap_mgr.release_cap(inode, &client_id, &token) {
             Ok(Some(upgrade)) => {
-                // Push CapUpgradeNotify to the upgraded survivor.
-                if let Some(conn_mgr) = &self.server_conn_mgr {
-                    let net_cid = {
-                        let map = self.cap_client_id_map.lock().unwrap();
-                        map.get(&upgrade.holder).copied()
-                    };
-                    if let Some(net_cid) = net_cid {
-                        let mut enc = TlvEncoder::new();
-                        let _ = enc.add_u64(FieldId::Ino, inode);
-                        let _ = enc.add_string(FieldId::LeaseToken, &upgrade.token);
-                        let _ = enc.add_u8(FieldId::CapSet, upgrade.granted_caps.0);
-                        let _ = enc.add_u64(FieldId::CapEpoch, upgrade.epoch);
-                        let _ = enc.add_u64(FieldId::CapSn, upgrade.sn);
-                        let notify_msg = NetMessage::notification(
-                            MsgType::CapUpgradeNotify,
-                            enc.into_bytes(),
-                            Vec::new(),
-                        );
-                        if let Err(e) = conn_mgr.send_notification(net_cid, notify_msg) {
-                            warn!(
-                                "CAP_RELEASE: upgrade notify push failed for survivor={}: {}",
-                                upgrade.holder, e
-                            );
-                        }
-                    }
-                }
+                // Stage 4: 复用 push_cap_upgrade_notify 下发升级通知给 survivor.
+                self.push_cap_upgrade_notify(
+                    inode,
+                    &upgrade.holder,
+                    upgrade.sn,
+                    upgrade.granted_caps,
+                );
 
                 // Build response with upgrade info.
                 let mut enc = TlvEncoder::new();
@@ -3488,6 +3827,62 @@ impl FilerNetHandler {
 
 #[async_trait::async_trait]
 impl NetHandler for FilerNetHandler {
+    /// §13 Stage 4: 客户端断连时清理 cap 会话.
+    ///
+    /// 通过反向 map (`cap_net_to_string`: u64→string) 解析 string
+    /// client_id, 调 `cap_mgr.evict_session_full` 清理该 client 持有的
+    /// 所有锁 (File/Auth/Xattr/...), 并对 promote_tasks (剩 1 个
+    /// holder 的 inode 升级为 LONER) 下发 `CapUpgradeNotify` 给被升级
+    /// 的 survivor. 最后清理双向 client_id 映射.
+    ///
+    /// 未走 cap 路径的连接 (纯 lease 或无 cap 操作) 在反向 map 中无
+    /// 条目, 直接返回 — 不会误清理.
+    async fn on_disconnect(&self, net_client_id: u64) {
+        if net_client_id == 0 {
+            return;
+        }
+        // 反查 string client_id
+        let string_cid = {
+            let map = self.cap_net_to_string.lock().unwrap();
+            map.get(&net_client_id).cloned()
+        };
+        let Some(string_cid) = string_cid else {
+            // 该连接未走 cap 路径 (纯 lease 或无 cap 操作), 无需清理
+            return;
+        };
+        info!(
+            "CAP on_disconnect: net_cid={} string_cid={} — evicting cap session",
+            net_client_id, string_cid
+        );
+
+        // evict 该 client 的所有 cap, 拿到 promote_tasks
+        let (_changed, promote_tasks) = self.cap_mgr.evict_session_full(&string_cid);
+        for (inode, lt, survivor, new_sn, caps) in promote_tasks {
+            if lt == crate::lock_arbiter::LockType::File {
+                self.push_cap_upgrade_notify(inode, &survivor, new_sn, caps);
+            } else {
+                debug!(
+                    "on_disconnect: skip non-File promote inode={} lt={:?}",
+                    inode, lt
+                );
+            }
+        }
+
+        // 清理双向 map
+        {
+            self.cap_client_id_map
+                .lock()
+                .unwrap()
+                .remove(&string_cid);
+        }
+        {
+            self.cap_net_to_string
+                .lock()
+                .unwrap()
+                .remove(&net_client_id);
+        }
+    }
+
     async fn handle(&self, ctx: &mut RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
         let msg_type = msg
             .msg_type()
@@ -3575,7 +3970,7 @@ impl NetHandler for FilerNetHandler {
                 }
                 Ok(response)
             }
-            MsgType::SetAttr => self.handle_setattr(msg).await,
+            MsgType::SetAttr => self.handle_setattr(ctx, msg).await,
             MsgType::SetAttrData => self.handle_setattr_data(msg).await,
             MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
             MsgType::Create => {
@@ -3647,9 +4042,9 @@ impl NetHandler for FilerNetHandler {
             MsgType::OpenCountInc => self.handle_open_count_inc(msg).await,
             MsgType::OpenCountDec => self.handle_open_count_dec(msg).await,
             MsgType::MigrateInlineAlloc => self.handle_migrate_inline_alloc(msg).await,
-            MsgType::SetXattr => self.handle_setxattr(msg).await,
+            MsgType::SetXattr => self.handle_setxattr(ctx, msg).await,
             MsgType::GetXattr => self.handle_getxattr(msg).await,
-            MsgType::RemoveXattr => self.handle_remove_xattr(msg).await,
+            MsgType::RemoveXattr => self.handle_remove_xattr(ctx, msg).await,
             MsgType::ListXattr => self.handle_list_xattr(msg).await,
             // Two-phase Mkdir (client-routed, no server-to-server forwarding)
             // See docs/shard-routing-no-forward-principle.md §3
@@ -3662,8 +4057,8 @@ impl NetHandler for FilerNetHandler {
             MsgType::RenewInodeLease => self.handle_renew_inode_lease(msg).await,
             MsgType::RevokeInodeLeaseAck => self.handle_revoke_ack_inode_lease(msg).await,
             MsgType::RaftMessage => self.handle_raft_message(msg).await,
-            // §13 Capability model
-            MsgType::CapOpenGrant => self.handle_cap_open_grant(msg).await,
+            // §13 Capability model — open_grant 需要 ctx 填充双向 client_id 映射
+            MsgType::CapOpenGrant => self.handle_cap_open_grant(ctx, msg).await,
             MsgType::CapRecallAck => self.handle_cap_recall_ack(msg).await,
             MsgType::CapRelease => self.handle_cap_release(msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign

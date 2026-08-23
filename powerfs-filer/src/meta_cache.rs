@@ -188,7 +188,7 @@ impl CachedInode {
     }
 
     /// Remove a client's cap record  `CInode::remove_client_cap`).
-    /// Called by `CapManager::release_cap` / `close_session` /
+    /// Called by `CapManager::release_cap` / `evict_session_full` /
     /// `drain_expired_recalls` via `MetaCache::cap_detach`.
     pub(crate) fn remove_client_cap(&self, client_id: &str) {
         let mut cm = self.client_caps.lock().unwrap();
@@ -205,18 +205,6 @@ impl CachedInode {
                 *loner = Some(sole.0.clone());
             }
         }
-    }
-
-    /// Snapshot of `(client_id, caps)` pairs — used for diagnostics
-    /// and leader-handoff recall  `CInode::export_client_caps`).
-    #[allow(dead_code)]
-    pub(crate) fn snapshot_client_caps(&self) -> Vec<(String, CapSet, u64 /* epoch */)> {
-        self.client_caps
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.caps, v.epoch))
-            .collect()
     }
 }
 
@@ -565,7 +553,7 @@ impl MetaCache {
         }
     }
 
-    /// Project UpdateInodeSizeChunks into MetaCache (Ceph MDS projected state model).
+    /// Project UpdateInodeSizeChunks into MetaCache ( MDS projected state model).
     ///
     /// Updates size/chunks/inline_data on a cached inode so subsequent
     /// `get_inode` calls return the new values immediately — before Raft
@@ -579,7 +567,7 @@ impl MetaCache {
     ///      stale size=0, chunks=[] → reader EIO
     ///
     /// With this method, step 2 also updates MetaCache so step 3 sees the
-    /// new size/chunks. This mirrors Ceph MDS's projected state: memory
+    /// new size/chunks. This mirrors  MDS's projected state: memory
     /// updates precede journal apply.
     ///
     /// If the inode is not in MetaCache, do nothing — `get_inode` will
@@ -674,7 +662,7 @@ impl MetaCache {
         existing.touch();
     }
 
-    /// Project setattr_meta (CRDT-merged) into MetaCache (Ceph MDS projected state model).
+    /// Project setattr_meta (CRDT-merged) into MetaCache ( MDS projected state model).
     ///
     /// Updates mode/uid/gid/mtime/atime/version on a cached inode so
     /// cross-client `getattr` returns the new values immediately.
@@ -1399,7 +1387,7 @@ impl MetaCache {
     /// Detach a client's cap from a cached inode
     /// `CInode::remove_client_cap`).
     ///
-    /// Called by `CapManager::release_cap` / `close_session` /
+    /// Called by `CapManager::release_cap` / `evict_session_full` /
     /// `drain_expired_recalls` to keep the inode-embedded `client_caps`
     /// map in sync with the `CapManager` state.
     pub fn cap_detach(&self, inode: u64, client_id: &str) {

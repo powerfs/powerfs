@@ -1056,7 +1056,7 @@ impl MetaShardManager {
         //
         // Do NOT wait_for_entry_removed here — that would add Raft apply
         // latency (1-3ms) to every unlink. The MetaCache deleted marker
-        // is the authoritative fast-path, matching Ceph's projected state
+        // is the authoritative fast-path, matching 's projected state
         // (MDS projects the unlink before journaling).
         if !self.is_async_meta_persist() {
             self.wait_for_entry_removed(shard_dir, parent_inode, name)
@@ -3696,7 +3696,7 @@ impl MetaShardManager {
         // but MetaCache still holds the create-time staged value (size=0,
         // chunks=[]). Cross-client getattr → get_inode → MetaCache hit →
         // returns stale size=0 → reader EIO after READ_LAG timeout.
-        // The projection mirrors Ceph MDS projected state: memory updates
+        // The projection mirrors  MDS projected state: memory updates
         // precede journal apply.
         let chunks_for_projection = chunks.clone();
         let inline_for_projection = inline_data.clone();
