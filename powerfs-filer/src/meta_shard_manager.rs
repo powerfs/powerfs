@@ -566,25 +566,64 @@ impl MetaShardManager {
         // skipped even when apply() batches multiple entries.
         let mgr = self.raft_group_manager.clone();
         tokio::spawn(async move {
-            let mut last_applied: u64 = 0;
+            // 初始化 last_applied 为 Raft 状态机已 apply 的最后 log index。
+            //
+            // 这避免了"首次通知只处理 notified index"的旧逻辑跳过同批提交的
+            // 前序条目。例如 create_file 用 propose_many 同时提交 CreateInode@N
+            // 和 AddDirEntry@N+1，apply() 处理完两笔后只通知 index=N+1。若
+            // last_applied 初始为 0，旧逻辑只处理 N+1，跳过 N（CreateInode）→
+            // dir_entry 存在但 inode 记录缺失 → lookup 返回 None → EIO。
+            //
+            // 重启场景：RocksDB 已持久化 last_applied_log，ShardStore 启动时也
+            // 从 RocksDB 加载了所有 in-memory 状态，所以从 last_applied+1 开始
+            // 处理新条目，不会重复 apply 旧条目。
+            let mut last_applied: u64 = mgr
+                .get_last_applied_index(shard_id)
+                .await
+                .unwrap_or(0);
+            if last_applied > 0 {
+                info!(
+                    "shard {}: apply loop starting from last_applied={} (recovered from RocksDB)",
+                    shard_id.0, last_applied
+                );
+            }
+            let mut first_notification_logged = false;
             while let Some(index) = apply_rx.recv().await {
+                if !first_notification_logged {
+                    info!(
+                        "shard {}: apply loop received FIRST notification index={} (last_applied={}) — \
+                         apply_notifier chain is working",
+                        shard_id.0, index, last_applied
+                    );
+                    first_notification_logged = true;
+                }
                 if index <= last_applied {
                     // Already processed (duplicate notification or out-of-order)
+                    debug!(
+                        "shard {}: apply notification index={} <= last_applied={}, skipping",
+                        shard_id.0, index, last_applied
+                    );
                     continue;
                 }
-                let start = if last_applied == 0 || index - last_applied > 100 {
-                    // First notification or large gap (e.g., after restart with
-                    // thousands of pre-existing entries): only process the
-                    // notified index. Old entries were already applied before
-                    // the shard store was created (loaded from RocksDB snapshot).
-                    index
-                } else {
-                    last_applied + 1
-                };
+                // 始终处理 [last_applied+1, index] 范围内的所有条目。
+                //
+                // 旧的 "first notification / large gap" 特殊路径会在 last_applied==0
+                // 或 gap>100 时只处理 notified index，跳过中间条目。这导致了
+                // propose_many 批量提交时首笔被跳过的 bug。现在 last_applied 已从
+                // RocksDB 恢复，无需特殊路径；即使 gap 较大（如重启后首批新条目），
+                // 也需要处理范围内的所有条目，因为它们是 committed 但尚未 apply
+                // 的新数据。
+                let start = last_applied + 1;
                 for idx in start..=index {
                     match mgr.read_applied_entry(shard_id, idx).await {
                         Ok(Some(payload)) => match ShardCommand::deserialize(&payload) {
-                            Ok(cmd) => shard_store.apply_command(cmd),
+                            Ok(cmd) => {
+                                debug!(
+                                    "shard {}: applying index={} cmd={:?}",
+                                    shard_id.0, idx, cmd
+                                );
+                                shard_store.apply_command(cmd);
+                            }
                             Err(e) => error!(
                                 "shard {}: failed to deserialize ShardCommand at index {}: {}",
                                 shard_id.0, idx, e
@@ -608,6 +647,10 @@ impl MetaShardManager {
                 }
                 last_applied = index;
             }
+            warn!(
+                "shard {}: apply loop EXITING — apply_rx channel closed (raft shutdown?)",
+                shard_id.0
+            );
         });
 
         // P3: Leader change watcher — clear MetaCache staging on leadership loss.
@@ -1714,29 +1757,55 @@ impl MetaShardManager {
         // different shards, so we:
         //   1. Find the inode number from the dir entry on the parent's shard.
         //   2. Fetch the inode record from the inode's own shard.
+        //
+        // P3: Check MetaCache FIRST (Staging/Dirty/Clean + Deleted markers).
+        // This is critical for `async_meta_persist` mode: `create_file` stages
+        // the new inode + dir entry in MetaCache BEFORE proposing to Raft, and
+        // returns to the client immediately after Raft COMMIT (not apply).
+        // Without consulting MetaCache here, a subsequent lookup from the
+        // same Filer would miss the staging entry, fall through to ShardStore
+        // (where the data appears only after Raft apply, ~1-5ms later), and
+        // spin-wait up to 50ms before returning None → EIO to the client.
+        // This was the root cause of "dir_entry exists but inode record missing"
+        // cross-client visibility failures.
         let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
 
-        let inode = {
-            let stores = self.shard_stores.read().unwrap();
-            let shard_store = stores.get(&parent_shard)?;
-            shard_store.get_dir_entry_inode(parent_inode, name)
-        };
-
-        // If dir_entry not found, return None immediately.
-        let inode = match inode {
-            Some(i) => i,
+        // 1. Resolve inode number from the dir entry.
+        let inode = match self.meta_cache.get_direntry(parent_inode, name) {
+            Some(Some(ino)) => ino, // Cache hit (Staging/Clean/Dirty)
+            Some(None) => return None, // Known deleted by a pending unlink
             None => {
-                log::debug!(
-                    "lookup: dir_entry not found parent_ino={} name='{}' shard={}",
-                    parent_inode,
-                    name,
-                    parent_shard.0
-                );
-                return None;
+                // Cache miss → query ShardStore and backfill a Clean copy.
+                let ino_opt = {
+                    let stores = self.shard_stores.read().unwrap();
+                    let shard_store = stores.get(&parent_shard)?;
+                    shard_store.get_dir_entry_inode(parent_inode, name)
+                };
+                match ino_opt {
+                    Some(ino) => {
+                        self.meta_cache
+                            .cache_put_clean_direntry(parent_inode, name, ino);
+                        ino
+                    }
+                    None => {
+                        log::debug!(
+                            "lookup: dir_entry not found parent_ino={} name='{}' shard={}",
+                            parent_inode,
+                            name,
+                            parent_shard.0
+                        );
+                        return None;
+                    }
+                }
             }
         };
 
-        // Fetch the inode record from its own shard (may differ from parent_shard).
+        // 2. Fetch the inode record. Check MetaCache first (same reasoning).
+        if let Some(cached) = self.meta_cache.get_inode(inode) {
+            return cached; // Some(Some(info)) or Some(None) for deleted
+        }
+
+        // Cache miss → fall through to ShardStore with cross-shard apply spin-wait.
         let inode_shard = self.shard_strategy.calculate_shard(inode);
         //
         // === CORRECTNESS: cross-shard split-create apply lag ===================
@@ -1788,7 +1857,14 @@ impl MetaShardManager {
         }
 
         let info = match info {
-            Some(i) => i,
+            Some(i) => {
+                // Backfill MetaCache with a Clean copy so subsequent lookups
+                // hit the fast path (same pattern as `get_inode`).
+                if i.delete_time == 0 {
+                    self.meta_cache.cache_put_clean(i.clone());
+                }
+                i
+            }
             None => {
                 log::warn!(
                     "lookup: inode record not found after {} retries inode={} shard={} \

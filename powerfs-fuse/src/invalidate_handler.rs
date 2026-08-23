@@ -708,13 +708,32 @@ impl NotificationHandler for InvalidateHandler {
             }
             MsgType::CapRecallNotify => {
                 // §13 Cap model: server recalls caps from this client.
-                // Notification TLV: Ino + LeaseToken + CapSet(recall) +
-                // CapSet(retained) + CapEpoch
+                // Notification TLV:
+                //   FieldId::Ino (u64)
+                //   FieldId::LeaseToken (string)
+                //   FieldId::CapSet (u8) — recall bits (low 4 meaningful;
+                //                       also duplicated inside the packed field)
+                //   FieldId::IsWriteOpen (u8) — PACKED: (recall & 0x0F) in low
+                //                               nibble, (retained & 0x0F) in HIGH
+                //                               nibble. Same wire format as the
+                //                               kernel C client, fixed in the
+                //                               companion CapRecallNotify decode.
+                //   FieldId::CapEpoch (u64)
+                //
+                // The retained caps MUST be extracted from the HIGH nibble
+                // of IsWriteOpen, NOT from a hypothetical second CapSet
+                // field (which doesn't exist and caused `retained_bits=0`
+                // before, forcing a full cap teardown on every recall).
                 let mut dec = TlvDecoder::new(&msg.body);
                 let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
                 let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
                 let _recall_bits = dec.next_u8(FieldId::CapSet).unwrap_or(0);
-                let retained_bits = dec.next_u8(FieldId::CapSet).unwrap_or(0);
+                // Retained lives in the HIGH nibble of FieldId::IsWriteOpen
+                // (packed: low 4 bits = recall copy, high 4 bits = retained).
+                // Same wire format the kernel C client decodes via the
+                // companion fix in decode_cap_recall_body().
+                let packed = dec.next_u8(FieldId::IsWriteOpen).unwrap_or(0);
+                let retained_bits = (packed >> 4) & 0x0F;
                 let epoch = dec.next_u64(FieldId::CapEpoch).unwrap_or(0);
                 let retained = CapSet(retained_bits);
 

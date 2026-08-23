@@ -26,7 +26,7 @@
 #
 # Prerequisites:
 #   - Test cluster running: ./docker/start_test_env.sh --wait
-#   - FUSE mounted at /mnt/fuse inside fuse-1-test container
+#   - FUSE mounted at /mnt/powerfs inside fuse-1-test container
 # =============================================================================
 
 set -uo pipefail
@@ -35,7 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULT_DIR="/tmp/powerfs/test/p1-$(date +%Y%m%d_%H%M%S)"
 FUSE_CONTAINER="fuse-1-test"
-FUSE_MOUNT="/mnt/fuse"
+FUSE_MOUNT="/mnt/powerfs"
 
 QUICK=0
 LOG_ONLY=0

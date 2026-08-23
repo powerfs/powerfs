@@ -18,7 +18,7 @@ use powerfs_common::{
 use powerfs_core::kv_cache::KVCacheEngine;
 use powerfs_core::kv_cache_persist::KVPersistStore;
 use powerfs_net::{PowerFsNetServer, ServerConnectionManager};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -77,6 +77,11 @@ pub struct MasterNode {
     event_provider: Arc<dyn EventProvider>,
     filer_nodes: RwLock<HashMap<String, FilerNodeInfo>>,
     shard_mapping: RwLock<HashMap<u64, String>>,
+    /// Per-shard Raft leader address (shard_id → "ip:net_port").
+    /// Populated by `ShardLeaderUpdate` notifications from filers.
+    /// Used by GetTopology to advertise per-shard leaders so fuse
+    /// clients route cap RPCs directly to the leader (zero-redirect).
+    shard_leaders: RwLock<HashMap<u64, String>>,
     stripe_round_robin: Arc<AtomicU32>,
     /// Round-robin counter for single-volume assignment (assign_volume).
     /// Ensures writes are distributed across all writable volumes instead
@@ -172,6 +177,7 @@ pub struct UpdateNodeVolumesParams {
 #[derive(Debug, Clone)]
 pub struct FuseClientInfo {
     pub client_id: String,
+    pub assigned_client_id: u64,
     pub client_type: String,
     pub mount_point: String,
     pub collection: String,
@@ -188,6 +194,9 @@ pub struct FuseClientInfo {
 pub struct ClientManager {
     clients: HashMap<String, mpsc::Sender<VolumeLocationUpdate>>,
     fuse_clients: HashMap<String, FuseClientInfo>,
+    next_assigned_client_id: AtomicU64,
+    client_blacklist: RwLock<HashSet<String>>,
+    uuid_to_assigned: RwLock<HashMap<String, u64>>,
 }
 
 impl ClientManager {
@@ -195,6 +204,9 @@ impl ClientManager {
         ClientManager {
             clients: HashMap::new(),
             fuse_clients: HashMap::new(),
+            next_assigned_client_id: AtomicU64::new(1),
+            client_blacklist: RwLock::new(HashSet::new()),
+            uuid_to_assigned: RwLock::new(HashMap::new()),
         }
     }
 
@@ -215,13 +227,51 @@ impl ClientManager {
         }
     }
 
+    fn assign_client_id(&self) -> u64 {
+        self.next_assigned_client_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn is_client_blacklisted(&self, uuid: &str) -> bool {
+        self.client_blacklist
+            .read()
+            .unwrap()
+            .contains(uuid)
+    }
+
+    fn register_client_by_uuid(&mut self, uuid: String, mut info: FuseClientInfo) -> u64 {
+        if self.is_client_blacklisted(&uuid) {
+            return 0;
+        }
+        let assigned_id = self.assign_client_id();
+        info.assigned_client_id = assigned_id;
+        self.uuid_to_assigned
+            .write()
+            .unwrap()
+            .insert(uuid, assigned_id);
+        self.register_fuse_client(info);
+        assigned_id
+    }
+
+    fn deregister_client_by_uuid(&mut self, uuid: &str) {
+        self.uuid_to_assigned.write().unwrap().remove(uuid);
+        self.fuse_clients.remove(uuid);
+    }
+
+    fn add_client_to_blacklist(&self, uuid: String) {
+        self.client_blacklist.write().unwrap().insert(uuid);
+    }
+
+    fn remove_client_from_blacklist(&self, uuid: &str) {
+        self.client_blacklist.write().unwrap().remove(uuid);
+    }
+
     fn register_fuse_client(&mut self, info: FuseClientInfo) {
         info!(
-            "Registering FUSE client: id={}, type={}, mount_point={}, collection={}",
-            info.client_id, info.client_type, info.mount_point, info.collection
+            "Registering FUSE client: id={}, assigned_id={}, type={}, mount_point={}, collection={}",
+            info.client_id, info.assigned_client_id, info.client_type, info.mount_point, info.collection
         );
-        // Preserve the original connected_at if the client already exists.
         if let Some(existing) = self.fuse_clients.get_mut(&info.client_id) {
+            existing.assigned_client_id = info.assigned_client_id;
             existing.client_type = info.client_type;
             existing.mount_point = info.mount_point;
             existing.collection = info.collection;
@@ -432,6 +482,7 @@ impl MasterNode {
             event_provider,
             filer_nodes: RwLock::new(HashMap::new()),
             shard_mapping: RwLock::new(HashMap::new()),
+            shard_leaders: RwLock::new(HashMap::new()),
             stripe_round_robin: Arc::new(AtomicU32::new(0)),
             volume_round_robin: Arc::new(AtomicU32::new(0)),
             zone_registry: RwLock::new(HashMap::new()),
@@ -769,6 +820,61 @@ impl MasterNode {
 
     pub fn list_filers(&self) -> Vec<FilerNodeInfo> {
         self.filer_nodes.read().unwrap().values().cloned().collect()
+    }
+
+    /// Update the per-shard leader address. Called by handle_shard_leader_update
+    /// when a filer notifies us it gained/lost leadership.
+    /// Returns true if the table actually changed (caller uses this to
+    /// decide whether to broadcast TopologyChanged).
+    pub fn update_shard_leader(&self, shard_id: u64, leader_addr: &str) -> bool {
+        let mut leaders = self.shard_leaders.write().unwrap();
+        if leader_addr.is_empty() {
+            // Lost leadership: remove entry
+            leaders.remove(&shard_id).is_some()
+        } else {
+            // Gained leadership: update entry (only signal change if different)
+            let old = leaders.insert(shard_id, leader_addr.to_string());
+            old.as_deref() != Some(leader_addr)
+        }
+    }
+
+    /// Get the leader address for a shard. Returns empty string if unknown.
+    pub fn get_shard_leader(&self, shard_id: u64) -> String {
+        self.shard_leaders
+            .read()
+            .unwrap()
+            .get(&shard_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get all shard leaders as (shard_id, leader_addr) pairs. Used by
+    /// GetTopology to advertise per-shard leaders to fuse clients.
+    pub fn list_shard_leaders(&self) -> Vec<(u64, String)> {
+        self.shard_leaders
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Broadcast a TopologyChanged NOTIFY to all connected TLV clients
+    /// (FUSE / kernel FS). Clients react by re-fetching the full topology
+    /// via GetTopology, picking up the new per-shard leader addresses.
+    /// Returns the number of clients notified.
+    pub fn broadcast_topology_changed(&self) -> usize {
+        let net_mgr_opt = self.net_manager.read().unwrap().clone();
+        if let Some(net_mgr) = net_mgr_opt {
+            let notify_msg = powerfs_net::NetMessage::notification(
+                powerfs_net::MsgType::TopologyChanged,
+                Vec::new(),
+                Vec::new(),
+            );
+            net_mgr.broadcast_notification(&notify_msg)
+        } else {
+            0
+        }
     }
 
     /// 获取集中式调试配置存储（用于 HTTP 端点和 GetDebugConfig handler 共享）
@@ -3067,6 +3173,39 @@ impl MasterNode {
         self.client_manager.read().unwrap().get_fuse_clients()
     }
 
+    pub fn assign_client_id(&self) -> u64 {
+        self.client_manager.read().unwrap().assign_client_id()
+    }
+
+    pub fn is_client_blacklisted(&self, uuid: &str) -> bool {
+        self.client_manager.read().unwrap().is_client_blacklisted(uuid)
+    }
+
+    pub fn register_client_by_uuid(&self, uuid: String, info: FuseClientInfo) -> u64 {
+        self.client_manager
+            .write()
+            .unwrap()
+            .register_client_by_uuid(uuid, info)
+    }
+
+    pub fn deregister_client_by_uuid(&self, uuid: &str) {
+        self.client_manager
+            .write()
+            .unwrap()
+            .deregister_client_by_uuid(uuid);
+    }
+
+    pub fn add_client_to_blacklist(&self, uuid: String) {
+        self.client_manager.read().unwrap().add_client_to_blacklist(uuid);
+    }
+
+    pub fn remove_client_from_blacklist(&self, uuid: &str) {
+        self.client_manager
+            .read()
+            .unwrap()
+            .remove_client_from_blacklist(uuid);
+    }
+
     pub async fn lookup_volume(
         &self,
         volume_ids: &[String],
@@ -3553,6 +3692,7 @@ impl Clone for MasterNode {
             event_provider: self.event_provider.clone(),
             filer_nodes: RwLock::new(self.filer_nodes.read().unwrap().clone()),
             shard_mapping: RwLock::new(self.shard_mapping.read().unwrap().clone()),
+            shard_leaders: RwLock::new(self.shard_leaders.read().unwrap().clone()),
             stripe_round_robin: self.stripe_round_robin.clone(),
             volume_round_robin: self.volume_round_robin.clone(),
             zone_registry: RwLock::new(self.zone_registry.read().unwrap().clone()),

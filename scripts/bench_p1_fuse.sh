@@ -40,7 +40,7 @@
 #
 # Prerequisites:
 #   - 测试集群运行中：./docker/start_test_env.sh --wait
-#   - FUSE 已挂载在 fuse-1-test 容器的 /mnt/fuse
+#   - FUSE 已挂载在 fuse-1-test 容器的 /mnt/powerfs
 # =============================================================================
 
 set -uo pipefail
@@ -49,7 +49,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RESULT_DIR="/tmp/powerfs/test/bench-$(date +%Y%m%d_%H%M%S)"
 FUSE_CONTAINER="fuse-1-test"
-FUSE_MOUNT="/mnt/fuse"
+FUSE_MOUNT="/mnt/powerfs"
 
 QUICK=0
 PHASE_FILTER=0
