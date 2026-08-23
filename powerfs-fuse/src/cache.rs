@@ -126,7 +126,7 @@ pub struct CachedEntry {
     /// Cleared on `release()` (last close) via `take_cap`.
     pub cap: Option<crate::client_cap::ClientCap>,
 
-    /// Dentry-level lease (per-name, like Ceph's Dentry::lease_ttl).
+    /// Dentry-level lease (per-name, like Powerfs's Dentry::lease_ttl).
     ///
     /// When `Some` and `expire_at > now`, this dentry is authoritative:
     ///   - Positive dentry (inode != 0): cached attr is valid
@@ -139,13 +139,13 @@ pub struct CachedEntry {
 
     /// The parent directory's version (shared_gen) when this dentry was
     /// last validated. Compared against the cached `dir_version` to detect
-    /// stale dentries after lease expiry (Ceph's cap_shared_gen mechanism).
+    /// stale dentries after lease expiry (Powerfs's cap_shared_gen mechanism).
     pub dir_shared_gen: u64,
 }
 
 /// Per-dentry lease metadata, granted by the Filer.
 ///
-/// Modeled after Ceph's Dentry lease (Dentry.h: lease_mds, lease_ttl,
+/// Modeled after Powerfs's Dentry lease (Dentry.h: lease_mds, lease_ttl,
 /// lease_seq, lease_gen). The Filer issues a lease TTL in lookup/readdir
 /// responses; the client stores it here and trusts the dentry (positive
 /// or negative) until `expire_at`.
@@ -159,7 +159,7 @@ pub struct DentryLease {
     pub issuer: u64,
 }
 
-/// Result of checking a dentry's lease status (three-layer, like Ceph).
+/// Result of checking a dentry's lease status (three-layer, like ).
 ///
 /// Layer 1: per-dentry lease (DentryLease::expire_at)
 /// Layer 2: dir shared_gen match + dir_complete (I_COMPLETE)
@@ -273,7 +273,7 @@ struct DirCacheEntry {
     cached_at: Instant,
     /// Directory version (shared_gen) from the Filer when this listing
     /// was fetched. Compared against incoming Invalidate notifications
-    /// to detect stale listings (Ceph's I_COMPLETE + shared_gen mechanism).
+    /// to detect stale listings (Powerfs's I_COMPLETE + shared_gen mechanism).
     dir_version: u64,
     /// Whether this directory listing is complete (I_COMPLETE equivalent).
     /// Set true after a full readdir; cleared on any invalidate.
@@ -1196,7 +1196,7 @@ impl MetadataCache {
         let mut dir_cache = self.dir_cache.write().unwrap();
         dir_cache.remove(&parent_inode);
         // Bump dir_version so stale dentries with dir_shared_gen mismatch
-        // are detected on next lookup (Ceph's clear_dir_complete_and_ordered).
+        // are detected on next lookup (Powerfs's clear_dir_complete_and_ordered).
         let mut versions = self.dir_versions.write().unwrap();
         let v = versions.entry(parent_inode).or_insert(0);
         *v = v.wrapping_add(1);

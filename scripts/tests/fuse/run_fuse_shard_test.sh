@@ -23,7 +23,7 @@
 set -u
 export LC_ALL=C
 
-MOUNT="${MOUNT:-/mnt/fuse}"
+MOUNT="${MOUNT:-/mnt/powerfs}"
 TEST_ROOT="$MOUNT/shard_test"
 FUSE_LOG="${FUSE_LOG:-/var/log/powerfs-fuse.log}"
 DIAG_DIR="${DIAG_DIR:-/tmp/fuse_shard_diag}"

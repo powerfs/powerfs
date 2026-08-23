@@ -17,7 +17,7 @@
 
 set -u
 
-MOUNT="/mnt/fuse"
+MOUNT="/mnt/powerfs"
 TEST_ROOT="$MOUNT/posix_test"
 PASS=0
 FAIL=0

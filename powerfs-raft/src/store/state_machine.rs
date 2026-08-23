@@ -32,6 +32,8 @@ use openraft::type_config::TypeConfigExt;
 use openraft::EntryPayload;
 use openraft::OptionalSend;
 use openraft::RaftSnapshotBuilder;
+use tracing::debug;
+use tracing::warn;
 use openraft::RaftTypeConfig;
 use rocksdb::DB;
 use serde::Deserialize;
@@ -251,10 +253,18 @@ where
         let mut responses: Vec<(openraft::storage::ApplyResponder<C>, C::R)> = Vec::new();
         // Normal entry 的 (key, value) 对，循环结束后再写入 batch（避免跨 await 持有 ColumnFamily）。
         let mut normal_data: Vec<([u8; 8], Vec<u8>)> = Vec::new();
+        // 诊断计数：本批 apply 处理的 entry 类型分布
+        let mut normal_count: usize = 0;
+        let mut membership_count: usize = 0;
+        let mut blank_count: usize = 0;
+        let mut first_index: Option<u64> = None;
 
         while let Some((entry, responder)) = entries.try_next().await? {
             let log_id = entry.log_id();
             let index = log_id.index();
+            if first_index.is_none() {
+                first_index = Some(index);
+            }
             last_applied_log = Some(log_id.clone());
             last_applied_index = Some(index);
 
@@ -266,17 +276,31 @@ where
                     // 将 C::D 序列化后暂存（key = index big-endian）。
                     let value_bytes = serialize(d)?;
                     normal_data.push((index.to_be_bytes(), value_bytes));
+                    normal_count += 1;
                 }
                 EntryPayload::Membership(mem) => {
                     last_membership = Some(StoredMembershipOf::<C>::new(Some(log_id), mem.clone()));
+                    membership_count += 1;
                 }
-                EntryPayload::Blank => {}
+                EntryPayload::Blank => {
+                    blank_count += 1;
+                }
             }
 
             // 发送默认响应。
             if let Some(responder) = responder {
                 responses.push((responder, C::R::default()));
             }
+        }
+
+        let total_entries = normal_count + membership_count + blank_count;
+        if total_entries > 0 {
+            debug!(
+                "RocksStateMachine::apply: processed {} entries (normal={}, membership={}, blank={}) \
+                 first_index={:?} last_index={:?}",
+                total_entries, normal_count, membership_count, blank_count,
+                first_index, last_applied_index
+            );
         }
 
         // 循环结束后获取 CF 句柄，写入 batch（此区域不跨 await）。
@@ -306,8 +330,36 @@ where
         if let Some(tx) = &self.apply_notifier {
             if let Some(idx) = last_applied_index {
                 // 非阻塞发送：channel 满时丢弃通知（下次 apply 会再发）。
-                let _ = tx.try_send(idx);
+                match tx.try_send(idx) {
+                    Ok(()) => {
+                        debug!(
+                            "RocksStateMachine::apply: notified apply_index={} (entries={})",
+                            idx, total_entries
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            "RocksStateMachine::apply: apply_notifier channel FULL, \
+                             dropped notification for index {} (next apply will resend)",
+                            idx
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        warn!(
+                            "RocksStateMachine::apply: apply_notifier channel CLOSED, \
+                             no consumer is reading (index {})",
+                            idx
+                        );
+                    }
+                }
             }
+        } else if total_entries > 0 {
+            // 没有 apply_notifier：可能是 MasterNode 模式（无业务逻辑需要 replay）
+            // 或 Filer 启动时未注入 channel。记录一次 DEBUG 帮助诊断。
+            debug!(
+                "RocksStateMachine::apply: no apply_notifier set, {} entries applied silently",
+                total_entries
+            );
         }
 
         Ok(())

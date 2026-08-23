@@ -22,7 +22,7 @@ FAIL=0
 FAILED_TESTS=()
 
 CONTAINER="fuse-1-test"
-TEST_DIR="/mnt/fuse/l2_persist_test"
+TEST_DIR="/mnt/powerfs/l2_persist_test"
 
 log()  { echo "[$(date '+%H:%M:%S')] $1"; }
 ok()   { echo "  OK: $1"; PASS=$((PASS+1)); }
@@ -141,7 +141,7 @@ docker restart "$CONTAINER" > /dev/null 2>&1
 
 log "等待 FUSE 重新挂载..."
 for i in $(seq 1 30); do
-    if docker exec "$CONTAINER" mount 2>/dev/null | grep -q "/mnt/fuse"; then
+    if docker exec "$CONTAINER" mount 2>/dev/null | grep -q "/mnt/powerfs"; then
         log "FUSE 已重新挂载"
         break
     fi

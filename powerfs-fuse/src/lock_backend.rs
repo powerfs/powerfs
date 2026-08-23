@@ -30,7 +30,8 @@ use async_trait::async_trait;
 use log::debug;
 use powerfs_fuse_core::FuseClientFacade;
 use powerfs_lock_fuse::FuseLockBackend;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
 /// Backend bridging `FuseLockBackend` to `FuseClientFacade` + the
 /// FUSE client's inode metadata cache.
@@ -205,6 +206,20 @@ pub struct FacadeCapHandler {
     flusher: Arc<dyn crate::invalidate_handler::CapFlusher>,
     client_id: String,
     handle: tokio::runtime::Handle,
+    /// Per-inode serialization for concurrent recall processing.
+    ///
+    /// Without this, recall epoch=N spawns a task that enters
+    /// `sync_inline_buffer` (Raft network blocking), while epoch=N+1
+    /// arrives and calls `immediate_ack()` in a SECOND independent task
+    /// that sends ACK without waiting for epoch=N's Raft to commit.
+    /// The server sees epoch=N+1's ACK → promotes waiting client →
+    /// that client reads a stale `content_size` from filer → overwrites
+    /// epoch=N's still-in-flight dirty data.
+    ///
+    /// Fix: both `flush_and_ack` and `immediate_ack` acquire the SAME
+    /// per-inode `tokio::Mutex` inside their spawned tasks, guaranteeing
+    /// recall processing for the same inode is strictly serial.
+    recall_locks: Arc<StdMutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl FacadeCapHandler {
@@ -219,7 +234,17 @@ impl FacadeCapHandler {
             flusher,
             client_id,
             handle,
+            recall_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    /// Get or create the per-inode recall serialization gate.
+    fn lock_for(&self, inode: u64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut guards = self.recall_locks.lock().unwrap();
+        guards
+            .entry(inode)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 
@@ -229,7 +254,15 @@ impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
         let flusher = self.flusher.clone();
         let client_id = self.client_id.clone();
         let token_for_flush = token.clone();
+        let lock = self.lock_for(inode);
         self.handle.spawn(async move {
+            // §13 Guard: Serialize same-inode recall processing. Waits here
+            // if a prior recall's flush (sync_inline_buffer Raft / chunk
+            // flush) is still in-flight, so we never emit an ACK before
+            // the in-flight Raft commits. Without this lock, the server
+            // promotes a waiting client on the 2nd ACK, and that client
+            // reads stale content_size → data overwrite / lost rows.
+            let _guard = lock.lock().await;
             debug!(
                 "FacadeCapHandler: flush_and_ack inode={} token={} — flushing dirty data before ACK",
                 inode, token_for_flush
@@ -274,7 +307,15 @@ impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
     fn immediate_ack(&self, inode: u64, token: String, _epoch: u64) {
         let facade = self.facade.clone();
         let client_id = self.client_id.clone();
+        let lock = self.lock_for(inode);
         self.handle.spawn(async move {
+            // §13 Guard: Must serialize with flush_and_ack for the same
+            // inode. Otherwise epoch=N is blocked on sync_inline_buffer
+            // Raft, epoch=N+1 arrives here and sends ACK immediately,
+            // and the server prematurely promotes another client to
+            // Exclusive before epoch=N's dirty data lands on the
+            // Filer — causing silent data loss.
+            let _guard = lock.lock().await;
             debug!(
                 "FacadeCapHandler: immediate_ack inode={} token={}",
                 inode, token

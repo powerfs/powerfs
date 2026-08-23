@@ -614,6 +614,39 @@ pub enum MsgType {
     Heartbeat = 0x0052,
     KeepConnected = 0x0053,
     VolumeList = 0x0054,
+    /// FUSE/kernel → Master: register (or re-register after restart) this
+    /// client and receive a master-assigned numeric `assigned_client_id`.
+    /// The Master also checks whether the persistent `client_uuid` is
+    /// blacklisted and, if so, denies the mount with
+    /// `STATUS_ERR_PERMISSION_DENIED`.
+    ///
+    /// Request TLV (reuses the KeepConnected field ids for symmetry):
+    ///   ClientUuid (0x61)  → persistent client identity string
+    ///   Backend             → client_type string ("fuse"/"kernel")
+    ///   Name                → mount_point string
+    ///   Collection          → collection name
+    ///   Replication         → replication placement
+    ///   Owner               → host/container hostname
+    ///   Limit               → pid (u64)
+    /// Response TLV (STATUS_OK = allowed, STATUS_ERR_PERMISSION_DENIED =
+    /// blacklisted, STATUS_ERR_REDIRECT = non-leader):
+    ///   ClientId (0x30)     → master-assigned numeric client_id (u64)
+    ///   Owner               → current master leader address (string)
+    ///   MountAllowed (0xD2) → 1 if mount is allowed, 0 otherwise (u8)
+    ///   Message (0x26)      → optional denial reason (string)
+    RegisterClient = 0x0055,
+    /// FUSE/kernel → Master (on unmount): signal graceful shutdown so the
+    /// Master can evict the client's heartbeat entry early (instead of
+    /// waiting for heartbeat-age timeout).  The request carries both the
+    /// persistent UUID and the assigned numeric id so either side can
+    /// correlate.
+    ///
+    /// Request TLV:
+    ///   ClientUuid (0x61) → persistent client identity
+    ///   ClientId (0x30)   → master-assigned numeric id (u64)
+    /// Response TLV:
+    ///   Owner             → leader address (string)
+    DeregisterClient = 0x0056,
 
     // Volume operations
     CreateVolume = 0x0060,
@@ -643,6 +676,23 @@ pub enum MsgType {
     /// List registered filers (addr + net_port + health + shard_ids).
     /// Used by kernel client on mount to discover filer nodes from Master.
     ListFilers = 0x0074,
+
+    /// Filer → Master: notify that this filer gained/lost leadership of a
+    /// shard Raft group. The Master maintains a `shard_id → leader_addr`
+    /// table so that fuse clients can route cap RPCs directly to the
+    /// shard leader on the very first request (zero-redirect fast path).
+    ///
+    /// Design principle: requests must not be forwarded between services;
+    /// a non-leader must reject and redirect. By having the Master
+    /// advertise per-shard leaders, the fuse client's first
+    /// `cap_open_grant` lands on the true leader instead of relying on
+    /// the Follower's `check_leader_strict` redirect fallback.
+    ///
+    /// Request TLV: ShardId(u64) + Force(u8, 1=gained 0=lost)
+    ///              + Owner(filer_id string) + FilerAddress(leader_addr)
+    /// Response: STATUS_OK only (Master updates internal table +
+    ///           broadcasts TopologyChanged to all connected clients).
+    ShardLeaderUpdate = 0x0075,
 
     // Extended Lease operations
     AcquireLease = 0x0080,
@@ -748,6 +798,8 @@ impl MsgType {
             0x0052 => Some(Self::Heartbeat),
             0x0053 => Some(Self::KeepConnected),
             0x0054 => Some(Self::VolumeList),
+            0x0055 => Some(Self::RegisterClient),
+            0x0056 => Some(Self::DeregisterClient),
             0x0060 => Some(Self::CreateVolume),
             0x0061 => Some(Self::DeleteVolume),
             0x0062 => Some(Self::WriteNeedle),
@@ -764,6 +816,7 @@ impl MsgType {
             0x0072 => Some(Self::TopologyChanged),
             0x0073 => Some(Self::AssignVolumeV2),
             0x0074 => Some(Self::ListFilers),
+            0x0075 => Some(Self::ShardLeaderUpdate),
             0x0080 => Some(Self::AcquireLease),
             0x0081 => Some(Self::ReleaseLease),
             0x0082 => Some(Self::RenewLease),
@@ -935,6 +988,8 @@ pub enum FieldId {
     Entries = 0x23,
     Count = 0x24,
     Entry = 0x25,
+    /// Human-readable error/status message string (e.g. RegisterClient denial reason).
+    Message = 0x26,
 
     // Delta sync fields
     ClientId = 0x30,
@@ -1000,6 +1055,11 @@ pub enum FieldId {
     /// Serialized Raft protocol message (eraftpb::Message protobuf bytes).
     /// Used by MsgType::RaftMessage for Filer inter-node Raft transport.
     RaftPayload = 0x9E,
+    /// Count of per-shard leader entries in GetTopology response (followed
+    /// by N × (ShardId + FilerAddress) pairs). Populated by the Master
+    /// from ShardLeaderUpdate notifications so fuse clients route cap RPCs
+    /// directly to the shard leader (zero-redirect fast path).
+    ShardLeaderEntries = 0x9F,
 
     // ===== FileLayout fields (0xA0-0xAF) — powerfs-layout crate =====
     // 设计文档 §9.1: 文件布局三维正交模型协议字段
@@ -1172,6 +1232,10 @@ pub enum FieldId {
     RCtimeSec = 0xD0,
     /// Last rstat refresh timestamp, nanoseconds part (u32).
     RCtimeNsec = 0xD1,
+    /// RegisterClient response flag: 1 = mount permission granted by
+    /// Master (client_uuid not blacklisted), 0 = denied (u8).
+    /// Denial reason is usually carried in FieldId::Message (0x26).
+    MountAllowed = 0xD2,
 }
 
 impl FieldId {
@@ -1211,6 +1275,7 @@ impl FieldId {
             0x23 => Some(Self::Entries),
             0x24 => Some(Self::Count),
             0x25 => Some(Self::Entry),
+            0x26 => Some(Self::Message),
             0x30 => Some(Self::ClientId),
             0x31 => Some(Self::Seq),
             0x32 => Some(Self::VclockEntries),
@@ -1246,6 +1311,7 @@ impl FieldId {
             0x9C => Some(Self::FilerAddress),
             0x9D => Some(Self::NetPort),
             0x9E => Some(Self::RaftPayload),
+            0x9F => Some(Self::ShardLeaderEntries),
             0xA0 => Some(Self::Placement),
             0xA1 => Some(Self::Reliability),
             0xA2 => Some(Self::ReliabilityState),
@@ -1296,6 +1362,7 @@ impl FieldId {
             0xCF => Some(Self::RSubdirs),
             0xD0 => Some(Self::RCtimeSec),
             0xD1 => Some(Self::RCtimeNsec),
+            0xD2 => Some(Self::MountAllowed),
             _ => None,
         }
     }

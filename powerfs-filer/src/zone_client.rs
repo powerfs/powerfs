@@ -224,6 +224,111 @@ fn parse_zones_response(body: &[u8], filer_id: &str) -> Result<Vec<ZoneInfo>, St
     Ok(zones)
 }
 
+/// Filer → Master: notify that this filer gained/lost leadership of a
+/// shard Raft group. Best-effort (fire-and-forget): the filer does not
+/// block on the Master's response — if the notification is lost, the
+/// fuse client's `check_leader_strict` redirect fallback still works.
+///
+/// The Master uses this to maintain a `shard_id → leader_addr` table
+/// so that fuse clients route cap RPCs directly to the shard leader on
+/// the very first request (zero-redirect fast path).
+///
+/// TLV: ShardId(u64) + Force(u8, 1=gained 0=lost)
+///      + Owner(filer_id) + FilerAddress(leader_addr)
+pub async fn notify_shard_leader_change(
+    master_addr: &str,
+    shard_id: u64,
+    is_leader: bool,
+    filer_id: &str,
+    leader_addr: &str,
+) {
+    let mut current_addr = master_addr.to_string();
+    // Retry on connection failure (e.g. Master still starting up during
+    // filer boot — shard_leader_notifier fires before Master's net_port
+    // is listening). 10 × 3s = 30s covers Master Raft election + boot.
+    const MAX_ATTEMPTS: usize = 10;
+
+    for depth in 0..MAX_ATTEMPTS {
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_u64(FieldId::ShardId, shard_id);
+        let _ = enc.add_u8(FieldId::Force, if is_leader { 1 } else { 0 });
+        let _ = enc.add_string(FieldId::Owner, filer_id);
+        let _ = enc.add_string(FieldId::FilerAddress, leader_addr);
+        let body = enc.into_bytes();
+
+        let client_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(1);
+        let reply = match powerfs_net::call_once(
+            &current_addr,
+            powerfs_net::ClientType::Filer,
+            client_id,
+            powerfs_net::CHANNEL_DATA,
+            powerfs_net::MsgType::ShardLeaderUpdate,
+            &body,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Connection failure (e.g. Master still booting). Retry
+                // after 3s — the shard_leader_notifier task is async so
+                // this does not block the filer's main runtime.
+                if depth + 1 < MAX_ATTEMPTS {
+                    warn!(
+                        "ZONE_CLIENT: notify_shard_leader_change to {} failed: {} (shard={}, is_leader={}, attempt={}/{}), retrying in 3s",
+                        current_addr, e, shard_id, is_leader, depth + 1, MAX_ATTEMPTS
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+                warn!(
+                    "ZONE_CLIENT: notify_shard_leader_change to {} failed after {} attempts: {} (shard={}, is_leader={})",
+                    current_addr, MAX_ATTEMPTS, e, shard_id, is_leader
+                );
+                return;
+            }
+        };
+
+        if reply.status == STATUS_ERR_REDIRECT {
+            if !reply.body.is_empty() {
+                let mut dec = TlvDecoder::new(&reply.body);
+                if let Ok(leader) = dec.next_string(FieldId::Owner) {
+                    if !leader.is_empty() && leader != current_addr {
+                        current_addr = leader;
+                        continue;
+                    }
+                }
+            }
+            warn!(
+                "ZONE_CLIENT: shard_leader_update redirected but no leader (shard={}, depth={})",
+                shard_id, depth
+            );
+            return;
+        }
+
+        if reply.status == STATUS_OK {
+            debug!(
+                "ZONE_CLIENT: shard_leader_update OK shard={} is_leader={} filer_id={} addr={}",
+                shard_id, is_leader, filer_id, leader_addr
+            );
+            return;
+        }
+
+        warn!(
+            "ZONE_CLIENT: shard_leader_update unexpected status={} (shard={}, is_leader={})",
+            reply.status, shard_id, is_leader
+        );
+        return;
+    }
+
+    warn!(
+        "ZONE_CLIENT: shard_leader_update exceeded {} attempts (shard={})",
+        MAX_ATTEMPTS, shard_id
+    );
+}
+
 /// 从 chunk 映射恢复 needle_id counter。
 /// File-key 分配步长.
 ///

@@ -23,7 +23,7 @@
 
 set -u
 
-MOUNT="/mnt/fuse"
+MOUNT="/mnt/powerfs"
 TEST_ROOT="$MOUNT/fuse_full_test"
 PASS=0
 FAIL=0

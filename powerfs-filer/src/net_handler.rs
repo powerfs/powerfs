@@ -1013,6 +1013,55 @@ impl FilerNetHandler {
         Ok(())
     }
 
+    /// Strict leader check for RPCs that bypass Raft propose().
+    ///
+    /// `check_leader` intentionally lets all requests pass through and relies
+    /// on `propose()` returning `not_leader` as the ground-truth fallback.
+    /// That works for write-path RPCs (create/mkdir/setattr/...) because they
+    /// call `propose()`. But **cap RPCs** (`CapOpenGrant` / `CapRecallAck` /
+    /// `CapRelease`) operate on the in-memory `LockArbiter` state and never
+    /// call `propose()` — so the fallback never fires and a Follower would
+    /// silently grant caps using its own (empty) local lock state, breaking
+    /// the "request must not be served by a non-leader" invariant.
+    ///
+    /// Design principle (hard constraint): requests must not be forwarded
+    /// between services; a non-leader must reject the request and let the
+    /// client reconnect to the real leader. This method enforces that for
+    /// cap RPCs by checking live Raft state (not stale metrics snapshot)
+    /// and returning `STATUS_ERR_REDIRECT` with the leader net address.
+    async fn check_leader_strict(
+        &self,
+        msg: &NetMessage,
+        shard_id: ShardId,
+    ) -> Result<(), NetMessage> {
+        let (is_leader, leader_addr) = self
+            .meta_shard_manager
+            .get_shard_leader_status(shard_id)
+            .await
+            .unwrap_or((false, String::new()));
+        if is_leader {
+            return Ok(());
+        }
+        // Not leader: build redirect response. Prefer the real leader
+        // address from live metrics; if unknown (election in progress),
+        // fall back to self-redirect so the client's round-robin retry
+        // (ROUTE_CHECKING) can still find the leader.
+        let self_grpc = self.meta_shard_manager.get_node_grpc_address();
+        let self_net = Self::grpc_addr_to_net_addr(&self_grpc, self.net_port);
+        let owner_net_addr = if !leader_addr.is_empty() {
+            Self::grpc_addr_to_net_addr(&leader_addr, self.net_port)
+        } else {
+            self_net
+        };
+        warn!(
+            "check_leader_strict: not leader for shard {}, redirecting client to {}",
+            shard_id.0, owner_net_addr
+        );
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_string(FieldId::Owner, &owner_net_addr);
+        Err(Self::build_response(msg, STATUS_ERR_REDIRECT, enc.into_bytes()))
+    }
+
     /// Convert gRPC address to net address by replacing the port.
     /// gRPC address format: "ip:grpc_port" (e.g., "172.21.0.33:8889")
     /// Net address format: "ip:net_port" (e.g., "172.21.0.33:8890")
@@ -1304,9 +1353,27 @@ impl FilerNetHandler {
             msg.header.seq, parent_ino, name
         );
 
-        // Check leadership for the correct shard before reading
+        // Check leadership for the correct shard before reading.
+        //
+        // P3: Use `check_leader_strict` (not the no-op `check_leader`) for
+        // lookups. This ensures the shard LEADER serves the lookup, which is
+        // critical for `async_meta_persist` mode:
+        //
+        // - The leader stages newly created inodes/direntries in MetaCache
+        //   BEFORE Raft apply completes. A lookup on the leader hits the
+        //   staging cache and returns immediately.
+        // - A follower has NO staging entry. If the lookup arrives before
+        //   Raft replication+apply completes (typically ~1-5ms but can be
+        //   longer under load), the follower returns NOT FOUND → EIO to the
+        //   client. This was the root cause of cross-client "file not found"
+        //   immediately after create.
+        //
+        // Design principle: "非leader节点不能处理请求；客户端收到非leader
+        // 错误后必须重连leader" — lookups are reads but must still be served
+        // by the leader for strong consistency (linearizability) with the
+        // staging cache.
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
-        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
             return Ok(redirect);
         }
 
@@ -1451,8 +1518,11 @@ impl FilerNetHandler {
         info!("FILER_NET_GETATTR: ino={}", ino);
 
         // inode-level read → route by calculate_shard(inode)
+        // P3: Use `check_leader_strict` for the same reason as handle_lookup —
+        // the leader has MetaCache staging entries for newly created inodes,
+        // followers don't. See handle_lookup comment for full rationale.
         let shard_id = self.shard_strategy.calculate_shard(ino);
-        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
             return Ok(redirect);
         }
 
@@ -2538,9 +2608,11 @@ impl FilerNetHandler {
             parent_ino, limit, last_name
         );
 
-        // Check leadership for the correct shard before reading
+        // Check leadership for the correct shard before reading.
+        // P3: Use `check_leader_strict` — newly created dir entries may only
+        // exist in the leader's MetaCache staging, not yet applied on followers.
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
-        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
             return Ok(redirect);
         }
 
@@ -3608,11 +3680,13 @@ impl FilerNetHandler {
         }
 
         // Route to shard leader (cap state lives on the leader).
+        // Strict check: cap RPCs bypass propose(), so a Follower has no
+        // not_leader fallback — it must reject and redirect the client.
         let shard_id = self
             .meta_shard_manager
             .get_shard_strategy()
             .calculate_shard(inode);
-        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
             return Ok(redirect);
         }
 
@@ -3707,18 +3781,18 @@ impl FilerNetHandler {
             ));
         }
 
-        // Route to shard leader.
+        // Route to shard leader (strict: cap state lives only on leader).
         let shard_id = self
             .meta_shard_manager
             .get_shard_strategy()
             .calculate_shard(inode);
-        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
             return Ok(redirect);
         }
 
         match self.cap_mgr.recall_ack(inode, &client_id, &token) {
             Ok(retained) => {
-                debug!(
+                info!(
                     "CAP_RECALL_ACK: inode={} client={} retained={:?}",
                     inode, client_id, retained
                 );
@@ -3768,12 +3842,12 @@ impl FilerNetHandler {
             ));
         }
 
-        // Route to shard leader.
+        // Route to shard leader (strict: cap state lives only on leader).
         let shard_id = self
             .meta_shard_manager
             .get_shard_strategy()
             .calculate_shard(inode);
-        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
             return Ok(redirect);
         }
 
