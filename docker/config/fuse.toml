@@ -22,6 +22,6 @@ request_timeout_secs = 10            # 测试环境: 10s, 给 Raft 共识足够�
 admin_port = 9999                    # Admin/debug HTTP server for request stats
 
 [fuse.lease]
-mode = "inode"
+mode = "cap"
 lease_duration_ms = 30000
 renew_interval_ms = 10000

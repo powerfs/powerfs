@@ -2999,10 +2999,14 @@ impl ShardStore {
                     "Shard {} A6-SYNC-FID: inode {} setting fid={:?} volume_id={} \
                      (from chunks[0] vid={} needle_id={:#x}) — \
                      prev_fid={:?} prev_vid={:?}",
-                    self.shard_id.0, inode,
-                    fid_str, vid,
-                    vid, file_key,
-                    info.fid, info.volume_id
+                    self.shard_id.0,
+                    inode,
+                    fid_str,
+                    vid,
+                    vid,
+                    file_key,
+                    info.fid,
+                    info.volume_id
                 );
                 info.fid = Some(fid_str);
                 info.volume_id = Some(vid);

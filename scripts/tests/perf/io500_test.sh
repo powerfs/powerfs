@@ -18,14 +18,14 @@
 #   - mdtest-easy-write-removal: Remove files
 #
 # Usage:
-#   ./io500_test.sh [--mount=/mnt/fuse] [--runtime=30] [--size=10g] [--quick]
+#   ./io500_test.sh [--mount=/mnt/powerfs] [--runtime=30] [--size=10g] [--quick]
 #
 # =============================================================================
 
 set -e
 
 # Default configuration
-MOUNT_DIR="${IO500_MOUNT:-/mnt/fuse}"
+MOUNT_DIR="${IO500_MOUNT:-/mnt/powerfs}"
 RUNTIME="${IO500_RUNTIME:-30}"  # seconds per test
 DATA_SIZE="${IO500_DATA_SIZE:-10g}"
 QUICK_MODE=false
@@ -40,7 +40,7 @@ while [[ $# -gt 0 ]]; do
         --quick) QUICK_MODE=true; RUNTIME=10; DATA_SIZE="1g" ;;
         --help|-h) 
             echo "IO500 Test Suite for PowerFS"
-            echo "Usage: $0 [--mount=/mnt/fuse] [--runtime=30] [--size=10g] [--quick]"
+            echo "Usage: $0 [--mount=/mnt/powerfs] [--runtime=30] [--size=10g] [--quick]"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;

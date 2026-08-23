@@ -17,14 +17,16 @@ replication = "000"
 threads = 8
 verbose = true
 container = true
+log_file = "/var/log/powerfs-fuse.log"
 # Fallback when master topology has no healthy filer shards yet.
 force_mount = true
 filer_addresses = ["172.30.0.31", "172.30.0.32", "172.30.0.33"]
 volume_addresses = ["172.30.0.21", "172.30.0.22", "172.30.0.23",
                     "172.30.0.24", "172.30.0.25", "172.30.0.26"]
 request_timeout_secs = 10
+admin_port = 9998
 
 [fuse.lease]
-mode = "inode"                          # 方案A: Filer inode metadata lease，强制write串行化
+mode = "cap"                            # §13: Cap 模型，通过 cap_open_grant + CapRecallNotify 实现强一致互斥
 lease_duration_ms = 30000
 renew_interval_ms = 10000

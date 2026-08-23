@@ -1092,21 +1092,40 @@ impl PowerFsFs {
             .runtime()
             .block_on(facade.cap_open_grant(inode, &cid, is_write_open))
         {
-            Ok((cap_token, caps_bits, epoch, sn, _duration_ms)) => {
+            Ok((cap_token, caps_bits, epoch, sn, duration_ms)) => {
                 let caps = crate::client_cap::CapSet(caps_bits);
                 let cap_id = sn;
                 let cap = crate::client_cap::ClientCap::new(
                     cap_id,
-                    cap_token,
+                    cap_token.clone(),
                     caps,
                     epoch,
                     is_write_open,
                     sn,
                 );
                 self.cache.grant_cap(inode, cap);
+                // §13 Fix (L4.17): Bind the cap token to the open-file
+                // lease registry. The release() path's flush_dirty_chunks
+                // consults this registry BEFORE falling through to
+                // ensure_lease. Without this binding, a chunk-mode file's
+                // release() has no token for the write RPC → ensure_lease
+                // runs the Volume Server's range-lease acquire → A and B
+                // race on the same stripe 0 exclusive lease → one gets
+                // STATUS_ERR_SERVER_ERROR=10 → write fails with EIO.
+                //
+                // Note: we deliberately reuse the existing
+                // OpenFileLeaseRegistry even though this is a *cap* token,
+                // not a legacy inode/range lease: Volume Server's
+                // lease_enabled=false (方案A config) skips token
+                // validation, so any non-empty string satisfies the
+                // write_blob code path that expects *some* token to
+                // forward. No sense building a parallel registry.
+                let expire_at = std::time::Instant::now()
+                    + std::time::Duration::from_millis(duration_ms);
+                self.open_file_leases.bind(inode, cap_token, expire_at);
                 debug!(
-                    "acquire_cap_on_open: cap_open_grant success inode={} caps={:#b} epoch={} sn={}",
-                    inode, caps_bits, epoch, sn
+                    "acquire_cap_on_open: cap_open_grant success inode={} caps={:#b} epoch={} sn={} bound_token={}ms",
+                    inode, caps_bits, epoch, sn, duration_ms
                 );
             }
             Err(e) => {
@@ -1227,10 +1246,28 @@ impl PowerFsFs {
         // token, try the open-file-lease registry (bound at open
         // time). Falls through to `None` → `ensure_lease` if no
         // lease is bound or it's expired — graceful degradation.
+        //
+        // §13 Fix (L4.17, layer 2/3): Add a SECONDARY fallback to the
+        // inode's cached cap token. Covers callers that flush without
+        // going through release() — e.g. the background dirty-chunk
+        // flusher (flush_all_dirty_chunks calls flush_dirty_chunks(…,
+        // None)), or a read path that flushes a dirty chunk before
+        // reading. The open_file_lease entry may have been removed by
+        // a concurrent release() on a different fd of the same inode,
+        // but the cache entry's cap survives until the entry is
+        // evicted. Using the cap token here avoids falling through to
+        // ensure_lease → Volume range-lease acquire → stripe 0 conflict
+        // → STATUS_ERR_SERVER_ERROR=10.
         let bound_token = if lease_token.is_some() {
             lease_token.map(|s| s.to_string())
         } else {
-            self.open_file_leases.get_valid_token(inode)
+            self.open_file_leases
+                .get_valid_token(inode)
+                .or_else(|| {
+                    self.cache
+                        .get_cap(inode)
+                        .map(|cap| cap.token.clone())
+                })
         };
         self.flush_dirty_chunks_impl(inode, bound_token.as_deref())
     }
@@ -2578,6 +2615,39 @@ impl crate::invalidate_handler::CapFlusher for PowerFsFs {
             // Flat/chunk mode: flush dirty chunks to Volume Server, then
             // sync metadata to Filer via Raft.
 
+            // §13 Guard: If the entry was concurrently evicted by the
+            // InvalidateHandler (inline_buffer removed AND no cached entry
+            // with chunks/fid), the dirty state has already been synced,
+            // or the evict path already handled cleanup. Skip expensive
+            // sync to avoid blocking on Raft commits / redirect retries
+            // that exceed the server's 2s GATHER timeout. Without this
+            // guard, inode=X evict → recall arrives → flush_and_sync
+            // takes the chunk branch on an inline-mode file, calling
+            // sync_size_chunks_on_close which retries ReleaseInodeLease
+            // against a non-leader → times out → server force-reclaims.
+            let entry_exists = self.cache.get_inode(inode).is_some();
+            let has_dirty_inline = self
+                .inline_buffers
+                .get(&inode)
+                .map(|b| b.dirty)
+                .unwrap_or(false);
+            let has_dirty_chunks = self.chunk_cache.has_dirty_chunks(inode);
+            let has_dirty_shards = self.has_dirty_for_inode(inode);
+            let has_any_buffers = self.inline_buffers.contains_key(&inode)
+                || entry_exists
+                || has_dirty_chunks
+                || has_dirty_inline
+                || has_dirty_shards;
+            if !has_any_buffers {
+                debug!(
+                    "PowerFsFs::cap_flush_and_sync: inode={} — no inline_buffer and no cached entry \
+                     (concurrent invalidation). Skipping flush as nothing to sync.",
+                    inode
+                );
+                self.cache.mark_cap_flushed(inode);
+                return Ok(());
+            }
+
             // Step 1: Flush dirty chunks to Volume Server. Pass the cap token
             // so write RPCs carry the correct fencing epoch.
             let flush_result = self.flush_dirty_chunks(inode, Some(lease_token));
@@ -2679,7 +2749,7 @@ impl FileSystem for PowerFsFs {
         //     client modified it (cross-client invalidation push).
         //
         // Previously we returned the Stale entry directly, mirroring an
-        // unpatched Ceph client. That caused:
+        // unpatched  client. That caused:
         //   * T1.3: lookup → create_fuse_entry reported a plausible size but
         //     subsequent getattr/read re-hit the same Stale entry, never
         //     triggering refresh, producing reads of 0 bytes (md5 empty).
@@ -2687,7 +2757,7 @@ impl FileSystem for PowerFsFs {
         // the Filer issued a real dentry lease, the Layer 1/2 handlers below
         // will still short-circuit correctly; otherwise we proceed to Step 2
         // (RPC to Filer) and re-insert a Clean entry with the authoritative
-        // fid/chunks/size — the same behaviour as Client::ll_lookup in Ceph
+        // fid/chunks/size — the same behaviour as Client::ll_lookup in 
         // (which always re-validates a dentry without a valid lease).
         if let Some(entry) = self.lookup_in_cache(parent, name_str) {
             use crate::cache::EntryState;
@@ -2707,7 +2777,7 @@ impl FileSystem for PowerFsFs {
             // which goes to Filer leader, but `stat` triggers lookup which
             // hits the unconditional Clean-state cache).
             //
-            // Ceph reference (Client::ll_lookup → MClientRequest::make_request
+            //  reference (Client::ll_lookup → MClientRequest::make_request
             // only short-circuits when cap/dentry-lease is valid): only trust
             // cache WITHOUT an RPC when Layer 1 or Layer 2 says YES (i.e.,
             // the Filer explicitly granted — and hasn't revoked — permission
@@ -2747,7 +2817,7 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        // 1b. Dentry lease three-layer check (aligned with Ceph):
+        // 1b. Dentry lease three-layer check (aligned with ):
         //
         // Layer 1: per-dentry lease valid → trust cache (positive or negative)
         // Layer 2: shared_gen matches + dir complete → trust cache
@@ -2876,8 +2946,8 @@ impl FileSystem for PowerFsFs {
                 // By harvesting the inline_data from LOOKUP (the canonical
                 // source that also drives stat()) we eliminate 100% of the
                 // lag window for inline-mode small files (<8KB). This also
-                // matches Ceph FUSE Client::ll_lookup which prefetches
-                // inline_data (in the Ceph "Backtrace" blob) directly in the
+                // matches  FUSE Client::ll_lookup which prefetches
+                // inline_data (in the  "Backtrace" blob) directly in the
                 // MDS lookup reply.
                 // P2.5 T1.6 Step3 fix: Flat模式文件因Raft apply lag/MetaCache投影
                 // 时序差，LOOKUP响应可能出现 placement=Inline(stale) + chunks非空。
@@ -3657,7 +3727,7 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        // Queue the filer-side unlink. Behaviour mirrors Ceph
+        // Queue the filer-side unlink. Behaviour mirrors 
         // `Client::_unlink` (a synchronous make_request that waits for the
         // MDS reply), with an optimisation for bulk deletions:
         //
@@ -3673,7 +3743,7 @@ impl FileSystem for PowerFsFs {
         //     old positive dentry.
         //   * LARGE queue (>= 16 entries) — keep the existing batched
         //     async-spawn behaviour for throughput (rm -rf big-directory/).
-        //     This mirrors Ceph's `MClientRequest_BATCH` / MDS
+        //     This mirrors 's `MClientRequest_BATCH` / MDS
         //     BatchOp capability; the error semantics for bulk deletion are
         //     allowed to be best-effort because shells do not check
         //     per-entry exit codes from `rm -rf`.
@@ -3683,7 +3753,7 @@ impl FileSystem for PowerFsFs {
         // Filer rejects the deletion, the cache will be repopulated
         // correctly on the next lookup RPC (because fn lookup now falls
         // through when state is Stale — see the 2650 guard). This is the
-        // same trade-off that Ceph makes: mark the cap dirty first, send
+        // same trade-off that  makes: mark the cap dirty first, send
         // to MDS, and rely on MDS recall/cap drop if the mutation fails.
         let shard_id = self.routing_shard(parent);
         // Result propagated back to the FUSE callback; Ok(()) only when
@@ -3783,7 +3853,7 @@ impl FileSystem for PowerFsFs {
         // Performed AFTER the synchronous Filer ACK so other clients (and
         // our own cached readdir listing) only observe the deletion once it
         // is durable on the Filer shard leader — same ordering as
-        // Ceph Server::_unlink_local_finish → mdcache.unlink → reply.
+        //  Server::_unlink_local_finish → mdcache.unlink → reply.
         self.invalidate_dir_entries(parent);
 
         match sync_flush_result {
@@ -4765,7 +4835,7 @@ impl FileSystem for PowerFsFs {
         //     data loss. Now we RETRY a few times with backoff; if the
         //     lease is still held by another client after retries,
         //     return EAGAIN so the application retries open (POSIX
-        //     semantics). This mirrors Ceph Client::open's cap acquire
+        //     semantics). This mirrors  Client::open's cap acquire
         //     which BLOCKS on MDS caps before granting the fd.
         //
         //   A3 (inline covered): Previously we only acquired a lease
@@ -4911,7 +4981,7 @@ impl FileSystem for PowerFsFs {
         // the "non-inline Ok(_)" branch which did nothing — leaving the cache
         // entry still empty and causing cross-client reads to return 0 bytes
         // (md5 = d41d8cd9…empty). This is the T1.3 root cause. Fix mirrors
-        // what Ceph Client::handle_caps does: on any refresh, merge the new
+        // what  Client::handle_caps does: on any refresh, merge the new
         // authoritative layout (fid/chunks/size) into the client cache.
         // Fallback refresh trigger (Bug5c fix + Bug6b fix + fx1 original):
         //   Case A: no usable inline_buffers + fid=None + chunks=[]
@@ -6458,10 +6528,35 @@ impl FileSystem for PowerFsFs {
                                     );
                                     match getattr_res {
                                         Ok(attr) if attr.is_inline() => {
-                                            let filer_inline_data =
+                                            let mut filer_inline_data =
                                                 attr.inline_data.unwrap_or_default();
                                             let dlen = filer_inline_data.len();
-                                            if dlen > 0 {
+                                            // §13 FIX (L4.21 data loss): Truncate inline_data
+                                            // to the authoritative content_size (filer_cs).
+                                            //
+                                            // Root cause: Filer occasionally returns an
+                                            // `inline_data` vec whose len() exceeds the
+                                            // declared `content_size` (trailing stale bytes
+                                            // from a prior Raft log entry / unpruned vec
+                                            // capacity). Without the truncate, `original_len`
+                                            // is set to dlen > filer_cs, so the NEXT writer's
+                                            // O_APPEND lands at `offset = filer_cs` where
+                                            // `offset < original_len` → `mod_in_place = true`
+                                            // → `can_append = false` → sync_inline_buffer
+                                            // fires OVERWRITE mode and silently replaces the
+                                            // entire file with the writer's local view, losing
+                                            // the other client's rows.
+                                            if (filer_cs as usize) < dlen {
+                                                warn!(
+                                                    "write append TRUST_FILER inline refresh: \
+                                                     inode={} truncating inline_data \
+                                                     dlen={} → filer_cs={} (stale trailing bytes)",
+                                                    inode, dlen, filer_cs,
+                                                );
+                                                filer_inline_data.truncate(filer_cs as usize);
+                                            }
+                                            let dlen = filer_inline_data.len();
+                                            if dlen > 0 || filer_cs > 0 {
                                                 warn!(
                                                     "write append TRUST_FILER inline refresh: \
                                                      inode={} replacing local inline_buf \
@@ -6472,12 +6567,20 @@ impl FileSystem for PowerFsFs {
                                                     self.inline_buffers.contains_key(&inode),
                                                     std::thread::current().id(),
                                                 );
+                                                // §13 FIX: Use filer_cs as original_len (NOT
+                                                // the vec len). This is the authoritative
+                                                // boundary: any future write at `offset =
+                                                // filer_cs` must be treated as APPEND (not
+                                                // mod_in_place), so `can_append` stays true
+                                                // and we send an incremental delta instead of
+                                                // a full OVERWRITE.
+                                                let original_len = filer_cs as usize;
                                                 self.inline_buffers.insert(
                                                     inode,
                                                     InlineBuffer {
                                                         data: filer_inline_data,
                                                         dirty: false,
-                                                        original_len: dlen,
+                                                        original_len,
                                                         modified_in_place: false,
                                                         needs_refresh: false,
                                                     },
@@ -8463,7 +8566,7 @@ impl FileSystem for PowerFsFs {
         // Mark the directory as complete (I_COMPLETE equivalent) so that
         // subsequent lookups can trust negative dentries (cache miss = ENOENT)
         // without sending an RPC, as long as the dir_version (shared_gen)
-        // hasn't changed. This is the Ceph I_COMPLETE mechanism.
+        // hasn't changed. This is the  I_COMPLETE mechanism.
         if offset == 0 {
             let dir_version = self.cache.get_dir_version(inode);
             self.cache.mark_dir_complete(inode, dir_version);

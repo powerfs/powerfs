@@ -2161,7 +2161,7 @@ fn attr_from_resp_with_layout(resp: serialize::AttrResponse, body: &[u8]) -> Met
 
     // Dentry lease: parse DirVersion and DentryLeaseTtl from the response body.
     // These are added by the Filer in lookup responses to support per-dentry
-    // lease caching (three-layer check like Ceph).
+    // lease caching (three-layer check).
     {
         use powerfs_net::serialize::TlvDecoder;
         let mut dec = TlvDecoder::new(body);

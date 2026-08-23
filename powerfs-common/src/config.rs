@@ -524,9 +524,9 @@ impl PowerFsConfig {
 
         // === Lease 模式校验 ===
         let mode = &self.fuse.lease.mode;
-        if mode != "range" && mode != "inode" {
+        if mode != "range" && mode != "inode" && mode != "cap" {
             return Err(ConfigError::ValidationError(format!(
-                "fuse.lease.mode must be 'range' or 'inode', got '{}'",
+                "fuse.lease.mode must be 'range', 'inode' or 'cap', got '{}'",
                 mode
             )));
         }
@@ -782,9 +782,9 @@ impl PowerFsConfig {
             ));
         }
         let mode = &self.fuse.lease.mode;
-        if mode != "range" && mode != "inode" {
+        if mode != "range" && mode != "inode" && mode != "cap" {
             return Err(ConfigError::ValidationError(format!(
-                "fuse.lease.mode must be 'range' or 'inode', got '{}'",
+                "fuse.lease.mode must be 'range', 'inode' or 'cap', got '{}'",
                 mode
             )));
         }

@@ -29,7 +29,7 @@
 
 set -u
 
-MOUNT="/mnt/fuse"
+MOUNT="/mnt/powerfs"
 TEST_ROOT="$MOUNT/l6_ltp_test"
 TMPDIR_LTP="$TEST_ROOT/tmp"
 RESULT_DIR="/tmp/l6_results"

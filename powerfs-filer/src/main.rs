@@ -278,6 +278,47 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         info!("Shard {} initialized", i);
     }
 
+    // Spawn per-shard leader-change notifiers: when this filer gains/loses
+    // leadership of a shard, notify the Master via ShardLeaderUpdate so it
+    // maintains the shard_id → leader_addr table. This enables the
+    // zero-redirect fast path: fuse clients fetch per-shard leaders from
+    // the Master's GetTopology and route cap RPCs directly on first request.
+    // Design principle: requests must not be forwarded between services;
+    // a non-leader must reject — by advertising leaders upfront, the
+    // client's first cap_open_grant lands on the true leader.
+    {
+        let master_net_port = filer_cfg.master_net_port;
+        let first_master_net = filer_cfg
+            .master_addresses
+            .first()
+            .map(|addr| {
+                let ip = addr.rfind(':').map(|i| &addr[..i]).unwrap_or(addr);
+                format!("{}:{}", ip, master_net_port)
+            })
+            .unwrap_or_default();
+        if !first_master_net.is_empty() {
+            let filer_id = format!("filer-{}", filer_cfg.raft_id);
+            let advertise_addr_for_notifier = format!("{}:{}", advertise_ip, net_port);
+            let rgm = raft_group_manager.clone();
+            for i in 0..filer_cfg.shard_count {
+                let shard_id = ShardId(i as u64);
+                rgm.spawn_shard_leader_notifier(
+                    shard_id,
+                    first_master_net.clone(),
+                    filer_id.clone(),
+                    advertise_addr_for_notifier.clone(),
+                )
+                .await;
+            }
+            info!(
+                "Spawned {} shard_leader_notifier tasks (master={}, filer_id={}, advertise={})",
+                filer_cfg.shard_count, first_master_net, filer_id, advertise_addr_for_notifier
+            );
+        } else {
+            warn!("Cannot spawn shard_leader_notifier: no master addresses configured");
+        }
+    }
+
     // Load existing root inodes from shard stores (for persistence across restarts)
     meta_shard_manager.load_root_inodes_from_shards();
 
@@ -424,6 +465,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let client_health =
                 Arc::new(powerfs_lock_health::ClientHealth::new(Default::default()));
             let base = base.with_client_health(client_health);
+            // §13: wire ServerConnectionManager → NetCapRevoker into
+            // CapManager. Without this, lock_arbiter enters GATHER state
+            // but recall() callback is NoopCapRevoker → no TLV push,
+            // 2s later force-reclaim timeout. MUST chain AFTER
+            // with_client_health so cloned cap_mgr keeps penalty.
+            let base = base.with_server_connection(net_manager.clone());
             if let Some(shard0_store) = meta_shard_manager.try_get_shard_store(ShardId(0)) {
                 let persistence = powerfs_filer::RaftLeasePersistence::new(
                     raft_group_manager.clone(),
@@ -503,6 +550,30 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                         info!(
                             "§8.3.1 force-reclaim sweep: reclaimed {} lease(s)",
                             reclaimed
+                        );
+                    }
+                }
+            });
+        }
+
+        // §13 Stage 4: cap 模型 sweep loop — 周期性调
+        // `force_reclaim_expired_cap_recalls` 处理 GATHER 超时
+        // force-reclaim + Loner 升级 (下发 CapUpgradeNotify).
+        // 与 legacy lease sweep 同 500ms 间隔, 保证 cap 模型下
+        // GATHER 超时 (recall_timeout 2s) 后 stuck holder 被强制回收,
+        // 等待的 writer/xlock 请求者被唤醒.
+        {
+            let sweep_handler = Arc::clone(&net_handler);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                tick.tick().await; // skip immediate first tick
+                loop {
+                    tick.tick().await;
+                    let promoted = sweep_handler.force_reclaim_expired_cap_recalls();
+                    if promoted > 0 {
+                        info!(
+                            "§13 Stage 4 cap sweep: {} promote task(s) dispatched",
+                            promoted
                         );
                     }
                 }

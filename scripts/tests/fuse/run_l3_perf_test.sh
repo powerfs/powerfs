@@ -18,7 +18,7 @@
 # =============================================================================
 
 set -u
-MOUNT="/mnt/fuse"
+MOUNT="/mnt/powerfs"
 TEST_DIR="$MOUNT/l3_perf_test"
 RESULT_DIR="/tmp/l3_results"
 PASS=0
