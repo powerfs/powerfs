@@ -13,7 +13,7 @@
 
 set -e
 
-MOUNT="${MOUNT_DIR:-/mnt/fuse}"
+MOUNT="${MOUNT_DIR:-/mnt/powerfs}"
 TEST_DIR="$MOUNT/feature_gap_test"
 PASS=0
 FAIL=0

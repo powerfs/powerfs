@@ -31,6 +31,8 @@ use crate::topology::{ClusterTopologyManager, MasterClient};
 pub struct StatsReporterConfig {
     /// Stable client identifier reported to Master, e.g. `fuse_<uuid>`.
     pub client_id: String,
+    /// Master-assigned numeric client id (0 if not yet assigned).
+    pub assigned_client_id: u64,
     /// FUSE client type label, e.g. `"fuse"`.
     pub client_type: String,
     /// Mount point path.
@@ -51,6 +53,7 @@ impl Default for StatsReporterConfig {
     fn default() -> Self {
         Self {
             client_id: String::new(),
+            assigned_client_id: 0,
             client_type: "fuse".to_string(),
             mount_point: String::new(),
             collection: String::new(),
@@ -201,6 +204,7 @@ async fn run_reporter_loop(
                         &config.replication,
                         &config.host,
                         config.pid,
+                        Some(config.assigned_client_id).filter(|&id| id != 0),
                     )
                     .await
                 {

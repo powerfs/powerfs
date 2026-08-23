@@ -20,14 +20,14 @@
 # Environment variables:
 #   TEST_TIMEOUT    - per-test timeout in seconds (default: 15)
 #   SUITE_TIMEOUT   - total suite timeout in seconds (default: 300)
-#   MOUNT           - mount point (default: /mnt/fuse)
+#   MOUNT           - mount point (default: /mnt/powerfs)
 #   FUSE_LOG        - FUSE client log path (default: /var/log/powerfs-fuse.log)
 #   DIAG_DIR        - diagnostics output dir (default: /tmp/fuse_test_diag)
 # =============================================================================
 
 set -u
 
-MOUNT="${MOUNT:-/mnt/fuse}"
+MOUNT="${MOUNT:-/mnt/powerfs}"
 TEST_ROOT="$MOUNT/watchdog_test"
 FUSE_LOG="${FUSE_LOG:-/var/log/powerfs-fuse.log}"
 DIAG_DIR="${DIAG_DIR:-/tmp/fuse_test_diag}"

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use log::{debug, info, warn};
+use openraft::alias::LogIdOf;
 use openraft::async_runtime::WatchReceiver;
 use openraft::Raft;
 use openraft::ServerState;
@@ -648,6 +649,109 @@ impl RaftGroupManagerV2 {
         });
     }
 
+    /// Spawn a background task that watches for leadership changes on the
+    /// given shard and notifies the Master via `ShardLeaderUpdate` RPC.
+    ///
+    /// When this filer GAINS leadership (non-Leader → Leader), it sends
+    /// `is_leader=1` + its own advertise_addr so the Master can update the
+    /// `shard_id → leader_addr` table. When it LOSES leadership
+    /// (Leader → non-Leader), it sends `is_leader=0` to clear the entry.
+    ///
+    /// This enables the zero-redirect fast path: fuse clients fetch the
+    /// per-shard leader address from the Master's GetTopology response and
+    /// route cap RPCs directly to the leader on the very first request.
+    ///
+    /// Best-effort: if the notification is lost, the fuse client's
+    /// `check_leader_strict` redirect fallback still works.
+    pub async fn spawn_shard_leader_notifier(
+        &self,
+        shard_id: ShardId,
+        master_addr: String,
+        filer_id: String,
+        advertise_addr: String,
+    ) {
+        let group = match self.get_group(shard_id).await {
+            Some(g) => g,
+            None => return,
+        };
+
+        let mut rx = group.raft.metrics();
+        let sid = shard_id.0;
+
+        tokio::spawn(async move {
+            let mut was_leader = rx.borrow_watched().state == ServerState::Leader;
+            debug!(
+                "shard_leader_notifier: shard {} initial state: was_leader={}",
+                sid, was_leader
+            );
+
+            // If we start as leader, notify the Master immediately so the
+            // shard_leaders table is populated on filer startup (not just
+            // on leadership changes during runtime).
+            if was_leader {
+                info!(
+                    "shard_leader_notifier: shard {} GAINED leadership at startup, notifying master",
+                    sid
+                );
+                crate::zone_client::notify_shard_leader_change(
+                    &master_addr,
+                    sid,
+                    true,
+                    &filer_id,
+                    &advertise_addr,
+                )
+                .await;
+            }
+
+            loop {
+                match rx.changed().await {
+                    Ok(_) => {
+                        let current_state = rx.borrow_watched().state;
+                        let is_leader = current_state == ServerState::Leader;
+                        if !was_leader && is_leader {
+                            // GAINED leadership: notify master with our address
+                            info!(
+                                "shard_leader_notifier: shard {} GAINED leadership, notifying master",
+                                sid
+                            );
+                            crate::zone_client::notify_shard_leader_change(
+                                &master_addr,
+                                sid,
+                                true,
+                                &filer_id,
+                                &advertise_addr,
+                            )
+                            .await;
+                        } else if was_leader && !is_leader {
+                            // LOST leadership: notify master to clear entry
+                            warn!(
+                                "shard_leader_notifier: shard {} LOST leadership (now {:?}), notifying master",
+                                sid, current_state
+                            );
+                            crate::zone_client::notify_shard_leader_change(
+                                &master_addr,
+                                sid,
+                                false,
+                                &filer_id,
+                                "",
+                            )
+                            .await;
+                        }
+                        was_leader = is_leader;
+                    }
+                    Err(_) => {
+                        // Sender dropped — Raft is shutting down
+                        debug!(
+                            "shard_leader_notifier: shard {} metrics stream closed, exiting",
+                            sid
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     /// Fire-and-forget propose: submit to Raft core and return immediately.
     ///
     /// Uses openraft's `client_write_ff` (fire-and-forget) API, which sends
@@ -935,6 +1039,24 @@ impl RaftGroupManagerV2 {
                 Err(_) => b.to_vec(),
             }
         }))
+    }
+
+    /// 读取指定 shard 的 Raft 状态机中已 apply 的最后 log index。
+    ///
+    /// 从 `raft_state_meta` CF 的 `"last_applied_log"` 键反序列化 `LogId` 获取 index。
+    /// 用于 apply 循环启动时初始化 `last_applied`，避免首次通知只处理最后一个 index
+    /// 而跳过同批提交的前序条目（如 CreateInode@N 被 AddDirEntry@N+1 的首次通知跳过）。
+    pub async fn get_last_applied_index(&self, shard_id: ShardId) -> Option<u64> {
+        let groups = self.groups.read().await;
+        let group = groups.get(&shard_id)?;
+
+        let cf = group.db.cf_handle(store::CF_STATE_META)?;
+        let bytes = group.db.get_cf(cf, "last_applied_log").ok()??;
+
+        // LogIdOf<FilerTypeConfig> = openraft::LogId<FilerTypeConfig::CommittedLeaderId>
+        let log_id: LogIdOf<FilerTypeConfig> =
+            serde_json::from_slice(&bytes).ok()?;
+        Some(log_id.index())
     }
 
     /// 扫描指定 shard 的所有 applied entries（按 index 升序）。

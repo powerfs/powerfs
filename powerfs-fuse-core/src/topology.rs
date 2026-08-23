@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::circuit_breaker::CircuitBreaker;
 #[cfg(test)]
 use crate::circuit_breaker::CircuitBreakerConfig;
+pub use powerfs_master_net::RegisterClientResult;
 use powerfs_master_net::{MasterNetError, TlvMasterClient, TlvMasterClientConfig};
 use powerfs_net as net;
 
@@ -510,6 +511,25 @@ impl MasterClient {
                     );
                 }
 
+                // ---- Apply authoritative per-shard leader addresses ----
+                //
+                // The filer list above only gives "first healthy filer" as
+                // default. The master now ships authoritative per-shard
+                // leaders (from ShardLeaderUpdate notifications). Overwrite
+                // the default so cap_open_grant hits the true leader on the
+                // first request (zero-redirect fast path).
+                for (sid, addr) in &topo.shard_leaders {
+                    if let Some(info) = topology.shards.get_mut(sid) {
+                        info.leader_addr = addr.clone();
+                    } else {
+                        topology.shards.insert(*sid, ShardInfo::new(*sid, addr.clone()));
+                    }
+                    log::info!(
+                        "fetch_topology: shard_leader sid={} addr={}",
+                        sid, addr
+                    );
+                }
+
                 log::info!(
                     "fetch_topology: leader={}, parsed {} volumes, {} filer routes, {} shard entries, shard_count={}",
                     topo.leader,
@@ -560,6 +580,7 @@ impl MasterClient {
         replication: &str,
         host: &str,
         pid: u64,
+        assigned_client_id: Option<u64>,
     ) -> Result<(), MasterClientError> {
         let mut enc = net::TlvEncoder::new();
         let _ = enc.add_string(net::FieldId::ClientUuid, client_id);
@@ -569,11 +590,50 @@ impl MasterClient {
         let _ = enc.add_string(net::FieldId::Replication, replication);
         let _ = enc.add_string(net::FieldId::Owner, host);
         let _ = enc.add_u64(net::FieldId::Limit, pid);
+        if let Some(assigned) = assigned_client_id {
+            let _ = enc.add_u64(net::FieldId::ClientId, assigned);
+        }
         let payload = enc.into_bytes();
 
         self.submit_request(net::MsgType::KeepConnected, &payload)
             .await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_register_client(
+        &self,
+        client_uuid: &str,
+        client_type: &str,
+        mount_point: &str,
+        collection: &str,
+        replication: &str,
+        host: &str,
+        pid: u64,
+    ) -> Result<RegisterClientResult, MasterClientError> {
+        self.tlv_client
+            .register_client(
+                client_uuid,
+                client_type,
+                mount_point,
+                collection,
+                replication,
+                host,
+                pid,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn send_deregister_client(
+        &self,
+        client_uuid: &str,
+        assigned_client_id: u64,
+    ) -> Result<(), MasterClientError> {
+        self.tlv_client
+            .deregister_client(client_uuid, assigned_client_id)
+            .await
+            .map_err(Into::into)
     }
 
     /// 断开连接

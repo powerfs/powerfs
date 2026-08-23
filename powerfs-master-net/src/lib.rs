@@ -23,6 +23,6 @@ pub mod client;
 pub mod error;
 pub mod types;
 
-pub use client::{TlvMasterClient, TlvMasterClientConfig};
+pub use client::{RegisterClientResult, TlvMasterClient, TlvMasterClientConfig};
 pub use error::{MasterNetError, MasterNetResult};
 pub use types::{AssignResult, TopologyInfo, VolumeLocation, VolumeRoute};

@@ -1213,6 +1213,44 @@ impl FacadeStorageProvider {
             return self.ensure_inode_lease(inode).await;
         }
 
+        // §13 Cap model (方案 E / 方案 C+D hybrid): Strong write consistency
+        // is enforced by the Filer's lock_arbiter FileLock/ScatterLock state
+        // machines, NOT by the Volume Server's primitive range-lease manager.
+        // Data flow:
+        //   1. Open → Filer: CapOpenGrant → client gets CAP_W (exclusive write
+        //      cap). Only ONE client holds CAP_W at any time (lock_arbiter
+        //      GATHER + epoch fencing guarantees linearization).
+        //   2. Write → local chunk cache (dirty).
+        //   3. Release/Recall → flush_dirty_chunks passes the cap token to
+        //      write_blob_batch_with_lease → Volume Server receives the
+        //      non-empty token but skips validation (lease_enabled=false
+        //      per cluster config).
+        //   4. Release → Filer: UpdateInodeSizeChunks Raft + CapRelease.
+        //
+        // The earlier fixes in fuse.rs (acquire_cap_on_open → bind to
+        // open_file_leases registry; flush_dirty_chunks → secondary cap
+        // fallback) should ALWAYS provide a token before we reach here.
+        // This block is the FINAL SAFETY NET: if a pathological code path
+        // still calls ensure_lease in cap mode, return an empty string
+        // instead of issuing an AcquireRangeLease RPC to the Volume Server,
+        // because that RPC has a direct-conflict fast path (no queuing,
+        // returns STATUS_ERR_SERVER_ERROR=10 when two clients race on the
+        // same stripe) — breaking L4.17's concurrent-write-of-different-
+        // offsets scenario.
+        //
+        // Safety: Volume Server's `lease_enabled=false` in the cluster
+        // config, so `WriteNeedle` handlers do not validate the token
+        // field — an empty string is fine. The authoritative consistency
+        // gate is the Filer-side lock_arbiter, NOT the Volume side.
+        if self.facade.lease_mode() == "cap" {
+            log::debug!(
+                "ensure_lease: cap mode — bypassing inode/range lease \
+                 (consistency via lock_arbiter). inode={} volume={} offset={}",
+                inode, volume_id, offset
+            );
+            return Ok(String::new());
+        }
+
         // 方案 D: range lease (Volume Server-managed) — existing logic
         let vid = volume_id;
         let stripe_start = crate::volume_client::stripe_start_from_offset(offset);

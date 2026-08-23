@@ -10,7 +10,8 @@ use powerfs_allocator::{ShardMap, ShardState};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
     FieldId, MsgType, NetHandler, NetMessage, NetResult, RequestContext, STATUS_ERR_BAD_REQUEST,
-    STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    STATUS_ERR_NOT_FOUND, STATUS_ERR_PERMISSION_DENIED, STATUS_ERR_REDIRECT,
+    STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::sync::Arc;
 
@@ -440,6 +441,7 @@ impl MasterNetHandler {
 
         let fuse_info = crate::master::FuseClientInfo {
             client_id: client_id.clone(),
+            assigned_client_id: 0,
             client_type,
             mount_point,
             collection,
@@ -460,6 +462,127 @@ impl MasterNetHandler {
         );
 
         let leader = self.master.get_leader().await;
+        let mut enc = TlvEncoder::new();
+        enc.add_string(FieldId::Owner, &leader)?;
+
+        Ok(Self::build_response(
+            msg,
+            STATUS_OK,
+            enc.into_bytes(),
+            Vec::new(),
+        ))
+    }
+
+    async fn handle_register_client(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let client_uuid = dec.next_string(FieldId::ClientUuid).unwrap_or_default();
+        let client_type = dec
+            .next_string(FieldId::Backend)
+            .unwrap_or_else(|_| "fuse".to_string());
+        let mount_point = dec.next_string(FieldId::Name).unwrap_or_default();
+        let collection = dec.next_string(FieldId::Collection).unwrap_or_default();
+        let replication = dec.next_string(FieldId::Replication).unwrap_or_default();
+        let host = dec.next_string(FieldId::Owner).unwrap_or_default();
+        let pid = dec.next_u64(FieldId::Limit).unwrap_or(0);
+
+        if !self.master.is_leader().await {
+            return self
+                .build_redirect_response(msg, "NET_REGISTER_CLIENT")
+                .await;
+        }
+
+        if client_uuid.is_empty() {
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        if self.master.is_client_blacklisted(&client_uuid) {
+            let leader = self.master.get_leader().await;
+            let mut enc = TlvEncoder::new();
+            enc.add_u8(FieldId::MountAllowed, 0);
+            enc.add_string(FieldId::Message, "client blacklisted by admin")?;
+            enc.add_string(FieldId::Owner, &leader)?;
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_PERMISSION_DENIED,
+                enc.into_bytes(),
+                Vec::new(),
+            ));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let fuse_info = crate::master::FuseClientInfo {
+            client_id: client_uuid.clone(),
+            assigned_client_id: 0,
+            client_type,
+            mount_point,
+            collection,
+            replication,
+            host,
+            pid,
+            connected_at: now,
+            last_heartbeat: now,
+            dirty_chunks: 0,
+            dirty_bytes: 0,
+            stats: None,
+        };
+
+        let assigned_id = self
+            .master
+            .register_client_by_uuid(client_uuid.clone(), fuse_info);
+
+        let leader_addr = self.master.get_leader().await;
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::ClientId, assigned_id);
+        enc.add_string(FieldId::Owner, &leader_addr)?;
+        enc.add_u8(FieldId::MountAllowed, 1);
+
+        info!(
+            "NET_REGISTER_CLIENT: uuid={}, assigned_id={}, leader={}",
+            client_uuid, assigned_id, leader_addr
+        );
+
+        Ok(Self::build_response(
+            msg,
+            STATUS_OK,
+            enc.into_bytes(),
+            Vec::new(),
+        ))
+    }
+
+    async fn handle_deregister_client(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let client_uuid = dec.next_string(FieldId::ClientUuid).unwrap_or_default();
+        let _assigned = dec.next_u64(FieldId::ClientId).unwrap_or(0);
+
+        if !self.master.is_leader().await {
+            return self
+                .build_redirect_response(msg, "NET_DEREGISTER_CLIENT")
+                .await;
+        }
+
+        self.master.deregister_client_by_uuid(&client_uuid);
+        let leader = self.master.get_leader().await;
+
+        info!(
+            "NET_DEREGISTER_CLIENT: uuid={}, leader={}",
+            client_uuid, leader
+        );
+
         let mut enc = TlvEncoder::new();
         enc.add_string(FieldId::Owner, &leader)?;
 
@@ -611,6 +734,10 @@ impl MasterNetHandler {
         //   range_start:u64 LE | range_end:u64 LE | shard_id:u64 LE | state:u8
         //
         // Absent (empty blob) → client falls back to from_shard_count.
+        //
+        // IMPORTANT: This MUST be encoded BEFORE ShardLeaderEntries to match
+        // the client's strict-sequential TLV decoder reading order
+        // (TotalShards → ShardMapEntries → ShardLeaderEntries).
         if total_shards > 0 {
             let shard_map = ShardMap::from_shard_count(total_shards);
             let entries = shard_map.entries_snapshot();
@@ -629,6 +756,27 @@ impl MasterNetHandler {
                 "NET_GET_TOPOLOGY: ShardMap entries={} ({} bytes)",
                 entries.len(),
                 blob.len()
+            );
+        }
+
+        // ---- Per-shard leader addresses ----
+        //
+        // Populated from ShardLeaderUpdate notifications sent by filers
+        // when they gain/lose leadership of a shard Raft group. FUSE
+        // clients use this to route cap RPCs directly to the shard leader
+        // on the very first request (zero-redirect fast path).
+        //
+        // Format: ShardLeaderEntries(u64 count) + N × (ShardId + FilerAddress)
+        // Old clients that don't know this field simply ignore it.
+        let leaders = self.master.list_shard_leaders();
+        let leader_count = leaders.len() as u64;
+        enc.add_u64(FieldId::ShardLeaderEntries, leader_count);
+        for (sid, addr) in &leaders {
+            enc.add_u64(FieldId::ShardId, *sid);
+            let _ = enc.add_string(FieldId::FilerAddress, addr);
+            info!(
+                "NET_GET_TOPOLOGY: shard_leader sid={} addr={}",
+                sid, addr
             );
         }
 
@@ -813,6 +961,87 @@ impl MasterNetHandler {
             enc.into_bytes(),
             Vec::new(),
         ))
+    }
+
+    /// Filer → Master: notify that this filer gained/lost leadership of a
+    /// shard Raft group. Updates the `shard_leaders` table and, if changed,
+    /// broadcasts TopologyChanged to all connected TLV clients so they
+    /// re-fetch topology and pick up the new per-shard leader address.
+    ///
+    /// This enables the zero-redirect fast path: fuse clients fetch
+    /// per-shard leaders from GetTopology and route cap RPCs directly to
+    /// the leader on the very first request.
+    async fn handle_shard_leader_update(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        // ShardId 0 is a valid shard (shards are 0-indexed). Distinguish
+        // "field present with value 0" from "field missing" by checking the
+        // Result rather than using unwrap_or(0) as a sentinel.
+        let shard_id = match dec.next_u64(FieldId::ShardId) {
+            Ok(sid) => sid,
+            Err(_) => {
+                warn!("SHARD_LEADER_UPDATE: missing ShardId field");
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_BAD_REQUEST,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+        };
+        let is_leader = dec.next_u8(FieldId::Force).unwrap_or(0) != 0;
+        let filer_id = dec.next_string(FieldId::Owner).unwrap_or_default();
+        let leader_addr = dec.next_string(FieldId::FilerAddress).unwrap_or_default();
+
+        if filer_id.is_empty() {
+            warn!(
+                "SHARD_LEADER_UPDATE: missing filer_id (shard={})",
+                shard_id
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        // Not leader? Redirect to the master leader.
+        if !self.master.is_leader().await {
+            return self
+                .build_redirect_response(msg, "SHARD_LEADER_UPDATE")
+                .await;
+        }
+
+        // Gained leadership → update entry with leader_addr.
+        // Lost leadership → clear entry (pass empty string).
+        let addr = if is_leader { leader_addr.as_str() } else { "" };
+        let changed = self.master.update_shard_leader(shard_id, addr);
+
+        info!(
+            "SHARD_LEADER_UPDATE: shard={} is_leader={} filer_id={} addr={} changed={}",
+            shard_id,
+            is_leader,
+            filer_id,
+            if is_leader { &leader_addr } else { "(cleared)" },
+            changed
+        );
+
+        // Broadcast TopologyChanged so fuse clients re-fetch topology and
+        // pick up the new per-shard leader (zero-redirect cap routing).
+        if changed {
+            let n = self.master.broadcast_topology_changed();
+            if n > 0 {
+                debug!(
+                    "SHARD_LEADER_UPDATE: broadcast TopologyChanged to {} TLV clients (shard={} is_leader={})",
+                    n, shard_id, is_leader
+                );
+            }
+        }
+
+        Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()))
     }
 
     /// Handle StatFs request from kernel client.
@@ -1051,8 +1280,11 @@ impl NetHandler for MasterNetHandler {
             MsgType::LookupVolume => self.handle_lookup_volume(msg).await,
             MsgType::Heartbeat => self.handle_heartbeat(msg).await,
             MsgType::KeepConnected => self.handle_keep_connected(msg).await,
+            MsgType::RegisterClient => self.handle_register_client(msg).await,
+            MsgType::DeregisterClient => self.handle_deregister_client(msg).await,
             MsgType::GetTopology => self.handle_get_topology(msg).await,
             MsgType::RegisterFiler => self.handle_register_filer(msg).await,
+            MsgType::ShardLeaderUpdate => self.handle_shard_leader_update(msg).await,
             MsgType::ListFilers => self.handle_list_filers(msg).await,
             MsgType::StatFs => self.handle_statfs(msg).await,
             MsgType::GetDebugConfig => self.handle_get_debug_config(msg).await,

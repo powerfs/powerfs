@@ -753,6 +753,7 @@ impl MasterService for MasterGrpcServer {
 
                                 let fuse_info = FuseClientInfo {
                                     client_id: cid.clone(),
+                                    assigned_client_id: 0,
                                     client_type: request.client_type.clone(),
                                     mount_point: request.mount_point.clone(),
                                     collection: request.collection.clone(),

@@ -14,14 +14,14 @@
 #
 # Prerequisites:
 #   - Docker cluster running with fuse-1-test container
-#   - FUSE mounted at /mnt/fuse in fuse-1-test container
+#   - FUSE mounted at /mnt/powerfs in fuse-1-test container
 
 set -u
 PASS=0
 FAIL=0
 FAILED_TESTS=()
 
-MOUNT="/mnt/fuse"
+MOUNT="/mnt/powerfs"
 TEST_DIR="$MOUNT/deep_dir_test"
 FUSE="docker exec fuse-1-test"
 

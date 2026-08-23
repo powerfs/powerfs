@@ -8,11 +8,19 @@ use log::{info, warn};
 use parking_lot::RwLock;
 use powerfs_net::{
     ClientConfig, ClientType, FieldId, MsgType, NetMessage, NotificationHandler, PowerFsNetClient,
-    TlvDecoder, TlvEncoder, STATUS_ERR_REDIRECT, STATUS_OK,
+    TlvDecoder, TlvEncoder, STATUS_ERR_PERMISSION_DENIED, STATUS_ERR_REDIRECT, STATUS_OK,
 };
 
 use crate::error::{MasterNetError, MasterNetResult};
 use crate::types::{AssignResult, FilerRoute, TopologyInfo, VolumeLocation, VolumeRoute};
+
+#[derive(Debug, Clone)]
+pub struct RegisterClientResult {
+    pub assigned_client_id: u64,
+    pub mount_allowed: bool,
+    pub leader: String,
+    pub deny_reason: Option<String>,
+}
 
 /// Wrapper that turns an `Arc<dyn NotificationHandler>` into a `Box<dyn
 /// NotificationHandler>` so it can be re-installed on every new
@@ -353,13 +361,29 @@ impl TlvMasterClient {
                 .collect();
         }
 
+        // Per-shard leader addresses: ShardLeaderEntries(u64 count) +
+        // N × (ShardId + FilerAddress). Absent on old masters → empty Vec.
+        // FUSE clients use this to route cap RPCs directly to the shard
+        // leader (zero-redirect fast path).
+        let mut shard_leaders: Vec<(u64, String)> = Vec::new();
+        if let Ok(leader_count) = dec.next_u64(FieldId::ShardLeaderEntries) {
+            for _ in 0..leader_count {
+                let sid = dec.next_u64(FieldId::ShardId).unwrap_or(0);
+                let addr = dec.next_string(FieldId::FilerAddress).unwrap_or_default();
+                if !addr.is_empty() {
+                    shard_leaders.push((sid, addr));
+                }
+            }
+        }
+
         info!(
-            "TlvMasterClient: get_topology leader={}, volumes={}, filers={}, total_shards={}, shard_map_entries={}",
+            "TlvMasterClient: get_topology leader={}, volumes={}, filers={}, total_shards={}, shard_map_entries={}, shard_leaders={}",
             leader,
             volumes.len(),
             filers.len(),
             total_shards,
-            shard_map_entries.len()
+            shard_map_entries.len(),
+            shard_leaders.len()
         );
 
         Ok(TopologyInfo {
@@ -368,6 +392,7 @@ impl TlvMasterClient {
             filers,
             total_shards,
             shard_map_entries,
+            shard_leaders,
         })
     }
 
@@ -433,6 +458,78 @@ impl TlvMasterClient {
         let data_center = dec.next_string(FieldId::Backend).unwrap_or_default();
 
         Ok(Some(VolumeLocation { url, data_center }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_client(
+        &self,
+        client_uuid: &str,
+        client_type: &str,
+        mount_point: &str,
+        collection: &str,
+        replication: &str,
+        host: &str,
+        pid: u64,
+    ) -> MasterNetResult<RegisterClientResult> {
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_string(FieldId::ClientUuid, client_uuid);
+        let _ = enc.add_string(FieldId::Backend, client_type);
+        let _ = enc.add_string(FieldId::Name, mount_point);
+        let _ = enc.add_string(FieldId::Collection, collection);
+        let _ = enc.add_string(FieldId::Replication, replication);
+        let _ = enc.add_string(FieldId::Owner, host);
+        let _ = enc.add_u64(FieldId::Limit, pid);
+        let payload = enc.into_bytes();
+
+        let resp = self.submit_request(MsgType::RegisterClient, &payload).await?;
+
+        let mut dec = TlvDecoder::new(&resp.body);
+        let assigned_id = dec.next_u64(FieldId::ClientId).unwrap_or(0);
+        let leader = dec.next_string(FieldId::Owner).unwrap_or_default();
+        let mount_allowed = dec.next_u8(FieldId::MountAllowed).unwrap_or(0) != 0;
+        let deny_reason = dec.next_string(FieldId::Message).ok();
+
+        if resp.header.status == STATUS_OK {
+            Ok(RegisterClientResult {
+                assigned_client_id: assigned_id,
+                mount_allowed,
+                leader,
+                deny_reason,
+            })
+        } else if resp.header.status == STATUS_ERR_PERMISSION_DENIED {
+            Ok(RegisterClientResult {
+                assigned_client_id: 0,
+                mount_allowed: false,
+                leader,
+                deny_reason,
+            })
+        } else {
+            Err(MasterNetError::ServerError {
+                status: resp.header.status,
+                detail: "register_client failed".into(),
+            })
+        }
+    }
+
+    pub async fn deregister_client(
+        &self,
+        client_uuid: &str,
+        assigned_client_id: u64,
+    ) -> MasterNetResult<()> {
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_string(FieldId::ClientUuid, client_uuid);
+        let _ = enc.add_u64(FieldId::ClientId, assigned_client_id);
+        let payload = enc.into_bytes();
+
+        let resp = self.submit_request(MsgType::DeregisterClient, &payload).await?;
+
+        if resp.header.status != STATUS_OK {
+            return Err(MasterNetError::ServerError {
+                status: resp.header.status,
+                detail: "deregister_client failed".into(),
+            });
+        }
+        Ok(())
     }
 
     // ── internals ────────────────────────────────────────────────

@@ -56,6 +56,12 @@ pub struct TopologyInfo {
     /// post-split ranges). When empty (old Master without the `ShardMapEntries`
     /// extension), clients fall back to `ShardMap::from_shard_count(total_shards)`.
     pub shard_map_entries: Vec<(u64, u64, u64, u8)>,
+    /// Per-shard Raft leader addresses (shard_id → "ip:net_port").
+    /// Populated by the Master from ShardLeaderUpdate notifications.
+    /// FUSE clients use this to route cap RPCs directly to the shard
+    /// leader (zero-redirect fast path). Empty when the Master is an
+    /// older build that doesn't ship the ShardLeaderEntries extension.
+    pub shard_leaders: Vec<(u64, String)>,
 }
 
 /// Result of an `assign()` call.

@@ -9,6 +9,7 @@ pub mod grpc_service;
 pub mod inode_lease_manager;
 pub mod inode_notifier;
 pub mod lease_persistence;
+pub mod lock_arbiter;
 pub mod meta_cache;
 pub mod meta_shard_manager;
 pub mod metadata_store;

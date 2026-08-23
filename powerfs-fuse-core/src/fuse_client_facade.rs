@@ -453,7 +453,7 @@ impl FuseClientFacade {
     ///
     /// 统一连接池由 FuseClientFacade 持有，MetaShardClient 与 VolumeClient
     /// 共享同一 `ClientConnPool`，避免连接管理重复实现。
-    pub async fn build_from_config(config: FuseClientFacadeConfig) -> Result<Self, String> {
+    pub async fn build_from_config(mut config: FuseClientFacadeConfig) -> Result<Self, String> {
         // 创建拓扑管理器
         let topology_manager = Arc::new(ClusterTopologyManager::new());
 
@@ -664,15 +664,45 @@ impl FuseClientFacade {
         // 启动连接池后台健康检查（ping + 自动重连）
         conn_pool.start_health_check();
 
+        // SYNCHRONOUS initial RegisterClient call BEFORE stats reporter loop starts.
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| hostname_or_unknown());
+        let pid = std::process::id() as u64;
+        let reg_res = master_client
+            .send_register_client(
+                &config.client_identity.client_uuid,
+                "fuse",
+                &config.mount_point,
+                &config.collection,
+                &config.replication,
+                &host,
+                pid,
+            )
+            .await
+            .map_err(|e| format!("RegisterClient failed: {}", e))?;
+        if !reg_res.mount_allowed {
+            return Err(format!(
+                "Master denied mount: {}",
+                reg_res
+                    .deny_reason
+                    .unwrap_or_else(|| "blacklisted".to_string())
+            ));
+        }
+        config.client_identity.client_id = reg_res.assigned_client_id;
+        log::info!(
+            "REGISTER_CLIENT: got assigned client_id={} from master",
+            reg_res.assigned_client_id
+        );
+
         // 启动 Master 统计上报器（TLV KeepConnected 心跳 + 拓扑变更通知）
         let reporter_config = crate::stats_reporter::StatsReporterConfig {
-            client_id: config.client_identity.client_id.to_string(),
+            client_id: config.client_identity.client_uuid.clone(),
+            assigned_client_id: config.client_identity.client_id,
             client_type: "fuse".to_string(),
             mount_point: config.mount_point.clone(),
             collection: config.collection.clone(),
             replication: config.replication.clone(),
-            host: hostname_or_unknown(),
-            pid: std::process::id() as u64,
+            host: host.clone(),
+            pid,
             report_interval: Duration::from_secs(5),
         };
         let mut reporter = crate::stats_reporter::MasterStatsReporter::new(
@@ -682,7 +712,8 @@ impl FuseClientFacade {
         );
         reporter.start();
         log::info!(
-            "FuseClientFacade: MasterStatsReporter started (TLV KeepConnected, client_id={})",
+            "FuseClientFacade: MasterStatsReporter started (TLV KeepConnected, client_uuid={}, assigned_id={})",
+            config.client_identity.client_uuid,
             config.client_identity.client_id
         );
         let stats_reporter = Some(reporter);
@@ -1277,6 +1308,19 @@ impl FuseClientFacade {
         // 停止连接池后台健康检查；连接本身由各 PowerFsNetClient Drop 时清理
         self.conn_pool.stop_health_check();
         log::info!("FuseClientFacade: All clients closed");
+    }
+
+    /// Graceful shutdown cleanup: deregister the client from Master.
+    /// Errors are silently ignored since we are tearing down anyway.
+    pub async fn stop(&self) {
+        let _ = self
+            .master_client
+            .send_deregister_client(
+                &self.config.client_identity.client_uuid,
+                self.config.client_identity.client_id,
+            )
+            .await;
+        self.close();
     }
 }
 
