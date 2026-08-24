@@ -110,6 +110,16 @@ pub struct MasterNode {
     /// Centralized debug config store. Shared (Arc inside) across all clones.
     /// Nodes poll `GetDebugConfig` to fetch their effective config every 2s.
     debug_config: crate::debug_config::DebugConfigStore,
+    /// Optional admin bearer token for the cert-signing HTTP API. When
+    /// `None` or empty, the `/api/cert/sign-*` endpoints run in dev mode
+    /// (no auth).
+    admin_token: Option<String>,
+    /// Directory where the CA certificate and key are persisted.
+    ca_dir: Option<String>,
+    /// Registration token for authenticating Volume/Filer node registrations.
+    /// When `None` or empty, registrations are open (dev mode). When set,
+    /// Volume/Filer must send a matching token in their TLV requests.
+    registration_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -232,10 +242,7 @@ impl ClientManager {
     }
 
     fn is_client_blacklisted(&self, uuid: &str) -> bool {
-        self.client_blacklist
-            .read()
-            .unwrap()
-            .contains(uuid)
+        self.client_blacklist.read().unwrap().contains(uuid)
     }
 
     fn register_client_by_uuid(&mut self, uuid: String, mut info: FuseClientInfo) -> u64 {
@@ -331,6 +338,9 @@ impl MasterNode {
         raft_peers: Vec<String>,
         net_port: u16,
         metrics_port: u16,
+        admin_token: Option<String>,
+        ca_dir: Option<String>,
+        registration_token: Option<String>,
     ) -> Result<Self> {
         let addr: SocketAddr = bind_address.parse()?;
 
@@ -492,6 +502,9 @@ impl MasterNode {
             volume_pins: RwLock::new(HashMap::new()),
             placement_strategy: RwLock::new("least_loaded".to_string()),
             debug_config: crate::debug_config::DebugConfigStore::new(),
+            admin_token,
+            ca_dir,
+            registration_token,
         };
 
         // P1.3: Replay Zone commands from Raft log to restore zone_registry.
@@ -3178,7 +3191,10 @@ impl MasterNode {
     }
 
     pub fn is_client_blacklisted(&self, uuid: &str) -> bool {
-        self.client_manager.read().unwrap().is_client_blacklisted(uuid)
+        self.client_manager
+            .read()
+            .unwrap()
+            .is_client_blacklisted(uuid)
     }
 
     pub fn register_client_by_uuid(&self, uuid: String, info: FuseClientInfo) -> u64 {
@@ -3196,7 +3212,10 @@ impl MasterNode {
     }
 
     pub fn add_client_to_blacklist(&self, uuid: String) {
-        self.client_manager.read().unwrap().add_client_to_blacklist(uuid);
+        self.client_manager
+            .read()
+            .unwrap()
+            .add_client_to_blacklist(uuid);
     }
 
     pub fn remove_client_from_blacklist(&self, uuid: &str) {
@@ -3629,19 +3648,40 @@ impl MasterNode {
             }
         }
 
-        // Start HTTP metrics server (Prometheus data collection only).
+        // Start HTTP metrics + cert API server.
         // Port is read explicitly from config metrics_port, no port arithmetic.
-        // Control-plane operations (log level, debug config) now go via MasterService gRPC.
-        // Exposes only: GET /metrics (Prometheus scrape endpoint).
+        // Exposes: GET /metrics (Prometheus scrape endpoint) and the
+        // /api/cert/* certificate-signing endpoints (master acts as cluster CA).
         {
             let metrics_port = self.metrics_port;
             let metrics_addr = format!("{}:{}", self.address.ip(), metrics_port);
-            info!(
-                "Starting metrics (Prometheus /metrics) server on {}",
-                metrics_addr
-            );
-            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr).await {
-                error!("Failed to start metrics server on {}: {}", metrics_addr, e);
+            info!("Starting metrics + cert API server on {}", metrics_addr);
+
+            // CA dir: main.rs resolves this from `master.ca_dir` (default
+            // `{dir}/ca`) and passes it in. Fallback to "./ca" only if the
+            // caller somehow left it unset.
+            let ca_dir = self.ca_dir.clone().unwrap_or_else(|| "./ca".to_string());
+
+            match crate::ca_manager::CaManager::new(&ca_dir, self.admin_token.clone()) {
+                Ok(ca_manager) => {
+                    let ca_manager = std::sync::Arc::new(ca_manager);
+                    if let Err(e) =
+                        crate::metrics::start_metrics_server(&metrics_addr, ca_manager).await
+                    {
+                        error!(
+                            "Failed to start metrics/cert server on {}: {}",
+                            metrics_addr, e
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to construct CA manager from {}: {}. \
+                         Cert API endpoints will be unavailable; metrics endpoint is also \
+                         served by the same server and will not start.",
+                        ca_dir, e
+                    );
+                }
             }
         }
 
@@ -3702,6 +3742,34 @@ impl Clone for MasterNode {
             volume_pins: RwLock::new(self.volume_pins.read().unwrap().clone()),
             placement_strategy: RwLock::new(self.placement_strategy.read().unwrap().clone()),
             debug_config: self.debug_config.clone(),
+            admin_token: self.admin_token.clone(),
+            ca_dir: self.ca_dir.clone(),
+            registration_token: self.registration_token.clone(),
+        }
+    }
+}
+
+impl MasterNode {
+    /// Verify a registration token sent by a Volume or Filer node.
+    ///
+    /// Returns `true` (dev mode) when no registration token is configured or
+    /// it is empty. Otherwise compares the provided token against the expected
+    /// one using a constant-time comparison to mitigate timing attacks.
+    pub fn verify_registration_token(&self, provided: &str) -> bool {
+        match &self.registration_token {
+            Some(expected) if !expected.is_empty() => {
+                let a = provided.as_bytes();
+                let b = expected.as_bytes();
+                if a.len() != b.len() {
+                    return false;
+                }
+                let mut diff: u8 = 0;
+                for (x, y) in a.iter().zip(b.iter()) {
+                    diff |= x ^ y;
+                }
+                diff == 0
+            }
+            _ => true,
         }
     }
 }

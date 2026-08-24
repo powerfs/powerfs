@@ -38,6 +38,9 @@ pub struct FilerNodeRegistration {
     /// 仅用于运维场景（如集群升级、临时 mismatch 调试）；正常启动应保持 false，
     /// 让 master 拒绝配置不一致的 filer 进入集群，避免路由错位。
     pub force: bool,
+    /// Registration token for master authentication. None = dev mode (no
+    /// token sent, master must also be in dev mode to accept).
+    pub registration_token: Option<String>,
 }
 
 /// 向 Master 发送 RegisterFiler 请求，获取 Zone 分配 (多 Zone)。
@@ -88,6 +91,12 @@ pub async fn register_filer(
         // 旧 master 不识别此字段会忽略，所以总是发送是安全的；但仅在 force=true 时
         // 显式置 1，避免日志噪音（master 端默认按 0 处理）。
         let _ = enc.add_u8(FieldId::Force, if reg.force { 1 } else { 0 });
+        // Registration token for node authentication.
+        if let Some(token) = &reg.registration_token {
+            if !token.is_empty() {
+                let _ = enc.add_string(FieldId::RegistrationToken, token);
+            }
+        }
         let body = enc.into_bytes();
 
         // 统一 RPC 客户端 (Layer A): connect → handshake → send → read

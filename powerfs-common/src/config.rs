@@ -63,6 +63,19 @@ pub struct MasterConfig {
     pub raft_peers: Vec<String>,
     /// powerfs-net 二进制协议端口 - 必须配置，FUSE客户端通过此端口连接
     pub net_port: u16,
+    /// Admin token for management API authentication (powerfs-cli, admin HTTP endpoints).
+    /// If set, all admin API requests must carry `Authorization: Bearer <admin_token>`.
+    /// If empty, admin APIs are open (insecure, for dev only).
+    #[serde(default)]
+    pub admin_token: Option<String>,
+    /// Directory for CA certificate and key storage. Default: `{dir}/ca`.
+    #[serde(default)]
+    pub ca_dir: Option<String>,
+    /// Registration token for authenticating Volume/Filer node registrations.
+    /// Volume and Filer must send this token in their Heartbeat/RegisterFiler
+    /// TLV requests. If empty/None, registrations are open (dev only).
+    #[serde(default)]
+    pub registration_token: Option<String>,
 }
 
 /// Volume 节点配置 - 所有端口和地址必须显式配置
@@ -96,6 +109,10 @@ pub struct VolumeConfig {
     /// enforced by the Filer's lock_arbiter (§13 Cap model) instead.
     #[serde(default = "default_true")]
     pub lease_enabled: bool,
+    /// Registration token for authenticating with the master on KeepConnected.
+    /// Must match the master's expected token; empty = no auth (dev only).
+    #[serde(default)]
+    pub registration_token: Option<String>,
 }
 
 /// Filer 节点配置 - 所有端口和地址必须显式配置
@@ -152,6 +169,10 @@ pub struct FilerConfig {
     /// Must be unique within the node (different from port / grpc_port /
     /// net_port).
     pub metrics_port: u16,
+    /// Registration token for authenticating with the master on shard registration.
+    /// Must match the master's expected token; empty = no auth (dev only).
+    #[serde(default)]
+    pub registration_token: Option<String>,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置

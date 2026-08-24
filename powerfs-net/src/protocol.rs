@@ -1236,6 +1236,10 @@ pub enum FieldId {
     /// Master (client_uuid not blacklisted), 0 = denied (u8).
     /// Denial reason is usually carried in FieldId::Message (0x26).
     MountAllowed = 0xD2,
+    /// Registration token (string). Sent by Volume/Filer in Heartbeat and
+    /// RegisterFiler TLV requests so the Master can authenticate the node
+    /// before accepting it into the cluster. Empty/absent = no auth (dev).
+    RegistrationToken = 0xD3,
 }
 
 impl FieldId {
@@ -1363,6 +1367,7 @@ impl FieldId {
             0xD0 => Some(Self::RCtimeSec),
             0xD1 => Some(Self::RCtimeNsec),
             0xD2 => Some(Self::MountAllowed),
+            0xD3 => Some(Self::RegistrationToken),
             _ => None,
         }
     }

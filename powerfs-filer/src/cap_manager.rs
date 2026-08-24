@@ -420,7 +420,10 @@ impl CapManager {
                 any_hit = true;
                 log::debug!(
                     "CapManager::recall_ack inode={} client={} sn={} lt={:?} matched",
-                    inode, client_id, sn, lt
+                    inode,
+                    client_id,
+                    sn,
+                    lt
                 );
             }
         }
@@ -428,7 +431,9 @@ impl CapManager {
         if !any_hit {
             log::warn!(
                 "CapManager::recall_ack no matching gather entry inode={} client={} sn={}",
-                inode, client_id, sn
+                inode,
+                client_id,
+                sn
             );
         }
 
@@ -508,9 +513,7 @@ impl CapManager {
     /// - `(inode, lock_type, survivor_client, new_sn, upgraded_caps)`
     /// - 仅 `LockType::File` 类型的 promote 才下发 `CapUpgradeNotify`
     ///   (其余 LockType 是元数据锁, 客户端无 cap 状态需同步)
-    pub fn drain_expired_recalls(
-        &self,
-    ) -> Vec<(u64, LockType, String, u64, CapSet)> {
+    pub fn drain_expired_recalls(&self) -> Vec<(u64, LockType, String, u64, CapSet)> {
         let inodes: Vec<u64> = self.active_inodes.lock().unwrap().iter().copied().collect();
         let mut all_promotes: Vec<(u64, LockType, String, u64, CapSet)> = Vec::new();
         for inode in inodes {

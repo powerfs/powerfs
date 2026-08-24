@@ -76,3 +76,5 @@ sysinfo = "0.30"
 tikv-jemallocator = "0.5"
 clap = { workspace = true }
 env_logger = { workspace = true }
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+time = "0.3"

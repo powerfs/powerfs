@@ -73,6 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meta_dir = master_cfg
         .meta_dir
         .unwrap_or_else(|| format!("{}/meta", dir));
+    let ca_dir = master_cfg.ca_dir.unwrap_or_else(|| format!("{}/ca", dir));
+    let admin_token = master_cfg.admin_token.clone();
+    let registration_token = master_cfg.registration_token.clone();
 
     let peers = if !args.peer.is_empty() {
         args.peer
@@ -148,6 +151,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peers,
         net_port,
         metrics_port,
+        admin_token,
+        Some(ca_dir),
+        registration_token,
     )
     .await?;
 

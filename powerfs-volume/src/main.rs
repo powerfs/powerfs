@@ -283,6 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_port: http_port as u32,
         net_port: net_port as u32,
         ip: &ip,
+        registration_token: volume_cfg.registration_token.as_deref(),
     });
 
     let register = args.register_with_master.unwrap_or(true);

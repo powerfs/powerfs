@@ -761,6 +761,9 @@ fn build_config(
             advertise_addr: Some(format!("{}:{}", ip, cfg.master_port)),
             raft_id,
             raft_peers: master_peers.to_vec(),
+            admin_token: None,
+            ca_dir: None,
+            registration_token: None,
         },
         volume: VolumeConfig {
             grpc_port: cfg.volume_grpc_port,
@@ -775,6 +778,7 @@ fn build_config(
             device_capacity: None,
             advertise_addr: Some(ip.to_string()),
             lease_enabled: true,
+            registration_token: None,
         },
         filer: FilerConfig {
             port: cfg.filer_port,
@@ -794,6 +798,7 @@ fn build_config(
             inline_max_size: None,
             force_register: false,
             metrics_port: cfg.filer_metrics_port,
+            registration_token: None,
         },
         s3: S3Config {
             port: cfg.s3_port,

@@ -8,10 +8,10 @@ mod kv_client;
 mod volume_client;
 
 use commands::{
-    AssignArgs, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs, ClusterTransferArgs,
-    CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, DebugArgs, FilerStatsArgs, FsckArgs,
-    FuseStatsArgs, GrowArgs, HeartbeatArgs, KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs,
-    StatusArgs, TopologyArgs, VolumeListArgs, WriteArgs,
+    AssignArgs, CertSubcommand, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs,
+    ClusterTransferArgs, CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, DebugArgs,
+    FilerStatsArgs, FsckArgs, FuseStatsArgs, GrowArgs, HeartbeatArgs, KvArgs, LookupArgs,
+    ManageArgs, MountArgs, ReadArgs, StatusArgs, TopologyArgs, VolumeListArgs, WriteArgs,
 };
 
 /// `powerfs-cli config` subcommands.
@@ -116,6 +116,13 @@ enum Commands {
 
     /// Allocator management API (placement strategy, volume pin, node maintenance, migrations)
     Manage(ManageArgs),
+
+    /// Certificate management (init-ca, sign-client, sign-server)
+    /// Connects to master CA API, requires admin token.
+    Cert {
+        #[command(subcommand)]
+        command: CertSubcommand,
+    },
 }
 
 #[tokio::main]
@@ -131,7 +138,9 @@ async fn main() {
     };
     env_logger::Builder::new().filter_level(log_level).init();
 
-    // `config` subcommands do not require a master connection; handle before creating client.
+    // `config` and `cert` subcommands do not require a master gRPC connection;
+    // they use local file I/O (config) or raw HTTP to the master admin API
+    // (cert). Handle them before creating the MasterClient.
     if let Commands::Config { command } = cli.command {
         match command {
             ConfigSubcommand::Gen(args) => {
@@ -140,6 +149,13 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+        return;
+    }
+    if let Commands::Cert { command } = cli.command {
+        if let Err(e) = commands::cert(command) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
         }
         return;
     }
@@ -177,6 +193,7 @@ async fn main() {
         Commands::Topology(args) => commands::topology(&cli.master, args).await,
         Commands::FilerStats(args) => commands::filer_stats(client, args).await,
         Commands::Config { .. } => unreachable!("handled above"),
+        Commands::Cert { .. } => unreachable!("handled above"),
         Commands::Manage(args) => commands::manage(client, args).await,
     };
 

@@ -166,7 +166,7 @@ fn s4_2_sweep_loop_force_reclaim_promotes_loner() {
     // (tick 的 promote 检查仅在 garbage_collect 返回 cleaned 时触发,
     //  GATHER 超时 gather_timeout 只唤醒 waiter, 不触发 promote)
     let arbiter = Arc::new(LockArbiter::new_for_test(
-        Duration::from_secs(10), // 长 recall_timeout, 不触发 GATHER 超时
+        Duration::from_secs(10),    // 长 recall_timeout, 不触发 GATHER 超时
         Duration::from_millis(100), // 短 lease_duration, 快速过期
     ));
     let revoker = Arc::new(CapturingRevoker::default());
@@ -238,10 +238,7 @@ async fn s4_3_acquire_xlock_gather_dispatch_and_await() {
         LockAcquireResult::Granted(_) => {
             panic!("C2 should NOT get Auth immediately — C1 holds it");
         }
-        LockAcquireResult::Waiting {
-            recall_tasks,
-            rx,
-        } => {
+        LockAcquireResult::Waiting { recall_tasks, rx } => {
             // 模拟 net_handler acquire_xlock: dispatch recall 给 C1
             assert!(!recall_tasks.is_empty(), "C1 must be recalled");
             for t in &recall_tasks {
@@ -375,9 +372,18 @@ fn s4_6_on_disconnect_multi_inode_promote_dispatch() {
 
     // C1 在两个 inode 都是 LONER, evict 后各剩 1 个 reader → 2 个 promote
     assert_eq!(promote_tasks.len(), 2, "2 survivors promoted");
-    let survivors: Vec<String> = promote_tasks.iter().map(|(_, _, s, _, _)| s.clone()).collect();
-    assert!(survivors.contains(&"C2".to_string()), "C2 promoted on inode 600");
-    assert!(survivors.contains(&"C3".to_string()), "C3 promoted on inode 601");
+    let survivors: Vec<String> = promote_tasks
+        .iter()
+        .map(|(_, _, s, _, _)| s.clone())
+        .collect();
+    assert!(
+        survivors.contains(&"C2".to_string()),
+        "C2 promoted on inode 600"
+    );
+    assert!(
+        survivors.contains(&"C3".to_string()),
+        "C3 promoted on inode 601"
+    );
 
     // 模拟 push_cap_upgrade_notify: 对 File 锁的 promote 下发
     for (inode, lt, survivor, new_sn, caps) in &promote_tasks {
@@ -401,7 +407,7 @@ fn s4_7_sweep_and_disconnect_reuse_push_notify_pattern() {
     // 验证 force_reclaim_expired_cap_recalls 和 on_disconnect 都通过
     // 相同的 push_cap_upgrade_notify 模式下发 promote (DRY 原则)
     let arbiter = Arc::new(LockArbiter::new_for_test(
-        Duration::from_secs(10), // 长 recall_timeout
+        Duration::from_secs(10),    // 长 recall_timeout
         Duration::from_millis(100), // 短 lease_duration
     ));
     let mgr = CapManager::new().with_arbiter(arbiter);
@@ -442,7 +448,11 @@ fn s4_7_sweep_and_disconnect_reuse_push_notify_pattern() {
     // 两条路径都通过相同模式下发 promote
     // sweep: 1 个 (C4 升级); evict: 1 个 (C5 升级)
     let total = notify_cap.count();
-    assert!(total >= 2, "至少 2 个 CapUpgradeNotify (sweep + evict), got {}", total);
+    assert!(
+        total >= 2,
+        "至少 2 个 CapUpgradeNotify (sweep + evict), got {}",
+        total
+    );
     let survivors: Vec<String> = notify_cap.snapshot().iter().map(|n| n.1.clone()).collect();
     assert!(
         survivors.contains(&"C4".to_string()) || survivors.contains(&"C5".to_string()),

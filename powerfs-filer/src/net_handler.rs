@@ -472,11 +472,8 @@ impl FilerNetHandler {
         let _ = enc.add_u8(FieldId::CapSet, caps.0);
         let _ = enc.add_u64(FieldId::CapEpoch, 0);
         let _ = enc.add_u64(FieldId::CapSn, new_sn);
-        let notify_msg = NetMessage::notification(
-            MsgType::CapUpgradeNotify,
-            enc.into_bytes(),
-            Vec::new(),
-        );
+        let notify_msg =
+            NetMessage::notification(MsgType::CapUpgradeNotify, enc.into_bytes(), Vec::new());
         match conn_mgr.send_notification(net_cid, notify_msg) {
             Ok(true) => {
                 info!(
@@ -549,7 +546,10 @@ impl FilerNetHandler {
     ) -> Option<u64> {
         use crate::lock_arbiter::{LockAcquireResult, LockType};
         let _ = LockType::File; // silence unused import if any
-        let acquire = self.cap_mgr.arbiter().xlock_async(inode, lock_type, client_id);
+        let acquire = self
+            .cap_mgr
+            .arbiter()
+            .xlock_async(inode, lock_type, client_id);
         match acquire {
             LockAcquireResult::Granted(g) => Some(g.sn),
             LockAcquireResult::Waiting { recall_tasks, rx } => {
@@ -1059,7 +1059,11 @@ impl FilerNetHandler {
         );
         let mut enc = TlvEncoder::new();
         let _ = enc.add_string(FieldId::Owner, &owner_net_addr);
-        Err(Self::build_response(msg, STATUS_ERR_REDIRECT, enc.into_bytes()))
+        Err(Self::build_response(
+            msg,
+            STATUS_ERR_REDIRECT,
+            enc.into_bytes(),
+        ))
     }
 
     /// Convert gRPC address to net address by replacing the port.
@@ -1619,7 +1623,11 @@ impl FilerNetHandler {
     }
 
     /// Handle SetAttr request (legacy unified path)
-    async fn handle_setattr(&self, ctx: &RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_setattr(
+        &self,
+        ctx: &RequestContext,
+        msg: &NetMessage,
+    ) -> NetResult<NetMessage> {
         // Use decode_setattr_req which correctly handles optional fields via
         // while-loop parsing. Previously used fixed-order next_u64 which
         // desynced the decoder (encoder uses add_u32 for Mode/Uid/Gid, and
@@ -3189,7 +3197,11 @@ impl FilerNetHandler {
     ///
     /// §13 Stage 4: setxattr 涉及 Xattr 锁 (IXATTR), 并发 setxattr/
     /// removexattr 必须互斥. 用 xlock_async 拿排他锁.
-    async fn handle_setxattr(&self, ctx: &RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_setxattr(
+        &self,
+        ctx: &RequestContext,
+        msg: &NetMessage,
+    ) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
@@ -3303,7 +3315,11 @@ impl FilerNetHandler {
     ///
     /// §13 Stage 4: removexattr 与 setxattr 共用 Xattr 锁 (IXATTR),
     /// 互斥保证一致性.
-    async fn handle_remove_xattr(&self, ctx: &RequestContext, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_remove_xattr(
+        &self,
+        ctx: &RequestContext,
+        msg: &NetMessage,
+    ) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
@@ -3961,10 +3977,7 @@ impl NetHandler for FilerNetHandler {
 
         // 清理双向 map
         {
-            self.cap_client_id_map
-                .lock()
-                .unwrap()
-                .remove(&string_cid);
+            self.cap_client_id_map.lock().unwrap().remove(&string_cid);
         }
         {
             self.cap_net_to_string

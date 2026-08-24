@@ -282,6 +282,11 @@ impl MasterNetHandler {
         let mem_bps = dec.next_u64(FieldId::MemoryUsage).unwrap_or(0);
         let cpu_usage = (cpu_bps as f32) / 10000.0;
         let memory_usage = (mem_bps as f32) / 10000.0;
+        // Registration token for node authentication. Absent on old clients
+        // (dev mode allows empty token when master has no token configured).
+        let reg_token = dec
+            .next_string(FieldId::RegistrationToken)
+            .unwrap_or_default();
 
         info!(
             "NET_HEARTBEAT: node={}, ip={}, volumes={}, cpu={:.1}%, mem={:.1}%",
@@ -291,6 +296,22 @@ impl MasterNetHandler {
             cpu_usage * 100.0,
             memory_usage * 100.0
         );
+
+        // Authenticate the node before processing the heartbeat. This runs
+        // before the leader check so unauthorized nodes are rejected even by
+        // followers (no redirect to leader for bad tokens).
+        if !self.master.verify_registration_token(&reg_token) {
+            warn!(
+                "NET_HEARTBEAT: rejected node={} — invalid registration token",
+                node_id_str
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_PERMISSION_DENIED,
+                b"invalid registration token".to_vec(),
+                Vec::new(),
+            ));
+        }
 
         // Heartbeat mutates Master topology state (add_node, volume registration).
         // Only the Raft leader should process it; followers return REDIRECT.
@@ -774,10 +795,7 @@ impl MasterNetHandler {
         for (sid, addr) in &leaders {
             enc.add_u64(FieldId::ShardId, *sid);
             let _ = enc.add_string(FieldId::FilerAddress, addr);
-            info!(
-                "NET_GET_TOPOLOGY: shard_leader sid={} addr={}",
-                sid, addr
-            );
+            info!("NET_GET_TOPOLOGY: shard_leader sid={} addr={}", sid, addr);
         }
 
         Ok(Self::build_response(
@@ -834,6 +852,27 @@ impl MasterNetHandler {
         let shard_count = dec.next_u64(FieldId::Limit).unwrap_or(0);
         let shard_ids_blob = dec.next_bytes(FieldId::ShardIdList).unwrap_or_default();
         let force = dec.next_u8(FieldId::Force).unwrap_or(0) != 0;
+        // Registration token for node authentication. Absent on old clients
+        // (dev mode allows empty token when master has no token configured).
+        let reg_token = dec
+            .next_string(FieldId::RegistrationToken)
+            .unwrap_or_default();
+
+        // Authenticate the filer before processing the registration. This
+        // runs before the leader check so unauthorized filers are rejected
+        // even by followers (no redirect to leader for bad tokens).
+        if !self.master.verify_registration_token(&reg_token) {
+            warn!(
+                "NET_REGISTER_FILER: rejected filer={} — invalid registration token",
+                filer_id
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_PERMISSION_DENIED,
+                b"invalid registration token".to_vec(),
+                Vec::new(),
+            ));
+        }
 
         if !self.master.is_leader().await {
             return self
@@ -996,10 +1035,7 @@ impl MasterNetHandler {
         let leader_addr = dec.next_string(FieldId::FilerAddress).unwrap_or_default();
 
         if filer_id.is_empty() {
-            warn!(
-                "SHARD_LEADER_UPDATE: missing filer_id (shard={})",
-                shard_id
-            );
+            warn!("SHARD_LEADER_UPDATE: missing filer_id (shard={})", shard_id);
             return Ok(Self::build_response(
                 msg,
                 STATUS_ERR_BAD_REQUEST,

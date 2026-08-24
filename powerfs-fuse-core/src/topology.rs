@@ -522,12 +522,11 @@ impl MasterClient {
                     if let Some(info) = topology.shards.get_mut(sid) {
                         info.leader_addr = addr.clone();
                     } else {
-                        topology.shards.insert(*sid, ShardInfo::new(*sid, addr.clone()));
+                        topology
+                            .shards
+                            .insert(*sid, ShardInfo::new(*sid, addr.clone()));
                     }
-                    log::info!(
-                        "fetch_topology: shard_leader sid={} addr={}",
-                        sid, addr
-                    );
+                    log::info!("fetch_topology: shard_leader sid={} addr={}", sid, addr);
                 }
 
                 log::info!(

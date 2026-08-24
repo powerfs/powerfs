@@ -109,7 +109,10 @@ async fn fs_concurrent_write_gather_recall() {
 
     // C2 wrlock_async → GATHER → Waiting (wrlock_async 是同步函数, 无需 spawn)
     let rx = match a.wrlock_async(INODE_CONCURRENT_WRITE, LockType::File, "C2") {
-        LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+        LockAcquireResult::Waiting {
+            recall_tasks: _,
+            rx,
+        } => rx,
         LockAcquireResult::Granted(_) => panic!("应 Waiting"),
     };
 
@@ -137,7 +140,10 @@ async fn fs_close_triggers_loner_promote() {
     // 构造 LONER + reader 共存场景 (§3 流程)
     let r1 = a.wrlock(INODE_CLOSE_PROMOTE, LockType::File, "C1");
     let rx = match a.wrlock_async(INODE_CLOSE_PROMOTE, LockType::File, "C2") {
-        LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+        LockAcquireResult::Waiting {
+            recall_tasks: _,
+            rx,
+        } => rx,
         LockAcquireResult::Granted(_) => panic!("应 Waiting"),
     };
     a.recall_ack(INODE_CLOSE_PROMOTE, LockType::File, "C1", r1.sn);
@@ -287,7 +293,10 @@ async fn fs_session_crash_evict_cleanup() {
 
     // C2 wrlock_async 加入 (制造 LONER+reader 共存)
     let rx = match a.wrlock_async(INODE_SESSION_CRASH, LockType::File, "C2") {
-        LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+        LockAcquireResult::Waiting {
+            recall_tasks: _,
+            rx,
+        } => rx,
         LockAcquireResult::Granted(_) => panic!("应 Waiting"),
     };
     a.recall_ack(INODE_SESSION_CRASH, LockType::File, "C1", r_file.sn);

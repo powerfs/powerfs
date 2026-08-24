@@ -19,7 +19,6 @@ use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::FieldId;
 use std::sync::Arc;
 
-
 /// Helper: hex dump first N bytes for debugging
 fn hex_dump(bytes: &[u8]) -> String {
     let n = bytes.len().min(128);
@@ -1173,7 +1172,9 @@ impl FacadeStorageProvider {
         log::debug!(
             "ensure_lease: cap mode — bypassing range lease \
              (consistency via lock_arbiter). inode={} volume={} offset={}",
-            inode, volume_id, offset
+            inode,
+            volume_id,
+            offset
         );
         Ok(String::new())
     }

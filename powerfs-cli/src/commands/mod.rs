@@ -1,4 +1,5 @@
 mod assign;
+mod cert;
 mod cluster_add;
 mod cluster_remove;
 mod cluster_status;
@@ -24,6 +25,7 @@ mod volume_list;
 mod write;
 
 pub use assign::{assign, AssignArgs};
+pub use cert::{cert, CertSubcommand};
 pub use cluster_add::{cluster_add, ClusterAddArgs};
 pub use cluster_remove::{cluster_remove, ClusterRemoveArgs};
 pub use cluster_status::{cluster_status, ClusterStatusArgs};
