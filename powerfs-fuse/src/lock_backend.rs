@@ -283,11 +283,17 @@ impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
                     "FacadeCapHandler: flush_and_ack inode={} token={} — flushing dirty data before ACK",
                     inode, token_for_flush
                 );
-                // Sync blocking flush → offload to blocking pool
+                // Sync blocking flush → offload to blocking pool.
+                // Pass a deadline of 1600 ms so sync_size_chunks_on_close
+                // bails before its retry sleep pushes us past the 1750 ms
+                // outer timeout (which would fire with no ACK → server
+                // force-reclaims at 2000 ms).
+                let flush_deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(1600);
                 let flush_result = tokio::task::spawn_blocking({
                     let f = flusher.clone();
                     let t = token_for_flush.clone();
-                    move || f.flush_and_sync(inode, &t)
+                    move || f.flush_and_sync_with_deadline(inode, &t, Some(flush_deadline))
                 })
                 .await;
                 let flush_result = match flush_result {

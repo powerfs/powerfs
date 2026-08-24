@@ -1649,7 +1649,7 @@ impl PowerFsFs {
                 // and the flusher correctly cleans up.
                 let is_open = self.open_inodes.read().unwrap().contains_key(&inode);
 
-                if let Err(e) = self.sync_size_chunks_on_close(inode) {
+                if let Err(e) = self.sync_size_chunks_on_close(inode, None) {
                     warn!(
                         "flush_all_dirty_chunks: post-flush sync for inode {} failed: {}",
                         inode, e
@@ -1704,7 +1704,11 @@ impl PowerFsFs {
     /// 流程：构建 UpdateInodeSizeChunksRequest → 带 retry+timeout 调用 filer → 成功后返回。
     /// 失败处理：重试到超时上限 → 返回 EIO + 标记 fsck（日志）。
     /// lease 在 sync 成功前不释放（崩溃则 lease 超时回收 + fsck 修复孤儿 chunks）。
-    fn sync_size_chunks_on_close(&self, inode: u64) -> std::io::Result<()> {
+    fn sync_size_chunks_on_close(
+        &self,
+        inode: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<()> {
         let entry = match self.cache.get_inode(inode) {
             Some(e) => e,
             None => {
@@ -1826,7 +1830,22 @@ impl PowerFsFs {
                 }
             }
             if attempt < max_retries {
-                std::thread::sleep(std::time::Duration::from_millis(500 * (attempt as u64)));
+                let sleep_dur = std::time::Duration::from_millis(500 * (attempt as u64));
+                // Cap recall deadline: bail before sleeping if the budget
+                // is exhausted. Without this, the 5 × 500 ms incremental
+                // retry sleep (5 s worst case) blows past the 1750 ms
+                // cap recall timeout → timeout fires with no ACK →
+                // server force-reclaims at 2000 ms.
+                if let Some(dl) = deadline {
+                    if std::time::Instant::now() + sleep_dur >= dl {
+                        warn!(
+                            "sync_size_chunks_on_close: inode={} deadline exceeded before retry {} — bailing (last_err={})",
+                            inode, attempt + 1, last_err
+                        );
+                        break;
+                    }
+                }
+                std::thread::sleep(sleep_dur);
             }
         }
 
@@ -2573,9 +2592,20 @@ fn parse_posix_acl_mode(acl_data: &[u8], cur_mode: u32) -> Option<u32> {
 /// where the lease token is removed while a flush is in flight.
 impl crate::invalidate_handler::CapFlusher for PowerFsFs {
     fn flush_and_sync(&self, inode: u64, lease_token: &str) -> std::io::Result<()> {
+        // Delegate to deadline-aware variant with no deadline (full retry
+        // loop for release/fsync/flush callers).
+        self.flush_and_sync_with_deadline(inode, lease_token, None)
+    }
+
+    fn flush_and_sync_with_deadline(
+        &self,
+        inode: u64,
+        lease_token: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<()> {
         debug!(
-            "PowerFsFs::cap_flush_and_sync: inode={} token={} — flushing dirty data",
-            inode, lease_token
+            "PowerFsFs::cap_flush_and_sync: inode={} token={} deadline={:?} — flushing dirty data",
+            inode, lease_token, deadline
         );
 
         // Inline files: data lives in inline_buffers, not chunk_cache.
@@ -2663,7 +2693,7 @@ impl crate::invalidate_handler::CapFlusher for PowerFsFs {
             // Step 2: Sync metadata (size + chunks) to Filer via Raft.
             // This ensures the Filer has the authoritative size before the
             // recall completes and another client opens the file.
-            let sync_result = self.sync_size_chunks_on_close(inode);
+            let sync_result = self.sync_size_chunks_on_close(inode, deadline);
             if let Err(ref e) = sync_result {
                 warn!(
                     "PowerFsFs::cap_flush_and_sync: sync_size_chunks_on_close failed for inode={} err={:?} \
@@ -7908,7 +7938,7 @@ impl FileSystem for PowerFsFs {
                         inode
                     );
                 }
-                let r = self.sync_size_chunks_on_close(inode);
+                let r = self.sync_size_chunks_on_close(inode, None);
                 if let Err(e) = &r {
                     error!(
                         "release: sync_size_chunks_on_close for inode {} failed: {} — data may be orphaned",
@@ -8949,7 +8979,7 @@ impl FileSystem for PowerFsFs {
                 // have already pushed a larger size, and our stale cache would
                 // overwrite it.
                 if had_dirty && !self.has_dirty_for_inode(inode) {
-                    match self.sync_size_chunks_on_close(inode) {
+                    match self.sync_size_chunks_on_close(inode, None) {
                         Ok(()) => {
                             debug!("flush: inode={} data + metadata synced", inode);
                             // Don't clear dirty here: release() will do that
@@ -9028,7 +9058,7 @@ impl FileSystem for PowerFsFs {
                 // Only sync if had_dirty was true (we actually flushed dirty
                 // chunks) AND no dirty chunks remain (fully clean).
                 if had_dirty && !self.has_dirty_for_inode(inode) {
-                    match self.sync_size_chunks_on_close(inode) {
+                    match self.sync_size_chunks_on_close(inode, None) {
                         Ok(()) => {
                             debug!("fsync: inode={} data + metadata synced", inode);
                             self.chunk_cache.clear_dirty(inode);

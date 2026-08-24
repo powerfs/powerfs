@@ -22,8 +22,8 @@ PASS=0
 FAIL=0
 FAILED_TESTS=()
 
-CLIENT_A="fuse-1-test"
-CLIENT_B="fuse-2-test"
+CLIENT_A="fuse-1"
+CLIENT_B="fuse-2"
 TEST_DIR="/mnt/powerfs/l4_consistency_v2"
 
 log()  { echo "[$(date '+%H:%M:%S')] $1"; }
