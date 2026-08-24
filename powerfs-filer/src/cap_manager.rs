@@ -139,7 +139,7 @@ pub struct RecallTask {
 ///
 /// Carries the new `(token, sn, epoch, caps)` the client must use for
 /// subsequent IO; the old (token, sn, epoch) is fenced off.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeTask {
     pub holder: String,
     pub token: String,

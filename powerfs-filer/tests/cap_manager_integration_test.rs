@@ -196,8 +196,8 @@ fn t1_7_recall_ack_completes_gather() {
     // C1 ACK recall — 应成功 (gather_done=true)
     let result = mgr.recall_ack(700, "C1", c1_token);
     assert!(result.is_ok(), "recall_ack succeeds");
-    // arbiter recall_ack 返回 NONE (cap_manager 不暴露 retained 查询)
-    assert_eq!(result.unwrap(), CapSet::NONE);
+    // arbiter recall_ack 返回 NONE (cap_manager 不在此路径下发 upgrade)
+    assert_eq!(result.unwrap(), None);
 }
 
 // ==================== T1.8: drain_expired_recalls 不 panic (空 + 有 active) ====================

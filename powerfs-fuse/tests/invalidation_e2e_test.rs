@@ -50,6 +50,9 @@ fn make_entry(inode: u64, parent: u64, name: &str, generation: u64) -> CachedEnt
         cached_at: Instant::now(),
         state: EntryState::default(),
         hold: HoldState::default(),
+        cap: None,
+        dentry_lease: None,
+        dir_shared_gen: 0,
     }
 }
 

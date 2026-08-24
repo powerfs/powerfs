@@ -563,8 +563,31 @@ impl ConnRegistry {
     ///
     /// 返回成功接收的客户端数量。
     pub fn broadcast(&self, msg: &NetMessage) -> usize {
+        self.broadcast_exclude(msg, None)
+    }
+
+    /// 向除发起方外的所有活跃客户端广播通知。
+    ///
+    /// Ceph parallel: MDS forward_to_mds / send_incremental 在推送 dentry
+    /// 失效通知时不会把消息发回给发起方 (`originating_client`)。发起方
+    /// 通过 RPC reply 的 release 字段完成本地失效，**不依赖** 自己发出
+    /// 的 broadcast 回调。PowerFS 在 net 层提供同样的 exclude 语义，避免
+    /// 发起方在 `invalidate_handler` 中重复处理自己刚提交的操作。
+    ///
+    /// `exclude_client_id = None` 时退化为普通广播。
+    pub fn broadcast_exclude(&self, msg: &NetMessage, exclude_client_id: Option<u64>) -> usize {
         let mut count = 0;
         for entry in self.conns.iter() {
+            // Skip the originating client — it already invalidated locally
+            // in the FUSE rename/unlink/create callback before sending the
+            // RPC (Phase 1-2 of fuse.rs rename). Re-processing its own
+            // broadcast here would double-invalidate and risk VFS lock
+            // contention with the in-flight VFS call.
+            if let Some(exclude) = exclude_client_id {
+                if entry.key() == &exclude {
+                    continue;
+                }
+            }
             let inner = entry.value();
             // 优先 meta 通道, 回退到任意通道
             let conn = inner.get(&1).or_else(|| inner.values().next());

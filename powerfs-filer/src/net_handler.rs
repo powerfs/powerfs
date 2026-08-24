@@ -952,6 +952,57 @@ impl FilerNetHandler {
         }
     }
 
+    /// Notify all clients that a specific dentry (parent, name) has changed.
+    ///
+    /// This extends notify_inode_change with (parent, name) so clients can
+    /// call notify_kernel_inval_entry(parent, name) to clear the kernel VFS
+    /// dentry cache — not just the userspace dentry lease.
+    ///
+    /// Ceph parallel: MDS pushes CEvent::DentryInvalidate containing the
+    /// specific (parent, name) so each client clears its kernel dentry.
+    ///
+    /// Ceph-aligned exclusion: when `exclude_client_id` is `Some(id)`, the
+    /// originating client is skipped — it has already invalidated locally
+    /// in the FUSE rename/unlink/create callback before sending the RPC
+    /// and updates its userspace cache from the RPC reply. Receiving its
+    /// own broadcast would be redundant and could race with the in-flight
+    /// VFS call (e.g. holding `i_rwsem` on the parent dir). MDS does not
+    /// forward its own rename/unlink/create notification back to the
+    /// originator; PowerFS mirrors that here.
+    ///
+    /// Used by rename/unlink/create to notify all clients that a specific
+    /// dentry (name → inode mapping) has changed.
+    fn notify_dentry_change(
+        &self,
+        inode: u64,
+        version: u64,
+        parent: u64,
+        name: &str,
+        exclude_client_id: Option<u64>,
+    ) {
+        if let Some(ref notifier) = self.inode_notifier {
+            let notifier = notifier.clone();
+            let name = name.to_string();
+            info!(
+                "FILER_NET_NOTIFY_DENTRY: inode={}, version={}, parent={}, name={}, exclude={:?}",
+                inode, version, parent, name, exclude_client_id
+            );
+            tokio::spawn(async move {
+                let count = notifier.broadcast_dentry_exclude(
+                    inode,
+                    version,
+                    parent,
+                    &name,
+                    exclude_client_id,
+                );
+                info!(
+                    "FILER_NET_NOTIFY_DENTRY: broadcast DentryInvalidate(inode={}, v={}, parent={}, name={}) to {} clients (exclude={:?})",
+                    inode, version, parent, name, count, exclude_client_id
+                );
+            });
+        }
+    }
+
     /// Build a response message
     fn build_response(msg: &NetMessage, status: u16, body: Vec<u8>) -> NetMessage {
         NetMessage::response(msg, status, body, Vec::new())
@@ -1962,7 +2013,7 @@ impl FilerNetHandler {
     ///   - 客户端不再传入 fid/cookie/offset, 由 Filer 完全自治
     ///   - 通过 set_chunks 持久化 chunk 映射 (Raft 强一致)
     ///   - 响应返回 VolumeId + FileKey 给客户端, 客户端直连 volume 读写
-    async fn handle_create(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_create(&self, msg: &NetMessage, client_id: u64) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
@@ -1978,8 +2029,8 @@ impl FilerNetHandler {
         let _ = dec.next_u64(FieldId::Size).ok();
 
         info!(
-            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}",
-            parent_ino, name, mode, uid, gid
+            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}, client_id={}",
+            parent_ino, name, mode, uid, gid, client_id
         );
 
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
@@ -2094,10 +2145,9 @@ impl FilerNetHandler {
                 // Raft quorum commit latency per create on the critical path.
                 let setattr_shard = self.shard_strategy.calculate_shard(ino);
 
-                // B5: notify 目录条目变更（parent readdir 缓存 + 新 inode）
+                // B5: dentry-level notify so clients clear kernel dentry cache
                 let v = self.next_version();
-                self.notify_inode_change(parent_ino, v);
-                self.notify_inode_change(ino, v);
+                self.notify_dentry_change(ino, v, parent_ino, &name, Some(client_id));
 
                 let mut enc = TlvEncoder::new();
                 enc.add_u64(FieldId::Ino, ino);
@@ -2222,7 +2272,7 @@ impl FilerNetHandler {
     }
 
     /// Handle Mkdir request
-    async fn handle_mkdir(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_mkdir(&self, msg: &NetMessage, client_id: u64) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
@@ -2231,10 +2281,9 @@ impl FilerNetHandler {
         let mode = dec.next_u64(FieldId::Mode).unwrap_or(0o755);
         let uid = dec.next_u64(FieldId::Uid).unwrap_or(0);
         let gid = dec.next_u64(FieldId::Gid).unwrap_or(0);
-
         info!(
-            "FILER_NET_MKDIR: parent_ino={}, name={}, mode={:o}",
-            parent_ino, name, mode
+            "FILER_NET_MKDIR: parent_ino={}, name={}, mode={:o}, client_id={}",
+            parent_ino, name, mode, client_id
         );
 
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
@@ -2265,10 +2314,9 @@ impl FilerNetHandler {
                 // The response is built from the InodeInfo returned (already
                 // carries mode/u32 with S_IFDIR set).
 
-                // B5: notify 目录条目变更（parent readdir 缓存 + 新目录 inode）
+                // B5: dentry-level notify so clients clear kernel dentry cache
                 let v = self.next_version();
-                self.notify_inode_change(parent_ino, v);
-                self.notify_inode_change(info.inode, v);
+                self.notify_dentry_change(info.inode, v, parent_ino, &name, Some(client_id));
 
                 // Return full attributes so the FUSE client can populate its
                 // cache with correct nlink/size/uid/gid/timestamps. Previously
@@ -2443,7 +2491,7 @@ impl FilerNetHandler {
     }
 
     /// Handle Unlink request
-    async fn handle_unlink(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_unlink(&self, msg: &NetMessage, client_id: u64) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let name = dec.next_string(FieldId::Name).unwrap_or_default();
@@ -2452,8 +2500,8 @@ impl FilerNetHandler {
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
 
         info!(
-            "FILER_NET_UNLINK: parent_ino={}, name={}, shard={}",
-            parent_ino, name, shard_id.0
+            "FILER_NET_UNLINK: parent_ino={}, name={}, shard={}, client_id={}",
+            parent_ino, name, shard_id.0, client_id
         );
 
         // Check leader BEFORE lookup. If we are not the leader for this
@@ -2490,10 +2538,17 @@ impl FilerNetHandler {
                             "FILER_NET_UNLINK: deleted inode={} ('{}/{}')",
                             info.inode, parent_ino, name
                         );
-                        // B5: notify 目录条目变更（parent readdir 缓存 + 被删 inode 失效）
+                        // B5: dentry-level notify so clients clear kernel dentry cache.
+                        // Ceph-aligned exclude: originator already invalidated
+                        // locally in the FUSE unlink callback — skip it.
                         let v = self.next_version();
-                        self.notify_inode_change(parent_ino, v);
-                        self.notify_inode_change(info.inode, v);
+                        self.notify_dentry_change(
+                            info.inode,
+                            v,
+                            parent_ino,
+                            &name,
+                            Some(client_id),
+                        );
                         Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
                     }
                     Err(e) => {
@@ -2651,7 +2706,7 @@ impl FilerNetHandler {
     }
 
     /// Handle Rename request
-    async fn handle_rename(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_rename(&self, msg: &NetMessage, client_id: u64) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let old_parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
         let old_name = dec.next_string(FieldId::Name).unwrap_or_default();
@@ -2659,8 +2714,8 @@ impl FilerNetHandler {
         let new_name = dec.next_string(FieldId::NewName).unwrap_or_default();
 
         info!(
-            "FILER_NET_RENAME: old_parent={}, old_name={}, new_parent={}, new_name={}",
-            old_parent_ino, old_name, new_parent_ino, new_name
+            "FILER_NET_RENAME: old_parent={}, old_name={}, new_parent={}, new_name={}, client_id={}",
+            old_parent_ino, old_name, new_parent_ino, new_name, client_id
         );
 
         // Check leader for the source shard (rename operates on old_parent's shard).
@@ -2691,17 +2746,46 @@ impl FilerNetHandler {
             .await
         {
             Ok(_) => {
-                // B5: notify 两个目录条目变更 + 被重命名 inode 本身
-                // Notifying the renamed inode is critical: it triggers
-                // FUSE_NOTIFY_INVAL_ENTRY on clients so they drop the old
-                // dentry cache, and FUSE_NOTIFY_INVAL_INODE to drop page
-                // cache. Without it, cross-client stat/ls on the old name
-                // continues to succeed after rename.
+                // B5: notify dentry-level changes to all clients.
+                //
+                // Using notify_dentry_change (not notify_inode_change) so
+                // clients receive (parent, name) and can call
+                // notify_kernel_inval_entry(parent, name) to clear the
+                // kernel VFS dentry cache. This is critical for
+                // rename-over-replace (e.g. `ar` creates a temp file then
+                // `rename("tmp", "libtest.a")`): without dentry-level
+                // invalidation, other clients' kernel dentry cache still
+                // points to the OLD target inode (with stale size/attrs).
+                //
+                // Ceph parallel: MDS pushes CEvent::DentryInvalidate with
+                // (parent, name) for both old and new paths — but does NOT
+                // forward back to the originating client. That client has
+                // already invalidated locally in the FUSE rename callback
+                // (Phase 1-2) before sending the RPC and updates its
+                // userspace cache from the RPC reply (Phase 4). Receiving
+                // its own broadcast would be redundant and could race with
+                // the in-flight VFS call holding `i_rwsem`.
                 let v = self.next_version();
-                self.notify_inode_change(old_parent_ino, v);
-                self.notify_inode_change(new_parent_ino, v);
-                if let Some(inode) = renamed_inode {
-                    self.notify_inode_change(inode, v);
+                // Old dentry: (old_parent, old_name) → old inode (or removed)
+                self.notify_dentry_change(
+                    renamed_inode.unwrap_or(0),
+                    v,
+                    old_parent_ino,
+                    &old_name,
+                    Some(client_id),
+                );
+                // New dentry: (new_parent, new_name) → renamed inode
+                // Only notify if the new path differs from the old path
+                if new_parent_ino != old_parent_ino || new_name != old_name {
+                    if let Some(inode) = renamed_inode {
+                        self.notify_dentry_change(
+                            inode,
+                            v,
+                            new_parent_ino,
+                            &new_name,
+                            Some(client_id),
+                        );
+                    }
                 }
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
@@ -4210,7 +4294,7 @@ impl NetHandler for FilerNetHandler {
             MsgType::SetAttrData => self.handle_setattr_data(msg).await,
             MsgType::SetAttrMeta => self.handle_setattr_meta(msg).await,
             MsgType::Create => {
-                let response = self.handle_create(msg).await?;
+                let response = self.handle_create(msg, ctx.client.client_id).await?;
                 // Subscribe the creating client to the parent directory and
                 // the new inode so it receives subsequent Invalidate
                 // notifications (e.g., another client truncating the file).
@@ -4243,7 +4327,7 @@ impl NetHandler for FilerNetHandler {
                 Ok(response)
             }
             MsgType::Mkdir => {
-                let response = self.handle_mkdir(msg).await?;
+                let response = self.handle_mkdir(msg, ctx.client.client_id).await?;
                 if response.header.status == STATUS_OK {
                     if let Some(ref notifier) = self.inode_notifier {
                         let client_id = ctx.client.client_id;
@@ -4264,9 +4348,9 @@ impl NetHandler for FilerNetHandler {
                 }
                 Ok(response)
             }
-            MsgType::Unlink => self.handle_unlink(msg).await,
+            MsgType::Unlink => self.handle_unlink(msg, ctx.client.client_id).await,
             MsgType::Rmdir => self.handle_rmdir(msg).await,
-            MsgType::Rename => self.handle_rename(msg).await,
+            MsgType::Rename => self.handle_rename(msg, ctx.client.client_id).await,
             MsgType::StatFs => self.handle_statfs(msg).await,
             MsgType::Symlink => self.handle_symlink(msg).await,
             MsgType::Readlink => self.handle_readlink(msg).await,

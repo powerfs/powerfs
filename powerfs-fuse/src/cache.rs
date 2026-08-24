@@ -1306,6 +1306,64 @@ impl MetadataCache {
         DentryLeaseStatus::Miss
     }
 
+    /// Atomically check dentry lease status AND retrieve the cached entry.
+    ///
+    /// This eliminates the TOCTOU race between `check_dentry_lease()` and
+    /// `get_inode_by_name()` that existed when they were called separately
+    /// in the lookup path. The InvalidateHandler could evict the entry
+    /// between the two calls, causing `check_dentry_lease` to return
+    /// `LeaseValid` (lease was valid when checked) but
+    /// `get_inode_by_name` to return `None` (entry was evicted in the
+    /// gap). The old code then fell through to a false negative (ENOENT)
+    /// for a file that exists on the Filer.
+    ///
+    /// By doing both checks under a single read lock, the gap is closed.
+    ///
+    /// Returns:
+    ///   - `(LeaseValid, Some(entry))` — positive dentry, trust cache
+    ///   - `(LeaseValid, None)` — negative dentry, trust cache (file doesn't exist)
+    ///     BUT only if a per-dentry lease is set; dir_complete alone is
+    ///     NOT sufficient (see NegativeComplete discussion).
+    ///   - `(SharedGenValid, Some(entry))` — positive, shared_gen matches
+    ///   - `(SharedGenValid, None)` — negative, shared_gen matches
+    ///   - `(NegativeComplete, None)` — dir complete but no per-dentry lease
+    ///   - `(Expired, _)` / `(Miss, None)` — fall through to RPC
+    pub fn check_and_get_dentry(
+        &self,
+        parent_inode: u64,
+        name: &str,
+    ) -> (DentryLeaseStatus, Option<CachedEntry>) {
+        let cache = self.inode_cache.read().unwrap();
+        for (_, entry) in cache.iter() {
+            if entry.parent == parent_inode && entry.name == name {
+                // Skip stale/tombstone entries — they're not usable
+                if entry.state == EntryState::Stale || entry.state == EntryState::Tombstone {
+                    return (DentryLeaseStatus::Expired, None);
+                }
+                // Layer 1: dentry lease valid?
+                if let Some(ref lease) = entry.dentry_lease {
+                    if Instant::now() < lease.expire_at {
+                        return (DentryLeaseStatus::LeaseValid, Some(entry.clone()));
+                    }
+                }
+                // Layer 2: shared_gen matches and dir is complete?
+                if self.dentry_shared_gen_valid(parent_inode, entry.dir_shared_gen)
+                    && self.is_dir_complete(parent_inode)
+                {
+                    return (DentryLeaseStatus::SharedGenValid, Some(entry.clone()));
+                }
+                return (DentryLeaseStatus::Expired, None);
+            }
+        }
+        // No cached entry for this name.
+        // Only return NegativeComplete if dir is complete — but callers
+        // should NOT trust this for negative answers (see lookup() fix).
+        if self.is_dir_complete(parent_inode) {
+            return (DentryLeaseStatus::NegativeComplete, None);
+        }
+        (DentryLeaseStatus::Miss, None)
+    }
+
     /// Invalidate (clear) dentry leases for all children of a directory.
     /// Called when the parent receives an Invalidate notification.
     pub fn invalidate_dentry_leases(&self, parent_inode: u64) {
@@ -1754,7 +1812,11 @@ impl MetadataCache {
         newdir: u64,
         newname: &str,
     ) -> Result<(), String> {
-        // Find the source entry
+        // Find the source entry. If not in cache (e.g., ar's temp file
+        // was created+closed without being cached, or was evicted), we
+        // still MUST remove the old target entry below — otherwise the
+        // stale target (e.g., the 8-byte libtest.a from ar's first phase)
+        // would be served on lookup until the dentry lease expires.
         let entry = {
             let children = self.list_children(olddir);
             let mut found = None;
@@ -1764,30 +1826,27 @@ impl MetadataCache {
                     break;
                 }
             }
-            found.ok_or_else(|| "source not found".to_string())?
+            found // Option<CachedEntry>, not error
         };
-
-        let inode = entry.inode;
-        let old_parent = entry.parent;
 
         // Remove the source entry from path_map BEFORE updating its name,
         // so that the target lookup below doesn't find the source entry.
-        let old_path = self.inode_to_path(inode).unwrap_or_default();
-        {
+        if let Some(ref e) = entry {
+            let old_path = self.inode_to_path(e.inode).unwrap_or_default();
             let mut path_map = self.path_map.write().unwrap();
             path_map.remove(&old_path);
         }
 
-        // If target exists, remove it BEFORE renaming the source.
-        // This must happen while the source still has its old name,
-        // otherwise list_children(newdir) would find the renamed source
-        // entry (which now has name == newname) and remove it instead.
+        // Remove the old target entry (rename-over-replace). This MUST
+        // happen regardless of whether the source is in cache — the Filer
+        // has already committed the rename, so the old target inode is
+        // stale and must be evicted to force a re-fetch on next lookup.
         if olddir == newdir {
             // Same directory: list children and find target by name.
             // The source entry still has oldname, so this is safe.
             let children = self.list_children(newdir);
             for (target_ino, name, _) in children {
-                if name == newname && target_ino != inode {
+                if name == newname && entry.as_ref().map_or(true, |e| target_ino != e.inode) {
                     let _ = self.remove_entry_only(target_ino);
                     break;
                 }
@@ -1802,6 +1861,17 @@ impl MetadataCache {
                 }
             }
         }
+
+        // If source not in cache, we're done — the old target has been
+        // removed, and the next lookup will re-fetch the correct state
+        // from the Filer.
+        let entry = match entry {
+            Some(e) => e,
+            None => return Ok(()),
+        };
+
+        let inode = entry.inode;
+        let old_parent = entry.parent;
 
         // Now update the source entry's parent and name
         {

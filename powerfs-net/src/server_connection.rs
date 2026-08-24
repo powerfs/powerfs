@@ -393,6 +393,18 @@ impl ServerConnectionManager {
         self.registry.broadcast(msg)
     }
 
+    /// Broadcast a notification to all connected clients except the
+    /// originating client identified by `exclude_client_id`.
+    ///
+    /// See `ConnRegistry::broadcast_exclude` for the Ceph-aligned rationale.
+    pub fn broadcast_notification_exclude(
+        &self,
+        msg: &NetMessage,
+        exclude_client_id: Option<u64>,
+    ) -> usize {
+        self.registry.broadcast_exclude(msg, exclude_client_id)
+    }
+
     /// Push an Invalidate(inode, version) notification to a single client.
     pub fn push_invalidate_notification(
         &self,
@@ -410,10 +422,65 @@ impl ServerConnectionManager {
         self.broadcast_notification(&msg)
     }
 
+    /// Broadcast a dentry-level Invalidate notification to all clients.
+    ///
+    /// This extends the inode-level Invalidate with (parent, name) info so
+    /// clients can call notify_kernel_inval_entry(parent, name) to clear
+    /// the kernel VFS dentry cache — not just the userspace dentry lease.
+    ///
+    /// Ceph parallel: MDS pushes CEvent::DentryInvalidate containing the
+    /// specific (parent, name) so each client clears its kernel dentry.
+    pub fn broadcast_dentry_invalidate(
+        &self,
+        inode: u64,
+        version: u64,
+        parent: u64,
+        name: &str,
+    ) -> usize {
+        self.broadcast_dentry_invalidate_exclude(inode, version, parent, name, None)
+    }
+
+    /// Broadcast a dentry-level Invalidate notification to all clients
+    /// EXCEPT the originating client (`exclude_client_id`).
+    ///
+    /// Ceph parallel: MDS does not forward a rename/unlink/create
+    /// notification back to the originating client. The originating
+    /// client has already performed local dentry+inode invalidation in
+    /// the FUSE callback (Phase 1-2 of `fuse.rs rename`) before sending
+    /// the RPC, and updates its userspace cache from the RPC reply
+    /// (Phase 4). Receiving its own broadcast would be redundant and
+    /// could race with the in-flight VFS call (e.g. holding `i_rwsem`).
+    pub fn broadcast_dentry_invalidate_exclude(
+        &self,
+        inode: u64,
+        version: u64,
+        parent: u64,
+        name: &str,
+        exclude_client_id: Option<u64>,
+    ) -> usize {
+        let msg = Self::build_dentry_invalidate_message(inode, version, parent, name);
+        self.broadcast_notification_exclude(&msg, exclude_client_id)
+    }
+
     fn build_invalidate_message(inode: u64, version: u64) -> NetMessage {
         let mut enc = TlvEncoder::new();
         enc.add_u64(FieldId::Ino, inode);
         enc.add_u64(FieldId::Version, version);
+        let body = enc.into_bytes();
+        NetMessage::notification(MsgType::Invalidate, body, Vec::new())
+    }
+
+    fn build_dentry_invalidate_message(
+        inode: u64,
+        version: u64,
+        parent: u64,
+        name: &str,
+    ) -> NetMessage {
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Ino, inode);
+        enc.add_u64(FieldId::Version, version);
+        enc.add_u64(FieldId::ParentIno, parent);
+        let _ = enc.add_string(FieldId::Name, name);
         let body = enc.into_bytes();
         NetMessage::notification(MsgType::Invalidate, body, Vec::new())
     }

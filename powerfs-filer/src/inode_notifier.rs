@@ -170,6 +170,49 @@ impl InodeNotifier {
         count
     }
 
+    /// Broadcast a dentry-level Invalidate notification to all clients.
+    ///
+    /// Unlike `broadcast` (inode-only), this carries (parent, name) so
+    /// clients can call notify_kernel_inval_entry(parent, name) to clear
+    /// the kernel VFS dentry cache — not just the userspace dentry lease.
+    ///
+    /// Used by rename/unlink/create to notify all clients that a specific
+    /// dentry (name → inode mapping) has changed.
+    pub fn broadcast_dentry(&self, inode: u64, version: u64, parent: u64, name: &str) -> usize {
+        self.broadcast_dentry_exclude(inode, version, parent, name, None)
+    }
+
+    /// Ceph-aligned variant: broadcast a dentry invalidation to all
+    /// clients EXCEPT the originating client.
+    ///
+    /// Ceph's MDS does not forward a rename/unlink/create dentry
+    /// notification back to the originating client — that client has
+    /// already invalidated locally in the FUSE callback before sending
+    /// the RPC, and updates its userspace cache from the RPC reply.
+    /// Receiving its own broadcast would be redundant and could race
+    /// with the in-flight VFS call.
+    pub fn broadcast_dentry_exclude(
+        &self,
+        inode: u64,
+        version: u64,
+        parent: u64,
+        name: &str,
+        exclude_client_id: Option<u64>,
+    ) -> usize {
+        let count = self.connection_manager.broadcast_dentry_invalidate_exclude(
+            inode,
+            version,
+            parent,
+            name,
+            exclude_client_id,
+        );
+        log::debug!(
+            "InodeNotifier: broadcast DentryInvalidate(inode={}, v={}, parent={}, name={}) to {} clients (exclude={:?})",
+            inode, version, parent, name, count, exclude_client_id
+        );
+        count
+    }
+
     /// Phase 3 Lease Recall: push an Invalidate notification to a
     /// specific client, bypassing the subscription check.
     ///
