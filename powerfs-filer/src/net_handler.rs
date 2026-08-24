@@ -3790,33 +3790,29 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
+        // H1 post-condition: recall_ack NEVER returns an inline Loner
+        // promote via Option<UpgradeTask> here.  Promoting from inside
+        // recall_ack would be wrong: the new wrlock/xlock caller (C2)
+        // hasn't joined `holders` yet when gather was built, so promoting
+        // on this path would bump the *previous* writer back to Loner
+        // CAP_W|X while C2 is still waiting — violating C2's exclusive
+        // intent (Ceph MDS Loner invariant: "only promote when holders
+        // matches the true live client set").
+        //
+        // Correct survivor promotion paths:
+        //   (a) Waiting callers: `recall_ack` marks gather_done and calls
+        //       `wake_waiters` → C2 retries wrlock/xlock →
+        //       gather_remaining==0 → C2 is appended to holders during
+        //       the retry → state correctly becomes Loner/Excl with the
+        //       *right* holder — C2 itself gets full caps in that reply.
+        //   (b) No waiters (single surviving client after evict/unlock):
+        //       500ms sweep loop calls `drain_expired_recalls` →
+        //       `tick()` promotes to Loner and dispatches
+        //       CapUpgradeNotify via the shared `push_cap_upgrade_notify`
+        //       helper (DRY).  500 ms is a bounded, observed-safe latency.
         match self.cap_mgr.recall_ack(inode, &client_id, &token) {
-            Ok(Some(upgrade)) => {
-                // H1 fix: gather_done → FileLock promote_to_loner returned an
-                // upgrade task. Push the survivor's CapUpgradeNotify *inline*
-                // with this ACK (same network turn), so the surviving writer
-                // immediately gets CAP_W|X restored instead of waiting up to
-                // one sweep tick (500 ms) — which was the cause of
-                // SHARED_WRITE stalls, and indirectly of L4.17's md5
-                // mismatch (writer B was stuck in SHARED_WRITE without
-                // CAP_X, so its writes couldn't cache → size drifted).
-                self.push_cap_upgrade_notify(
-                    inode,
-                    &upgrade.holder,
-                    upgrade.sn,
-                    upgrade.granted_caps,
-                );
-                info!(
-                    "CAP_RECALL_ACK: inode={} client={} — survivor={} promoted to LONER, CapUpgradeNotify dispatched",
-                    inode, client_id, upgrade.holder
-                );
-                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
-            }
-            Ok(None) => {
-                info!(
-                    "CAP_RECALL_ACK: inode={} client={} (no Loner promote)",
-                    inode, client_id
-                );
+            Ok(_) => {
+                info!("CAP_RECALL_ACK: inode={} client={} acked", inode, client_id);
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }
             Err(e) => {
