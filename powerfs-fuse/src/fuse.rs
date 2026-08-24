@@ -963,26 +963,116 @@ impl PowerFsFs {
         if fd < 0 {
             return;
         }
-        let mut buf = [0u8; 40];
-        buf[0..4].copy_from_slice(&40u32.to_ne_bytes());
-        buf[4..8].copy_from_slice(&2i32.to_ne_bytes());
-        buf[8..16].copy_from_slice(&0u64.to_ne_bytes());
+        // FUSE_NOTIFY_INVAL_INODE message layout (FUSE kernel ABI):
+        //   OutHeader: len(4) + error(4) + unique(8) = 16 bytes
+        //   NotifyInvalInodeOut: ino(8) + off(8) + len(8) = 24 bytes
+        // Total = 40 bytes. off=0, len=-1 means "invalidate entire file".
+        let total_len: usize = 40;
+        let mut buf = vec![0u8; total_len];
+        buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes());
+        buf[4..8].copy_from_slice(&(-2i32).to_ne_bytes()); // -FUSE_NOTIFY_INVAL_INODE
+        buf[8..16].copy_from_slice(&0u64.to_ne_bytes()); // unique
         buf[16..24].copy_from_slice(&inode.to_ne_bytes());
-        buf[24..32].copy_from_slice(&0i64.to_ne_bytes());
-        buf[32..40].copy_from_slice(&(-1i64).to_ne_bytes());
-        let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 40) };
+        buf[24..32].copy_from_slice(&0i64.to_ne_bytes()); // off = 0
+        buf[32..40].copy_from_slice(&(-1i64).to_ne_bytes()); // len = -1 (all)
+                                                             // Spawn a detached thread to avoid VFS lock contention when called
+                                                             // from a FUSE callback (e.g. rename holds i_rwsem on the parent,
+                                                             // and a synchronous write(/dev/fuse) here would return EINVAL).
+                                                             // Ceph parallel: CEvent::Invalidate is dispatched via a separate
+                                                             // workqueue, not inline on the request path.
+        std::thread::spawn(move || {
+            let ret = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, total_len) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                log::warn!(
+                    "notify_kernel_inval_inode: failed for inode={}: {} (errno={})",
+                    inode,
+                    err,
+                    err.raw_os_error().unwrap_or(0)
+                );
+            } else {
+                log::info!(
+                    "notify_kernel_inval_inode: sent FUSE_NOTIFY_INVAL_INODE for inode={} (dropping stale page cache + attrs)",
+                    inode
+                );
+            }
+        });
+    }
+
+    /// Notify the kernel to invalidate a dentry entry (name → inode mapping).
+    ///
+    /// This sends FUSE_NOTIFY_INVAL_ENTRY (notify_code=3), which tells the
+    /// kernel VFS to drop its dentry cache for `(parent, name)`. The next
+    /// lookup for this name will re-enter FUSE, allowing the userspace
+    /// cache to return the correct (possibly different) inode.
+    ///
+    /// This is critical for rename-over-replace (e.g. `ar` creates a temp
+    /// file then `rename("tmp", "libtest.a")`): without this notification,
+    /// the kernel's dentry cache still points to the OLD inode (the one
+    /// that had only 8 bytes of `!<arch>\n`), so `stat()` and `fstat()`
+    /// return the old size=8 instead of the new file's size=1516.
+    ///
+    /// Ceph parallel: MDS sends a CEvent::DentryInvalidate to clear kernel
+    /// dentries on rename-over-replace.
+    fn notify_kernel_inval_entry(&self, parent: u64, name: &str) {
+        let fd = self.fuse_fd.load(std::sync::atomic::Ordering::Acquire);
+        if fd < 0 {
+            return;
+        }
+        let name_bytes = name.as_bytes();
+        let name_len = name_bytes.len();
+        // FUSE_NOTIFY_INVAL_ENTRY wire format (matches libfuse
+        // fuse_lowlevel_notify_inval_entry and Linux kernel
+        // fs/fuse/dev.c:fuse_notify_inval_entry):
+        //
+        //   fuse_out_header (16 bytes):
+        //     len:    u32  (total message length, including header)
+        //     error:  i32  (MUST be -FUSE_NOTIFY_INVAL_ENTRY = -3; the
+        //                   kernel dispatches on `error < 0` to the notify
+        //                   path — a positive value is treated as a normal
+        //                   reply with unique=0, which the kernel discards
+        //                   silently or returns EINVAL)
+        //     unique: u64  (0, unused for notifications)
+        //   fuse_notify_inval_entry_out (16 bytes):
+        //     parent:  u64
+        //     namelen: u32  (length WITHOUT the null terminator)
+        //     padding: u32
+        //   name: namelen bytes + NUL + padding to 8-byte boundary
+        //
+        // Critical: libfuse sends `namelen + 1` bytes of name data (the
+        // trailing NUL is included in the wire bytes even though
+        // `outarg.namelen` excludes it). The kernel reads `namelen` bytes
+        // and appends its own NUL. If we omit the NUL in the wire bytes,
+        // the kernel may read garbage into the dentry name (or the
+        // message is rejected as EINVAL when len doesn't match).
+        let header_len = 4 + 4 + 8 + 8 + 4 + 4; // 32 bytes
+        let name_with_null = name_len + 1;
+        let name_padded = (name_with_null + 7) & !7; // round up to 8
+        let total_len = header_len + name_padded;
+        let mut buf = vec![0u8; total_len];
+        buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes());
+        buf[4..8].copy_from_slice(&(-3i32).to_ne_bytes()); // -FUSE_NOTIFY_INVAL_ENTRY
+        buf[8..16].copy_from_slice(&0u64.to_ne_bytes()); // unique = 0
+        buf[16..24].copy_from_slice(&parent.to_ne_bytes());
+        buf[24..28].copy_from_slice(&(name_len as u32).to_ne_bytes()); // namelen without NUL
+                                                                       // buf[28..32] = padding (already zero)
+        buf[32..32 + name_len].copy_from_slice(name_bytes);
+        buf[32 + name_len] = 0; // NUL terminator
+                                // buf[32 + name_len + 1 .. total_len] = padding (already zero)
+        let n = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, total_len) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
             warn!(
-                "release: notify_kernel_inval_inode failed for inode={}: {} (errno={})",
-                inode,
+                "notify_kernel_inval_entry: failed for parent={}, name={}: {} (errno={})",
+                parent,
+                name,
                 err,
                 err.raw_os_error().unwrap_or(0)
             );
         } else {
-            debug!(
-                "release: sent FUSE_NOTIFY_INVAL_INODE for inode={} (last handle closed, invalidating stale page cache)",
-                inode
+            info!(
+                "notify_kernel_inval_entry: sent FUSE_NOTIFY_INVAL_ENTRY for parent={}, name={}",
+                parent, name
             );
         }
     }
@@ -2845,17 +2935,37 @@ impl FileSystem for PowerFsFs {
         // the client held it, so it couldn't push Invalidate notifications
         // when another client modified the directory. The new mechanism uses
         // Filer-issued per-dentry leases and dir_version (shared_gen) tracking.
-        match self.cache.check_dentry_lease(parent, name_str) {
-            DentryLeaseStatus::LeaseValid => {
-                // Layer 1: dentry lease is valid. If the entry exists in
-                // cache, return it; otherwise it's a negative dentry.
-                if let Some(entry) = self.cache.get_inode_by_name(parent, name_str) {
-                    debug!(
-                        "lookup: dentry lease valid, cache HIT (parent={}, name={})",
-                        parent, name_str
-                    );
-                    return Ok(self.create_fuse_entry(&entry));
-                }
+        // Atomic dentry lease check + entry retrieval.
+        //
+        // Previously `check_dentry_lease()` and `get_inode_by_name()` were
+        // called separately, creating a TOCTOU race: InvalidateHandler could
+        // evict the entry between the two calls. `check_dentry_lease` would
+        // return `LeaseValid` (lease was valid when checked) but
+        // `get_inode_by_name` would return `None` (entry was evicted in the
+        // gap). The old code then returned a false negative (ENOENT) for a
+        // file that exists on the Filer — causing gcc's `#include` to fail.
+        //
+        // `check_and_get_dentry()` does both under a single read lock,
+        // eliminating the gap. This aligns with Ceph's design where dentry
+        // and inode are in the same structure (no separate lookup step).
+        //
+        // For negative answers: only per-dentry leases (LeaseValid + None)
+        // are trustworthy. `NegativeComplete` (dir_complete without a
+        // per-dentry lease) falls through to RPC — Ceph never trusts
+        // I_COMPLETE alone for negative answers.
+        match self.cache.check_and_get_dentry(parent, name_str) {
+            (DentryLeaseStatus::LeaseValid, Some(entry)) => {
+                debug!(
+                    "lookup: dentry lease valid, cache HIT (parent={}, name={})",
+                    parent, name_str
+                );
+                return Ok(self.create_fuse_entry(&entry));
+            }
+            (DentryLeaseStatus::LeaseValid, None) => {
+                // Per-dentry lease says "this name doesn't exist" and the
+                // Filer granted a negative lease. This is the ONLY case
+                // where we trust a negative answer without RPC — Ceph's
+                // MDS grants negative dentry leases the same way.
                 debug!(
                     "lookup: dentry lease valid, negative (parent={}, name={})",
                     parent, name_str
@@ -2869,46 +2979,34 @@ impl FileSystem for PowerFsFs {
                     entry_timeout: Duration::ZERO,
                 });
             }
-            DentryLeaseStatus::SharedGenValid => {
-                // Layer 2: lease expired but shared_gen matches + dir complete.
-                if let Some(entry) = self.cache.get_inode_by_name(parent, name_str) {
-                    debug!(
-                        "lookup: shared_gen valid, cache HIT (parent={}, name={})",
-                        parent, name_str
-                    );
-                    return Ok(self.create_fuse_entry(&entry));
-                }
-                // Negative dentry (dir complete + shared_gen match → ENOENT)
+            (DentryLeaseStatus::SharedGenValid, Some(entry)) => {
                 debug!(
-                    "lookup: shared_gen valid, negative (parent={}, name={})",
+                    "lookup: shared_gen valid, cache HIT (parent={}, name={})",
                     parent, name_str
                 );
-                return Ok(Entry {
-                    inode: 0,
-                    generation: 0,
-                    attr: unsafe { std::mem::zeroed() },
-                    attr_flags: 0,
-                    attr_timeout: Duration::ZERO,
-                    entry_timeout: Duration::ZERO,
-                });
+                return Ok(self.create_fuse_entry(&entry));
             }
-            DentryLeaseStatus::NegativeComplete => {
-                // No cached entry, but dir is complete → ENOENT
+            (DentryLeaseStatus::SharedGenValid, None) => {
+                // Should not happen: SharedGenValid requires the entry to
+                // exist (we found it in the for loop). But if the entry
+                // was Stale/Tombstone, we returned Expired instead.
+                // Fall through to RPC for safety.
                 debug!(
-                    "lookup: dir complete, negative (parent={}, name={})",
+                    "lookup: shared_gen valid but no entry (unexpected), querying Filer (parent={}, name={})",
                     parent, name_str
                 );
-                return Ok(Entry {
-                    inode: 0,
-                    generation: 0,
-                    attr: unsafe { std::mem::zeroed() },
-                    attr_flags: 0,
-                    attr_timeout: Duration::ZERO,
-                    entry_timeout: Duration::ZERO,
-                });
             }
-            DentryLeaseStatus::Expired | DentryLeaseStatus::Miss => {
-                // Fall through to RPC
+            (DentryLeaseStatus::NegativeComplete, _) => {
+                // Dir is marked complete but we have no per-dentry lease
+                // for this name. NOT trustworthy for negative answers —
+                // Ceph requires a per-dentry lease, not just I_COMPLETE.
+                // Fall through to RPC for the authoritative answer.
+                debug!(
+                    "lookup: dir complete but no per-dentry lease, querying Filer (parent={}, name={})",
+                    parent, name_str
+                );
+            }
+            (DentryLeaseStatus::Expired, _) | (DentryLeaseStatus::Miss, _) => {
                 debug!(
                     "lookup: dentry lease expired/miss, querying filer (parent={}, name={})",
                     parent, name_str
@@ -8516,10 +8614,79 @@ impl FileSystem for PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
 
-        // Step 2: 通过 MetadataClient.rename RPC 走 Filer Raft leader（强一致，原子提交）
-        // Filer 端原子处理：删除旧目标（如有）+ 移动/重命名条目。
-        // 空目录检查由 Filer 在 Raft 提交时完成，返回 ENOTEMPTY 错误。
-        // shard_id = calculate_shard_id(olddir)（源目录的 shard）
+        // ──────────────────────────────────────────────────────────────
+        // Local kernel invalidation BEFORE the rename RPC.
+        //
+        // These notifications are fire-and-forget: std::thread::spawn
+        // sends them off the request path, so they do NOT block the
+        // synchronous RPC below. Spawning a thread is required because
+        // a synchronous write(/dev/fuse) here would deadlock against
+        // the VFS i_rwsem held by rename on the parent directory.
+        //
+        // CephFS parallel (default synchronous behavior): ceph_rename()
+        // → ceph_mdsc_do_request() synchronously waits for the MDS reply;
+        // MDS commits via MDLog and then asynchronously dispatches
+        // CEvent::DentryInvalidate + CEvent::Invalidate to clear kernel
+        // dentry + page cache on the source AND replaced target inodes.
+        // PowerFS diverges: FUSE has no cap-recall mechanism, so the
+        // client must actively push FUSE_NOTIFY_INVAL_ENTRY/INODE itself.
+        // We do it BEFORE the RPC (not after) because:
+        //   1. It's async anyway — no cost to the RPC latency.
+        //   2. If the RPC fails, the invalidated kernel dentry is
+        //      harmless: the next lookup re-enters FUSE, which re-fetches
+        //      the unchanged state from the Filer — no inconsistency.
+        //   3. FUSE_NOTIFY_INVAL_ENTRY uses (parent, name) so it's safe
+        //      to fire before the Filer commits — it only drops the
+        //      kernel cache, doesn't change on-disk state.
+        //
+        // Critical for rename-over-replace (e.g. `ar` writes a temp
+        // file stXXXX with full content, then `rename(stXXXX,
+        // libpowerfs_util.a)`): without inode page-cache invalidation,
+        // the kernel keeps the OLD target inode's page cache (8 bytes
+        // of `!<arch>\n` magic) even after the dentry is dropped, so
+        // stat()/read() return size=8 instead of the new file's size.
+        // ──────────────────────────────────────────────────────────────
+
+        // Snapshot source inode and replaced target inode BEFORE any
+        // mutation (cache.rename removes the target entry, so we must
+        // capture it first).
+        let source_inode = self
+            .cache
+            .get_inode_by_name(olddir, old_str)
+            .map(|e| e.inode);
+        let replaced_target_inode = self
+            .cache
+            .get_inode_by_name(newdir, new_str)
+            .map(|e| e.inode);
+        info!(
+            "rename: olddir={}, oldname={}, newdir={}, newname={}, source_inode={:?}, replaced_target_inode={:?}",
+            olddir, old_str, newdir, new_str, source_inode, replaced_target_inode
+        );
+
+        // Phase 1: kernel dentry invalidation (name → inode mapping)
+        self.notify_kernel_inval_entry(olddir, old_str);
+        if newdir != olddir || new_str != old_str {
+            self.notify_kernel_inval_entry(newdir, new_str);
+        }
+        // Phase 2: kernel inode page-cache + attrs invalidation.
+        // Source inode is being moved — any page cache under its old
+        // name is stale relative to the new path.
+        if let Some(ino) = source_inode {
+            self.notify_kernel_inval_inode(ino);
+        }
+        // Replaced target inode (rename-over-replace) — its page cache
+        // belongs to the OLD file and must be dropped so the kernel
+        // doesn't serve stale content under the new dentry.
+        if let Some(ino) = replaced_target_inode {
+            if Some(ino) != source_inode {
+                self.notify_kernel_inval_inode(ino);
+            }
+        }
+
+        // Phase 3: send rename RPC to Filer Raft leader (synchronous —
+        // FUSE requires success/failure to be returned to VFS).
+        // Filer atomically: removes old target (if any) + renames source.
+        // Empty-dir check is done by Filer at Raft commit time.
         let meta_client = self.client.facade().meta_shard_client().clone();
         let shard_id = self.routing_shard(olddir);
         let old_owned = old_str.to_string();
@@ -8541,8 +8708,9 @@ impl FileSystem for PowerFsFs {
                 std::io::Error::from_raw_os_error(errno)
             })?;
 
-        // RPC 成功后更新本地缓存（path_map + inode_cache）
-        // cache.rename 失败仅影响本地缓存一致性，不影响 Filer 已提交的状态
+        // Phase 4: RPC succeeded — update userspace cache (path_map +
+        // inode_cache). Failure here only affects local cache
+        // consistency, not the Filer's committed state.
         if let Err(e) = self.cache.rename(olddir, old_str, newdir, new_str) {
             warn!(
                 "rename: cache.rename failed (filer already committed): {}",

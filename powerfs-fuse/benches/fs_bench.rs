@@ -36,6 +36,9 @@ fn make_file_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         cached_at: Instant::now(),
         state: EntryState::default(),
         hold: HoldState::default(),
+        cap: None,
+        dentry_lease: None,
+        dir_shared_gen: 0,
     }
 }
 
@@ -70,6 +73,9 @@ fn make_dir_entry(inode: u64, parent: u64, name: &str) -> CachedEntry {
         cached_at: Instant::now(),
         state: EntryState::default(),
         hold: HoldState::default(),
+        cap: None,
+        dentry_lease: None,
+        dir_shared_gen: 0,
     }
 }
 

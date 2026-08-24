@@ -150,6 +150,16 @@ pub struct InvalidateHandler {
     /// Invalidate notifications for the same (inode, version) pair.
     /// Keyed by inode, value is the server version that was processed.
     processed_versions: Arc<RwLock<HashMap<u64, u64>>>,
+    /// Last-processed version per (parent, name) dentry. Used to suppress
+    /// duplicate dentry-level kernel invalidations for the same
+    /// (parent, name, version) tuple. Ceph-aligned defense-in-depth: even
+    /// though the Filer excludes the originating client from the dentry
+    /// broadcast, a duplicate message may still arrive on network retry /
+    /// Filer re-push. Without this guard each duplicate re-spawns a
+    /// `FUSE_NOTIFY_INVAL_ENTRY` worker thread that races with the
+    /// in-flight VFS call holding `i_rwsem` on the parent dir.
+    /// Key: (parent_ino, name). Value: last processed server version.
+    processed_dentry_versions: Arc<RwLock<HashMap<(u64, String), u64>>>,
     /// Raw file descriptor for /dev/fuse, used to send kernel cache
     /// invalidation notifications (FUSE_NOTIFY_INVAL_INODE). Set to -1
     /// until the FUSE session is mounted. This is required because the
@@ -198,6 +208,7 @@ impl InvalidateHandler {
             chunk_cache,
             inline_buffers,
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
+            processed_dentry_versions: Arc::new(RwLock::new(HashMap::new())),
             fuse_fd: Arc::new(AtomicI32::new(-1)),
             open_inodes: Arc::new(RwLock::new(HashMap::new())),
             lease_state: RwLock::new(None),
@@ -219,6 +230,7 @@ impl InvalidateHandler {
             chunk_cache,
             inline_buffers,
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
+            processed_dentry_versions: Arc::new(RwLock::new(HashMap::new())),
             fuse_fd,
             open_inodes: Arc::new(RwLock::new(HashMap::new())),
             lease_state: RwLock::new(None),
@@ -244,6 +256,7 @@ impl InvalidateHandler {
             chunk_cache,
             inline_buffers,
             processed_versions: Arc::new(RwLock::new(HashMap::new())),
+            processed_dentry_versions: Arc::new(RwLock::new(HashMap::new())),
             fuse_fd,
             open_inodes,
             lease_state: RwLock::new(None),
@@ -313,7 +326,7 @@ impl InvalidateHandler {
 
         // OutHeader
         buf[0..4].copy_from_slice(&40u32.to_ne_bytes()); // len
-        buf[4..8].copy_from_slice(&2i32.to_ne_bytes()); // error = NotifyOpcode::InvalInode
+        buf[4..8].copy_from_slice(&(-2i32).to_ne_bytes()); // -FUSE_NOTIFY_INVAL_INODE
         buf[8..16].copy_from_slice(&0u64.to_ne_bytes()); // unique = 0
 
         // NotifyInvalInodeOut
@@ -343,18 +356,33 @@ impl InvalidateHandler {
     /// Send a FUSE_NOTIFY_INVAL_ENTRY notification to the kernel to
     /// invalidate the dentry cache for a directory entry.
     ///
-    /// # WARNING: DEADLOCK RISK — DO NOT CALL FROM NOTIFICATION PATH
+    /// Send a FUSE_NOTIFY_INVAL_ENTRY notification to the kernel to
+    /// invalidate the dentry cache for a directory entry.
     ///
-    /// This method is retained for reference but is NOT called from
-    /// `handle_notification`. FUSE_NOTIFY_INVAL_ENTRY requires the kernel
-    /// to acquire `i_rwsem` (inode_lock) on the parent directory, which
-    /// deadlocks when another VFS operation holds `i_rwsem` and is waiting
-    /// for a FUSE reply. See the comment in `handle_notification` for the
-    /// full deadlock chain.
+    /// # Deadlock Safety
     ///
-    /// Use `notify_kernel_inval_inode` on the parent directory instead,
-    /// which invalidates the page cache without acquiring `i_rwsem`.
-    #[allow(dead_code)]
+    /// This method is called from `handle_notification` (the notification
+    /// processing path). FUSE_NOTIFY_INVAL_ENTRY requires the kernel to
+    /// acquire `i_rwsem` on the parent directory. If another VFS operation
+    /// (e.g. stat, readdir) holds `i_rwsem` and is waiting for a FUSE reply,
+    /// calling this synchronously would deadlock:
+    ///
+    ///   1. VFS op A: holds `i_rwsem` on parent, calls FUSE getattr, waits for reply
+    ///   2. InvalidateHandler: receives Invalidate, calls notify_kernel_inval_entry
+    ///   3. notify_kernel_inval_entry: write(/dev/fuse) blocks waiting for kernel
+    ///      to acquire `i_rwsem` — but it's held by VFS op A
+    ///   4. FUSE reply for VFS op A can't be processed because notification
+    ///      handler is blocked → deadlock
+    ///
+    /// Solution: spawn a detached thread that does the write. The thread
+    /// doesn't hold any VFS locks, so:
+    ///   - If `i_rwsem` is free: write completes immediately, dentry cleared.
+    ///   - If `i_rwsem` is held by VFS op A: the thread blocks, but the
+    ///     notification handler continues unblocked. VFS op A eventually
+    ///     gets its FUSE reply, releases `i_rwsem`, and the thread completes.
+    ///
+    /// Ceph parallel: CEvent::DentryInvalidate is dispatched via a
+    /// separate workqueue, not inline on the notification path.
     fn notify_kernel_inval_entry(&self, parent: u64, name: &str) {
         let fd = self.fuse_fd.load(Ordering::Acquire);
         if fd < 0 {
@@ -368,40 +396,67 @@ impl InvalidateHandler {
         // Pack the notification message as raw bytes
         // OutHeader: 16 bytes
         // NotifyInvalEntryOut: parent(8) + namelen(4) + padding(4) = 16 bytes
-        // name: variable (including null terminator)
+        // name: variable (including null terminator + padding to 8-byte boundary)
+        //
+        // FUSE kernel ABI (libfuse fuse_lowlevel_notify_inval_entry +
+        // fs/fuse/dev.c:fuse_notify_inval_entry):
+        //   - error field MUST be -FUSE_NOTIFY_INVAL_ENTRY (= -3). The
+        //     kernel dispatches notify messages on `error < 0`. A positive
+        //     value is treated as a normal reply with unique=0, which the
+        //     kernel discards silently or returns EINVAL. The previous
+        //     +3 here was the root cause of T2.3.7 link failure: the
+        //     dentry cache was never cleared, so ld stat() returned the
+        //     OLD target inode (size=8 magic header) instead of the new
+        //     one (size=1516 actual .a).
+        //   - The wire data carries namelen+1 bytes (with trailing NUL)
+        //     even though outarg.namelen excludes the NUL. The kernel
+        //     reads `namelen` bytes and appends its own NUL.
+        //   - The whole message is padded to 8-byte alignment per FUSE ABI.
         let name_bytes = name.as_bytes();
-        let name_with_null_len = name_bytes.len() + 1; // +1 for null terminator
-        let total_len = 16 + 16 + name_with_null_len;
+        let name_len = name_bytes.len();
+        let name_with_null_len = name_len + 1; // +1 for null terminator
+                                               // FUSE requires the trailing name blob to be padded to 8-byte alignment
+        let name_padded = (name_with_null_len + 7) & !7;
+        let total_len = 16 + 16 + name_padded;
 
         let mut buf = vec![0u8; total_len];
 
         // OutHeader
         buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes()); // len
-        buf[4..8].copy_from_slice(&3i32.to_ne_bytes()); // error = NotifyOpcode::InvalEntry
+        buf[4..8].copy_from_slice(&(-3i32).to_ne_bytes()); // -FUSE_NOTIFY_INVAL_ENTRY
         buf[8..16].copy_from_slice(&0u64.to_ne_bytes()); // unique = 0
 
         // NotifyInvalEntryOut
         buf[16..24].copy_from_slice(&parent.to_ne_bytes()); // parent
-        buf[24..28].copy_from_slice(&(name_bytes.len() as u32).to_ne_bytes()); // namelen (without null)
+        buf[24..28].copy_from_slice(&(name_len as u32).to_ne_bytes()); // namelen (without null)
         buf[28..32].copy_from_slice(&0u32.to_ne_bytes()); // padding
 
-        // name (null-terminated)
-        buf[32..32 + name_bytes.len()].copy_from_slice(name_bytes);
-        // null terminator is already 0 from vec initialization
+        // name (null-terminated + padding)
+        buf[32..32 + name_len].copy_from_slice(name_bytes);
+        buf[32 + name_len] = 0; // NUL terminator (kernel reads `namelen` bytes then appends own NUL)
+                                // buf[32 + name_len + 1 .. total_len] = padding (already zero)
 
-        let ret = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, total_len) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            warn!(
-                "notify_kernel_inval_entry: write to /dev/fuse failed for parent={}, name={}: {} (errno={})",
-                parent, name, err, err.raw_os_error().unwrap_or(0)
-            );
-        } else {
-            info!(
-                "notify_kernel_inval_entry: sent FUSE_NOTIFY_INVAL_ENTRY for parent={}, name={} ({} bytes)",
-                parent, name, ret
-            );
-        }
+        // Spawn a detached thread to avoid deadlock in the notification path.
+        // See the method-level comment for the full deadlock analysis.
+        let fd_owned = fd;
+        let parent_owned = parent;
+        let name_owned = name.to_string();
+        std::thread::spawn(move || {
+            let ret =
+                unsafe { libc::write(fd_owned, buf.as_ptr() as *const libc::c_void, total_len) };
+            if ret < 0 {
+                let err = std::io::Error::last_os_error();
+                log::warn!(
+                    "notify_kernel_inval_entry: write to /dev/fuse failed for parent={}, name={}: {} (errno={})",
+                    parent_owned, name_owned, err, err.raw_os_error().unwrap_or(0)
+                );
+            } else {
+                log::info!(
+                    "notify_kernel_inval_entry: sent FUSE_NOTIFY_INVAL_ENTRY for parent={}, name={} ({} bytes)",
+                    parent_owned, name_owned, ret
+                );
+            }
+        });
     }
 
     /// Check if this (inode, version) pair has already been processed.
@@ -418,6 +473,34 @@ impl InvalidateHandler {
     fn mark_processed(&self, inode: u64, version: u64) {
         let mut processed = self.processed_versions.write().unwrap();
         let entry = processed.entry(inode).or_insert(0);
+        if version > *entry {
+            *entry = version;
+        }
+    }
+
+    /// Check if a dentry-level (parent, name, version) invalidation has
+    /// already been processed. Returns true if the same or a newer
+    /// version was already seen for this (parent, name) pair.
+    ///
+    /// Defense-in-depth on top of the Filer's `exclude_client_id`
+    /// optimization: even with the Filer excluding the originator, a
+    /// duplicate dentry notification may still arrive (network retry,
+    /// Filer re-push on follower promotion, etc.). Each duplicate would
+    /// otherwise re-spawn a `FUSE_NOTIFY_INVAL_ENTRY` worker thread that
+    /// races with the in-flight VFS call holding `i_rwsem`.
+    fn is_duplicate_dentry(&self, parent_ino: u64, name: &str, version: u64) -> bool {
+        let processed = self.processed_dentry_versions.read().unwrap();
+        match processed.get(&(parent_ino, name.to_string())) {
+            Some(&last_seen) => version <= last_seen,
+            None => false,
+        }
+    }
+
+    /// Record that a dentry-level (parent, name, version) invalidation
+    /// has been processed.
+    fn mark_dentry_processed(&self, parent_ino: u64, name: &str, version: u64) {
+        let mut processed = self.processed_dentry_versions.write().unwrap();
+        let entry = processed.entry((parent_ino, name.to_string())).or_insert(0);
         if version > *entry {
             *entry = version;
         }
@@ -442,10 +525,47 @@ impl NotificationHandler for InvalidateHandler {
                 let mut dec = TlvDecoder::new(&msg.body);
                 let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
                 let version = dec.next_u64(FieldId::Version).unwrap_or(0);
+                // Dentry-level fields (optional — present when the Filer
+                // sends notify_dentry_change for rename/unlink/create).
+                // When present, we call notify_kernel_inval_entry(parent, name)
+                // to clear the kernel VFS dentry cache — not just the
+                // userspace dentry lease. This aligns with Ceph's
+                // CEvent::DentryInvalidate mechanism.
+                let parent_ino = dec.next_u64(FieldId::ParentIno).unwrap_or(0);
+                let dentry_name = dec.next_string(FieldId::Name).unwrap_or_default();
 
                 if inode == 0 {
                     warn!("InvalidateHandler: received Invalidate with inode=0, ignoring");
                     return;
+                }
+
+                // Dentry-level kernel cache invalidation: if the Filer
+                // sent (parent, name), notify the kernel to drop the
+                // dentry. This forces the next stat/lookup to re-enter
+                // FUSE and get the fresh inode (critical for
+                // rename-over-replace where the old inode has stale size).
+                //
+                // Defense-in-depth: dedup by (parent, name, version) so a
+                // duplicate broadcast (network retry, follower re-push)
+                // does not re-spawn a `FUSE_NOTIFY_INVAL_ENTRY` worker
+                // thread that would race with the in-flight VFS call
+                // holding `i_rwsem` on the parent dir. The Filer already
+                // excludes the originating client from the broadcast;
+                // this is the client-side backstop.
+                if parent_ino != 0 && !dentry_name.is_empty() {
+                    if self.is_duplicate_dentry(parent_ino, &dentry_name, version) {
+                        debug!(
+                            "InvalidateHandler: skipping duplicate dentry invalidation (parent={}, name={}, v={})",
+                            parent_ino, dentry_name, version
+                        );
+                    } else {
+                        debug!(
+                            "InvalidateHandler: notify_kernel_inval_entry(parent={}, name={}) for inode={}, v={}",
+                            parent_ino, dentry_name, inode, version
+                        );
+                        self.notify_kernel_inval_entry(parent_ino, &dentry_name);
+                        self.mark_dentry_processed(parent_ino, &dentry_name, version);
+                    }
                 }
 
                 // Never evict the root inode (inode=1). The root must always
@@ -487,6 +607,46 @@ impl NotificationHandler for InvalidateHandler {
                     );
                     return;
                 }
+
+                // ── Dir completeness & dentry lease invalidation ──
+                //
+                // This MUST happen BEFORE any skip (pinned/dirty/open)
+                // check and BEFORE the EVICT branch. The Invalidate
+                // notification means "this inode's content/metadata changed
+                // on the server". If this inode is a directory, ALL its
+                // children's dentry leases (positive AND negative) must be
+                // cleared, and dir_complete must be set to false —
+                // regardless of whether the inode itself is later evicted,
+                // skipped (pinned), or marked stale.
+                //
+                // Why this matters:
+                //   Client A creates `util.h` in directory D.
+                //   Filer sends Invalidate(D, v) to all clients.
+                //   Client B (and A itself) previously did a full readdir on
+                //   D, so `is_dir_complete(D)` is true. A prior lookup of
+                //   `util.h.gch` (non-existent) cached a negative result
+                //   under the dir_complete umbrella (NegativeComplete path
+                //   in check_dentry_lease).
+                //   If D is pinned (e.g. it's the cwd or an open dir),
+                //   the EVICT branch never runs, so invalidate_dir() and
+                //   invalidate_dentry_leases() are never called. The stale
+                //   dir_complete=true persists. When gcc opens `util.h`,
+                //   lookup sees cache miss + dir_complete=true → returns
+                //   NegativeComplete → ENOENT → "fatal error: util.h: No
+                //   such file or directory".
+                //
+                // Ceph parallel: MDS pushes a dirfrag invalidate that
+                // unconditionally clears I_COMPLETE and all dentry leases
+                // on the affected directory, even if the inode itself is
+                // cap-held (pinned). The cap only protects the inode's
+                // data/metadata, NOT the directory listing completeness.
+                //
+                // Safety: calling invalidate_dentry_leases(inode) and
+                // invalidate_dir(inode) on a non-directory inode is a
+                // no-op (no entries match parent=inode, no dir_cache
+                // entry exists).
+                self.cache.invalidate_dentry_leases(inode);
+                self.cache.invalidate_dir(inode);
 
                 // Skip invalidation for pinned (open) inodes. An open file
                 // holds a data lease, so the client's cached metadata/data is
@@ -693,15 +853,8 @@ impl NotificationHandler for InvalidateHandler {
                         handler.on_inode_evicted(inode);
                     }
 
-                    // Dentry lease invalidation: when a directory's content
-                    // changes (create/mkdir/unlink/rmdir on a child), the
-                    // Filer sends an Invalidate for the parent inode. Clear
-                    // all per-dentry leases for this parent's children and
-                    // mark the dir listing as incomplete (clear I_COMPLETE),
-                    // so subsequent lookups re-query the Filer instead of
-                    // trusting stale negative dentries.
-                    self.cache.invalidate_dentry_leases(inode);
-                    self.cache.invalidate_dir(inode);
+                    // Dentry lease invalidation: already done unconditionally
+                    // above (before skip checks). No need to repeat here.
 
                     // Clear any directory lease on this inode: the server
                     // invalidated it (another client modified it), so our
