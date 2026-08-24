@@ -32,13 +32,13 @@ use openraft::type_config::TypeConfigExt;
 use openraft::EntryPayload;
 use openraft::OptionalSend;
 use openraft::RaftSnapshotBuilder;
-use tracing::debug;
-use tracing::warn;
 use openraft::RaftTypeConfig;
 use rocksdb::DB;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc;
+use tracing::debug;
+use tracing::warn;
 
 use crate::pb_impl::CommittedLidOf;
 use crate::store::CF_STATE_DATA;

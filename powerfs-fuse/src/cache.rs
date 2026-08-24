@@ -3456,7 +3456,9 @@ mod cap_tests {
             EntryState::Dirty
         );
         let cap_before = cache.get_cap(inode).unwrap();
-        assert!(cap_before.dirty_caps.contains(crate::client_cap::CapSet::CAP_W));
+        assert!(cap_before
+            .dirty_caps
+            .contains(crate::client_cap::CapSet::CAP_W));
 
         cache.invalidate_all();
 
@@ -3467,7 +3469,9 @@ mod cap_tests {
         );
 
         // Dirty entry itself is preserved (local authoritative data).
-        let entry = cache.peek_inode(inode).expect("Dirty entry must be preserved");
+        let entry = cache
+            .peek_inode(inode)
+            .expect("Dirty entry must be preserved");
         assert_eq!(entry.state, EntryState::Dirty);
     }
 
@@ -3480,7 +3484,11 @@ mod cap_tests {
     fn test_invalidate_all_clears_cap_on_flushing_entry() {
         let cache = MetadataCache::new();
         let inode = 602u64;
-        cache.insert(make_entry_with_state(inode, "flushing.txt", EntryState::Clean));
+        cache.insert(make_entry_with_state(
+            inode,
+            "flushing.txt",
+            EntryState::Clean,
+        ));
         grant_exclusive_cap(&cache, inode, "tok-flush");
         // mark_dirty_cap_w sets Dirty + CAP_W dirty, then mark_flushing
         // transitions to Flushing.
@@ -3503,7 +3511,9 @@ mod cap_tests {
         );
 
         // Flushing entry itself is preserved.
-        let entry = cache.peek_inode(inode).expect("Flushing entry must be preserved");
+        let entry = cache
+            .peek_inode(inode)
+            .expect("Flushing entry must be preserved");
         assert_eq!(entry.state, EntryState::Flushing);
     }
 
@@ -3543,10 +3553,22 @@ mod cap_tests {
         cache.invalidate_all();
 
         // All caps cleared.
-        assert!(cache.take_cap(700).is_none(), "inode 700 cap must be cleared");
-        assert!(cache.take_cap(701).is_none(), "inode 701 cap must be cleared");
-        assert!(cache.take_cap(702).is_none(), "inode 702 had no cap, still None");
-        assert!(cache.take_cap(703).is_none(), "inode 703 cap must be cleared");
+        assert!(
+            cache.take_cap(700).is_none(),
+            "inode 700 cap must be cleared"
+        );
+        assert!(
+            cache.take_cap(701).is_none(),
+            "inode 701 cap must be cleared"
+        );
+        assert!(
+            cache.take_cap(702).is_none(),
+            "inode 702 had no cap, still None"
+        );
+        assert!(
+            cache.take_cap(703).is_none(),
+            "inode 703 cap must be cleared"
+        );
 
         // Dirty/Flushing entries preserved; Clean entries' state is now Stale.
         assert_eq!(

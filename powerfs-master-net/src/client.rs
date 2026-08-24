@@ -481,7 +481,9 @@ impl TlvMasterClient {
         let _ = enc.add_u64(FieldId::Limit, pid);
         let payload = enc.into_bytes();
 
-        let resp = self.submit_request(MsgType::RegisterClient, &payload).await?;
+        let resp = self
+            .submit_request(MsgType::RegisterClient, &payload)
+            .await?;
 
         let mut dec = TlvDecoder::new(&resp.body);
         let assigned_id = dec.next_u64(FieldId::ClientId).unwrap_or(0);
@@ -521,7 +523,9 @@ impl TlvMasterClient {
         let _ = enc.add_u64(FieldId::ClientId, assigned_client_id);
         let payload = enc.into_bytes();
 
-        let resp = self.submit_request(MsgType::DeregisterClient, &payload).await?;
+        let resp = self
+            .submit_request(MsgType::DeregisterClient, &payload)
+            .await?;
 
         if resp.header.status != STATUS_OK {
             return Err(MasterNetError::ServerError {

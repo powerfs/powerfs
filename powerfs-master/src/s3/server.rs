@@ -412,7 +412,11 @@ pub mod handlers {
             Ok(true) => {
                 // bucket 删除成功：写穿 bucket_cache=false, 并清理该 bucket 下所有 entry_cache
                 state.cache.bucket_cache.set(&bucket, false).await;
-                state.cache.entry_cache.clear_prefix(&format!("/{}/", bucket)).await;
+                state
+                    .cache
+                    .entry_cache
+                    .clear_prefix(&format!("/{}/", bucket))
+                    .await;
                 (StatusCode::NO_CONTENT, "".to_string())
             }
             Ok(false) => {
@@ -1467,6 +1471,9 @@ mod tests {
                 vec![],
                 0,
                 0,
+                None,
+                Some(dir.path().join("ca").to_str().unwrap().to_string()),
+                None,
             )
             .await
             .unwrap(),

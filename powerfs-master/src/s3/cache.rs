@@ -69,7 +69,10 @@ impl BucketCache {
     {
         let mut cache = self.cache.write().await;
         for (bucket, exists) in items {
-            cache.insert(bucket.as_ref().to_string(), CacheEntry::new(exists, self.ttl));
+            cache.insert(
+                bucket.as_ref().to_string(),
+                CacheEntry::new(exists, self.ttl),
+            );
         }
     }
 

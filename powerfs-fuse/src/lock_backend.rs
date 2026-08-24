@@ -151,7 +151,10 @@ impl FacadeLeaseReleaser {
 
 impl crate::invalidate_handler::LeaseReleaser for FacadeLeaseReleaser {
     fn release(&self, inode: u64, _token: String) {
-        debug!("FacadeLeaseReleaser: inode={} release noop (cap mode)", inode);
+        debug!(
+            "FacadeLeaseReleaser: inode={} release noop (cap mode)",
+            inode
+        );
     }
 }
 

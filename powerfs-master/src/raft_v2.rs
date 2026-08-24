@@ -302,34 +302,52 @@ impl RaftNodeV2 {
                     // 如果不同，打印警告，并启动后台任务在成为 leader 后通过
                     // add_learner 更新 RocksDB 中的地址。
                     let metrics_recv = raft.metrics();
-                    let membership = metrics_recv.borrow_watched().membership_config.membership().clone();
+                    let membership = metrics_recv
+                        .borrow_watched()
+                        .membership_config
+                        .membership()
+                        .clone();
                     drop(metrics_recv);
 
                     let mut addr_mismatches: Vec<(String, String, String)> = Vec::new();
 
                     // 检查本节点地址
-                    if let Some((_, node)) = membership.nodes().find(|(k, _)| k.as_str() == node_id.as_str()) {
+                    if let Some((_, node)) = membership
+                        .nodes()
+                        .find(|(k, _)| k.as_str() == node_id.as_str())
+                    {
                         if node.addr != address {
                             warn!(
                                 "RaftNodeV2: node {} address mismatch: RocksDB='{}', current='{}'. \
                                  Will use new address and update via Raft when leader is elected.",
                                 node_id, node.addr, address
                             );
-                            addr_mismatches.push((node_id.clone(), node.addr.clone(), address.clone()));
+                            addr_mismatches.push((
+                                node_id.clone(),
+                                node.addr.clone(),
+                                address.clone(),
+                            ));
                         }
                     }
 
                     // 检查 peer 地址
                     for peer in &peers {
                         let peer_id = peer.id.to_string();
-                        if let Some((_, node)) = membership.nodes().find(|(k, _)| k.as_str() == peer_id.as_str()) {
+                        if let Some((_, node)) = membership
+                            .nodes()
+                            .find(|(k, _)| k.as_str() == peer_id.as_str())
+                        {
                             if node.addr != peer.address {
                                 warn!(
                                     "RaftNodeV2: peer {} address mismatch: RocksDB='{}', config='{}'. \
                                      Will update to new address.",
                                     peer_id, node.addr, peer.address
                                 );
-                                addr_mismatches.push((peer_id, node.addr.clone(), peer.address.clone()));
+                                addr_mismatches.push((
+                                    peer_id,
+                                    node.addr.clone(),
+                                    peer.address.clone(),
+                                ));
                             }
                         }
                     }
@@ -345,7 +363,13 @@ impl RaftNodeV2 {
                                 if state == ServerState::Leader {
                                     for (nid, old_addr, new_addr) in &addr_mismatches {
                                         match raft_clone
-                                            .add_learner(nid.clone(), BasicNode { addr: new_addr.clone() }, true)
+                                            .add_learner(
+                                                nid.clone(),
+                                                BasicNode {
+                                                    addr: new_addr.clone(),
+                                                },
+                                                true,
+                                            )
                                             .await
                                         {
                                             Ok(_) => {

@@ -26,6 +26,10 @@ pub struct MasterClient {
     net_port: u32,
     ip: String,
     heartbeat_running: Arc<AtomicBool>,
+    /// Registration token for node authentication. Sent in every Heartbeat
+    /// TLV so the master can verify the node is authorized to join.
+    /// `None` or empty = no token (dev mode, master must also be in dev mode).
+    registration_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -38,6 +42,8 @@ pub struct NewMasterClientParams<'a> {
     pub http_port: u32,
     pub net_port: u32,
     pub ip: &'a str,
+    /// Registration token for master authentication. None = dev mode.
+    pub registration_token: Option<&'a str>,
 }
 
 impl MasterClient {
@@ -60,6 +66,7 @@ impl MasterClient {
             net_port: params.net_port,
             ip: params.ip.to_string(),
             heartbeat_running: Arc::new(AtomicBool::new(false)),
+            registration_token: params.registration_token.map(|s| s.to_string()),
         }
     }
 
@@ -221,6 +228,13 @@ impl MasterClient {
         let mem_bps = (memory_usage.clamp(0.0, 1.0) * 10000.0) as u64;
         let _ = enc.add_u64(FieldId::CpuUsage, cpu_bps);
         let _ = enc.add_u64(FieldId::MemoryUsage, mem_bps);
+
+        // Registration token for node authentication.
+        if let Some(token) = &self.registration_token {
+            if !token.is_empty() {
+                let _ = enc.add_string(FieldId::RegistrationToken, token);
+            }
+        }
 
         for vol in volumes {
             let _ = enc.add_u64(FieldId::Ino, vol.volume_id);

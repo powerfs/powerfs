@@ -605,6 +605,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let filer_raft_id = filer_cfg.raft_id;
             let shard_count = filer_cfg.shard_count as u64;
             let force_register = filer_cfg.force_register;
+            let registration_token_for_reg = filer_cfg.registration_token.clone();
             let net_port_for_reg = net_port;
             // S3 HTTP port (filer_cfg.port). The S3 server also serves the
             // /admin/shards endpoint, so the Master needs this port to
@@ -628,6 +629,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     shard_count,
                     shard_ids,
                     force: force_register,
+                    registration_token: registration_token_for_reg,
                 };
 
                 // 从 master_addresses ("ip:http_port") 提取 IP, 拼接 master_net_port

@@ -1,6 +1,9 @@
-use axum::{routing::get, Router, Server};
+use axum::{routing::get, routing::post, Router, Server};
 use log::{error, info};
 use prometheus::{register_counter, register_gauge, Counter, Encoder, Gauge, TextEncoder};
+use std::sync::Arc;
+
+use crate::ca_manager::{get_ca_cert, sign_client, sign_server, CaManager};
 
 lazy_static::lazy_static! {
     pub static ref RAFT_TERM: Gauge = register_gauge!(
@@ -44,18 +47,24 @@ lazy_static::lazy_static! {
     ).unwrap();
 }
 
-pub async fn start_metrics_server(addr: &str) -> Result<(), String> {
-    let app = Router::new().route("/metrics", get(metrics_handler));
+pub async fn start_metrics_server(addr: &str, ca_manager: Arc<CaManager>) -> Result<(), String> {
+    let app = Router::new()
+        .route("/metrics", get(metrics_handler))
+        // Certificate Authority HTTP API (master acts as cluster CA).
+        .route("/api/cert/ca", get(get_ca_cert))
+        .route("/api/cert/sign-client", post(sign_client))
+        .route("/api/cert/sign-server", post(sign_server))
+        .with_state(ca_manager);
 
     let addr = addr
         .parse()
         .map_err(|e| format!("Invalid metrics address: {}", e))?;
 
-    info!("Metrics server listening on http://{}", addr);
+    info!("Metrics + cert API server listening on http://{}", addr);
 
     tokio::spawn(async move {
         if let Err(e) = Server::bind(&addr).serve(app.into_make_service()).await {
-            error!("Metrics server error: {}", e);
+            error!("Metrics/cert API server error: {}", e);
         }
     });
 

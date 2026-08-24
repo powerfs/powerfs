@@ -501,7 +501,8 @@ impl MdLock {
             GatherTarget::ToExcl => {
                 // xlock 完成: 移除已 ACK 的旧 holder (被 recall 的),
                 // 只保留新 xlock holder (GATHER 期间未在 gather_list 中).
-                self.holders.retain(|h| !acked_clients.contains(&h.client_id));
+                self.holders
+                    .retain(|h| !acked_clients.contains(&h.client_id));
                 self.state = LockState::Excl;
             }
             GatherTarget::ToShared => {
@@ -1163,13 +1164,7 @@ impl LockArbiter {
     ///
     /// 返回 `true` = 找到匹配的 gather 条目并标记了 ACK (无论 gather 是否
     /// 全部完成); `false` = 此 lock_type 上没有匹配的 gather 条目.
-    pub fn recall_ack(
-        &self,
-        inode: u64,
-        lock_type: LockType,
-        client_id: &str,
-        sn: u64,
-    ) -> bool {
+    pub fn recall_ack(&self, inode: u64, lock_type: LockType, client_id: &str, sn: u64) -> bool {
         let mut locks = self.locks.lock().unwrap();
         Self::ensure_init_locked(&mut locks, inode);
         let lock_arr = locks.get_mut(&inode).unwrap();
@@ -2189,9 +2184,16 @@ mod tests {
         assert!(matched, "C1 ACK 应匹配到 gather 条目");
         // C2 retry wrlock → gather_remaining==0 → gather_complete → C2 加入 holders → state=Loner
         let r2_retry = a.wrlock(200, LockType::File, "C2");
-        assert!(r2_retry.granted_caps.is_exclusive(), "C2 retry 应拿到 LONER EXCL");
+        assert!(
+            r2_retry.granted_caps.is_exclusive(),
+            "C2 retry 应拿到 LONER EXCL"
+        );
         // C2: LONER → 全套 R|W|X
-        assert!(r2_retry.granted_caps.has_r() && r2_retry.granted_caps.has_w() && r2_retry.granted_caps.has_x());
+        assert!(
+            r2_retry.granted_caps.has_r()
+                && r2_retry.granted_caps.has_w()
+                && r2_retry.granted_caps.has_x()
+        );
         // 此时 holders=[C1(R), C2(R|W|X)], eval 为 File 类 Loner, 所以 eval_issued 应该是全套, 但
         // 实际上 FileLock::eval_file Loner 只在 holders.len() == 1 时下发全套, 这里 2 个 holders
         // 会走到 Sync(或 Loner 判断失败), 所以验证 C2 自身 granted_caps 即可 (上面已断言).
@@ -2265,7 +2267,10 @@ mod tests {
         // C2 wrlock_async → GATHER → Waiting (wrlock_async 是同步函数, 无需 spawn)
         let rx = match a.wrlock_async(400, LockType::File, "C2") {
             LockAcquireResult::Granted(_) => panic!("应 Waiting"),
-            LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+            LockAcquireResult::Waiting {
+                recall_tasks: _,
+                rx,
+            } => rx,
         };
 
         // C1 ACK → GATHER 完成 → wake_waiters 通知 C2 (重新调用 wrlock 添加 holder)
@@ -2375,7 +2380,10 @@ mod tests {
         // C2 wrlock_async → GATHER → Waiting (wrlock_async 是同步函数, 无需 spawn)
         let rx = match a.wrlock_async(600, LockType::File, "C2") {
             LockAcquireResult::Granted(_) => panic!("应 Waiting"),
-            LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+            LockAcquireResult::Waiting {
+                recall_tasks: _,
+                rx,
+            } => rx,
         };
 
         // C1 ACK → GATHER 完成 → wake_waiters → 添加 C2 holder
@@ -2424,7 +2432,10 @@ mod tests {
         // C2 wrlock_async → GATHER → Waiting (wrlock_async 是同步函数, 无需 spawn)
         let rx = match a.wrlock_async(800, LockType::File, "C2") {
             LockAcquireResult::Granted(_) => panic!("应进入 Waiting"),
-            LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+            LockAcquireResult::Waiting {
+                recall_tasks: _,
+                rx,
+            } => rx,
         };
 
         // C1 ACK → GATHER 完成 → wake_waiters 通知 C2

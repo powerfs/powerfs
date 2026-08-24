@@ -1,4 +1,5 @@
 pub mod allocator_integration;
+pub mod ca_manager;
 pub mod collection;
 pub mod debug_config;
 pub mod filer_client;
@@ -19,3 +20,5 @@ pub mod volume_assigner;
 pub mod volume_client;
 pub mod volume_proto;
 // pub mod volume_router; // Temporarily disabled due to compilation issues
+
+pub use ca_manager::CaManager;

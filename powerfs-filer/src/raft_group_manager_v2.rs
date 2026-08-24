@@ -1054,8 +1054,7 @@ impl RaftGroupManagerV2 {
         let bytes = group.db.get_cf(cf, "last_applied_log").ok()??;
 
         // LogIdOf<FilerTypeConfig> = openraft::LogId<FilerTypeConfig::CommittedLeaderId>
-        let log_id: LogIdOf<FilerTypeConfig> =
-            serde_json::from_slice(&bytes).ok()?;
+        let log_id: LogIdOf<FilerTypeConfig> = serde_json::from_slice(&bytes).ok()?;
         Some(log_id.index())
     }
 

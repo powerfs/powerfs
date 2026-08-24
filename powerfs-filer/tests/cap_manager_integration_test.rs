@@ -59,7 +59,8 @@ struct CountingPenalty {
 #[allow(dead_code)]
 impl powerfs_filer::cap_manager::RecallTimeoutPenalty for CountingPenalty {
     fn on_recall_ack_timeout(&self, _client_id: &str) {
-        self.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -148,7 +149,11 @@ fn t1_5_two_writers_gather_recall_second_gets_none() {
     // arbiter wrlock: 两 writer 走 ToShared, retain = EXCLUSIVE.remove(W+X) = R
     // (C1 被 reader 化, 不是完全降级为 NONE — 这是 arbiter 的语义, 与
     // 公版 wrlock 不强制 recall 全部 cap 一致)
-    assert_eq!(recall.retained_caps, CapSet::CAP_R, "C1 retains CAP_R (reader-ized)");
+    assert_eq!(
+        recall.retained_caps,
+        CapSet::CAP_R,
+        "C1 retains CAP_R (reader-ized)"
+    );
 }
 
 // ==================== T1.6: writer + reader 共存, writer release 触发 reader 升级 ====================

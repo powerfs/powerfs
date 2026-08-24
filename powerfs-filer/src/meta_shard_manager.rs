@@ -577,10 +577,7 @@ impl MetaShardManager {
             // 重启场景：RocksDB 已持久化 last_applied_log，ShardStore 启动时也
             // 从 RocksDB 加载了所有 in-memory 状态，所以从 last_applied+1 开始
             // 处理新条目，不会重复 apply 旧条目。
-            let mut last_applied: u64 = mgr
-                .get_last_applied_index(shard_id)
-                .await
-                .unwrap_or(0);
+            let mut last_applied: u64 = mgr.get_last_applied_index(shard_id).await.unwrap_or(0);
             if last_applied > 0 {
                 info!(
                     "shard {}: apply loop starting from last_applied={} (recovered from RocksDB)",
@@ -1772,7 +1769,7 @@ impl MetaShardManager {
 
         // 1. Resolve inode number from the dir entry.
         let inode = match self.meta_cache.get_direntry(parent_inode, name) {
-            Some(Some(ino)) => ino, // Cache hit (Staging/Clean/Dirty)
+            Some(Some(ino)) => ino,    // Cache hit (Staging/Clean/Dirty)
             Some(None) => return None, // Known deleted by a pending unlink
             None => {
                 // Cache miss → query ShardStore and backfill a Clean copy.

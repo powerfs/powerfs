@@ -167,7 +167,10 @@ async fn scenario_4_loner_full_cycle() {
     );
 
     let rx = match a.wrlock_async(300, LockType::File, "C2") {
-        LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+        LockAcquireResult::Waiting {
+            recall_tasks: _,
+            rx,
+        } => rx,
         LockAcquireResult::Granted(_) => panic!("应 Waiting"),
     };
     println!("  2. C2 wrlock_async → GATHER → Waiting");
@@ -230,7 +233,10 @@ async fn scenario_6_evict_client() {
     println!("  C1 wrlock → LONER, sn={}", r1.sn);
 
     let rx = match a.wrlock_async(500, LockType::File, "C2") {
-        LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+        LockAcquireResult::Waiting {
+            recall_tasks: _,
+            rx,
+        } => rx,
         LockAcquireResult::Granted(_) => panic!("应 Waiting"),
     };
     a.recall_ack(500, LockType::File, "C1", r1.sn);
@@ -275,7 +281,10 @@ async fn scenario_7_async_wait() {
     }
 
     let rx = match a.wrlock_async(600, LockType::File, "C2") {
-        LockAcquireResult::Waiting { recall_tasks: _, rx } => rx,
+        LockAcquireResult::Waiting {
+            recall_tasks: _,
+            rx,
+        } => rx,
         LockAcquireResult::Granted(_) => panic!("应 Waiting"),
     };
     println!("  C2 wrlock_async → Waiting (注册 oneshot)");
