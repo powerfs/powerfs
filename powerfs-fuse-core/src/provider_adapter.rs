@@ -18,17 +18,7 @@ use powerfs_layout::reliability::{CompressionState, Reliability, ReliabilityStat
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::FieldId;
 use std::sync::Arc;
-use std::time::Duration;
 
-/// P1-3: Lease proactive renew threshold.
-///
-/// When a cached lease's remaining time drops below this threshold,
-/// `ensure_lease` proactively renews it before returning the token to the
-/// caller. This prevents lease expiry mid-write for long operations.
-///
-/// Set to 10s: with a 60s default lease duration, this gives the renew
-/// RPC ample time to complete while leaving 50s of "fresh" validity.
-const RENEW_THRESHOLD: Duration = Duration::from_secs(10);
 
 /// Helper: hex dump first N bytes for debugging
 fn hex_dump(bytes: &[u8]) -> String {
@@ -1155,35 +1145,6 @@ impl FacadeStorageProvider {
     }
 }
 
-/// 构建 RangeLease 请求 TLV
-fn build_range_lease_tlv(
-    file_key: u64,
-    stripe_start: u64,
-    stripe_count: u64,
-    client_id: &str,
-    exclusive: bool,
-    duration_ms: u64,
-) -> Vec<u8> {
-    let mut enc = TlvEncoder::new();
-    let _ = enc.add_u64(FieldId::Ino, file_key);
-    let _ = enc.add_u64(FieldId::Offset, stripe_start);
-    let _ = enc.add_u64(FieldId::Limit, stripe_count);
-    if !client_id.is_empty() {
-        let _ = enc.add_string(FieldId::ClientId, client_id);
-    }
-    let _ = enc.add_u64(FieldId::Mode, if exclusive { 1 } else { 0 });
-    let _ = enc.add_u64(FieldId::LeaseDuration, duration_ms);
-    enc.into_bytes()
-}
-
-/// 解析 RangeLease 响应 TLV → (lease_token, epoch)
-fn parse_range_lease_response(payload: &[u8]) -> Option<(String, u64)> {
-    let mut dec = TlvDecoder::new(payload);
-    let token = dec.next_string(FieldId::LeaseId).ok()?;
-    let epoch = dec.next_u64(FieldId::LeaseEpoch).unwrap_or(0);
-    Some((token, epoch))
-}
-
 impl FacadeStorageProvider {
     /// 获取/续期指定 (volume, inode, stripe) 的有效 lease 并返回 token。
     /// 优先读缓存；若缓存未命中或已过期，向 Volume 发起 RangeLease 请求并更新缓存。
@@ -1197,268 +1158,24 @@ impl FacadeStorageProvider {
     async fn ensure_lease(
         &self,
         volume_id: u64,
-        file_key: u64,
+        _file_key: u64,
         inode: u64,
         offset: u64,
     ) -> powerfs_common::error::Result<String> {
-        // 方案 A: inode metadata lease (Filer-managed).
+        // §13 Cap model: Strong write consistency is enforced by the
+        // Filer's lock_arbiter (FileLock/ScatterLock state machines),
+        // NOT by the Volume Server's range-lease manager.
         //
-        // When lease_mode == "inode", the Volume Server backend doesn't
-        // support range lease (e.g., NVMe-oF target). We acquire a per-inode
-        // exclusive lease from the Filer instead. The token is still passed
-        // to write_needle, but Volume Server skips validation because
-        // lease_enabled=false. Consistency is guaranteed by Filer's
-        // UpdateInodeSizeChunks Raft commit.
-        if self.facade.is_inode_lease_mode() {
-            return self.ensure_inode_lease(inode).await;
-        }
-
-        // §13 Cap model (方案 E / 方案 C+D hybrid): Strong write consistency
-        // is enforced by the Filer's lock_arbiter FileLock/ScatterLock state
-        // machines, NOT by the Volume Server's primitive range-lease manager.
-        // Data flow:
-        //   1. Open → Filer: CapOpenGrant → client gets CAP_W (exclusive write
-        //      cap). Only ONE client holds CAP_W at any time (lock_arbiter
-        //      GATHER + epoch fencing guarantees linearization).
-        //   2. Write → local chunk cache (dirty).
-        //   3. Release/Recall → flush_dirty_chunks passes the cap token to
-        //      write_blob_batch_with_lease → Volume Server receives the
-        //      non-empty token but skips validation (lease_enabled=false
-        //      per cluster config).
-        //   4. Release → Filer: UpdateInodeSizeChunks Raft + CapRelease.
-        //
-        // The earlier fixes in fuse.rs (acquire_cap_on_open → bind to
-        // open_file_leases registry; flush_dirty_chunks → secondary cap
-        // fallback) should ALWAYS provide a token before we reach here.
-        // This block is the FINAL SAFETY NET: if a pathological code path
-        // still calls ensure_lease in cap mode, return an empty string
-        // instead of issuing an AcquireRangeLease RPC to the Volume Server,
-        // because that RPC has a direct-conflict fast path (no queuing,
-        // returns STATUS_ERR_SERVER_ERROR=10 when two clients race on the
-        // same stripe) — breaking L4.17's concurrent-write-of-different-
-        // offsets scenario.
-        //
-        // Safety: Volume Server's `lease_enabled=false` in the cluster
-        // config, so `WriteNeedle` handlers do not validate the token
-        // field — an empty string is fine. The authoritative consistency
-        // gate is the Filer-side lock_arbiter, NOT the Volume side.
-        if self.facade.lease_mode() == "cap" {
-            log::debug!(
-                "ensure_lease: cap mode — bypassing inode/range lease \
-                 (consistency via lock_arbiter). inode={} volume={} offset={}",
-                inode, volume_id, offset
-            );
-            return Ok(String::new());
-        }
-
-        // 方案 D: range lease (Volume Server-managed) — existing logic
-        let vid = volume_id;
-        let stripe_start = crate::volume_client::stripe_start_from_offset(offset);
-
-        // Fast path: use cached valid lease token via facade
-        // Cache key is (volume_id, inode, stripe_start) to match server-side
-        // StripeKey { inode, stripe_start, stripe_count } registration.
-        if let Some(tok) = self.facade.get_valid_lease_token(vid, inode, stripe_start) {
-            // P1-3: proactively renew if remaining time is below threshold.
-            // This prevents lease expiry mid-write for long operations.
-            if let Some(remaining) = self.facade.get_lease_remaining(vid, inode, stripe_start) {
-                if remaining < RENEW_THRESHOLD {
-                    log::debug!(
-                        "ensure_lease: proactive renew for volume={} inode={} stripe_start={} remaining_ms={} < threshold_ms={}",
-                        vid,
-                        inode,
-                        stripe_start,
-                        remaining.as_millis(),
-                        RENEW_THRESHOLD.as_millis()
-                    );
-                    // Best-effort renew: if it fails, fall back to the
-                    // existing valid token (server-side grace period covers
-                    // brief overruns). A failed renew is not fatal.
-                    if let Err(e) = self
-                        .facade
-                        .renew_lease(vid, inode, stripe_start, &tok)
-                        .await
-                    {
-                        log::warn!(
-                            "ensure_lease: proactive renew failed for volume={} inode={} stripe_start={} err={} (falling back to existing token)",
-                            vid,
-                            inode,
-                            stripe_start,
-                            e
-                        );
-                    }
-                }
-            }
-            return Ok(tok);
-        }
-
-        let client_id = self.facade.client_id();
-        let duration_ms = 60_000; // 1 min default exclusive lease
-                                  // Register lease with real inode (not file_key) so server-side
-                                  // validate_token_with_grace_period(token, holder, inode) matches
-        let payload = build_range_lease_tlv(inode, stripe_start, 1, &client_id, true, duration_ms);
-
+        // Volume Server's `lease_enabled=false` in the cluster config,
+        // so `WriteNeedle` handlers do not validate the token field —
+        // an empty string is fine. The authoritative consistency gate
+        // is the Filer-side lock_arbiter, NOT the Volume side.
         log::debug!(
-            "ensure_lease: acquiring for volume={} file_key={} inode={} stripe_start={} client={}",
-            volume_id,
-            file_key,
-            inode,
-            stripe_start,
-            client_id
+            "ensure_lease: cap mode — bypassing range lease \
+             (consistency via lock_arbiter). inode={} volume={} offset={}",
+            inode, volume_id, offset
         );
-
-        // P3: If the volume is not in the local router (e.g., topology sync
-        // is incomplete or the Filer allocated a volume the FUSE client hasn't
-        // discovered yet), resolve it from the Master before submitting the
-        // lease request. Without this, process_lease_request_internal returns
-        // VolumeNotFound and the flush fails silently.
-        if self.facade.volume_client().get_volume(vid).is_none() {
-            log::debug!(
-                "ensure_lease: volume {} not in router, resolving from Master",
-                vid
-            );
-            let vol_provider = FacadeVolumeProvider::new(self.facade.clone());
-            use powerfs_common::traits::VolumeProvider;
-            match vol_provider.lookup_volume(VolumeId(vid)).await {
-                Ok(locations) if !locations.is_empty() => {
-                    self.facade
-                        .volume_client()
-                        .resolve_and_set_volume_route(vid, &locations);
-                    log::info!(
-                        "ensure_lease: resolved volume {} -> {} locations, added to router",
-                        vid,
-                        locations.len()
-                    );
-                }
-                Ok(_) => {
-                    return Err(PowerFsError::Internal(format!(
-                        "Volume {} not found in Master topology (empty locations)",
-                        vid
-                    )));
-                }
-                Err(e) => {
-                    return Err(PowerFsError::Internal(format!(
-                        "Failed to look up volume {} from Master: {}",
-                        vid, e
-                    )));
-                }
-            }
-        }
-
-        let result = self
-            .facade
-            .submit_lease_request(vid, payload)
-            .await
-            .map_err(|e| PowerFsError::Internal(format!("Lease request failed: {}", e)))?;
-
-        // Lease response TLV can be in either data or payload field depending on handler
-        let resp_payload = result
-            .data
-            .clone()
-            .or_else(|| result.payload.clone())
-            .ok_or_else(|| PowerFsError::Internal("Lease response has empty body".into()))?;
-
-        log::debug!(
-            "ensure_lease: lease resp bytes={}, data={:?}, payload={:?}",
-            resp_payload.len(),
-            result.data.as_ref().map(Vec::len),
-            result.payload.as_ref().map(Vec::len)
-        );
-
-        let (lease_token, _epoch) = parse_range_lease_response(&resp_payload).ok_or_else(|| {
-            PowerFsError::Internal(format!(
-                "Failed to parse RangeLease response ({} bytes)",
-                resp_payload.len()
-            ))
-        })?;
-
-        // Store lease via facade with (inode, stripe_start) as cache key
-        self.facade.update_lease(
-            vid,
-            inode,
-            stripe_start,
-            lease_token.clone(),
-            Duration::from_millis(duration_ms),
-        );
-
-        log::debug!(
-            "ensure_lease: acquired token={:.16}... for volume={} inode={} stripe_start={}",
-            lease_token,
-            volume_id,
-            inode,
-            stripe_start
-        );
-
-        Ok(lease_token)
-    }
-
-    /// Ensure an inode metadata lease is held (方案 A, Phase 2).
-    ///
-    /// Filer-managed per-inode exclusive lease. Used when the Volume Server
-    /// backend doesn't support range lease (e.g., NVMe-oF target).
-    ///
-    /// Flow:
-    /// 1. Fast path: if a cached lease is still valid, return it. Proactively
-    ///    renew if remaining time < RENEW_THRESHOLD.
-    /// 2. Slow path: acquire a new lease from the Filer, cache it, return token.
-    ///
-    /// The returned token is passed to `write_needle` as the `LeaseToken`
-    /// field. Volume Server skips validation because `lease_enabled=false`.
-    async fn ensure_inode_lease(&self, inode: u64) -> powerfs_common::error::Result<String> {
-        // Fast path: use cached valid inode lease token
-        if let Some((token, remaining)) = self.facade.get_valid_inode_lease_token(inode) {
-            // P1-3: proactively renew if remaining time is below threshold.
-            if remaining < RENEW_THRESHOLD {
-                let client_id = self.facade.client_id();
-                let duration_ms = self.facade.lease_duration_ms();
-                log::debug!(
-                    "ensure_inode_lease: proactive renew for inode={} remaining_ms={} < threshold_ms={}",
-                    inode,
-                    remaining.as_millis(),
-                    RENEW_THRESHOLD.as_millis()
-                );
-                // Best-effort renew: if it fails, fall back to existing token.
-                // The Filer's grace period covers brief overruns.
-                // renew_inode_lease auto-updates cache on success.
-                if let Err(e) = self
-                    .facade
-                    .renew_inode_lease(inode, &client_id, &token, duration_ms)
-                    .await
-                {
-                    log::warn!(
-                        "ensure_inode_lease: proactive renew failed for inode={} err={} (falling back to existing token)",
-                        inode,
-                        e
-                    );
-                }
-            }
-            return Ok(token);
-        }
-
-        // Slow path: acquire new inode lease from Filer
-        // acquire_inode_lease auto-caches the token on success.
-        let client_id = self.facade.client_id();
-        let duration_ms = self.facade.lease_duration_ms();
-
-        log::debug!(
-            "ensure_inode_lease: acquiring for inode={} client={}",
-            inode,
-            client_id
-        );
-
-        let (token, _expire_at_ms) = self
-            .facade
-            .acquire_inode_lease(inode, &client_id, duration_ms)
-            .await
-            .map_err(|e| PowerFsError::Internal(format!("AcquireInodeLease failed: {}", e)))?;
-
-        log::debug!(
-            "ensure_inode_lease: acquired token={:.16}... for inode={}",
-            token,
-            inode
-        );
-
-        Ok(token)
+        Ok(String::new())
     }
 
     /// 写入数据时使用指定的 lease token（若提供），否则自动获取。

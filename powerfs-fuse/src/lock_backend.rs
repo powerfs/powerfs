@@ -66,36 +66,35 @@ pub fn volume_id_from_cache(cache: &MetadataCache, inode: u64) -> Result<u64, St
 impl FuseLockBackend for FacadeLockBackend {
     async fn acquire_inode_lease(
         &self,
-        inode: u64,
-        client_id: &str,
-        duration_ms: u64,
+        _inode: u64,
+        _client_id: &str,
+        _duration_ms: u64,
     ) -> Result<(String, u64), String> {
-        self.facade
-            .acquire_inode_lease(inode, client_id, duration_ms)
-            .await
+        // Inode metadata lease (方案 A) is retired in favor of the §13 Cap
+        // model. Server-side consistency is enforced by the Filer's
+        // lock_arbiter (FileLock/ScatterLock). This method is kept on the
+        // trait for API compatibility; the lockify background sync handles
+        // the error gracefully (falls back to local-only lock).
+        Err("inode_lease retired in cap mode — use lock_arbiter caps".to_string())
     }
 
     async fn release_inode_lease(
         &self,
-        inode: u64,
-        client_id: &str,
-        token: &str,
+        _inode: u64,
+        _client_id: &str,
+        _token: &str,
     ) -> Result<(), String> {
-        self.facade
-            .release_inode_lease(inode, client_id, token)
-            .await
+        Ok(())
     }
 
     async fn renew_inode_lease(
         &self,
-        inode: u64,
-        client_id: &str,
-        token: &str,
-        duration_ms: u64,
+        _inode: u64,
+        _client_id: &str,
+        _token: &str,
+        _duration_ms: u64,
     ) -> Result<(), String> {
-        self.facade
-            .renew_inode_lease(inode, client_id, token, duration_ms)
-            .await
+        Ok(())
     }
 
     async fn acquire_range_lease(
@@ -141,43 +140,20 @@ impl FuseLockBackend for FacadeLockBackend {
 
 /// Phase 3 Lease Recall: concrete `LeaseReleaser` that wraps the
 /// `FuseClientFacade` + a tokio runtime handle so the sync
-/// `InvalidateHandler` can spawn async `ReleaseInodeLease` RPCs.
-///
-/// Constructed in `PowerFsFs::new` after the sync client (which owns
-/// the runtime) is available.
-pub struct FacadeLeaseReleaser {
-    facade: Arc<FuseClientFacade>,
-    client_id: String,
-    handle: tokio::runtime::Handle,
-}
+/// `InvalidateHandler` lease releaser. In cap mode, the inode metadata
+/// lease (方案 A) is retired; CapRelease is handled by the `CapHandler`
+/// path. This struct is kept for `LeaseReleaser` trait compatibility.
+pub struct FacadeLeaseReleaser;
 
 impl FacadeLeaseReleaser {
-    pub fn new(
-        facade: Arc<FuseClientFacade>,
-        client_id: String,
-        handle: tokio::runtime::Handle,
-    ) -> Self {
-        Self {
-            facade,
-            client_id,
-            handle,
-        }
+    pub fn new() -> Self {
+        Self
     }
 }
 
 impl crate::invalidate_handler::LeaseReleaser for FacadeLeaseReleaser {
-    fn release(&self, inode: u64, token: String) {
-        let facade = self.facade.clone();
-        let client_id = self.client_id.clone();
-        self.handle.spawn(async move {
-            if let Err(e) = facade.release_inode_lease(inode, &client_id, &token).await {
-                debug!(
-                    "FacadeLeaseReleaser: release_inode_lease inode={} failed: {} \
-                     (will TTL on server side)",
-                    inode, e
-                );
-            }
-        });
+    fn release(&self, inode: u64, _token: String) {
+        debug!("FacadeLeaseReleaser: inode={} release noop (cap mode)", inode);
     }
 }
 
