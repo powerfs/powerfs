@@ -70,7 +70,7 @@ impl FuseLockBackend for FacadeLockBackend {
         _client_id: &str,
         _duration_ms: u64,
     ) -> Result<(String, u64), String> {
-        // Inode metadata lease (方案 A) is retired in favor of the §13 Cap
+        // Inode metadata lease is retired in favor of the §13 Cap
         // model. Server-side consistency is enforced by the Filer's
         // lock_arbiter (FileLock/ScatterLock). This method is kept on the
         // trait for API compatibility; the lockify background sync handles
@@ -138,11 +138,9 @@ impl FuseLockBackend for FacadeLockBackend {
     }
 }
 
-/// Phase 3 Lease Recall: concrete `LeaseReleaser` that wraps the
-/// `FuseClientFacade` + a tokio runtime handle so the sync
-/// `InvalidateHandler` lease releaser. In cap mode, the inode metadata
-/// lease (方案 A) is retired; CapRelease is handled by the `CapHandler`
-/// path. This struct is kept for `LeaseReleaser` trait compatibility.
+/// Phase 3 Lease Recall: concrete `LeaseReleaser`.
+/// In cap mode, CapRelease is handled by the `CapHandler` path.
+/// This struct is kept for `LeaseReleaser` trait compatibility.
 pub struct FacadeLeaseReleaser;
 
 impl FacadeLeaseReleaser {

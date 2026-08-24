@@ -205,10 +205,7 @@ pub struct FuseClientFacadeConfig {
     pub collection: String,
     /// Replication placement (reported to master via KeepConnected heartbeat).
     pub replication: String,
-    /// Lease mode: "range" (方案 D, default) or "inode" (方案 A).
-    /// "range" — Volume Server manages per-stripe range lease.
-    /// "inode" — Filer manages per-inode metadata lease (for backends
-    ///          that don't support lease, e.g., NVMe-oF target).
+    /// Lease mode (always "cap" after config validation).
     pub lease_mode: String,
     /// Lease duration in milliseconds (default 30000 = 30s).
     pub lease_duration_ms: u64,
@@ -308,10 +305,8 @@ impl FuseClientFacadeConfig {
         self
     }
 
-    /// 设置 Lease 模式 ("range" 或 "inode") 及相关参数。
-    ///
-    /// - "range" (方案 D, 默认): Volume Server 管理 per-stripe range lease
-    /// - "inode" (方案 A):       Filer 管理 per-inode metadata lease
+    /// Set lease mode and related parameters.
+    /// (Only "cap" is accepted after config validation.)
     pub fn with_lease_mode(mut self, mode: &str, duration_ms: u64, renew_interval_ms: u64) -> Self {
         self.lease_mode = mode.to_string();
         self.lease_duration_ms = duration_ms;
@@ -824,12 +819,12 @@ impl FuseClientFacade {
             .map_err(|e| format!("RenewLease failed: {}", e))
     }
 
-    // ======= Inode Metadata Lease (方案 A, Phase 2) =======
+    // ======= Inode Metadata Lease =======
     //
-    // Filer-managed per-inode exclusive lease. Delegated to MetaShardClient
-    // (which talks to the Filer shard leader via powerfs-net).
-    // Used when lease_mode == "inode" (e.g., NVMe-oF target backend that
-    // doesn't support Volume Server range lease).
+    // Retired in cap mode. Server-side consistency is enforced by the
+    // Filer's lock_arbiter (FileLock/ScatterLock). The trait methods are
+    // kept on FuseLockBackend for API compatibility; the FacadeLockBackend
+    // impl returns errors/noops.
 
     /// 当前 Lease 模式 (恒为 "cap")。
     pub fn lease_mode(&self) -> &str {
@@ -1561,9 +1556,9 @@ impl SyncFuseClientFacade {
             .get_all_valid_lease_tokens_for_inode(volume_id, inode)
     }
 
-    // ======= Inode Metadata Lease sync wrappers (方案 A, Phase 2) =======
+    // ======= Lease mode accessor =======
 
-    /// 当前 Lease 模式: "range" (方案 D) 或 "inode" (方案 A)。
+    /// 当前 Lease 模式 (恒为 "cap")。
     pub fn lease_mode(&self) -> &str {
         self.facade.lease_mode()
     }
