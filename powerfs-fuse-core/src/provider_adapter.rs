@@ -1051,7 +1051,10 @@ impl MetadataProvider for FacadeMetadataProvider {
         }
 
         if has_meta {
-            let timestamp = Utc::now().timestamp() as u64;
+            // Nanosecond-precision CRDT timestamp (see meta_shard_client.rs
+            // comment on the same precision fix — avoids dropping same-second
+            // mode/uid/gid writes in the update_entry close path).
+            let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
             let meta_payload =
                 build_setattr_meta_tlv(ino, mode, uid, gid, mtime, atime, client_id, timestamp);
             let _result = self

@@ -2896,6 +2896,7 @@ impl MetaShardManager {
         // mark Dirty. Otherwise cross-client getattr hits MetaCache and
         // returns stale mode/mtime/atime. This was the root cause of T1.3
         // "utimes cross-client not synced" and "directory chmod not visible".
+        let merged_mode = inode_info.mode;
         let merged_copy = inode_info.clone();
         store.update_inode(inode_info)?;
         self.meta_cache.project_setattr_meta(inode, merged_copy);
@@ -2944,9 +2945,9 @@ impl MetaShardManager {
             );
         }
 
-        debug!(
-            "setattr_meta CRDT merged: inode={}, mode={:?}, uid={:?}, gid={:?}, client={}, ts={}",
-            inode, mode, uid, gid, client_id, timestamp
+        info!(
+            "DEBUG_setattr_meta: merged inode={}, mode_final={:08o}, mode_input={:?}, uid={:?}, gid={:?}, client={}, ts={}",
+            inode, merged_mode, mode, uid, gid, client_id, timestamp
         );
 
         Ok(())

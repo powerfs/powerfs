@@ -1692,9 +1692,10 @@ impl FilerNetHandler {
                 }
 
                 info!(
-                    "FILER_NET_GETATTR: returned info for ino={}, name={}, size={}, chunks={}",
+                    "FILER_NET_GETATTR: returned info for ino={}, name={}, mode=0{:o}, size={}, chunks={}",
                     ino,
                     entry_info.name,
+                    entry_info.mode,
                     entry_info.size,
                     info.chunks.len()
                 );
@@ -1923,9 +1924,28 @@ impl FilerNetHandler {
 
         match result {
             Ok(_) => {
-                // Notify other clients that this inode's metadata changed
-                self.notify_inode_change(ino, self.next_version());
-                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+                // Generate a single version for both the Invalidate
+                // notification AND the RPC response. This is critical:
+                // previously notify_inode_change and build_response each
+                // called next_version() separately, producing two
+                // different version numbers. The client received version
+                // V from the Invalidate (async push) but its cache
+                // generation was never updated (update_attr doesn't bump
+                // generation), so is_inode_stale(V > old_gen) returned
+                // true and the InvalidateHandler evicted the cache entry
+                // the setattr caller just wrote via update_attr.
+                //
+                // By returning the SAME version in the response body,
+                // the client can set entry.generation = version, making
+                // is_inode_stale(version == entry.generation) return
+                // false → InvalidateHandler skips eviction (line 748-752
+                // "already fresh" branch). This eliminates the
+                // self-invalidation race without any retry/fallback.
+                let v = self.next_version();
+                self.notify_inode_change(ino, v);
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_u64(FieldId::Version, v);
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
             }
             Err(e) => {
                 warn!("FILER_NET_SETATTR_META failed: {}", e);

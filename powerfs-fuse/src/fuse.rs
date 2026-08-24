@@ -3355,20 +3355,22 @@ impl FileSystem for PowerFsFs {
         };
         let meta_client = self.client.facade().meta_shard_client().clone();
         let shard_id = self.routing_shard(inode);
-        self.client
-            .block_on(async move { meta_client.setattr(inode, &params, shard_id).await })
-            .map_err(|e| {
-                let errno = filer_error_to_errno(&e.to_string());
-                if errno == libc::EIO {
-                    error!("setattr RPC failed for inode {}: {}", inode, e);
-                } else {
-                    debug!(
-                        "setattr RPC failed for inode {}: {} -> errno={}",
-                        inode, e, errno
-                    );
-                }
-                std::io::Error::from_raw_os_error(errno)
-            })?;
+        let setattr_result = self
+            .client
+            .block_on(async move { meta_client.setattr(inode, &params, shard_id).await });
+
+        let attr = setattr_result.map_err(|e| {
+            let errno = filer_error_to_errno(&e.to_string());
+            if errno == libc::EIO {
+                error!("setattr RPC failed for inode {}: {}", inode, e);
+            } else {
+                debug!(
+                    "setattr RPC failed for inode {}: {} -> errno={}",
+                    inode, e, errno
+                );
+            }
+            std::io::Error::from_raw_os_error(errno)
+        })?;
 
         // RPC 成功后更新本地缓存（含 size，供 FUSE 立即返回最新 stat）
         self.cache.update_attr(
@@ -3382,6 +3384,22 @@ impl FileSystem for PowerFsFs {
                 mtime: mtime.map(|t| t as i64),
             },
         );
+
+        // Bump cache generation to match the server version returned in the
+        // SetAttrMeta response. Without this, the InvalidateHandler receives
+        // an Invalidate notification with version V (broadcast by the Filer
+        // to ALL clients including this one), compares it against the stale
+        // entry.generation (never bumped by update_attr), finds V >
+        // old_generation, and evicts the cache entry that update_attr just
+        // wrote. This was the root cause of the tar xzf "Cannot change mode"
+        // EIO bug and the chmod self-invalidation race.
+        //
+        // By setting generation = server_version, the InvalidateHandler's
+        // is_inode_stale(V == entry.generation) check returns false, so it
+        // takes the "already fresh" skip branch instead of evicting.
+        if attr.server_version > 0 {
+            self.cache.update_generation(inode, attr.server_version);
+        }
 
         // EntryState: 标记 Dirty 以反映本地属性已修改（仅在 size/mode/uid/gid 实际变化时）
         if mode.is_some() || size.is_some() || uid.is_some() || gid.is_some() {
@@ -3441,35 +3459,109 @@ impl FileSystem for PowerFsFs {
         if let Some(updated) = self.cache.get_inode(inode) {
             Ok((self.create_stat(&updated), TTL))
         } else {
-            // Cache was invalidated (by InvalidateHandler) between update_attr
-            // and this check. Fetch fresh metadata from the filer instead of
-            // returning ENOENT. The setattr RPC already succeeded, so the
-            // filer has the updated attributes.
+            // Cache miss after setattr RPC should be extremely rare now:
+            // update_generation() sets entry.generation = server_version,
+            // so the InvalidateHandler's is_inode_stale(version ==
+            // generation) returns false and skips eviction. A miss here
+            // means a concurrent Invalidate from ANOTHER client (not the
+            // self-setattr one) arrived between update_attr and
+            // get_inode. In that case, do an authoritative GetAttr RPC to
+            // fetch the post-setattr state. The setattr already committed
+            // on the Filer, so GetAttr will return the updated attributes.
             debug!(
-                "setattr: cache miss after RPC for inode={}, fetching fresh metadata",
+                "setattr: cache miss after RPC for inode={}, doing authoritative GetAttr RPC",
                 inode
             );
-            match self.client.get_entry_by_inode(inode) {
-                Ok(Some((filer_entry, path))) => {
-                    let parent = if path.is_empty() || path == "/" {
-                        ROOT_INODE
+            let meta_client = self.client.facade().meta_shard_client().clone();
+            let shard_id = self.routing_shard(inode);
+            match self
+                .client
+                .block_on(async move { meta_client.getattr(inode, shard_id).await })
+            {
+                Ok(attr) => {
+                    // Build stat64 directly from MetadataAttr, bypassing
+                    // cache entirely. This is correct because the Filer just
+                    // committed the setattr and the GetAttr response reflects
+                    // the post-setattr state.
+                    let mut stat: libc::stat64 = unsafe { std::mem::zeroed() };
+                    stat.st_ino = attr.inode;
+                    const S_IFMT: u32 = 0o170000;
+                    stat.st_mode = if attr.file_type == libc::DT_DIR {
+                        ((attr.mode & !S_IFMT) | 0o040000) as libc::mode_t
+                    } else if attr.file_type == libc::DT_LNK {
+                        ((attr.mode & !S_IFMT) | 0o120000) as libc::mode_t
+                    } else if (attr.mode & S_IFMT) != 0 {
+                        attr.mode as libc::mode_t
                     } else {
-                        let parent_path = match path.rfind('/') {
-                            Some(0) => "/".to_string(),
-                            Some(pos) => path[..pos].to_string(),
-                            None => "/".to_string(),
-                        };
-                        self.resolve_path_inode(&parent_path).unwrap_or(ROOT_INODE)
+                        (attr.mode | 0o100000) as libc::mode_t
                     };
-                    let cached = self.entry_to_cached(parent, &filer_entry);
-                    Ok((self.create_stat(&cached), TTL))
+                    stat.st_nlink = attr.nlink as u64;
+                    stat.st_uid = attr.uid;
+                    stat.st_gid = attr.gid;
+                    stat.st_size = attr.size as i64;
+                    stat.st_blksize = 4096;
+                    stat.st_blocks = attr.size.div_ceil(512) as i64;
+                    stat.st_atime = attr.atime as i64;
+                    stat.st_mtime = attr.mtime as i64;
+                    stat.st_ctime = attr.ctime;
+                    // Best-effort cache repopulation: if InvalidateHandler
+                    // evicts it again, that's fine — the stat is already
+                    // returned to the kernel.
+                    let cached = CachedEntry {
+                        inode: attr.inode,
+                        parent: self
+                            .cache
+                            .get_inode(inode)
+                            .map(|e| e.parent)
+                            .unwrap_or(ROOT_INODE),
+                        name: String::new(),
+                        is_dir: attr.file_type == libc::DT_DIR,
+                        is_symlink: attr.file_type == libc::DT_LNK,
+                        symlink_target: attr.symlink_target.clone(),
+                        nlink: attr.nlink,
+                        fid: None,
+                        size: attr.size,
+                        mode: attr.mode & 0o7777,
+                        uid: attr.uid,
+                        gid: attr.gid,
+                        atime: attr.atime as i64,
+                        mtime: attr.mtime as i64,
+                        ctime: attr.ctime,
+                        xattrs: HashMap::new(),
+                        chunks: Vec::new(),
+                        hard_link_id: String::new(),
+                        hard_link_counter: 0,
+                        content_size: attr.size,
+                        disk_size: 0,
+                        generation: 0,
+                        placement: attr.placement.clone(),
+                        reliability: attr.reliability.clone(),
+                        replica_chunks: Vec::new(),
+                        shard_id: attr.shard_id,
+                        cached_at: Instant::now(),
+                        state: EntryState::Clean,
+                        hold: HoldState::default(),
+                        cap: None,
+                        dentry_lease: None,
+                        dir_shared_gen: 0,
+                    };
+                    self.cache.insert(cached);
+                    Ok((stat, TTL))
                 }
-                _ => {
+                Err(e) => {
+                    // GetAttr RPC failed. Since the setattr RPC already
+                    // succeeded, the metadata IS updated on the Filer —
+                    // we just can't return the fresh stat to the kernel
+                    // right now. Returning EIO would make the kernel
+                    // surface a spurious error (e.g. tar fails). Instead
+                    // return ENOENT so the kernel re-LOOKUPs the path,
+                    // which will fetch the correct (post-setattr) inode.
                     warn!(
-                        "setattr: failed to fetch fresh metadata for inode={} after RPC",
-                        inode
+                        "setattr: GetAttr fallback failed for inode={} after successful setattr: {}. \
+                         Returning ENOENT to trigger kernel re-LOOKUP",
+                        inode, e
                     );
-                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                    Err(std::io::Error::from_raw_os_error(libc::ENOENT))
                 }
             }
         }

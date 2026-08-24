@@ -1687,6 +1687,27 @@ impl MetadataCache {
         }
     }
 
+    /// Update the cache entry's generation to match the server-side version.
+    ///
+    /// Called by setattr() after a successful SetAttrMeta RPC. The Filer
+    /// returns the same version in both the Invalidate notification (async
+    /// push to all clients) and the RPC response. Setting
+    /// `entry.generation = server_version` makes `is_inode_stale` return
+    /// false when the Invalidate arrives (version == generation → not
+    /// stale), preventing the InvalidateHandler from evicting the cache
+    /// entry that `update_attr` just wrote.
+    ///
+    /// Without this, the InvalidateHandler would evict the entry between
+    /// `update_attr` and `get_inode`, causing a cache miss and forcing a
+    /// fallback GetAttr RPC — or worse, returning EIO if the fallback
+    /// also failed.
+    pub fn update_generation(&self, inode: u64, generation: u64) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.generation = generation;
+        }
+    }
+
     /// List children of a directory from cache by scanning inode_cache
     /// parent field. Supports hard links (same inode, different names).
     pub fn list_children(&self, parent_inode: u64) -> Vec<(u64, String, bool)> {
