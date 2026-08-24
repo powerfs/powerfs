@@ -39,6 +39,6 @@ pub use anti_affinity::{NodeId, VolumeInfo};
 pub use encoding::{ChunkEncoding, ChunkRef};
 pub use error::LayoutError;
 pub use layout::FileLayout;
-pub use placement::{Placement, PlacementSpec};
+pub use placement::{Placement, PlacementSpec, StorageMode};
 pub use policy::PlacementPolicy;
 pub use reliability::{CompressionState, Reliability, ReliabilityState};

@@ -1249,81 +1249,169 @@ impl FilerNetHandler {
             return Ok(());
         }
 
-        // P2.5: Inline 模式 — 数据直接存 Filer 元数据, 响应携带 inline_data
-        if let Some(data) = &info.inline_data {
-            let max_size = (INLINE_HARD_LIMIT).max(data.len() as u32);
-            let layout = FileLayout {
-                placement: Placement::Inline { max_size },
-                reliability: info.reliability.clone(),
-                reliability_state: info.reliability_state.clone(),
-                compression: info.compression_state.clone(),
-                encoding: ChunkEncoding::InlineData { data: data.clone() },
-            };
-            encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
-                .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
-            return Ok(());
-        }
-
-        // Empty file (no inline_data, no chunks): default to Inline mode.
-        // Without this, detect_placement_from_chunks([]) returns Flat, causing
-        // the kernel client to set placement=FLAT. write_end then skips the
-        // Inline path, writeback fails with -EINVAL (no volume_id/file_key),
-        // and close skips chunk sync. Result: data lost on remount.
-        if info.chunks.is_empty() {
-            let layout = FileLayout {
-                placement: Placement::Inline {
-                    max_size: INLINE_HARD_LIMIT,
-                },
-                reliability: info.reliability.clone(),
-                reliability_state: info.reliability_state.clone(),
-                compression: info.compression_state.clone(),
-                encoding: ChunkEncoding::InlineData { data: Vec::new() },
-            };
-            encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
-                .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
-            return Ok(());
-        }
-
-        // Flat / Stripe 模式 — chunk 列表
-        let chunks: Vec<ChunkRef> = info
-            .chunks
-            .iter()
-            .map(|c| ChunkRef {
-                offset: c.offset,
-                size: c.size,
-                needle_id: c.needle_id,
-                volume_id: c.volume_id,
-                crc32: c.crc32,
-                mtime: c.mtime,
-            })
-            .collect();
-
-        // K3: 检测 Stripe 模式 — chunks 跨多个 volume (anti-affinity 分配).
-        // Flat: 所有 chunk 同一 volume_id; Stripe: 每个 stripe unit 不同 volume_id.
-        // stripe_size 从 chunk offset 差值推断 (chunks[1].offset - chunks[0].offset).
-        let placement = detect_placement_from_chunks(&chunks);
-
-        let layout = FileLayout {
-            placement: placement.clone(),
-            reliability: info.reliability.clone(),
-            reliability_state: info.reliability_state.clone(),
-            compression: info.compression_state.clone(),
-            encoding: ChunkEncoding::PerChunk {
-                chunks: chunks.clone(),
-            },
+        // ---- Authoritative storage mode ----
+        //
+        // `info.storage_mode` is the persisted state bit, set explicitly
+        // during CREATE (Inline) and MIGRATE/sync (Flat via Raft). It is
+        // the authoritative source for deciding the wire-protocol
+        // Placement — NOT inferred from data fields.
+        //
+        // This eliminates the rsync data loss race: previously the Filer
+        // inferred Inline from `chunks.is_empty()` during Raft apply lag
+        // (after sync_size_chunks_on_close submitted but before apply),
+        // causing the FUSE client to create a stale empty inline buffer →
+        // reads returned 0 bytes for a file whose data was on Volume Server.
+        //
+        // Transitional safety: old inodes (created before this field) have
+        // `storage_mode = Inline` (serde default). If such an inode has
+        // non-empty chunks, it's actually Flat — treat it as Flat until
+        // the next sync updates the field.
+        let effective_mode = if info.storage_mode.is_inline() && !info.chunks.is_empty() {
+            powerfs_layout::StorageMode::Flat
+        } else {
+            info.storage_mode
         };
 
-        encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
-            .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+        info!(
+            "ENCODE_CHUNKS: inode={} storage_mode={:?} effective={:?} size={} chunks={} inline_data={} fid={:?}",
+            info.inode,
+            info.storage_mode,
+            effective_mode,
+            info.size,
+            info.chunks.len(),
+            info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+            info.fid
+        );
 
-        // 兼容字段: 直接添加 VolumeId (0x92) + FileKey (0x94), 与 CREATE 响应一致.
-        // 内核 powerfs_net_lookup/getattr 用 find_u64(0x92/0x94) 解析.
-        // Flat: 从第一个 chunk 提取 (单卷模型).
-        // Stripe: 内核 K3 通过 volume_ids[] 数组定位, VolumeId/FileKey 仅作为
-        //         base needle_id 的兜底 (file_key = chunks[0].needle_id).
-        if let Some(first) = chunks.first() {
-            enc.add_u64(FieldId::VolumeId, first.volume_id);
-            enc.add_u64(FieldId::FileKey, first.needle_id);
+        match effective_mode {
+            powerfs_layout::StorageMode::Inline => {
+                // Inline mode: data in Filer metadata (inline_data).
+                // Empty file (no data yet) also uses Inline so the kernel
+                // client's write_end enters the Inline path.
+                let data = info.inline_data.clone().unwrap_or_default();
+                let max_size = (INLINE_HARD_LIMIT).max(data.len() as u32);
+                let layout = FileLayout {
+                    placement: Placement::Inline { max_size },
+                    reliability: info.reliability.clone(),
+                    reliability_state: info.reliability_state.clone(),
+                    compression: info.compression_state.clone(),
+                    encoding: ChunkEncoding::InlineData { data },
+                };
+                encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                    .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+                return Ok(());
+            }
+            powerfs_layout::StorageMode::Flat => {
+                // Flat mode: data on a single Volume Server.
+                // Encode chunks (may be empty during Raft apply lag —
+                // the client uses fid/volume_id to locate the file).
+                let chunks: Vec<ChunkRef> = info
+                    .chunks
+                    .iter()
+                    .map(|c| ChunkRef {
+                        offset: c.offset,
+                        size: c.size,
+                        needle_id: c.needle_id,
+                        volume_id: c.volume_id,
+                        crc32: c.crc32,
+                        mtime: c.mtime,
+                    })
+                    .collect();
+
+                let layout = FileLayout {
+                    placement: Placement::Flat,
+                    reliability: info.reliability.clone(),
+                    reliability_state: info.reliability_state.clone(),
+                    compression: info.compression_state.clone(),
+                    encoding: ChunkEncoding::PerChunk {
+                        chunks: chunks.clone(),
+                    },
+                };
+                encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                    .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+
+                // VolumeId/FileKey: from chunks[0] if available, else
+                // from fid string (Raft apply lag case where chunks
+                // are temporarily empty but fid is set).
+                if let Some(first) = chunks.first() {
+                    enc.add_u64(FieldId::VolumeId, first.volume_id);
+                    enc.add_u64(FieldId::FileKey, first.needle_id);
+                } else if let Some(fid_str) = &info.fid {
+                    if let Ok(fid) = powerfs_common::types::Fid::from_string(fid_str) {
+                        enc.add_u64(FieldId::VolumeId, fid.volume_id.0);
+                        enc.add_u64(FieldId::FileKey, fid.file_key);
+                    }
+                } else if let Some(vid) = info.volume_id {
+                    enc.add_u64(FieldId::VolumeId, vid);
+                }
+            }
+            powerfs_layout::StorageMode::Stripe | powerfs_layout::StorageMode::WideStripe => {
+                // Stripe / WideStripe: multi-volume parallel I/O.
+                // Detect from chunks (anti-affinity volume_ids).
+                let chunks: Vec<ChunkRef> = info
+                    .chunks
+                    .iter()
+                    .map(|c| ChunkRef {
+                        offset: c.offset,
+                        size: c.size,
+                        needle_id: c.needle_id,
+                        volume_id: c.volume_id,
+                        crc32: c.crc32,
+                        mtime: c.mtime,
+                    })
+                    .collect();
+
+                let placement = detect_placement_from_chunks(&chunks);
+
+                let layout = FileLayout {
+                    placement: placement.clone(),
+                    reliability: info.reliability.clone(),
+                    reliability_state: info.reliability_state.clone(),
+                    compression: info.compression_state.clone(),
+                    encoding: ChunkEncoding::PerChunk {
+                        chunks: chunks.clone(),
+                    },
+                };
+                encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                    .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+
+                if let Some(first) = chunks.first() {
+                    enc.add_u64(FieldId::VolumeId, first.volume_id);
+                    enc.add_u64(FieldId::FileKey, first.needle_id);
+                }
+            }
+            powerfs_layout::StorageMode::Ec => {
+                // Erasure coding (future use) — encode as Flat for now.
+                let chunks: Vec<ChunkRef> = info
+                    .chunks
+                    .iter()
+                    .map(|c| ChunkRef {
+                        offset: c.offset,
+                        size: c.size,
+                        needle_id: c.needle_id,
+                        volume_id: c.volume_id,
+                        crc32: c.crc32,
+                        mtime: c.mtime,
+                    })
+                    .collect();
+
+                let layout = FileLayout {
+                    placement: Placement::Flat,
+                    reliability: info.reliability.clone(),
+                    reliability_state: info.reliability_state.clone(),
+                    compression: info.compression_state.clone(),
+                    encoding: ChunkEncoding::PerChunk {
+                        chunks: chunks.clone(),
+                    },
+                };
+                encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                    .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+
+                if let Some(first) = chunks.first() {
+                    enc.add_u64(FieldId::VolumeId, first.volume_id);
+                    enc.add_u64(FieldId::FileKey, first.needle_id);
+                }
+            }
         }
 
         // P4: 副本 chunk 列表 — 编码到 FieldId::ReplicaChunks,
@@ -3098,6 +3186,17 @@ impl FilerNetHandler {
         // 否则双客户端并发 migrate 会得到两套不同的 fid → 数据写到两个独立 Volume 文件，
         // 后 sync 的那个覆盖前一个的 chunks 元数据 → 先写的客户端数据永久丢失。
         if let Some(info) = self.meta_shard_manager.get_inode(inode) {
+            // Idempotency: if storage_mode is already Flat, the file has been
+            // migrated. We must return the existing allocation (from chunks or
+            // fid) rather than allocating a new one, preventing dual-client
+            // migrate races that lose data.
+            if info.storage_mode.is_volume_backed() {
+                info!(
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} storage_mode={:?} — \
+                     already migrated, attempting idempotent reuse",
+                    inode, info.storage_mode
+                );
+            }
             // Case 1: chunks 非空 → 已完成一次迁移并 sync，复用首个 chunk 的位置
             if let Some(first) = info.chunks.first() {
                 info!(
@@ -3143,11 +3242,24 @@ impl FilerNetHandler {
             }
             // 无 inline_data 且无 chunks/fid：通常是新建空文件，正常分配即可
             if info.inline_data.is_none() && info.chunks.is_empty() && info.fid.is_none() {
-                warn!(
-                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode {} has no inline_data and no chunks — \
-                     may already be migrated or never written, allocating anyway",
-                    inode
-                );
+                if info.storage_mode.is_volume_backed() {
+                    // storage_mode=Flat but no chunks/fid — indicates a data
+                    // integrity issue (file was truncated to 0 but mode wasn't
+                    // reset, or Raft apply was partial). Log at error level
+                    // so it's visible in monitoring.
+                    log::error!(
+                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} storage_mode={:?} but \
+                         no chunks/fid/inline_data — data integrity anomaly, allocating fresh",
+                        inode,
+                        info.storage_mode
+                    );
+                } else {
+                    warn!(
+                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode {} has no inline_data and no chunks — \
+                         may already be migrated or never written, allocating anyway",
+                        inode
+                    );
+                }
             }
         } else {
             warn!(

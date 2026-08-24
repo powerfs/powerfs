@@ -648,10 +648,60 @@ impl MetaCache {
                     );
                 }
                 existing.info.size = clamped;
+                existing.info.blocks = clamped.div_ceil(512);
                 existing.info.chunks = chunks;
-                // inline_data left as-is (should be None for flat files)
+                // T1.6 fix (2026-08-24): Clear inline_data to mirror
+                // ShardStore's `info.inline_data = None` in the
+                // Overwrite-Flat branch (shard_store.rs L3012).
+                //
+                // Root cause (T1.6.2 "并发写同文件数据不一致"):
+                //   1. dd-0 writes 4K → sync_inline_buffer (append) →
+                //      Filer inline_data=[4K], size=4K
+                //   2. dd-3 writes 4K at offset 12K → triggers inline→Flat
+                //      migrate. migrate_inline_alloc RPC does NOT clear
+                //      Filer inline_data ("inode NOT modified, inline_data
+                //      preserved for crash safety").
+                //   3. dd-3 release → sync_size_chunks_on_close sends
+                //      inline_data=None, is_append=false. ShardStore apply
+                //      sets info.inline_data=None (correct). BUT MetaCache
+                //      project left inline_data as-is (Some([4K])).
+                //   4. Subsequent LOOKUP hits MetaCache fast path → returns
+                //      stale inline_data=[4K] + size=32768. Client prefills
+                //      inline_buffers with 4K → reads only see 4K.
+                // Fix: clear inline_data in the projection, matching
+                // ShardStore semantics. If a concurrent inline write
+                // re-populates inline_data after this projection, the next
+                // inline sync will set it again via the append/overwrite
+                // branch above.
+                if existing.info.inline_data.is_some() {
+                    log::debug!(
+                        "MetaCache Overwrite-Flat: inode {} clearing stale inline_data (len={}) — \
+                         Flat sync, data now lives on Volume Server",
+                        inode,
+                        existing
+                            .info
+                            .inline_data
+                            .as_ref()
+                            .map(|d| d.len())
+                            .unwrap_or(0),
+                    );
+                    existing.info.inline_data = None;
+                }
             }
         }
+
+        // Project storage_mode to match ShardStore semantics — see
+        // shard_store.rs update_inode_size_chunks_atomic. This ensures
+        // cross-client getattr (MetaCache fast path) returns the correct
+        // mode immediately, before Raft apply.
+        let new_mode = if existing.info.inline_data.is_some() {
+            powerfs_layout::StorageMode::Inline
+        } else if !existing.info.chunks.is_empty() {
+            powerfs_layout::StorageMode::Flat
+        } else {
+            existing.info.storage_mode
+        };
+        existing.info.storage_mode = new_mode;
 
         let new_bytes = estimate_inode_bytes(&existing.info);
         if new_bytes >= old_bytes {
@@ -664,9 +714,20 @@ impl MetaCache {
 
     /// Project setattr_meta (CRDT-merged) into MetaCache ( MDS projected state model).
     ///
-    /// Updates mode/uid/gid/mtime/atime/version on a cached inode so
-    /// cross-client `getattr` returns the new values immediately.
-    /// If the inode is not in MetaCache, inserts it as Dirty.
+    /// Updates **only** mode/uid/gid/mtime/atime/version/nlink on a cached
+    /// inode so cross-client `getattr` returns the new values immediately.
+    ///
+    /// CRITICAL: Must NOT replace the entire `InodeInfo`. In async meta
+    /// persist mode, `setattr_meta` reads from the ShardStore (not MetaCache),
+    /// which may have stale data fields (size=0, inline_data=None) if a prior
+    /// `update_inode_size_chunks` Raft command hasn't been applied yet.
+    /// Replacing the whole InodeInfo would overwrite the MetaCache's projected
+    /// data fields (size, chunks, inline_data, storage_mode) with stale store
+    /// data, causing subsequent GETATTR fast-path reads to return 0-byte files.
+    ///
+    /// Fix: Only merge the metadata fields that setattr_meta actually changes,
+    /// preserving all data fields (size, chunks, inline_data, storage_mode, fid,
+    /// volume_id, etc.) from the existing MetaCache entry.
     pub fn project_setattr_meta(&self, inode: u64, info: crate::shard_store::InodeInfo) {
         let mut tbl = self.inode_table.write().unwrap();
         let old_bytes = if let Some(existing) = tbl.get_mut(&inode) {
@@ -675,7 +736,17 @@ impl MetaCache {
                 CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
             }
             let old = estimate_inode_bytes(&existing.info);
-            existing.info = info;
+            // Only update metadata fields — preserve all data fields from
+            // the existing MetaCache entry (which has the most recent
+            // projected state from update_inode_size_chunks).
+            existing.info.mode = info.mode;
+            existing.info.uid = info.uid;
+            existing.info.gid = info.gid;
+            existing.info.mtime = info.mtime;
+            existing.info.atime = info.atime;
+            existing.info.ctime = info.ctime;
+            existing.info.nlink = info.nlink;
+            existing.info.version = info.version;
             existing.state = CacheState::Dirty;
             existing.touch();
             old
@@ -733,6 +804,242 @@ impl MetaCache {
                 tbl.insert(key, de);
                 self.trim.charge(de_bytes);
             }
+        }
+    }
+
+    /// Mark ONLY the directory entry as `Deleted` (NOT the inode).
+    ///
+    /// Used for hardlink unlink where `nlink > 1`: the dir_entry for the
+    /// unlinked name is removed (ENOENT for that name), but the inode
+    /// survives for remaining links. Calling [`stage_delete`] here would
+    /// mark the inode as Deleted, causing `get_inode(inode)` to return
+    /// `Some(None)` → ENOENT for the surviving hardlink (T1.2 "hardlink
+    /// 删除源后丢失" bug).
+    pub fn stage_delete_direntry_only(&self, parent_inode: u64, name: &str, inode: u64) {
+        self.stage_delete_total.fetch_add(1, Ordering::Relaxed);
+        // Only mark the direntry as Deleted; do NOT touch the inode table.
+        let mut tbl = self.direntry_table.write().unwrap();
+        let key = (parent_inode, name.to_string());
+        if let Some(de) = tbl.get_mut(&key) {
+            de.state = CacheState::Deleted;
+            de.touch();
+        } else {
+            let de_bytes = estimate_dentry_bytes(name);
+            let de = CachedDirEntry::new(inode, CacheState::Deleted);
+            de.touch();
+            tbl.insert(key, de);
+            self.trim.charge(de_bytes);
+        }
+    }
+
+    /// Stage a rename at propose time (leader-side projected state).
+    ///
+    /// Atomically mirrors `stage_create`/`stage_delete` for rename so that
+    /// lookups on the leader see the post-rename name→inode mapping BEFORE
+    /// Raft apply completes (closing the commit→apply visibility gap that
+    /// caused `stat old_name` to spuriously succeed after rename).
+    ///
+    ///   1. Marks the old dir_entry as `Deleted` → `get_direntry(old)` returns
+    ///      `Some(None)` → ENOENT.
+    ///   2. Inserts the new dir_entry as `Staging` → `get_direntry(new)` returns
+    ///      `Some(Some(inode))`.
+    ///   3. Updates the cached inode's `name` + `parent_inode` (if present) so
+    ///      `get_inode` returns the new name/parent immediately.
+    ///
+    /// On Raft propose failure the caller MUST invoke [`invalidate_rename`]
+    /// to roll back this projection (mirroring `invalidate_staging`).
+    pub fn stage_rename(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        inode: u64,
+    ) {
+        // 1. Mark old dir_entry as Deleted
+        {
+            let mut tbl = self.direntry_table.write().unwrap();
+            let key = (old_parent, old_name.to_string());
+            if let Some(de) = tbl.get_mut(&key) {
+                de.state = CacheState::Deleted;
+                de.touch();
+            } else {
+                let de_bytes = estimate_dentry_bytes(old_name);
+                let de = CachedDirEntry::new(inode, CacheState::Deleted);
+                de.touch();
+                tbl.insert(key, de);
+                self.trim.charge(de_bytes);
+            }
+        }
+        // 2. Insert new dir_entry as Staging
+        {
+            let mut tbl = self.direntry_table.write().unwrap();
+            let key = (new_parent, new_name.to_string());
+            let de = CachedDirEntry::new(inode, CacheState::Staging);
+            de.touch();
+            if tbl.insert(key, de).is_some() {
+                self.trim.release(estimate_dentry_bytes(new_name));
+            }
+            self.trim.charge(estimate_dentry_bytes(new_name));
+        }
+        // 3. Update cached inode's name + parent (if present)
+        {
+            let mut tbl = self.inode_table.write().unwrap();
+            if let Some(ci) = tbl.get_mut(&inode) {
+                let old_bytes = estimate_inode_bytes(&ci.info);
+                ci.info.name = new_name.to_string();
+                ci.info.parent_inode = new_parent;
+                let new_bytes = estimate_inode_bytes(&ci.info);
+                if new_bytes >= old_bytes {
+                    self.trim.charge(new_bytes - old_bytes);
+                } else {
+                    self.trim.release(old_bytes - new_bytes);
+                }
+                ci.touch();
+            }
+        }
+    }
+
+    /// Roll back a [`stage_rename`] projection when the Raft propose fails.
+    ///
+    /// Restores consistency by:
+    ///   1. Removing the stale `Staging` new dir_entry.
+    ///   2. Clearing the `Deleted` marker on the old dir_entry (promotes to
+    ///      `Clean` so lookups fall back to ShardStore, which still has the
+    ///      old name→inode mapping).
+    ///   3. Leaving the inode's name/parent untouched — the next
+    ///      `get_inode`/`cache_put_clean` from ShardStore will overwrite it
+    ///      with the authoritative (old) values.
+    pub fn invalidate_rename(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+    ) {
+        // 1. Drop the stale Staging new dir_entry
+        {
+            let mut tbl = self.direntry_table.write().unwrap();
+            let key = (new_parent, new_name.to_string());
+            let should_remove = tbl
+                .get(&key)
+                .map(|de| de.state == CacheState::Staging)
+                .unwrap_or(false);
+            if should_remove && tbl.remove(&key).is_some() {
+                self.trim.release(estimate_dentry_bytes(new_name));
+            }
+        }
+        // 2. Clear the Deleted marker on the old dir_entry (→ Clean so
+        //    get_direntry falls through to ShardStore on next miss, rather
+        //    than returning the stale Some(None)=ENOENT).
+        {
+            let mut tbl = self.direntry_table.write().unwrap();
+            let key = (old_parent, old_name.to_string());
+            if let Some(de) = tbl.get_mut(&key) {
+                if de.state == CacheState::Deleted {
+                    de.state = CacheState::Clean;
+                    de.touch();
+                }
+            }
+        }
+    }
+
+    /// Confirm a rename after Raft apply (runs on all replicas).
+    ///
+    /// Finalizes the MetaCache projection made by [`stage_rename`] (leader)
+    /// and populates the cache on followers (which did not stage):
+    ///   1. Removes the old dir_entry entirely (drop the Deleted marker).
+    ///   2. Promotes the new dir_entry `Staging`→`Clean`, or inserts a
+    ///      `Clean` copy for followers that have no staging entry.
+    ///   3. Updates the cached inode's `name` + `parent_inode` (if present).
+    pub fn confirm_rename(
+        &self,
+        old_parent: u64,
+        old_name: &str,
+        new_parent: u64,
+        new_name: &str,
+        inode: u64,
+    ) {
+        // 1. Remove old dir_entry
+        self.confirm_remove_direntry(old_parent, old_name);
+        // 2. Promote/insert new dir_entry as Clean
+        {
+            let key = (new_parent, new_name.to_string());
+            let mut tbl = self.direntry_table.write().unwrap();
+            match tbl.get_mut(&key) {
+                Some(de) if de.state == CacheState::Staging => {
+                    de.state = CacheState::Clean;
+                    de.touch();
+                }
+                None => {
+                    let de = CachedDirEntry::new(inode, CacheState::Clean);
+                    de.touch();
+                    tbl.insert(key, de);
+                    self.trim.charge(estimate_dentry_bytes(new_name));
+                }
+                _ => {}
+            }
+        }
+        // 3. Update cached inode's name + parent (if present)
+        {
+            let mut tbl = self.inode_table.write().unwrap();
+            if let Some(ci) = tbl.get_mut(&inode) {
+                let old_bytes = estimate_inode_bytes(&ci.info);
+                ci.info.name = new_name.to_string();
+                ci.info.parent_inode = new_parent;
+                let new_bytes = estimate_inode_bytes(&ci.info);
+                if new_bytes >= old_bytes {
+                    self.trim.charge(new_bytes - old_bytes);
+                } else {
+                    self.trim.release(old_bytes - new_bytes);
+                }
+                ci.touch();
+            }
+        }
+    }
+
+    /// Update a cached inode's `name` + `parent_inode` after a cross-shard
+    /// `RenameInode` Raft apply (Phase D). Unlike [`confirm_rename`] (which
+    /// also handles dir entries), this only touches the inode record because
+    /// the dir entries were moved by separate `AddDirEntry`/`RemoveDirEntry`
+    /// commands on their own shards.
+    pub fn confirm_rename_inode(&self, inode: u64, new_name: &str, new_parent: u64) {
+        let mut tbl = self.inode_table.write().unwrap();
+        if let Some(ci) = tbl.get_mut(&inode) {
+            let old_bytes = estimate_inode_bytes(&ci.info);
+            ci.info.name = new_name.to_string();
+            ci.info.parent_inode = new_parent;
+            let new_bytes = estimate_inode_bytes(&ci.info);
+            if new_bytes >= old_bytes {
+                self.trim.charge(new_bytes - old_bytes);
+            } else {
+                self.trim.release(old_bytes - new_bytes);
+            }
+            ci.touch();
+        }
+    }
+
+    /// Bump the cached inode's `nlink` after an `IncrementNlink` Raft apply
+    /// (hardlink creation). Without this, `handle_getattr` (which reads
+    /// MetaCache first) returns the stale pre-link `nlink=1` even though
+    /// ShardStore has already incremented it (T1.2 hardlink nlink bug).
+    pub fn confirm_increment_nlink(&self, inode: u64) {
+        let mut tbl = self.inode_table.write().unwrap();
+        if let Some(ci) = tbl.get_mut(&inode) {
+            ci.info.nlink = ci.info.nlink.saturating_add(1);
+            ci.touch();
+        }
+    }
+
+    /// Decrement the cached inode's `nlink` after a `DecrementNlink` Raft
+    /// apply (unlink of a hardlink). Mirrors [`confirm_increment_nlink`].
+    pub fn confirm_decrement_nlink(&self, inode: u64) {
+        let mut tbl = self.inode_table.write().unwrap();
+        if let Some(ci) = tbl.get_mut(&inode) {
+            if ci.info.nlink > 0 {
+                ci.info.nlink -= 1;
+            }
+            ci.touch();
         }
     }
 

@@ -49,6 +49,55 @@ pub enum Placement {
     },
 }
 
+/// **Persisted** storage mode in `InodeInfo`.
+///
+/// Unlike `Placement` (which is a wire-protocol encoding with extra data
+/// like `max_size` / `stripe_size`), `StorageMode` is the authoritative
+/// state bit stored in the inode record. It is set explicitly:
+/// - `CREATE` → `Inline` (data lives in Filer metadata as `inline_data`)
+/// - `MIGRATE` (via Raft) → `Flat` (data moved to Volume Server)
+/// - `sync_size_chunks` → preserves/updates to `Flat` when chunks non-empty
+///
+/// `encode_chunks_fields` reads this field directly instead of inferring
+/// the mode from data fields (`inline_data` / `chunks` / `fid`), which was
+/// fragile during inline→flat migration (Raft apply lag caused stale
+/// Inline inference → client created empty inline buffer → reads returned
+/// 0 bytes for files whose data was actually on the Volume Server).
+///
+/// **Backward compatibility**: `#[serde(default)]` on the `InodeInfo`
+/// field means existing inodes deserialize to `Inline`. A transitional
+/// safety check in `encode_chunks_fields` treats `Inline + non-empty
+/// chunks` as `Flat` until all inodes are re-synced with the correct
+/// `storage_mode`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StorageMode {
+    /// Data stored in Filer metadata (`inline_data` field).
+    /// No Volume Server involvement.
+    #[default]
+    Inline,
+    /// Data on a single Volume Server (`chunks` + `fid`).
+    Flat,
+    /// Data striped across multiple volumes (parallel I/O).
+    Stripe,
+    /// Data striped across the entire cluster (max parallelism).
+    WideStripe,
+    /// Erasure-coded data (future use).
+    Ec,
+}
+
+impl StorageMode {
+    /// Returns true if this mode stores data in Filer metadata
+    /// (no Volume Server involvement).
+    pub fn is_inline(self) -> bool {
+        matches!(self, Self::Inline)
+    }
+
+    /// Returns true if this mode stores data on Volume Server(s).
+    pub fn is_volume_backed(self) -> bool {
+        !self.is_inline()
+    }
+}
+
 /// xattr 解析结果 (不含 Inline, Inline 由独立 powerfs.inline 控制)
 ///
 /// 从 `powerfs.placement` xattr 解析得到, 用于创建文件时继承父目录策略.
