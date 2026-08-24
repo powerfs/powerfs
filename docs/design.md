@@ -1,18 +1,22 @@
 # PowerFS｜面向极致HPC \& AI集群的融合存储文件系统设计方案（Rust原生重构 \+ SeaweedFS \+ BeeGFS双借鉴）
 
-> ⚠️ **[架构更新 - 2026-07-13]** PowerFS 已重定位为**弱一致分布式数据同步存储**。
+> ⚠️ **[架构更新 - 2026-08-24]** PowerFS 架构已全面演进，以下为当前状态。
 >
-> **核心变更**：
-> - 一致性模型从全局线性一致改为 OR-Set CRDT 最终一致 + 冲突不丢失
-> - 文件名从唯一主键改为 `(name+client+seq)` 唯一标识，并发全部保留
-> - 写操作从强制走 Master 改为本地 OR-Set 即返回，异步 delta 同步
-> - 失效机制从全局广播改为增量 delta 推送，客户端无限扩容无衰减
-> - 新增三级合并模式：Auto / Manual / AI
-> - 新增 POSIX 投影层：主版本可见 + 冲突副本进 `.conflicts/` 隐藏目录
+> **核心演进**：
+> - **通信协议**：从 gRPC 全面迁移到 powerfs-net TLV 二进制协议（MsgType + FieldId），零拷贝、低延迟
+> - **一致性模型**：Filer 元数据使用 Raft 强一致（content_size + chunks 列表）；Cap model + lock_arbiter 管理分布式写锁
+> - **认证架构**：三层认证模型 — admin_token（管理 API）+ registration_token（节点注册）+ ClientId（客户端挂载）
+> - **证书管理**：Master 作为集群 CA，通过 rcgen 自签名生成 CA 证书，统一签发客户端/服务器证书
+> - **FUSE 模式**：`mode=perf|ha`，perf 模式跳过 lease 续约/invalidate 通知，ha 模式为默认（完整 Cap 保护）
+> - **内核客户端**：Kernel Client 使用 powerfs-net TLV 协议直连 Master/Filer，GFP_NOFS 防递归，dget/dput 防 UAF
 >
-> **详细方案**：[design/fuse-cache-architecture.md](design/fuse-cache-architecture.md) v2.0
+> **关联文档**：
+> - [network-architecture.md](network-architecture.md) — powerfs-net TLV 协议设计
+> - [lease-design.md](lease-design.md) — Lease 模型与 Cap 协议
+> - [lock-protocol.md](lock-protocol.md) — 分布式锁协议
+> - [filer-architecture-design.md](filer-architecture-design.md) — Filer 分片架构
 >
-> 本文档以下内容为早期设计，部分描述（如"完整标准 POSIX 语义"、"强一致"）已调整，请以新方案为准。
+> 本文档为顶层设计，部分早期描述（如 gRPC 通信、旧性能数据）已在下方标注更新。
 
 ---
 
@@ -175,13 +179,15 @@ PowerFS内置原生S3 Gateway，支持标准AWS S3协议，元数据由Master统
 
 | 组件 | 端口 | 职责 | 是否存储数据 |
 |------|------|------|------------|
-| **PowerFS S3 Gateway** | 9000 | S3协议处理、认证管理、分片上传、Bucket管理 | **不存储** |
-| **PowerFS Master** | 9527 | 元数据管理（DirectoryTree）、卷分配、集群调度 | **存储元数据** |
-| **PowerFS Volume Server** | 8080+ | 实际数据存储（Needle格式）、EC纠删码、Bitrot检测 | **存储对象数据** |
+| **PowerFS S3 Gateway** | 配置文件指定 | S3协议处理、认证管理、分片上传、Bucket管理 | **不存储** |
+| **PowerFS Master** | 配置文件指定 | 元数据管理（DirectoryTree）、卷分配、集群调度、CA 证书签发 | **存储元数据** |
+| **PowerFS Volume Server** | 配置文件指定 | 实际数据存储（Needle格式）、EC纠删码、Bitrot检测 | **存储对象数据** |
+
+> **注意**：所有端口必须在配置文件中显式设置，无默认值。Master 配置 `port`（HTTP）、`raft_port`、`metrics_port`、`net_port` 四个端口，且必须互不相同。
 
 **S3 Gateway启动方式**：
 ```bash
-powerfs s3 start --master-addr http://powerfs-master:9527 --port 9000
+powerfs s3 start --config /etc/powerfs/powerfs.yaml
 ```
 
 ---
@@ -326,15 +332,17 @@ powerfs s3 start --master-addr http://powerfs-master:9527 --port 9000
 
 ## 6\. FUSE客户端性能优化方案
 
-### 6\.1 性能瓶颈分析
+> **[更新说明]** 以下方案多数已实现。通信协议已从 gRPC 全面迁移到 powerfs-net TLV 二进制协议，写入路径已使用异步批量刷新，连接复用通过 powerfs-net 统一 RPC 层实现。
 
-当前FUSE客户端写入性能约1.8 MB/s，远低于预期。主要瓶颈包括：
+### 6\.1 性能瓶颈分析（历史基线）
+
+早期 FUSE 客户端写入性能约 1.8 MB/s，主要瓶颈包括：
 
 1. **同步写入路径**：每个write请求都在FUSE工作线程中同步完成，包含缓存操作、锁竞争、数据拷贝等开销
 2. **数据克隆开销**：写入路径中存在多次数据克隆（`buf.clone()`、`chunk_vec.to_vec()`），增加内存分配和拷贝成本
 3. **锁竞争**：`chunk_cache`和`dirty_chunks`使用全局RwLock，高并发场景下存在严重锁竞争
 4. **单线程FUSE会话**：FUSE默认单线程处理所有请求，无法利用多核CPU
-5. **gRPC串行调用**：元数据更新和数据写入通过gRPC同步调用，阻塞写入路径
+5. **~~gRPC串行调用~~** → **TLV 同步调用**：元数据更新和数据写入通过 powerfs-net TLV 协议同步调用，阻塞写入路径（已通过 write_batch + 异步 flush 优化）
 
 ### 6\.2 优化方案（按优先级排序）
 
@@ -344,7 +352,7 @@ powerfs s3 start --master-addr http://powerfs-master:9527 --port 9000
 
 **实现要点**：
 - 启动独立后台线程，定期扫描`dirty_chunks`集合
-- 批量收集脏chunk，合并gRPC调用，减少网络往返
+- 批量收集脏chunk，合并TLV 调用，减少网络往返（已通过 write_batch 实现）
 - 使用无锁数据结构（如`crossbeam::queue`）替代RwLock，降低锁竞争
 - 支持手动触发刷新（如文件关闭时）和自动定时刷新
 
@@ -384,25 +392,205 @@ powerfs s3 start --master-addr http://powerfs-master:9527 --port 9000
 
 **预期效果**：小文件写入性能提升3-5倍
 
-#### 方案5：gRPC连接复用与批量调用
+#### 方案5：~~gRPC连接复用~~ → TLV 统一 RPC 层（已实现）
 
-**核心思想**：优化gRPC通信效率
+**核心思想**：使用 powerfs-net TLV 二进制协议替代 gRPC，统一连接管理
 
 **实现要点**：
-- 实现gRPC连接池，复用TCP连接
-- 批量发送元数据更新请求，减少网络往返
-- 配置gRPC流式传输，支持大文件分段传输
+- ~~实现gRPC连接池，复用TCP连接~~ → powerfs-net 统一 RPC 层（connect → handshake → send → read）
+- 批量发送元数据更新请求，减少网络往返（write_batch 批量提交）
+- ~~配置gRPC流式传输~~ → TLV 请求-响应模式 + KeepConnected 长连接流
 
-**预期效果**：元数据操作延迟降低50%
+**预期效果**：元数据操作延迟降低50%（已实现）
 
 ### 6\.3 优化路线图
 
-| 阶段 | 优化项 | 预期性能提升 | 时间预估 |
-|------|--------|-------------|----------|
-| Phase 1 | 异步后台脏数据刷新 | 写入延迟降低90% | 1-2天 |
-| Phase 2 | 零拷贝写入路径 | 写入延迟降低30% | 1天 |
-| Phase 3 | 多线程FUSE会话 | 吞吐量提升2-4倍 | 1天 |
-| Phase 4 | 写入合并优化 | 小文件写入提升3-5倍 | 1-2天 |
-| Phase 5 | gRPC连接复用 | 元数据操作降低50% | 1天 |
+| 阶段 | 优化项 | 预期性能提升 | 状态 |
+|------|--------|-------------|------|
+| Phase 1 | 异步后台脏数据刷新 | 写入延迟降低90% | ✅ 已实现 |
+| Phase 2 | 零拷贝写入路径 | 写入延迟降低30% | ✅ 已实现 |
+| Phase 3 | 多线程FUSE会话 | 吞吐量提升2-4倍 | ✅ 已实现 |
+| Phase 4 | 写入合并优化 | 小文件写入提升3-5倍 | ✅ 已实现（write_batch） |
+| Phase 5 | TLV 统一 RPC 层 | 元数据操作降低50% | ✅ 已实现 |
+
+---
+
+## 7\. 安全认证架构
+
+PowerFS 采用三层认证模型，覆盖管理访问、节点注册和客户端挂载三个安全边界。
+
+### 7\.1 认证层级总览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    三层认证架构                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐ │
+│  │  Layer 1:       │  │  Layer 2:       │  │  Layer 3:       │ │
+│  │  admin_token    │  │  registration_  │  │  ClientId       │ │
+│  │                 │  │  token          │  │                 │ │
+│  ├─────────────────┤  ├─────────────────┤  ├─────────────────┤ │
+│  │ • CLI 管理 API  │  │ • Volume 注册   │  │ • FUSE 挂载     │ │
+│  │ • 证书签发 API  │  │ • Filer 注册    │  │ • Cap 授权      │ │
+│  │ • Bearer Token  │  │ • TLV 字段携带  │  │ • Master 分配   │ │
+│  │ • Master 配置   │  │ • Master 校验   │  │ • 全局唯一      │ │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘ │
+│         │                       │                       │       │
+│         ▼                       ▼                       ▼       │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │              Master (集群 CA + 认证中心)                │   │
+│  │  • admin_token 校验 (constant-time)                     │   │
+│  │  • registration_token 校验 (constant-time)              │   │
+│  │  • ClientId 黑名单 (RegisterClient 拒绝)               │   │
+│  │  • CA 证书签发 (rcgen 自签名)                           │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| 层级 | 认证方式 | 适用场景 | 配置位置 | 校验方 |
+|------|---------|---------|---------|--------|
+| **admin_token** | Bearer Token (HTTP Header) | CLI 管理 API、证书签发 API | `master.admin_token` | CaManager::verify_admin_token |
+| **registration_token** | TLV FieldId 0xD3 | Volume Heartbeat、Filer RegisterFiler | `master/volume/filer.registration_token` | MasterNode::verify_registration_token |
+| **ClientId** | Master 分配的全局唯一 ID | FUSE 客户端挂载、Cap 授权 | Master 运行时分配 | Master RegisterClient + 黑名单 |
+
+### 7\.2 Master CA 证书管理
+
+Master 作为集群唯一的 Certificate Authority，负责签发所有 TLS 证书：
+
+**CA 初始化**：
+- Master 首次启动时，通过 `rcgen` 自动生成自签名 CA 证书（10 年有效期）
+- CA 证书 (`ca.crt`) 和私钥 (`ca.key`) 持久化到 `ca_dir`（默认 `{dir}/ca`）
+- 私钥文件权限 `0600`，仅在 Master 节点保存
+- 后续启动加载已有 CA，不重新生成
+
+**证书签发 HTTP API**（挂在 Master metrics/admin HTTP 端口）：
+
+| 端点 | 方法 | 认证 | 用途 |
+|------|------|------|------|
+| `/api/cert/ca` | GET | 无需认证 | 获取 CA 证书 PEM（客户端需要它来验证服务器证书） |
+| `/api/cert/sign-client` | POST | admin_token | 签发客户端证书（ClientAuth + 可选 ClientId SAN URI） |
+| `/api/cert/sign-server` | POST | admin_token | 签发服务器证书（ServerAuth + SAN IP/DNS） |
+
+**证书生命周期**：
+- 客户端/服务器证书有效期 1 年
+- CA 证书有效期 10 年
+- 证书续期：重新调用签发 API 即可
+
+### 7\.3 证书分发流程
+
+```
+┌──────────┐         ┌──────────┐         ┌──────────┐
+│  运维人员 │         │  Master  │         │ 目标节点  │
+│  (CLI)   │         │   (CA)   │         │(FUSE/Filer│
+│          │         │          │         │/Volume)  │
+└────┬─────┘         └────┬─────┘         └────┬─────┘
+     │                    │                    │
+     │  1. init-ca        │                    │
+     │ ──────────────────>│                    │
+     │  GET /api/cert/ca  │                    │
+     │  (无认证)          │                    │
+     │<──────────────────│                    │
+     │  ca.crt            │                    │
+     │                    │                    │
+     │  2. sign-client    │                    │
+     │  或 sign-server    │                    │
+     │ ──────────────────>│                    │
+     │  POST /api/cert/*  │                    │
+     │  Authorization:    │                    │
+     │  Bearer <token>    │                    │
+     │<──────────────────│                    │
+     │  client.crt+key   │                    │
+     │  或 server.crt+key│                    │
+     │                    │                    │
+     │  3. 分发证书文件    │                    │
+     │ ────────────────────────────────────────>│
+     │  ca.crt + cert + key                  │
+     │                    │                    │
+     │                    │  4. 节点启动时     │
+     │                    │<──────────────────│
+     │                    │  Volume: Heartbeat │
+     │                    │  Filer: RegisterFiler│
+     │                    │  (携带 registration_token)│
+     │                    │                    │
+     │                    │  5. Master 校验    │
+     │                    │  registration_token│
+     │                    │<──────────────────│
+     │                    │  STATUS_OK /       │
+     │                    │  STATUS_ERR_PERMISSION_DENIED│
+     │                    │                    │
+```
+
+**CLI 证书管理命令**：
+```bash
+# 1. 获取 CA 证书（无需 admin_token）
+powerfs-cli cert init-ca --master-api master:metrics_port --admin-token <token> -o /etc/powerfs/certs/
+
+# 2. 签发客户端证书（FUSE 客户端用）
+powerfs-cli cert sign-client --master-api master:metrics_port --admin-token <token> \
+  --common-name "fuse-client-1" --client-id "client-001" -o /etc/powerfs/certs/
+
+# 3. 签发服务器证书（Filer/Volume 用）
+powerfs-cli cert sign-server --master-api master:metrics_port --admin-token <token> \
+  --common-name "filer-1" --san 172.20.0.21 --san filer-1.powerfs.local -o /etc/powerfs/certs/
+```
+
+### 7\.4 Registration Token 节点认证
+
+Volume 和 Filer 在向 Master 注册时必须携带 `registration_token`，Master 在处理注册请求前先校验 token。
+
+**TLV 协议层**：
+- `FieldId::RegistrationToken = 0xD3`（string 类型）
+- Volume 在 `MsgType::Heartbeat` 请求中携带
+- Filer 在 `MsgType::RegisterFiler` 请求中携带
+
+**Master 校验流程**（`net_handler.rs`）：
+1. 解码 TLV 请求中的 `RegistrationToken` 字段
+2. 调用 `MasterNode::verify_registration_token()` 进行常量时间比较
+3. 校验在 **leader 检查之前** 执行，即使 follower 也拒绝未授权节点（不重定向到 leader）
+4. 校验失败返回 `STATUS_ERR_PERMISSION_DENIED` + 错误消息
+
+**Dev 模式**：
+- `registration_token` 为 `None` 或空字符串时，Master 跳过校验（dev 模式）
+- 生产环境必须设置非空 token，Volume/Filer 配置中填写相同值
+
+**配置示例**（`powerfs.yaml`）：
+```yaml
+master:
+  registration_token: "secure-cluster-token-2026"
+
+volume:
+  registration_token: "secure-cluster-token-2026"
+
+filer:
+  registration_token: "secure-cluster-token-2026"
+```
+
+### 7\.5 Admin Token 管理认证
+
+Admin token 用于保护 Master 的管理 HTTP API（证书签发、调试控制等）。
+
+**校验机制**：
+- HTTP 请求头 `Authorization: Bearer <admin_token>`
+- `CaManager::verify_admin_token()` 使用常量时间比较（防时序攻击）
+- Dev 模式：`admin_token` 为 `None` 或空时，管理 API 完全开放
+
+**配置示例**：
+```yaml
+master:
+  admin_token: "admin-secret-token-2026"
+  ca_dir: "/data/powerfs/master/ca"
+```
+
+### 7\.6 ClientId 客户端认证
+
+ClientId 是 Master 在 FUSE 客户端首次连接时分配的全局唯一标识，用于 Cap 授权和写锁管理。
+
+**分配流程**：
+- FUSE 客户端通过 `KeepConnected` TLV 请求连接 Master
+- Master 分配 ClientId 并维护 `client_uuid → client_id` 映射
+- Master 维护黑名单，`RegisterClient` 响应中 `MountAllowed=0` 表示拒绝挂载
+
+**与证书的区别**：ClientId 不需要预配置，由 Master 运行时自动分配。证书用于 TLS 加密通道，ClientId 用于应用层身份识别和 Cap 授权。
 
 > （注：部分内容可能由 AI 生成）

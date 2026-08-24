@@ -13,3 +13,4 @@ master_net_port = 9334
 max_volume_size = 107374182400   # 100GB
 initial_volume_count = 2
 advertise_addr = "172.20.0.22"
+registration_token = "powerfs-cluster-test"

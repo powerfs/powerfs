@@ -17,3 +17,4 @@ max_volume_size = 107374182400
 initial_volume_count = 4
 advertise_addr = "172.30.0.22"
 lease_enabled = false            # 方案A: 使用inode metadata lease，Volume跳过range lease验证
+registration_token = "powerfs-cluster-test"  # 节点注册认证令牌 (必须与master一致)
