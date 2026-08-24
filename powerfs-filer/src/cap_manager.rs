@@ -382,11 +382,6 @@ impl CapManager {
         }
     }
 
-    /// 客户端 ACK recall. 委托 `arbiter.recall_ack(inode, File, client, sn)`.
-    ///
-    /// 返回 `Ok(NONE)` 表示 ACK 已处理 (lock_arbiter 内部已降级 holder caps,
-    /// 具体保留值由 arbiter 维护, 调用方无需关心; 仅做日志记录).
-    ///
     /// 客户端 ACK recall. 遍历所有 `LockType` 调 `arbiter.recall_ack`,
     /// 命中匹配 (client_id, sn) 的 lock_type 即完成 GATHER 计数减一.
     ///
@@ -395,37 +390,49 @@ impl CapManager {
     /// ACK 后 arbiter 找不到匹配 lock_type, GATHER 不完成, waiter
     /// 阻塞到 tick force-reclaim 2s 超时). 现遍历全部 lock_type 解决.
     ///
+    /// **Loner promote 策略**: 不在 recall_ack 内联 promote (详见
+    /// `arbiter.recall_ack` 注释 — C2 还没加入 holders 时 promote
+    /// 会错误升级旧 holder). promote 通过两条路径:
+    ///   1) 被 `wake_waiters` 唤醒的新 caller 在重试 wrlock/xlock 时
+    ///      直接作为新 holder 拿到 LONER/EXCL cap (在其自身 RPC 返回值里).
+    ///   2) 稳定单 holder 由 `drain_expired_recalls()` 的 500ms sweep
+    ///      tick 升级为 LONER, 并下发 `CapUpgradeNotify`.
+    ///
     /// token → sn 解析依赖 cap_manager 自有 token 格式
     /// (`cap-{inode}-{client}-{sn}`), 不接受外部伪造 token.
-    pub fn recall_ack(&self, inode: u64, client_id: &str, token: &str) -> Result<CapSet, String> {
+    ///
+    /// 返回 `Ok(None)` 总是成立 (不在此路径下发 upgrade); 仅 Err 表示
+    /// token 解析失败.
+    pub fn recall_ack(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+    ) -> Result<Option<UpgradeTask>, String> {
         let sn = parse_sn_from_token(token)
             .ok_or_else(|| format!("invalid token (no sn suffix): {}", token))?;
 
-        // 遍历所有 lock_type, arbiter.recall_ack 内部判断是否有匹配
-        // (client_id, sn) 的 gather entry, 命中则 ACK 并返回 true.
-        let mut any_gather_done = false;
+        let mut any_hit = false;
         for i in 0..LockType::NUM_TYPES {
             let lt = LockType::from_index(i);
-            if self.arbiter.recall_ack(inode, lt, client_id, sn) {
-                any_gather_done = true;
+            let matched = self.arbiter.recall_ack(inode, lt, client_id, sn);
+            if matched {
+                any_hit = true;
                 log::debug!(
-                    "CapManager::recall_ack inode={} client={} sn={} lt={:?} gather_done=true",
+                    "CapManager::recall_ack inode={} client={} sn={} lt={:?} matched",
                     inode, client_id, sn, lt
                 );
             }
         }
 
-        if !any_gather_done {
+        if !any_hit {
             log::warn!(
                 "CapManager::recall_ack no matching gather entry inode={} client={} sn={}",
                 inode, client_id, sn
             );
         }
 
-        // arbiter recall_ack 后 holder.granted_caps = retain_caps;
-        // arbiter 不暴露 retained_caps 查询接口, 调用方仅用于日志,
-        // 返回 NONE 不影响逻辑.
-        Ok(CapSet::NONE)
+        Ok(None)
     }
 
     /// 释放 cap (close). 委托 `arbiter.unlock(inode, File, sn)`.

@@ -1140,17 +1140,47 @@ impl LockArbiter {
     }
 
     /// recall_ack: 客户端 ACK recall, GATHER 计数减一
-    pub fn recall_ack(&self, inode: u64, lock_type: LockType, client_id: &str, sn: u64) -> bool {
+    /// 客户端 ACK 一次 recall.
+    ///
+    /// 在 `gather_list` 中找到匹配 `(client_id, sn)` 的条目并标记 `acked=true`.
+    /// 如果所有 gather 条目都 ACK 了 (含 force-reclaim 标记), 调用
+    /// `gather_complete()` 完成目标状态跃迁, 然后 `wake_waiters` 唤醒所有
+    /// 阻塞的 wrlock/xlock/async waiter (它们会重试并在 holder 稳定后
+    /// 自行完成 Loner/Excl 授予).
+    ///
+    /// **Loner promote 的正确触发时机**:
+    /// - recall_ack 路径上: 新 caller (C2) 还没加入 `holders` (因为
+    ///   wrlock/xlock 在 GATHER 建表时已 `return LockGrantResult::NONE` 提前
+    ///   返回, 未 push 新 holder). 此时 `holders.len()` 与真实存活客户端数
+    ///   不一致, 绝不能在此处 promote 会把被降级的旧 reader 升级为 W+X.
+    /// - 正确路径:
+    ///   1) `wake_waiters` 唤醒 C2 → C2 重试 wrlock/xlock →
+    ///      `gather_remaining==0` → `gather_complete()` → C2 被加入
+    ///      `holders` → `state=Loner/Excl` → C2 在本次返回中直接拿到全套 cap.
+    ///   2) 只剩 1 个稳定 holder 时 (非 C2 waiting 场景), 由
+    ///      `tick()/unlock()/evict_client()` 路径 promote (500 ms sweep
+    ///      tick 内下发 `CapUpgradeNotify`).
+    ///
+    /// 返回 `true` = 找到匹配的 gather 条目并标记了 ACK (无论 gather 是否
+    /// 全部完成); `false` = 此 lock_type 上没有匹配的 gather 条目.
+    pub fn recall_ack(
+        &self,
+        inode: u64,
+        lock_type: LockType,
+        client_id: &str,
+        sn: u64,
+    ) -> bool {
         let mut locks = self.locks.lock().unwrap();
         Self::ensure_init_locked(&mut locks, inode);
         let lock_arr = locks.get_mut(&inode).unwrap();
         let lock = &mut lock_arr[lock_type as usize];
 
-        // 标记 ACK
+        let mut matched = false;
         let mut all_done = true;
         for g in &mut lock.gather_list {
             if g.client_id == client_id && g.sn == sn {
                 g.acked = true;
+                matched = true;
                 debug!(
                     "mdlock_recall_ack inode={} type={:?} client={} sn={}",
                     inode, lock_type, client_id, sn
@@ -1161,7 +1191,11 @@ impl LockArbiter {
             }
         }
 
-        // 更新 holder: 降级 cap
+        if !matched {
+            return false;
+        }
+
+        // 更新 holder: 降级 cap (retain_caps 已由建 gather 时写好)
         if let Some(h) = lock.find_holder_mut(client_id) {
             h.granted_caps = h.retain_caps;
             h.recall_in_flight = false;
@@ -1181,10 +1215,9 @@ impl LockArbiter {
 
         if gather_done {
             self.wake_waiters(inode, lock_type);
-            return true;
         }
 
-        false
+        true
     }
 
     // ==================== eval 触发 ====================
@@ -2151,9 +2184,18 @@ mod tests {
         assert!(recall.retained_caps.has_r());
         assert!(!recall.retained_caps.has_w());
 
-        // C1 ACK → GATHER 完成 → 状态 SHARED
-        let done = a.recall_ack(200, LockType::File, "C1", r1.sn);
-        assert!(done);
+        // C1 ACK → GATHER 完成 → 状态 SYNC (C2 还没 retry, 尚未加入 holders)
+        let matched = a.recall_ack(200, LockType::File, "C1", r1.sn);
+        assert!(matched, "C1 ACK 应匹配到 gather 条目");
+        // C2 retry wrlock → gather_remaining==0 → gather_complete → C2 加入 holders → state=Loner
+        let r2_retry = a.wrlock(200, LockType::File, "C2");
+        assert!(r2_retry.granted_caps.is_exclusive(), "C2 retry 应拿到 LONER EXCL");
+        // C2: LONER → 全套 R|W|X
+        assert!(r2_retry.granted_caps.has_r() && r2_retry.granted_caps.has_w() && r2_retry.granted_caps.has_x());
+        // 此时 holders=[C1(R), C2(R|W|X)], eval 为 File 类 Loner, 所以 eval_issued 应该是全套, 但
+        // 实际上 FileLock::eval_file Loner 只在 holders.len() == 1 时下发全套, 这里 2 个 holders
+        // 会走到 Sync(或 Loner 判断失败), 所以验证 C2 自身 granted_caps 即可 (上面已断言).
+        let _ = r2;
     }
 
     #[test]
@@ -2167,9 +2209,14 @@ mod tests {
         // xlock: retain_caps = NONE
         assert_eq!(r2.recall_tasks[0].retained_caps, CapSet::NONE);
 
-        // ACK 后状态 → EXCL
-        let done = a.recall_ack(201, LockType::Auth, "C1", r1.sn);
-        assert!(done);
+        // ACK: C1 被 ToExcl 移除 (gather_complete 从 acked_clients 清理). 然后 C2 retry 拿到 EXCL
+        let matched = a.recall_ack(201, LockType::Auth, "C1", r1.sn);
+        assert!(matched, "C1 ACK 应匹配到 gather 条目 (Auth xlock)");
+        // C2 retry xlock → gather_remaining==0 → gather_complete → holders=[C2] → state=Excl
+        let r2_retry = a.xlock(201, LockType::Auth, "C2");
+        // Auth Loner/Excl: CAP_R | CAP_X
+        assert!(r2_retry.granted_caps.has_r() && r2_retry.granted_caps.has_x());
+        assert_eq!(r2_retry.granted_caps, CapSet::CAP_R | CapSet::CAP_X);
     }
 
     // ============================================================

@@ -4850,12 +4850,20 @@ impl FileSystem for PowerFsFs {
         //     for inline, but Filer-level inode lease still provides
         //     exclusive access for write opens).
         //
-        // Lease duration + retry budget. The Filer's inode-lease
-        // default is 60s; our retry budget of 3 × 100ms = 300ms is
-        // long enough to absorb a transient conflict (another client
-        // in the middle of release → lease_release_remote RPC) and
-        // short enough to not hang applications.
-        if self.client.is_inode_lease_mode() && is_write_open {
+        // Lease duration + retry budget.
+        //
+        // LEGACY inode-mode pre-acquire (§方案 A / Filer-side inode lease):
+        // range/inode lease modes 已被 validate() 阻止 (config 只允许
+        // lease.mode="cap"), 所以 `is_inode_lease_mode` 恒为 false, 下
+        // 面整个 if 块是死代码, 保留为将来需要 soft inode-lease 时的
+        // 参考. cap 模式的一致性由 §13 的 CapOpenGrant + LockArbiter
+        // GATHER 屏障保证, 见下一段 acquire_cap_on_open().
+        //
+        // The Filer's inode-lease default is 60s; our retry budget of
+        // 3 × 100ms = 300ms is long enough to absorb a transient conflict
+        // and short enough to not hang applications.
+        #[allow(clippy::overly_complex_bool_expr)]
+        if false && self.client.is_inode_lease_mode() && is_write_open {
             const LEASE_ACQUIRE_RETRIES: u32 = 3;
             const LEASE_RETRY_DELAY_MS: u64 = 100;
             let client_id = self.client.client_id();
@@ -8021,30 +8029,25 @@ impl FileSystem for PowerFsFs {
             }
         }
 
-        // 4. 释放 Volume lease（best-effort，close 时释放 write + read lease）
-        //    write lease: 由 ensure_lease 缓存，通过 VolumeClient 释放
-        //    read lease: 由 LeaseManager 缓存，必须在 server 上释放（不能仅
-        //    清本地缓存），否则残留的读 lease 会阻止其他客户端获取写 lease
-        //    （stripe lease conflict）。
-        //    仍在 flush lock 内 —— 后台 flusher 此刻被阻塞，不会用旧 token 写入。
+        // 4. 释放 Volume lease (range/inode LEGACY)
         //
-        //    If flush failed, keep the write lease so the background flusher
-        //    can retry without re-acquiring (which may fail if the volume
-        //    server is under load). Read leases are still released to avoid
-        //    blocking other clients' write leases on shared files.
-        if flush_result.is_ok() {
+        // §13 Cap 模型下,一致性完全由 Filer 的 lock_arbiter (FileLock
+        // /ScatterLock/SimpleLock/LocalLock) 提供. Volume Server 端的
+        // range lease 与 Filer 端的 inode metadata lease 两类旧方案已
+        // 退役: config.validate() 会拒绝 lease.mode != "cap", 因此下
+        // 面的 legacy 释放分支永远不会命中 (if false 短路). 保留代码
+        // 壳供将来回归参考, 实际 release 只走上面的 CapRelease RPC.
+        #[allow(clippy::overly_complex_bool_expr)]
+        if false && flush_result.is_ok() {
             if let Some(entry) = self.cache.get_inode(inode) {
                 if let Some(ref fid) = entry.fid {
                     let client_id = self.client.client_id();
 
-                    // 方案 A (inode lease mode): release the single inode
-                    // metadata lease held from the Filer. Volume Server
-                    // leases are not used in this mode.
+                    // 方案 A (inode lease mode)
                     if self.client.is_inode_lease_mode() {
                         if let Some((token, _remaining)) =
                             self.client.get_valid_inode_lease_token(inode)
                         {
-                            // release_inode_lease auto-invalidates cache on success
                             if let Err(e) =
                                 self.client.release_inode_lease(inode, &client_id, &token)
                             {
@@ -8052,13 +8055,11 @@ impl FileSystem for PowerFsFs {
                                     "release: inode lease release for inode {} failed (best-effort): {}",
                                     inode, e
                                 );
-                                // On failure, manually invalidate to allow re-acquire
                                 self.client.invalidate_inode_lease(inode);
                             }
                         }
                     } else {
-                        // 方案 D (range lease mode): release per-stripe leases
-                        // 4a. 释放 write lease（遍历所有 stripe lease，逐个远程释放）
+                        // 方案 D (range lease mode): write + read leases
                         let write_tokens = self
                             .client
                             .get_all_valid_lease_tokens_for_inode(fid.volume_id.0, inode);
@@ -8076,7 +8077,6 @@ impl FileSystem for PowerFsFs {
                                 );
                             }
                         }
-                        // 4b. 释放 read lease（从 LeaseManager 缓存取所有 token，在 server 上释放）
                         let read_tokens = self
                             .lease_manager
                             .release_all_for_inode(fid.volume_id.0, inode);
@@ -8097,19 +8097,16 @@ impl FileSystem for PowerFsFs {
                     }
                 }
             }
-        } else {
-            // Flush failed: release read leases only (to avoid blocking other
-            // clients), but keep the write lease for background flusher retry.
+        } else if false {
+            // Flush failed → release read-only legacy leases.
             if let Some(entry) = self.cache.get_inode(inode) {
                 if let Some(ref fid) = entry.fid {
-                    // 方案 A: keep the inode lease (for background flusher retry)
                     if self.client.is_inode_lease_mode() {
                         debug!(
                             "release: keeping inode lease for inode {} (flush failed, retry pending)",
                             inode
                         );
                     } else {
-                        // 方案 D: release read leases only
                         let read_tokens = self
                             .lease_manager
                             .release_all_for_inode(fid.volume_id.0, inode);

@@ -225,18 +225,27 @@ pub struct FuseConfig {
     pub admin_port: u16,
 }
 
-/// Lease 模式配置
-/// - "range" (方案 D，默认): Volume Server 管理 per-stripe range lease
-/// - "inode"  (方案 A):       Filer 管理 per-inode metadata lease
+/// Lease 模式配置 — §13 Capability model 是唯一生产模式.
+/// - "cap" (默认, §13 Capability): Filer 端 lock_arbiter 统一仲裁
+///   FileLock/ScatterLock/SimpleLock/LocalLock 状态机, 提供
+///   strong consistency (linearization) + GATHER 同步屏障.
+///
+/// 历史遗留 "range" (方案 D, Volume Server range lease) 和 "inode"
+/// (方案 A, Filer inode metadata lease) 已废弃: 代码保留但
+/// validate() 拒绝, 避免误配置进入旧路径.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseConfig {
-    /// Lease 模式: "range" 或 "inode"
+    /// Lease 模式: 仅允许 "cap"
     #[serde(default = "default_lease_mode")]
     pub mode: String,
-    /// Lease 有效期 (毫秒)
+    /// Lease 有效期 (毫秒) — 在 cap 模式下用作
+    /// `DEFAULT_LEASE_DURATION_MS` (30s) 的 Filer 侧 cap holder
+    /// TTL 参考值, 与 `DEFAULT_RECALL_TIMEOUT_MS` (2s) 独立.
     #[serde(default = "default_lease_duration_ms")]
     pub lease_duration_ms: u64,
-    /// 续租间隔 (毫秒)
+    /// 续租间隔 (毫秒) — cap 模式下保留字段用于后续 "soft-cap"
+    /// 主动续约模式; 当前 lock_arbiter 不发 renew, 仅靠 epoch
+    /// fencing 驱动 recall, 因此此值仅作为配置兼容占位.
     #[serde(default = "default_renew_interval_ms")]
     pub renew_interval_ms: u64,
 }
@@ -252,7 +261,7 @@ impl Default for LeaseConfig {
 }
 
 fn default_lease_mode() -> String {
-    "range".to_string()
+    "cap".to_string()
 }
 
 fn default_lease_duration_ms() -> u64 {
@@ -524,9 +533,9 @@ impl PowerFsConfig {
 
         // === Lease 模式校验 ===
         let mode = &self.fuse.lease.mode;
-        if mode != "range" && mode != "inode" && mode != "cap" {
+        if mode != "cap" {
             return Err(ConfigError::ValidationError(format!(
-                "fuse.lease.mode must be 'range', 'inode' or 'cap', got '{}'",
+                "fuse.lease.mode must be 'cap' (legacy 'range'/'inode' removed), got '{}'",
                 mode
             )));
         }
@@ -782,9 +791,9 @@ impl PowerFsConfig {
             ));
         }
         let mode = &self.fuse.lease.mode;
-        if mode != "range" && mode != "inode" && mode != "cap" {
+        if mode != "cap" {
             return Err(ConfigError::ValidationError(format!(
-                "fuse.lease.mode must be 'range', 'inode' or 'cap', got '{}'",
+                "fuse.lease.mode must be 'cap' (legacy 'range'/'inode' removed), got '{}'",
                 mode
             )));
         }
@@ -903,9 +912,9 @@ container = false
 request_timeout_secs = 10          # 请求超时 (秒), 测试环境建议 3s
 
 [fuse.lease]
-mode = "range"               # "range" (方案D, 默认) 或 "inode" (方案A, NVMe-oF target)
-lease_duration_ms = 30000    # lease 有效期 30s
-renew_interval_ms = 10000    # 续租间隔 10s
+mode = "cap"                 # §13 Capability 模型 (唯一允许值; 旧 "range"/"inode" 已废弃并被 validate 拒绝)
+lease_duration_ms = 30000    # Filer 侧 cap holder TTL 参考值 (毫秒)
+renew_interval_ms = 10000    # 保留字段: 后续 soft-cap 主动续约模式使用
 
 [monitor]
 addr = "0.0.0.0:8081"                      # (必填) 监听地址
