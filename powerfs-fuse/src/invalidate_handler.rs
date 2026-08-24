@@ -57,6 +57,30 @@ pub trait CapFlusher: Send + Sync {
     /// The `lease_token` is the cap token — passed to the Volume Server
     /// write RPCs so they carry the correct fencing epoch.
     fn flush_and_sync(&self, inode: u64, lease_token: &str) -> std::io::Result<()>;
+
+    /// Deadline-aware variant for the cap recall path.
+    ///
+    /// The server's GATHER timeout is 2000 ms. The cap handler's outer
+    /// `tokio::time::timeout(1750 ms)` wraps the `spawn_blocking` call to
+    /// this method. If `deadline` is `Some(t)`, the implementation MUST
+    /// check `Instant::now() < t` before each retry sleep in
+    /// `sync_size_chunks_on_close` and bail early if exceeded — otherwise
+    /// the retry loop (5 × 500 ms incremental sleep = 5 s worst case)
+    /// easily blows past the 1750 ms budget, the timeout fires with no
+    /// ACK sent, and the server force-reclaims at 2000 ms.
+    ///
+    /// Default: ignore deadline (delegate to `flush_and_sync`).  Concrete
+    /// implementations (`PowerFsFs`) override to thread the deadline into
+    /// the retry loop.
+    fn flush_and_sync_with_deadline(
+        &self,
+        inode: u64,
+        lease_token: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> std::io::Result<()> {
+        let _ = deadline;
+        self.flush_and_sync(inode, lease_token)
+    }
 }
 
 /// Cap model handler — delegates recall ACK to the Filer via
