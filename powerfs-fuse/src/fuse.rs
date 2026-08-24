@@ -100,7 +100,7 @@ pub struct FuseApp {
     /// 所有 Filer 节点地址列表（用于网络错误时轮换重试）
     filer_addrs: Vec<String>,
     filer_net_port: u16,
-    /// Lease mode: "range" (方案 D) or "inode" (方案 A)
+    /// Lease mode (always "cap" after config validation)
     lease_mode: String,
     lease_duration_ms: u64,
     lease_renew_interval_ms: u64,
@@ -640,7 +640,7 @@ struct PowerFsFs {
     /// Phase-4 §5.1 Lockify: the manager is built with `with_lockify`
     /// enabled, so `mkdir`/`create`/`mknod`/`symlink` paths call
     /// `lock_manager.acquire_local(inode, ...)` to speculatively
-    /// populate the inode lease cache without an RPC. The async sync
+    /// populate the local lock cache without an RPC. The async sync
     /// (off the critical path) CAS-replaces the local token with a
     /// server-issued token.
     lock_manager: Arc<powerfs_lock_fuse::FuseLockManager>,
@@ -653,7 +653,7 @@ struct PowerFsFs {
     /// HashSet 的 remove 会误删仍在使用的 inode。
     open_inodes: Arc<RwLock<HashMap<u64, usize>>>,
     /// Phase-4 §5.2 (P3): Open-file lease registry. When a file is
-    /// opened in inode-lease mode, the inode lease is pre-acquired at
+    /// opened in cap mode, the cap token is acquired at
     /// `open()` time and bound here. `flush_dirty_chunks` passes the
     /// bound token to `write_blob_batch_with_lease`, bypassing
     /// `ensure_lease`'s cache lookup on every flush. `release()`
@@ -1007,7 +1007,7 @@ impl PowerFsFs {
     }
 
     /// Phase-4 §5.1 Lockify fast path: speculatively populate the
-    /// inode lease cache with a local token after a fresh inode is
+    /// local lock cache with a local token after a fresh inode is
     /// minted by the Filer (creat/mkdir/mknod/symlink). The async
     /// sync RPC (off the critical path) CAS-replaces the local
     /// token with a server-issued token. On conflict the local
@@ -1108,12 +1108,11 @@ impl PowerFsFs {
                 // STATUS_ERR_SERVER_ERROR=10 → write fails with EIO.
                 //
                 // Note: we deliberately reuse the existing
-                // OpenFileLeaseRegistry even though this is a *cap* token,
-                // not a legacy inode/range lease: Volume Server's
-                // lease_enabled=false (方案A config) skips token
+                // OpenFileLeaseRegistry for the cap token:
+                // Volume Server's lease_enabled=false skips token
                 // validation, so any non-empty string satisfies the
-                // write_blob code path that expects *some* token to
-                // forward. No sense building a parallel registry.
+                // write_blob code path. No sense building a parallel
+                // registry.
                 let expire_at = std::time::Instant::now()
                     + std::time::Duration::from_millis(duration_ms);
                 self.open_file_leases.bind(inode, cap_token, expire_at);
@@ -4838,7 +4837,7 @@ impl FileSystem for PowerFsFs {
             }
         });
 
-        // Phase-4 §5.2 (P3): Pre-acquire the inode lease at open time
+        // Phase-4 §5.2 (P3): Acquire the cap token at open time
         // and bind it to the open-file registry. Subsequent
         // `flush_dirty_chunks` calls pass this token to
         // `write_blob_batch_with_lease`, bypassing `ensure_lease`'s

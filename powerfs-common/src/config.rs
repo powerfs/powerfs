@@ -93,7 +93,7 @@ pub struct VolumeConfig {
     /// Whether Volume Server supports range lease validation in write_needle.
     /// Set to `false` for backends that don't support lease (e.g., NVMe-oF target).
     /// When false, write_needle skips lease token validation; consistency is
-    /// enforced by Filer's inode metadata lease (方案 A) instead.
+    /// enforced by the Filer's lock_arbiter (§13 Cap model) instead.
     #[serde(default = "default_true")]
     pub lease_enabled: bool,
 }
@@ -230,9 +230,8 @@ pub struct FuseConfig {
 ///   FileLock/ScatterLock/SimpleLock/LocalLock 状态机, 提供
 ///   strong consistency (linearization) + GATHER 同步屏障.
 ///
-/// 历史遗留 "range" (方案 D, Volume Server range lease) 和 "inode"
-/// (方案 A, Filer inode metadata lease) 已废弃: 代码保留但
-/// validate() 拒绝, 避免误配置进入旧路径.
+/// 历史遗留 "range" 和 "inode" 模式已废弃: validate() 拒绝,
+/// 相关代码已删除.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseConfig {
     /// Lease 模式: 仅允许 "cap"
@@ -874,7 +873,7 @@ master_net_port = 9334   # Master的powerfs-net端口 (必填, 用于TLV心跳)
 node_id = "volume-server-1"
 max_volume_size = 107374182400   # 100GB (must be 100GB, not 10GB)
 initial_volume_count = 4
-lease_enabled = true          # Volume Server 是否支持 range lease (NVMe-oF target 设为 false)
+lease_enabled = true          # Volume Server 是否支持 lease 验证 (NVMe-oF target 设为 false)
 
 [filer]
 port = 8888              # HTTP端口 (必填)

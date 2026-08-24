@@ -120,7 +120,7 @@ fn main() {
     let volume_net_port = fuse_cfg.volume_net_port;
     let volume_addrs = fuse_cfg.volume_addresses.clone();
 
-    // Lease mode config (方案 A: inode / 方案 D: range)
+    // Lease mode config (always "cap" after validation)
     let lease_mode = fuse_cfg.lease.mode.clone();
     let lease_duration_ms = fuse_cfg.lease.lease_duration_ms;
     let lease_renew_interval_ms = fuse_cfg.lease.renew_interval_ms;
