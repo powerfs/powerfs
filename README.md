@@ -114,7 +114,7 @@ docker run -d --name redis -p 6379:6379 redis:7-alpine
 
 ## Architecture
 
-PowerFS adopts a **three-layer decoupled, OR-Set CRDT weak-consistency, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
+PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency + Cap model distributed locking, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
 
 ### 3-Layer Decoupled Architecture
 
@@ -128,18 +128,18 @@ PowerFS adopts a **three-layer decoupled, OR-Set CRDT weak-consistency, three-in
 └───────┼─────────────┼────────────────────┼─────────────────┘
         │             │                    │
 ┌───────▼─────────────▼────────────────────▼─────────────────┐
-│      OR-Set CRDT Weak-Consistency Metadata Layer (Core)    │
+│    Filer Raft Strong-Consistency Metadata Layer (Core)      │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  Lockless Cache | Delta Sync | Conflict Merge        │  │
-│  │  Multi-Protocol Isolation (POSIX/KV/S3)              │  │
+│  │  Bucket Sharding | Cap Model | lock_arbiter          │  │
+│  │  Callback Invalidation Push | Multi-Protocol Isolation│  │
 │  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────┬──────────────────────────────┘
                               │
 ┌─────────────────────────────▼──────────────────────────────┐
-│              Raft Global Scheduling Layer                  │
+│              Master (Raft Scheduling + CA + Volume Routing)  │
 │              (High-Availability Cluster)                   │
 │  ┌──────────────────────────────────────────────────────┐  │
-│  │  Cluster Management | Resource Allocation | Topology │  │
+│  │  Cluster Mgmt | Resource Alloc | Topology | CA Cert  │  │
 │  └──────────────────────────────────────────────────────┘  │
 └─────────────────────────────┬──────────────────────────────┘
                               │
@@ -147,13 +147,13 @@ PowerFS adopts a **three-layer decoupled, OR-Set CRDT weak-consistency, three-in
 │             Multi-Interface Unified Data Layer             │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
 │  │  Volume 1    │  │  Volume 2    │  │  Volume N    │      │
-│  │  (8080)      │  │  (8081)      │  │  (8xxx)      │      │
+│  │  (Needle)    │  │  (Needle)    │  │  (Needle)    │      │
 │  └──────────────┘  └──────────────┘  └──────────────┘      │
-│               [Unified Needle Binary Format]               │
+│               [Unified Needle Binary Format + RocksDB]     │
 └────────────────────────────────────────────────────────────┘
 ```
 
-1. **OR-Set CRDT Weak-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. Lockless OR-Set CRDT directory cache with `(name+client+seq)` unique identity, concurrent writes all preserved without silent overwrite. Eliminates broadcast storm via incremental delta sync, enabling unlimited client linear scaling. Native multi-protocol metadata isolation for POSIX/KV/S3.
+1. **Filer Raft Strong-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. Bucket-based sharding where each bucket is an independent Raft group. All metadata operations (mkdir, create, unlink, setattr, content_size, chunks) go through Raft commit for linearizability. Cap model + lock_arbiter manages distributed write locks; Callback Invalidation push ensures cross-client cache coherence without broadcast storms.
 
 ## Benchmark
 
@@ -267,17 +267,22 @@ log_level = "info"
 redis_url = "redis://127.0.0.1:6379"
 
 [master]
-port = 9333
-net_port = 9334
+port = 9333                    # HTTP/gRPC端口
+raft_port = 9335              # Raft端口 (必须与port不同)
+metrics_port = 9300           # Metrics/Admin HTTP端口 (cert API挂载于此)
+net_port = 9334               # powerfs-net TLV端口
 dir = "/data/master"
 ip = "0.0.0.0"
 raft_id = 1
 advertise_addr = "192.168.1.100:9333"
-peers = [
-    "192.168.1.100:9333",
-    "192.168.1.101:9333",
-    "192.168.1.102:9333",
+raft_peers = [
+    "192.168.1.100:9335",
+    "192.168.1.101:9335",
+    "192.168.1.102:9335",
 ]
+admin_token = "your-admin-secret"        # 管理API认证令牌 (CLI cert命令需要)
+ca_dir = "/data/master/ca"              # CA证书存储目录
+registration_token = "your-cluster-token" # 节点注册认证令牌
 ```
 
 ### Quick Start (Single Node)
@@ -401,7 +406,28 @@ powerfs-cli --config config/master-1.toml volumes
 
 # Create bucket
 powerfs-cli --config config/master-1.toml create-bucket my-bucket
+
+# Certificate management (requires admin_token)
+powerfs-cli cert init-ca --master-api master-1:9300 --admin-token "your-admin-secret" -o /etc/powerfs/certs/
+powerfs-cli cert sign-client --master-api master-1:9300 --admin-token "your-admin-secret" \
+  --common-name "fuse-client-1" -o /etc/powerfs/certs/
+powerfs-cli cert sign-server --master-api master-1:9300 --admin-token "your-admin-secret" \
+  --common-name "filer-1" --san 172.20.0.31 -o /etc/powerfs/certs/
 ```
+
+### Security & Authentication
+
+PowerFS uses a **three-tier authentication** model:
+
+| Layer | Auth Method | Scope | Config Field |
+|-------|-----------|-------|-------------|
+| **admin_token** | Bearer Token (HTTP) | CLI management API, cert signing | `master.admin_token` |
+| **registration_token** | TLV FieldId 0xD3 | Volume/Filer node registration | `master/volume/filer.registration_token` |
+| **ClientId** | Master-assigned ID | FUSE client mount, Cap authorization | Runtime (no config) |
+
+- **Master CA**: Master acts as cluster Certificate Authority (rcgen self-signed CA), signs client/server TLS certs via HTTP API (`/api/cert/ca`, `/api/cert/sign-client`, `/api/cert/sign-server`)
+- **Dev mode**: Empty/None tokens = no auth (for development only)
+- **Production**: Set non-empty `admin_token` and `registration_token`; use CLI cert commands to manage TLS certificates
 
 ### Docker Deployment (Recommended)
 
@@ -638,11 +664,17 @@ Commands:
   volumes         List all volumes
   create-bucket   Create a new bucket
   delete-bucket   Delete a bucket
+  cert            Certificate management (init-ca, sign-client, sign-server)
   help            Print help
 
 Options:
   -c, --config <CONFIG>  Path to TOML configuration file (required)
   -h, --help             Print help
+
+Cert subcommands (use --master-api <addr:port> --admin-token <token>):
+  init-ca         Fetch master CA certificate to local directory
+  sign-client     Request master to sign a client certificate
+  sign-server     Request master to sign a server certificate
 ```
 
 ## Architecture Details
@@ -696,9 +728,9 @@ Options:
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                         │
 │  │  Volume 1   │  │  Volume 2   │  │  Volume N   │                         │
 │  │ (Needle +   │  │ (Needle +   │  │ (Needle +   │                         │
-│  │  RangeLease)│  │  RangeLease)│  │  RangeLease)│                         │
+│  │  Cap Model) │  │  Cap Model) │  │  Cap Model) │                         │
 │  └─────────────┘  └─────────────┘  └─────────────┘                         │
-│       [Unified Needle Binary Format + RocksDB Index + Per-Stripe Lease]   │
+│       [Unified Needle Binary Format + RocksDB Index + Cap Model]          │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -790,6 +822,15 @@ Options:
 - [x] fio performance benchmark (Phase 2 results documented)
 - [x] IO500 moderate config full run (all phases completed, exit 0)
 - [x] Multi-node Raft failover testing
+
+### Phase 4b: Security & Authentication (Completed 2026-08)
+- [x] **Three-tier authentication**: admin_token (management API) + registration_token (node registration) + ClientId (client mount)
+- [x] **Master CA**: Master acts as cluster CA, rcgen self-signed certificate generation
+- [x] **Certificate signing HTTP API**: GET /api/cert/ca, POST /api/cert/sign-client, POST /api/cert/sign-server
+- [x] **CLI cert commands**: powerfs-cli cert init-ca/sign-client/sign-server with --admin-token
+- [x] **Registration token TLV**: FieldId::RegistrationToken (0xD3) in Heartbeat and RegisterFiler
+- [x] **Constant-time token comparison**: Anti-timing-attack for both admin_token and registration_token
+- [x] **Cap model + lock_arbiter**: Distributed write lock management replacing range/inode lease modes
 
 ### Phase 5: Performance & Enterprise Features (In Progress)
 - [ ] Random read/write performance optimization (read-before-write overhead reduction)

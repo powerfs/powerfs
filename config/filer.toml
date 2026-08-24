@@ -11,3 +11,4 @@ shard_count = 4
 raft_id = 1
 master_addresses = ["172.20.0.11:9333", "172.20.0.12:9333", "172.20.0.13:9333"]
 master_net_port = 9334
+registration_token = "powerfs-cluster-test"

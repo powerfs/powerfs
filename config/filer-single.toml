@@ -11,6 +11,7 @@ node_addr = "172.20.0.35:8889"
 net_address = "0.0.0.0:9334"
 master_addr = "172.20.0.11:9333"
 peers = []
+registration_token = "powerfs-cluster-test"
 [filer.placement]
 mode = "hybrid"
 load_balance = "random"

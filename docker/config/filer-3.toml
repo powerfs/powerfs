@@ -18,3 +18,4 @@ shard_count = 3
 raft_id = 3
 raft_peers = ["172.30.0.31:8889", "172.30.0.32:8889", "172.30.0.33:8889"]
 inline_max_size = 8192
+registration_token = "powerfs-cluster-test"  # 节点注册认证令牌 (必须与master一致)
