@@ -174,6 +174,7 @@ fn main() {
                 reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
                 compression_state: powerfs_layout::reliability::CompressionState::default(),
                 replica_chunks: Vec::new(),
+                storage_mode: powerfs_layout::StorageMode::Inline,
             };
 
             match store.create_inode_sync(root_inode.clone()) {

@@ -7576,8 +7576,16 @@ impl FileSystem for PowerFsFs {
             let routing_shard = self.routing_shard(inode);
             self.cache.mark_flushing(inode);
             let sync_result = self.sync_inline_buffer(inode, "release inline:");
-            let sync_ok = match sync_result {
-                Ok(_) => true,
+            // Track whether data was ACTUALLY synced (Ok(true)) vs. nothing
+            // to sync (Ok(false), buffer not dirty). When nothing is synced,
+            // the cache entry may hold stale data from a prior Invalidate
+            // eviction + Filer re-fetch. Using mark_clean in that case would
+            // trap the stale data (e.g., size=0 for a Flat file whose chunks
+            // were synced by a prior release), causing reads to return empty.
+            // mark_stale forces the next read to re-fetch from the Filer,
+            // which by then should have the correct data (Raft applied).
+            let (sync_ok, actually_synced) = match sync_result {
+                Ok(synced) => (true, synced),
                 Err(e) => {
                     error!(
                         "release inline: sync_inline_buffer failed for inode {}: {}",
@@ -7586,7 +7594,7 @@ impl FileSystem for PowerFsFs {
                     // Sync failed: revert Flushing → Dirty so the background
                     // flusher retries.
                     self.cache.mark_dirty(inode);
-                    false
+                    (false, false)
                 }
             };
             // Determine if inline buffer can be removed after this release:
@@ -7719,13 +7727,16 @@ impl FileSystem for PowerFsFs {
                 // before the next open anyway (a new struct file forces a
                 // fresh lookup that fills pages from our read callback).
                 //
-                // FIX: Use mark_clean instead of mark_stale when sync succeeded.
-                // mark_stale causes the next stat/getattr to re-fetch from Filer,
-                // but in async_meta_persist mode the Filer may not have applied
-                // the Raft log yet → returns size=0 → user sees 0-byte file.
-                // mark_clean keeps the local cache (with correct size) as
-                // authoritative; the next open() will refresh from Filer.
-                if sync_ok {
+                // FIX: Use mark_clean only when data was ACTUALLY synced
+                // (actually_synced=true). When sync_inline_buffer returned
+                // Ok(false) (buffer not dirty, nothing synced), the cache
+                // entry may hold stale data from an InvalidateHandler eviction
+                // + Filer re-fetch. Marking such stale data as clean traps
+                // it — subsequent reads return 0 bytes for a file whose
+                // chunks were synced by a prior Flat release. Using mark_stale
+                // forces the next read to re-fetch from the Filer, which by
+                // then should have the correct data (Raft apply completed).
+                if sync_ok && actually_synced {
                     self.cache.mark_clean(inode);
                 } else {
                     self.cache.mark_stale(inode);

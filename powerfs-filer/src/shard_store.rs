@@ -80,6 +80,12 @@ pub struct InodeInfo {
     // 主副本在 chunks[].volume_id / chunks[].needle_id, 副本在 replica_chunks[]
     #[serde(default)]
     pub replica_chunks: Vec<StoredFileChunk>,
+    /// Authoritative storage mode (Inline / Flat / Stripe / ...).
+    /// Set explicitly during CREATE (Inline) and MIGRATE (Flat via Raft).
+    /// `encode_chunks_fields` reads this directly instead of inferring from
+    /// data fields, eliminating the inline→flat migration race condition.
+    #[serde(default)]
+    pub storage_mode: powerfs_layout::StorageMode,
 }
 
 impl InodeInfo {
@@ -117,6 +123,7 @@ impl InodeInfo {
             reliability_state: ReliabilityState::default(),
             compression_state: CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         }
     }
 }
@@ -699,7 +706,36 @@ impl ShardStore {
                 new_parent_inode,
                 new_name,
             } => {
-                self.rename(old_parent_inode, old_name, new_parent_inode, new_name);
+                self.rename(
+                    old_parent_inode,
+                    old_name.clone(),
+                    new_parent_inode,
+                    new_name.clone(),
+                );
+                // P3: Raft apply 完成，更新 MetaCache 使 dir_entry 投影与
+                // ShardStore 一致。没有这一步，leader 在 propose 阶段做的
+                // stage_rename 投影永远不会被确认，follower 的缓存也永远
+                // 不会被更新 → lookup(old_name) 一直返回旧 inode（T1.2
+                // rename 后 stat old_name 仍成功的根因）。
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    // 解析被重命名 inode：rename() 已把它放到
+                    // dir_entries[new_parent][new_name]，从那里取。
+                    let inode = {
+                        let de = self.directory_entries.read().unwrap();
+                        de.get(&new_parent_inode)
+                            .and_then(|d| d.get(&new_name))
+                            .copied()
+                    };
+                    if let Some(ino) = inode {
+                        cache.confirm_rename(
+                            old_parent_inode,
+                            &old_name,
+                            new_parent_inode,
+                            &new_name,
+                            ino,
+                        );
+                    }
+                }
             }
             ShardCommand::PutObject {
                 parent_inode,
@@ -906,6 +942,11 @@ impl ShardStore {
                             e
                         );
                     }
+                    // P3: 同步 MetaCache 缓存的 nlink，否则 getattr 返回旧
+                    // nlink=1（T1.2 hardlink nlink bug）。
+                    if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                        cache.confirm_increment_nlink(inode);
+                    }
                 } else {
                     log::warn!(
                         "Shard {} apply IncrementNlink: inode {} not found",
@@ -940,6 +981,10 @@ impl ShardStore {
                             new_nlink
                         );
                     }
+                    // P3: 同步 MetaCache 缓存的 nlink（与 IncrementNlink 对称）。
+                    if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                        cache.confirm_decrement_nlink(inode);
+                    }
                 } else {
                     log::warn!(
                         "Shard {} apply DecrementNlink: inode {} not found",
@@ -973,6 +1018,12 @@ impl ShardStore {
                             inode,
                             e
                         );
+                    }
+                    // P3: 同步更新 MetaCache 中缓存的 inode 的 name/parent。
+                    // 跨 shard rename 的 Phase D 走这条 apply 路径；没有这步，
+                    // get_inode(inode) 返回的仍是旧 name/parent。
+                    if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                        cache.confirm_rename_inode(inode, &new_name, new_parent_inode);
                     }
                 } else {
                     log::warn!(
@@ -1276,6 +1327,7 @@ impl ShardStore {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -1357,6 +1409,7 @@ impl ShardStore {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -1544,6 +1597,7 @@ impl ShardStore {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -2969,6 +3023,36 @@ impl ShardStore {
             }
         }
 
+        // Set storage_mode explicitly based on what was just synced.
+        // At write time, the caller (FUSE sync_size_chunks_on_close) knows
+        // the mode — it sends inline_data for Inline files and chunks for
+        // Flat files. Setting the mode here ensures encode_chunks_fields
+        // (read path) can use the authoritative state instead of inferring
+        // from data fields, which was fragile during Raft apply lag.
+        let new_mode = if info.inline_data.is_some() {
+            powerfs_layout::StorageMode::Inline
+        } else if !info.chunks.is_empty() {
+            powerfs_layout::StorageMode::Flat
+        } else {
+            // Both empty: keep existing mode (file truncated to 0 bytes,
+            // but mode doesn't change — an Inline file stays Inline, a
+            // Flat file stays Flat with its fid preserved).
+            info.storage_mode
+        };
+        if info.storage_mode != new_mode {
+            log::info!(
+                "Shard {} storage_mode TRANSITION: inode {} {:?} → {:?} \
+                 (inline_data={} chunks={})",
+                self.shard_id.0,
+                inode,
+                info.storage_mode,
+                new_mode,
+                info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                info.chunks.len(),
+            );
+            info.storage_mode = new_mode;
+        }
+
         // A6 FIX: 从 chunks[0] 回填 info.fid / info.volume_id。
         //
         // Root cause (T1.6 cross-client concurrent append data loss):
@@ -3351,6 +3435,7 @@ impl ShardStore {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -3579,6 +3664,7 @@ mod tests {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         }
     }
 

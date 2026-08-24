@@ -714,6 +714,7 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
@@ -1052,6 +1053,29 @@ impl MetaShardManager {
         name: &str,
         inode: u64,
     ) -> Result<(), String> {
+        let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
+        let shard_ino = self.shard_strategy.calculate_shard(inode);
+
+        // Phase B (moved up): Check nlink BEFORE staging the deletion in
+        // MetaCache. The stage method must match the upcoming Raft command:
+        //   - nlink > 1 (hardlink): stage_delete_direntry_only → inode stays
+        //     alive for remaining links. Calling stage_delete here would mark
+        //     the inode as Deleted, breaking surviving hardlinks (T1.2 bug
+        //     "hardlink 删除源后丢失").
+        //   - nlink == 1 (last link): stage_delete → both dir_entry and
+        //     inode become invisible immediately.
+        // Reading nlink before staging is safe: the caller (unlink/rmdir)
+        // holds the parent dir xlock, so no concurrent link/unlink can
+        // change nlink between this read and the propose below.
+        let nlink = {
+            let stores = self.shard_stores.read().unwrap();
+            if let Some(store) = stores.get(&shard_ino) {
+                store.get_inode(inode).map(|info| info.nlink).unwrap_or(0)
+            } else {
+                0
+            }
+        };
+
         // Stage the deletion BEFORE proposing Raft so the entry becomes
         // immediately invisible to subsequent reads (POSIX semantics on the
         // same client). MetaCache Deleted markers are swept after Raft
@@ -1059,10 +1083,12 @@ impl MetaShardManager {
         // fall back to ShardStore (stale Deleted markers never win over
         // live entries on a propose failure because lookup/getattr call
         // `get_dir_entry_inode`/`get_inode` after MetaCache misses).
-        self.meta_cache.stage_delete(parent_inode, name, inode);
-
-        let shard_dir = self.shard_strategy.calculate_shard(parent_inode);
-        let shard_ino = self.shard_strategy.calculate_shard(inode);
+        if nlink > 1 {
+            self.meta_cache
+                .stage_delete_direntry_only(parent_inode, name, inode);
+        } else {
+            self.meta_cache.stage_delete(parent_inode, name, inode);
+        }
 
         // Phase A: remove dir entry on the parent's shard.
         let cmd_dir = ShardCommand::RemoveDirEntry {
@@ -1102,18 +1128,6 @@ impl MetaShardManager {
             self.wait_for_entry_removed(shard_dir, parent_inode, name)
                 .await;
         }
-
-        // Phase B: Check nlink to decide between DecrementNlink and DeleteInode.
-        // For hardlinks (nlink > 1), only decrement nlink so other links survive.
-        // For the last link (nlink == 1), delete the inode entirely.
-        let nlink = {
-            let stores = self.shard_stores.read().unwrap();
-            if let Some(store) = stores.get(&shard_ino) {
-                store.get_inode(inode).map(|info| info.nlink).unwrap_or(0)
-            } else {
-                0
-            }
-        };
 
         if nlink > 1 {
             // Hardlink: decrement nlink, keep inode alive for remaining links.
@@ -1207,8 +1221,26 @@ impl MetaShardManager {
         // Stage all deletions BEFORE the Raft propose so subsequent reads
         // on this filer immediately return ENOENT (matches POSIX semantics
         // for a single client thread that unlinks then stats).
+        // For each entry, check nlink first: hardlinks (nlink > 1) must use
+        // stage_delete_direntry_only to keep the inode alive for the
+        // remaining links. Calling stage_delete on a hardlink would mark
+        // the inode as Deleted, breaking surviving links (T1.2 bug
+        // "hardlink 删除源后丢失"). Mirrors propose_remove_direntry_and_inode.
         for (_, parent_inode, inode, name) in &resolved {
-            self.meta_cache.stage_delete(*parent_inode, name, *inode);
+            let shard_ino = self.shard_strategy.calculate_shard(*inode);
+            let nlink = {
+                let stores = self.shard_stores.read().unwrap();
+                stores
+                    .get(&shard_ino)
+                    .and_then(|s| s.get_inode(*inode).map(|info| info.nlink))
+                    .unwrap_or(0)
+            };
+            if nlink > 1 {
+                self.meta_cache
+                    .stage_delete_direntry_only(*parent_inode, name, *inode);
+            } else {
+                self.meta_cache.stage_delete(*parent_inode, name, *inode);
+            }
         }
 
         // Step 2: Batch all RemoveDirEntry commands into one propose_many on
@@ -1406,6 +1438,7 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
@@ -1473,6 +1506,7 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         // Propose ONLY CreateInode (no AddDirEntry — that's Phase B).
@@ -1660,6 +1694,27 @@ impl MetaShardManager {
         let new_shard = self.shard_strategy.calculate_shard(new_parent_inode);
 
         if old_shard == new_shard {
+            // Resolve inode BEFORE proposing so we can stage the rename in
+            // MetaCache (closes the commit→apply visibility gap that caused
+            // `stat old_name` to succeed after rename — `get_direntry` was
+            // returning the stale pre-rename dir_entry until Raft apply
+            // ran, which never updated the cache).
+            let inode = match self.lookup(old_parent_inode, old_name) {
+                Some(info) => info.inode,
+                None => return Err("rename: source not found".to_string()),
+            };
+
+            // Stage the rename in MetaCache (leader-side projected state).
+            // After this, get_direntry(old) → Some(None) = ENOENT, and
+            // get_direntry(new) → Some(Some(inode)).
+            self.meta_cache.stage_rename(
+                old_parent_inode,
+                old_name,
+                new_parent_inode,
+                new_name,
+                inode,
+            );
+
             let cmd = ShardCommand::Rename {
                 old_parent_inode,
                 old_name: old_name.to_string(),
@@ -1667,7 +1722,16 @@ impl MetaShardManager {
                 new_name: new_name.to_string(),
             };
 
-            self.propose_meta(old_shard, cmd.serialize()).await?;
+            if let Err(e) = self.propose_meta(old_shard, cmd.serialize()).await {
+                // Roll back the projection (mirrors invalidate_staging).
+                self.meta_cache.invalidate_rename(
+                    old_parent_inode,
+                    old_name,
+                    new_parent_inode,
+                    new_name,
+                );
+                return Err(e);
+            }
 
             if !self.is_async_meta_persist() {
                 self.wait_for_entry_appeared(old_shard, new_parent_inode, new_name)
@@ -1691,13 +1755,30 @@ impl MetaShardManager {
                     .ok_or_else(|| "rename: source not found".to_string())?
             };
 
+            // Stage the rename in MetaCache (same reasoning as same-shard).
+            self.meta_cache.stage_rename(
+                old_parent_inode,
+                old_name,
+                new_parent_inode,
+                new_name,
+                inode,
+            );
+
             // Phase B: AddDirEntry on new_parent's shard
             let add_cmd = ShardCommand::AddDirEntry {
                 parent_inode: new_parent_inode,
                 name: new_name.to_string(),
                 inode,
             };
-            self.propose_meta(new_shard, add_cmd.serialize()).await?;
+            if let Err(e) = self.propose_meta(new_shard, add_cmd.serialize()).await {
+                self.meta_cache.invalidate_rename(
+                    old_parent_inode,
+                    old_name,
+                    new_parent_inode,
+                    new_name,
+                );
+                return Err(e);
+            }
             if !self.is_async_meta_persist() {
                 self.wait_for_entry_appeared(new_shard, new_parent_inode, new_name)
                     .await;
@@ -1708,7 +1789,19 @@ impl MetaShardManager {
                 parent_inode: old_parent_inode,
                 name: old_name.to_string(),
             };
-            self.propose_meta(old_shard, rem_cmd.serialize()).await?;
+            if let Err(e) = self.propose_meta(old_shard, rem_cmd.serialize()).await {
+                // AddDirEntry already committed on new_parent's shard.
+                // The cache projection is still valid (new name → inode),
+                // but the old dir_entry is still live. Leave the staging
+                // as-is: get_direntry(old) returns Some(None) which is
+                // slightly stale, but the next leader-change invalidates
+                // everything. Log and propagate the error.
+                log::warn!(
+                    "cross-shard rename: RemoveDirEntry failed (AddDirEntry already committed): {}",
+                    e
+                );
+                return Err(e);
+            }
             if !self.is_async_meta_persist() {
                 self.wait_for_entry_removed(old_shard, old_parent_inode, old_name)
                     .await;
@@ -2216,6 +2309,7 @@ impl MetaShardManager {
                 reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
                 compression_state: powerfs_layout::reliability::CompressionState::default(),
                 replica_chunks: Vec::new(),
+                storage_mode: powerfs_layout::StorageMode::Inline,
             });
         }
 
@@ -2386,6 +2480,7 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
@@ -2691,9 +2786,24 @@ impl MetaShardManager {
 
         let store = store.ok_or_else(|| format!("shard {} not found", shard_id.0))?;
 
-        let mut inode_info = store
-            .get_inode(inode)
-            .ok_or_else(|| "inode not found".to_string())?;
+        // Read from MetaCache first (which has the most recent projected
+        // state from update_inode_size_chunks), falling back to the store
+        // only on cache miss.
+        //
+        // CRITICAL: In async meta_persist mode, reading from the store
+        // directly can return STALE data (size=0, inline_data=None) if a
+        // prior update_inode_size_chunks Raft command hasn't been applied
+        // yet. Using that stale data as the base for setattr would:
+        //   1. Write stale data to the store via store.update_inode()
+        //   2. Overwrite MetaCache's correct projected data via
+        //      project_setattr_meta (now fixed to only update metadata
+        //      fields, but the store write still needs correct base data)
+        let mut inode_info = match self.get_inode(inode) {
+            Some(info) => info,
+            None => {
+                return Err(format!("inode {} not found", inode));
+            }
+        };
 
         // Build CRDT MetaState from current inode
         let mut state = crate::crdt_meta::MetaState {
@@ -3099,6 +3209,7 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
@@ -3586,6 +3697,7 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
         };
 
         self.propose_create_inode_and_direntry(info, bucket_root_inode, key, inode)
@@ -4216,6 +4328,7 @@ impl MetaShardManager {
                     reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
                     compression_state: powerfs_layout::reliability::CompressionState::default(),
                     replica_chunks: Vec::new(),
+                    storage_mode: powerfs_layout::StorageMode::Inline,
                 };
                 store.create_inode_atomic(inode_info, entry_orset.parent_ino, &entry_orset.name)?;
                 debug!(
