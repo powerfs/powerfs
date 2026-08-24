@@ -3791,10 +3791,31 @@ impl FilerNetHandler {
         }
 
         match self.cap_mgr.recall_ack(inode, &client_id, &token) {
-            Ok(retained) => {
+            Ok(Some(upgrade)) => {
+                // H1 fix: gather_done → FileLock promote_to_loner returned an
+                // upgrade task. Push the survivor's CapUpgradeNotify *inline*
+                // with this ACK (same network turn), so the surviving writer
+                // immediately gets CAP_W|X restored instead of waiting up to
+                // one sweep tick (500 ms) — which was the cause of
+                // SHARED_WRITE stalls, and indirectly of L4.17's md5
+                // mismatch (writer B was stuck in SHARED_WRITE without
+                // CAP_X, so its writes couldn't cache → size drifted).
+                self.push_cap_upgrade_notify(
+                    inode,
+                    &upgrade.holder,
+                    upgrade.sn,
+                    upgrade.granted_caps,
+                );
                 info!(
-                    "CAP_RECALL_ACK: inode={} client={} retained={:?}",
-                    inode, client_id, retained
+                    "CAP_RECALL_ACK: inode={} client={} — survivor={} promoted to LONER, CapUpgradeNotify dispatched",
+                    inode, client_id, upgrade.holder
+                );
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Ok(None) => {
+                info!(
+                    "CAP_RECALL_ACK: inode={} client={} (no Loner promote)",
+                    inode, client_id
                 );
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
             }

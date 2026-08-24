@@ -255,50 +255,97 @@ impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
         let client_id = self.client_id.clone();
         let token_for_flush = token.clone();
         let lock = self.lock_for(inode);
+        let handler = Arc::downgrade(&self.recall_locks);
         self.handle.spawn(async move {
-            // §13 Guard: Serialize same-inode recall processing. Waits here
-            // if a prior recall's flush (sync_inline_buffer Raft / chunk
-            // flush) is still in-flight, so we never emit an ACK before
-            // the in-flight Raft commits. Without this lock, the server
-            // promotes a waiting client on the 2nd ACK, and that client
-            // reads stale content_size → data overwrite / lost rows.
-            let _guard = lock.lock().await;
-            debug!(
-                "FacadeCapHandler: flush_and_ack inode={} token={} — flushing dirty data before ACK",
-                inode, token_for_flush
-            );
-            // Step 1: Flush dirty chunks + sync metadata. This uses the
-            // same path as release() (drain_dirty_for_inode →
-            // write_blob_batch_with_lease → sync_size_chunks_on_close),
-            // ensuring dirty data is safely persisted before we ACK.
-            let flush_result = flusher.flush_and_sync(inode, &token_for_flush);
-            match flush_result {
-                Ok(()) => {
-                    debug!(
-                        "FacadeCapHandler: flush succeeded for inode={}, sending CapRecallAck",
-                        inode
-                    );
-                    // Step 2: Send CapRecallAck — the server will complete
-                    // the recall and grant caps to the waiting client.
-                    if let Err(e) = facade.cap_recall_ack(inode, &client_id, &token).await {
+            // H3 + H8: Total work must complete within 1750ms (BEFORE server's
+            // 2000ms gather_timeout fires). Critically: flush_and_sync() is a
+            // SYNCHRONOUS blocking function (Raft RPCs + volume blob writes
+            // with retries). We CANNOT run it inline in the async task —
+            // tokio::time::timeout only yields at `.await` points, so a
+            // blocking inline call would:
+            //   - Starve the tokio runtime thread (H8: all async tasks stall)
+            //   - Make the 1750ms timeout 100% ineffective (guard stays held
+            //     until sync code returns, causing CASCADE force-reclaims:
+            //     every recall epoch times out → every client gets reclaimed)
+            //
+            // Fix (H7): run only the SYNC flush portion inside
+            // `tokio::task::spawn_blocking` (dedicated blocking worker pool),
+            // then `.await` its JoinHandle — awaiting is a proper yield point
+            // so the outer 1750ms timeout CAN interrupt the wait, dropping
+            // `_guard` immediately at timeout. The spawn_blocking worker
+            // continues the abandoned flush in background (can't be killed
+            // without pthread_cancel) but we've already released the
+            // per-inode serialization gate, allowing fresh recall epochs
+            // to make progress instead of guaranteed cascade timeout.
+            let work = async {
+                let _guard = lock.lock().await;
+                debug!(
+                    "FacadeCapHandler: flush_and_ack inode={} token={} — flushing dirty data before ACK",
+                    inode, token_for_flush
+                );
+                // Sync blocking flush → offload to blocking pool
+                let flush_result = tokio::task::spawn_blocking({
+                    let f = flusher.clone();
+                    let t = token_for_flush.clone();
+                    move || f.flush_and_sync(inode, &t)
+                })
+                .await;
+                let flush_result = match flush_result {
+                    Ok(res) => res,
+                    Err(join_err) => Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("spawn_blocking panicked: {}", join_err),
+                    )),
+                };
+                match flush_result {
+                    Ok(()) => {
                         debug!(
-                            "FacadeCapHandler: cap_recall_ack inode={} failed: {} \
-                             (server will force-reclaim after 2s timeout)",
+                            "FacadeCapHandler: flush succeeded for inode={}, sending CapRecallAck",
+                            inode
+                        );
+                        if let Err(e) = facade.cap_recall_ack(inode, &client_id, &token).await {
+                            debug!(
+                                "FacadeCapHandler: cap_recall_ack inode={} failed: {} \
+                                 (server will force-reclaim after 2s timeout)",
+                                inode, e
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "FacadeCapHandler: flush FAILED for inode={} err={:?} — NOT sending ACK \
+                             (server will force-reclaim after 2s timeout; dirty data retained for retry)",
                             inode, e
                         );
                     }
                 }
-                Err(e) => {
-                    // Flush failed — do NOT send ACK. The server's 2s
-                    // recall timeout will force-reclaim the cap. Dirty
-                    // data remains in the local cache for the background
-                    // flusher to retry. Sending ACK without successful
-                    // flush would lose dirty data.
-                    debug!(
-                        "FacadeCapHandler: flush FAILED for inode={} err={:?} — NOT sending ACK \
-                         (server will force-reclaim after 2s timeout; dirty data retained for retry)",
-                        inode, e
+                // _guard dropped here → per-inode serialization released
+            };
+
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(1750),
+                work,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(_elapsed) => {
+                    log::warn!(
+                        "FacadeCapHandler: flush_and_ack TIMEOUT inode={} after 1750ms — \
+                         per-inode lock released (spawn_blocking flush thread continues in \
+                         background, ignored). Server will likely force-reclaim this cap.",
+                        inode
                     );
+                }
+            }
+
+            // H2: reclaim HashMap slot if we're the last ref.
+            if let Some(recall_locks) = handler.upgrade() {
+                if Arc::strong_count(&lock) == 1 {
+                    let mut g = recall_locks.lock().unwrap();
+                    if g.get(&inode).map(|e| Arc::strong_count(e)) == Some(1) {
+                        g.remove(&inode);
+                    }
                 }
             }
         });
@@ -308,26 +355,65 @@ impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
         let facade = self.facade.clone();
         let client_id = self.client_id.clone();
         let lock = self.lock_for(inode);
+        let handler = Arc::downgrade(&self.recall_locks);
         self.handle.spawn(async move {
-            // §13 Guard: Must serialize with flush_and_ack for the same
-            // inode. Otherwise epoch=N is blocked on sync_inline_buffer
-            // Raft, epoch=N+1 arrives here and sends ACK immediately,
-            // and the server prematurely promotes another client to
-            // Exclusive before epoch=N's dirty data lands on the
-            // Filer — causing silent data loss.
-            let _guard = lock.lock().await;
-            debug!(
-                "FacadeCapHandler: immediate_ack inode={} token={}",
-                inode, token
-            );
-            if let Err(e) = facade.cap_recall_ack(inode, &client_id, &token).await {
+            // H3: same timeout rationale as flush_and_ack. Here the only
+            // blocking work is the cap_recall_ack network call; still bound
+            // it to keep the per-inode lock bounded.
+            let work = async {
+                let _guard = lock.lock().await;
                 debug!(
-                    "FacadeCapHandler: cap_recall_ack inode={} failed: {} \
-                     (server will force-reclaim after 2s timeout)",
-                    inode, e
+                    "FacadeCapHandler: immediate_ack inode={} token={}",
+                    inode, token
                 );
+                if let Err(e) = facade.cap_recall_ack(inode, &client_id, &token).await {
+                    debug!(
+                        "FacadeCapHandler: cap_recall_ack inode={} failed: {} \
+                         (server will force-reclaim after 2s timeout)",
+                        inode, e
+                    );
+                }
+            };
+
+            match tokio::time::timeout(std::time::Duration::from_millis(1750), work).await {
+                Ok(()) => {}
+                Err(_elapsed) => {
+                    log::warn!(
+                        "FacadeCapHandler: immediate_ack TIMEOUT inode={} after 1750ms — \
+                         releasing per-inode lock.",
+                        inode
+                    );
+                }
+            }
+
+            // H2: reclaim HashMap slot.
+            if let Some(recall_locks) = handler.upgrade() {
+                if Arc::strong_count(&lock) == 1 {
+                    let mut g = recall_locks.lock().unwrap();
+                    if g.get(&inode).map(|e| Arc::strong_count(e)) == Some(1) {
+                        g.remove(&inode);
+                    }
+                }
             }
         });
+    }
+
+    /// H2 / H5: Eager HashMap cleanup when the server-pushed Invalidate
+    /// EVICT path drops our cached inode entry. Called by
+    /// `InvalidateHandler` right after `cache.invalidate_inode()` +
+    /// `chunk_cache.remove_inode_chunks()`.
+    ///
+    /// This is a best-effort eager reclaim. The leak-proof cleanup is
+    /// the strong_count==1 check at the END of every flush_and_ack /
+    /// immediate_ack spawned task.
+    fn on_inode_evicted(&self, inode: u64) {
+        let mut guards = self.recall_locks.lock().unwrap();
+        guards.remove(&inode);
+        let capacity = guards.capacity();
+        let len = guards.len();
+        if capacity > 1024 && len < capacity / 4 {
+            guards.shrink_to(len.next_power_of_two());
+        }
     }
 }
 

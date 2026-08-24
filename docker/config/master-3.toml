@@ -63,7 +63,7 @@ verbose = false
 container = false
 
 [fuse.lease]
-mode = "range"
+mode = "cap"
 lease_duration_ms = 30000
 renew_interval_ms = 10000
 

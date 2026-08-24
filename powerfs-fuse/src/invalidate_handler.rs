@@ -71,6 +71,22 @@ pub trait CapHandler: Send + Sync {
     /// Send `CapRecallAck` without flushing (no dirty data). Called
     /// when `RecallAction::ImmediateAck` is returned.
     fn immediate_ack(&self, inode: u64, token: String, epoch: u64);
+
+    /// H5: Eager per-inode recall gate cleanup. Called by
+    /// `InvalidateHandler` AFTER it has evicted both the metadata
+    /// cache entry and the chunk cache for `inode` (server-pushed
+    /// Invalidate EVICT path).
+    ///
+    /// The per-task reclaim at the end of flush_and_ack /
+    /// immediate_ack tasks is the leak-proof HashMap cleanup
+    /// (strong_count == 1 → remove slot). This callback is just an
+    /// eager optimization — without it, a workload that does lots of
+    /// small file invalidations would accumulate empty HashMap slots
+    /// until the next recall epoch's task reclaims them, which could
+    /// take O(minutes).
+    ///
+    /// Default impl: no-op (some test handlers don't track slots).
+    fn on_inode_evicted(&self, _inode: u64) {}
 }
 
 /// Handler for server-pushed Invalidate notifications
@@ -641,6 +657,17 @@ impl NotificationHandler for InvalidateHandler {
                     // may no longer correspond to the current chunks list.
                     self.cache.invalidate_inode(inode);
                     self.chunk_cache.remove_inode_chunks(inode);
+
+                    // H5: Eagerly evict the per-inode recall gate from the
+                    // FacadeCapHandler's HashMap. The cache entry is gone, so
+                    // the next access will allocate a fresh inode cache
+                    // entry — any pending recall task for the OLD generation
+                    // will fail the sn/epoch check on the server anyway, so
+                    // the slot is dead weight. (Per-task strong_count
+                    // reclaim is the leak-proof fallback.)
+                    if let Some(handler) = self.cap_handler.read().unwrap().as_ref() {
+                        handler.on_inode_evicted(inode);
+                    }
 
                     // Dentry lease invalidation: when a directory's content
                     // changes (create/mkdir/unlink/rmdir on a child), the
