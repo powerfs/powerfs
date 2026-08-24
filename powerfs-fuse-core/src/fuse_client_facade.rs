@@ -353,31 +353,6 @@ pub struct FuseClientFacade {
     /// 上报循环检测到通道关闭后自动退出。
     #[allow(dead_code)]
     stats_reporter: Option<crate::stats_reporter::MasterStatsReporter>,
-    /// Inode metadata lease cache (方案 A).
-    ///
-    /// Per-inode cache of Filer-managed leases. Keyed by inode number.
-    /// Used only when `lease_mode == "inode"`. The cache avoids re-acquiring
-    /// the lease on every write; `ensure_lease` checks validity and renews
-    /// proactively when nearing expiry.
-    inode_lease_cache: Arc<std::sync::Mutex<std::collections::HashMap<u64, InodeLeaseCacheEntry>>>,
-}
-
-/// Cached inode metadata lease entry (方案 A).
-#[derive(Clone)]
-struct InodeLeaseCacheEntry {
-    token: String,
-    expire_at: std::time::Instant,
-}
-
-impl InodeLeaseCacheEntry {
-    fn is_valid(&self) -> bool {
-        std::time::Instant::now() < self.expire_at
-    }
-
-    fn remaining(&self) -> Duration {
-        self.expire_at
-            .saturating_duration_since(std::time::Instant::now())
-    }
 }
 
 impl FuseClientFacade {
@@ -445,7 +420,6 @@ impl FuseClientFacade {
             volume_client,
             conn_pool,
             stats_reporter: None,
-            inode_lease_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -726,7 +700,6 @@ impl FuseClientFacade {
             volume_client,
             conn_pool,
             stats_reporter,
-            inode_lease_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         };
 
         // 启动后台处理循环
@@ -858,7 +831,7 @@ impl FuseClientFacade {
     // Used when lease_mode == "inode" (e.g., NVMe-oF target backend that
     // doesn't support Volume Server range lease).
 
-    /// 当前 Lease 模式: "range" (方案 D) 或 "inode" (方案 A)。
+    /// 当前 Lease 模式 (恒为 "cap")。
     pub fn lease_mode(&self) -> &str {
         &self.config.lease_mode
     }
@@ -866,46 +839,6 @@ impl FuseClientFacade {
     /// Lease 有效期 (毫秒)。
     pub fn lease_duration_ms(&self) -> u64 {
         self.config.lease_duration_ms
-    }
-
-    /// 是否使用 inode metadata lease (方案 A)。
-    pub fn is_inode_lease_mode(&self) -> bool {
-        self.config.lease_mode == "inode"
-    }
-
-    /// 获取 inode metadata lease (方案 A)。委托给 MetaShardClient → Filer。
-    ///
-    /// 成功后自动缓存 token，后续 `get_valid_inode_lease_token` 可直接命中。
-    /// 返回 `(token, expire_at_ms)`。token 用于后续 release/renew。
-    pub async fn acquire_inode_lease(
-        &self,
-        inode: u64,
-        client_id: &str,
-        duration_ms: u64,
-    ) -> Result<(String, u64), String> {
-        let result = self
-            .meta_shard_client
-            .acquire_inode_lease(inode, client_id, duration_ms)
-            .await?;
-        // Auto-cache the lease
-        self.update_inode_lease(inode, &result.0, Duration::from_millis(duration_ms));
-        Ok(result)
-    }
-
-    /// 释放 inode metadata lease (方案 A)。委托给 MetaShardClient → Filer。
-    /// 成功后自动清除缓存。
-    pub async fn release_inode_lease(
-        &self,
-        inode: u64,
-        client_id: &str,
-        token: &str,
-    ) -> Result<(), String> {
-        self.meta_shard_client
-            .release_inode_lease(inode, client_id, token)
-            .await?;
-        // Auto-invalidate cache
-        self.invalidate_inode_lease(inode);
-        Ok(())
     }
 
     /// §13 Cap model: send a `CapOpenGrant` request to the Filer. Returns
@@ -947,56 +880,6 @@ impl FuseClientFacade {
         self.meta_shard_client
             .cap_release(inode, client_id, token)
             .await
-    }
-
-    /// 续租 inode metadata lease (方案 A)。委托给 MetaShardClient → Filer。
-    /// 成功后自动更新缓存过期时间。
-    pub async fn renew_inode_lease(
-        &self,
-        inode: u64,
-        client_id: &str,
-        token: &str,
-        duration_ms: u64,
-    ) -> Result<(), String> {
-        self.meta_shard_client
-            .renew_inode_lease(inode, client_id, token, duration_ms)
-            .await?;
-        // Auto-update cache expiry
-        self.update_inode_lease(inode, token, Duration::from_millis(duration_ms));
-        Ok(())
-    }
-
-    // ------- Inode lease cache management (方案 A) -------
-
-    /// Get a valid cached inode lease token + remaining duration.
-    /// Returns None if not cached or expired.
-    pub fn get_valid_inode_lease_token(&self, inode: u64) -> Option<(String, Duration)> {
-        let cache = self.inode_lease_cache.lock().unwrap();
-        cache.get(&inode).and_then(|entry| {
-            if entry.is_valid() {
-                Some((entry.token.clone(), entry.remaining()))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Cache an inode lease token after successful acquire/renew.
-    pub fn update_inode_lease(&self, inode: u64, token: &str, duration: Duration) {
-        let mut cache = self.inode_lease_cache.lock().unwrap();
-        cache.insert(
-            inode,
-            InodeLeaseCacheEntry {
-                token: token.to_string(),
-                expire_at: std::time::Instant::now() + duration,
-            },
-        );
-    }
-
-    /// Remove an inode lease from the cache (after release or on error).
-    pub fn invalidate_inode_lease(&self, inode: u64) {
-        let mut cache = self.inode_lease_cache.lock().unwrap();
-        cache.remove(&inode);
     }
 
     /// 获取指定 inode 的所有有效 stripe lease token（委托给 VolumeClient）
@@ -1688,71 +1571,6 @@ impl SyncFuseClientFacade {
     /// Lease 有效期 (毫秒)。
     pub fn lease_duration_ms(&self) -> u64 {
         self.facade.lease_duration_ms()
-    }
-
-    /// 是否使用 inode metadata lease (方案 A)。
-    pub fn is_inode_lease_mode(&self) -> bool {
-        self.facade.is_inode_lease_mode()
-    }
-
-    /// Get a valid cached inode lease token + remaining duration (方案 A).
-    /// Synchronous — just reads from the in-memory cache.
-    pub fn get_valid_inode_lease_token(&self, inode: u64) -> Option<(String, std::time::Duration)> {
-        self.facade.get_valid_inode_lease_token(inode)
-    }
-
-    /// Remove an inode lease from the cache (方案 A). Synchronous.
-    pub fn invalidate_inode_lease(&self, inode: u64) {
-        self.facade.invalidate_inode_lease(inode)
-    }
-
-    /// 同步获取 inode metadata lease (方案 A)。
-    /// 返回 `(token, expire_at_ms)`。
-    pub fn acquire_inode_lease(
-        &self,
-        inode: u64,
-        client_id: &str,
-        duration_ms: u64,
-    ) -> Result<(String, u64), String> {
-        let facade = self.facade.clone();
-        let client_id = client_id.to_string();
-        self.block_on(async move {
-            facade
-                .acquire_inode_lease(inode, &client_id, duration_ms)
-                .await
-        })
-    }
-
-    /// 同步释放 inode metadata lease (方案 A)。
-    pub fn release_inode_lease(
-        &self,
-        inode: u64,
-        client_id: &str,
-        token: &str,
-    ) -> Result<(), String> {
-        let facade = self.facade.clone();
-        let client_id = client_id.to_string();
-        let token = token.to_string();
-        self.runtime
-            .block_on(async move { facade.release_inode_lease(inode, &client_id, &token).await })
-    }
-
-    /// 同步续租 inode metadata lease (方案 A)。
-    pub fn renew_inode_lease(
-        &self,
-        inode: u64,
-        client_id: &str,
-        token: &str,
-        duration_ms: u64,
-    ) -> Result<(), String> {
-        let facade = self.facade.clone();
-        let client_id = client_id.to_string();
-        let token = token.to_string();
-        self.block_on(async move {
-            facade
-                .renew_inode_lease(inode, &client_id, &token, duration_ms)
-                .await
-        })
     }
 
     pub fn delete_entry(
