@@ -63,6 +63,19 @@ pub struct MetadataAttr {
     /// Used by the dentry lease mechanism to detect stale dentries.
     /// 0 = Filer didn't provide it (old version); client falls back to RPC.
     pub dir_version: u64,
+    /// Server-side version stamp returned by SetAttrMeta responses.
+    ///
+    /// The Filer returns the SAME version in both the async Invalidate
+    /// notification (pushed to all clients) AND the SetAttrMeta RPC
+    /// response (returned to the caller). The caller uses this to bump
+    /// `CachedEntry.generation` so that the subsequent InvalidateHandler
+    /// check `is_inode_stale(server_version > entry.generation)` returns
+    /// false (version == generation), preventing self-invalidation of the
+    /// cache entry that `update_attr` just wrote.
+    ///
+    /// 0 = Filer didn't provide a version (old version or non-SetAttrMeta
+    /// response); the caller leaves generation unchanged.
+    pub server_version: u64,
     /// Dentry lease TTL in milliseconds, granted by the Filer in lookup
     /// responses. When non-zero, the client may trust the dentry (positive
     /// or negative) for this duration without sending further lookup RPCs.

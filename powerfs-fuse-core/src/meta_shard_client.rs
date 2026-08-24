@@ -1979,12 +1979,8 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         rdev: resp.rdev,
         file_type: file_type_from_mode(resp.mode),
         symlink_target: None,
-        // create 响应携带 Filer 自分配的 volume_id/needle_id；
-        // lookup/getattr 响应通常为 None（chunks 由单独字段编码）。
         volume_id: resp.volume_id,
         file_key: resp.file_key,
-        // 默认无 FileLayout (mkdir/symlink 等简单响应). 需要布局信息的调用点
-        // (lookup/getattr/create) 用 attr_from_resp_with_layout.
         placement: None,
         inline_data: None,
         inline_max_size: None,
@@ -1993,6 +1989,7 @@ fn attr_from_resp(resp: serialize::AttrResponse) -> MetadataAttr {
         replica_chunks: Vec::new(),
         shard_id: resp.shard_id,
         dir_version: 0,
+        server_version: 0,
         dentry_lease_ttl_ms: 0,
     }
 }
@@ -2495,6 +2492,7 @@ impl MetadataClient for MetaShardClient {
                             replica_chunks: Vec::new(),
                             shard_id: child_shard,
                             dir_version: 0,
+                            server_version: 0,
                             dentry_lease_ttl_ms: 0,
                         })
                     } else {
@@ -2566,7 +2564,19 @@ impl MetadataClient for MetaShardClient {
             if crdt_safe {
                 use powerfs_net::serialize::TlvEncoder;
                 use powerfs_net::FieldId;
-                let now = chrono::Utc::now().timestamp() as u64;
+                // Use microsecond-precision timestamp instead of seconds for
+                // CRDT LWW ordering. Previously the seconds-precision caused
+                // the LWW guard (`timestamp > self.mode_timestamp`) to reject
+                // mode/uid/gid changes issued within the same second (e.g.
+                // tar xzf's `uid/gid setattr` followed closely by `mode
+                // setattr` both landed on ts=1787573753, so the second SetMode
+                // was rejected as "Idempotent" — leaving files at their
+                // `open(CREAT)` mode of 0600/0400/0700 instead of 0660/0444/0755.
+                // Microsecond precision (≈1e6x finer) fully closes this
+                // window; combined with the >= tie-break in crdt_meta.rs the
+                // two fixes together guarantee setattr_meta writes are never
+                // spuriously dropped on any realistic timing.
+                let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
                 let client_id_str = self.client_id.to_string();
                 let mut enc = TlvEncoder::new();
                 let _ = enc.add_u64(FieldId::Ino, ino);
@@ -2593,17 +2603,33 @@ impl MetadataClient for MetaShardClient {
                     .send_coherence_msg(MsgType::SetAttrMeta, shard_id, body)
                     .await
                     .map_err(map_err)?;
-                // SetAttrMeta returns STATUS_OK + empty body (no attr).
-                // FUSE layer's setattr() uses local cache (updated via
-                // cache.update_attr with the params we passed) to build
-                // stat64, so the returned MetadataAttr is not consumed.
-                // Return a minimal attr to satisfy the trait signature.
+                // SetAttrMeta response body contains a single Version field
+                // (FieldId::Version) that matches the version used in the
+                // Invalidate notification broadcast to all clients. The FUSE
+                // layer uses this to bump CachedEntry.generation so that
+                // is_inode_stale(server_version == generation) returns false,
+                // preventing the InvalidateHandler from evicting the cache
+                // entry that update_attr just wrote.
+                let mut server_version: u64 = 0;
+                {
+                    use powerfs_net::serialize::TlvDecoder;
+                    let mut dec = TlvDecoder::new(&resp);
+                    while let Some((fid, len)) = dec.next_field() {
+                        if fid == powerfs_net::FieldId::Version {
+                            server_version = dec.read_u64(len).unwrap_or(0);
+                        } else {
+                            let _ = dec.skip(len);
+                        }
+                    }
+                }
                 log::debug!(
-                    "setattr CRDT path: ino={}, size=None, mode={:?}, uid={:?}, gid={:?}, mtime={:?}, atime={:?}, resp_len={}",
-                    ino, params.mode, params.uid, params.gid, params.mtime, params.atime, resp.len()
+                    "setattr CRDT path: ino={}, size=None, mode={:?}, uid={:?}, gid={:?}, mtime={:?}, atime={:?}, resp_len={}, server_version={}",
+                    ino, params.mode, params.uid, params.gid, params.mtime, params.atime, resp.len(), server_version
                 );
-                let attr_resp = serialize::decode_attr_resp(&resp).unwrap_or_default();
-                return Ok(attr_from_resp(attr_resp));
+                let mut attr = attr_from_resp(serialize::AttrResponse::default());
+                attr.inode = ino;
+                attr.server_version = server_version;
+                return Ok(attr);
             }
 
             let body = serialize::encode_setattr_req(

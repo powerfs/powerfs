@@ -153,8 +153,21 @@ impl MetaState {
             MetaDelta::SetMode {
                 mode, timestamp, ..
             } => {
-                // LWW: update only if timestamp is strictly newer
-                if *timestamp > self.mode_timestamp {
+                // LWW: update if timestamp is newer, OR when timestamps are
+                // equal but the mode value differs. The strict `>` guard used
+                // to drop writes that landed on the same second as a prior
+                // setattr_meta (see meta_shard_client.rs precision fix). Given
+                // equal timestamps, accepting the last writer's value is safe
+                // because there is no logical ordering to preserve — and
+                // rejecting the write silently causes real data corruption
+                // (e.g. `chmod` and `chown` both issued in the same second:
+                // the second one gets dropped, leaving stale file mode).
+                // We still return Idempotent when both timestamp AND value
+                // match, so genuinely duplicate replays don't count as
+                // applied changes (avoids spurious Dirty transitions).
+                if *timestamp > self.mode_timestamp
+                    || (*timestamp == self.mode_timestamp && self.mode != Some(*mode))
+                {
                     self.mode = Some(*mode);
                     self.mode_timestamp = *timestamp;
                     MergeResult::Applied
@@ -163,7 +176,10 @@ impl MetaState {
                 }
             }
             MetaDelta::SetUid { uid, timestamp, .. } => {
-                if *timestamp > self.uid_timestamp {
+                // Same tie-break rule as SetMode (see SetMode comment above).
+                if *timestamp > self.uid_timestamp
+                    || (*timestamp == self.uid_timestamp && self.uid != Some(*uid))
+                {
                     self.uid = Some(*uid);
                     self.uid_timestamp = *timestamp;
                     MergeResult::Applied
@@ -172,7 +188,10 @@ impl MetaState {
                 }
             }
             MetaDelta::SetGid { gid, timestamp, .. } => {
-                if *timestamp > self.gid_timestamp {
+                // Same tie-break rule as SetMode (see SetMode comment above).
+                if *timestamp > self.gid_timestamp
+                    || (*timestamp == self.gid_timestamp && self.gid != Some(*gid))
+                {
                     self.gid = Some(*gid);
                     self.gid_timestamp = *timestamp;
                     MergeResult::Applied
