@@ -47,6 +47,21 @@ struct Args {
     /// 启用数据完整性验证
     #[arg(long)]
     verify_data: bool,
+
+    /// 可选：CA 证书文件路径（PEM）。用于验证 master 返回的服务端证书；
+    /// 当前保留用于未来 9334 TLS 升级，TLV 层暂时不强制读取。
+    #[arg(long)]
+    ca_crt: Option<String>,
+
+    /// 客户端证书文件路径（PEM）。生产模式下 master 有 CA 时必填。
+    /// 内容读取后通过 TLV FieldId::ClientCert(0xD4) 嵌入 RegisterClient 请求。
+    #[arg(long)]
+    client_crt: Option<String>,
+
+    /// 客户端证书私钥文件路径（PEM）。保留用于 9334 端口 TLS 升级；
+    /// 当前 TLV 0xD4 只发送公钥证书，私钥保存在本地即可。
+    #[arg(long)]
+    client_key: Option<String>,
 }
 
 /// 异步信号安全的处理器：只调用write(2)和umount2(2)
@@ -269,6 +284,60 @@ fn main() {
         .expect("Failed to create tokio runtime");
     let runtime_arc = Arc::new(runtime);
 
+    // ---- 客户端证书 ----
+    //
+    // 优先级: CLI --client-crt > fuse.toml [fuse] client_crt > None
+    // 生产模式 master 有 CA manager 时，必须携带经 `powerfs-cli cert sign-client`
+    // 签发的证书，并且证书的 san_ips 必须包含当前节点 IP，mount_dirs 必须包含
+    // 本 mount_point。读取失败直接 abort（不要默默降级到 dev-mode 行为）。
+    let client_crt_path: Option<&str> = args
+        .client_crt
+        .as_deref()
+        .or(fuse_cfg.client_crt.as_deref());
+    let ca_crt_path: Option<&str> = args
+        .ca_crt
+        .as_deref()
+        .or(fuse_cfg.ca_crt.as_deref());
+    let client_key_path: Option<&str> = args
+        .client_key
+        .as_deref()
+        .or(fuse_cfg.client_key.as_deref());
+
+    let client_cert_pem = match client_crt_path {
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(pem) => {
+                info!(
+                    "Loaded client certificate from {} ({} bytes)",
+                    path,
+                    pem.len()
+                );
+                Some(pem)
+            }
+            Err(e) => {
+                eprintln!("ERROR: failed to read client_crt {}: {}", path, e);
+                process::exit(1);
+            }
+        },
+        None => {
+            warn!("client_crt not provided (checked CLI --client-crt and config) — \
+                  if master has CA manager enabled, RegisterClient will be denied");
+            None
+        }
+    };
+    // ca_crt / client_key 保留用于未来 9334 端口 TLS 升级；这里只校验参数存在性。
+    if let Some(path) = ca_crt_path {
+        if !std::path::Path::new(path).exists() {
+            eprintln!("ERROR: ca_crt file not found: {}", path);
+            process::exit(1);
+        }
+    }
+    if let Some(path) = client_key_path {
+        if !std::path::Path::new(path).exists() {
+            eprintln!("ERROR: client_key file not found: {}", path);
+            process::exit(1);
+        }
+    }
+
     let result = runtime_arc.block_on(async {
         let fuse_client = FuseApp::new(
             &master_addrs,
@@ -287,19 +356,11 @@ fn main() {
             force_mount,
             request_timeout_secs,
             admin_port,
+            client_cert_pem,
             runtime_arc.clone(),
         )
         .await
         .expect("Failed to create FUSE client");
-
-        // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
-        let node_id = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse-unknown".to_string());
-        let master_endpoints: Vec<(String, u16)> = master_addrs
-            .iter()
-            .map(|a| (a.clone(), master_net_port))
-            .collect();
-        powerfs_common::debug_config_poller::DebugConfigPoller::new(node_id, master_endpoints)
-            .start();
 
         info!("Mounting PowerFS at: {}", mount_point);
 

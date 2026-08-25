@@ -65,17 +65,39 @@ impl Default for StatsReporterConfig {
     }
 }
 
-/// `NotificationHandler` that marks the local topology stale whenever
-/// the Master pushes a `TopologyChanged` NOTIFY.
-struct TopologyChangedHandler {
-    dirty: Arc<AtomicBool>,
+/// Combined `NotificationHandler` for Master-pushed NOTIFY frames.
+///
+/// Handles:
+///   - `TopologyChanged`: marks the local topology cache stale so the next
+///     reporter tick re-fetches it via `MasterClient::fetch_topology`.
+///   - `DebugConfigChanged`: decodes the pushed body (same TLV schema as
+///     `GetDebugConfig` response) and applies it locally via
+///     `powerfs_common::debug_config_poller::apply_config`.
+///
+/// Both paths are coalesced into a single handler struct because
+/// `MasterClient::set_notification_handler` is overwrite-semantic: a
+/// second call would replace the previous handler instead of chaining.
+struct ClusterEventHandler {
+    topology_dirty: Arc<AtomicBool>,
+    node_id: String,
 }
 
-impl NotificationHandler for TopologyChangedHandler {
+impl NotificationHandler for ClusterEventHandler {
     fn handle_notification(&self, msg: &NetMessage) {
-        if msg.msg_type() == Some(MsgType::TopologyChanged) {
-            self.dirty.store(true, Ordering::Relaxed);
-            log::debug!("TopologyChanged NOTIFY received, topology marked stale");
+        match msg.msg_type() {
+            Some(MsgType::TopologyChanged) => {
+                self.topology_dirty.store(true, Ordering::Relaxed);
+                log::debug!("TopologyChanged NOTIFY received, topology marked stale");
+            }
+            Some(MsgType::DebugConfigChanged) => {
+                match powerfs_net::serialize::decode_get_debug_config_resp(&msg.body) {
+                    Ok(cfg) => {
+                        powerfs_common::debug_config_poller::apply_config(&cfg, &self.node_id);
+                    }
+                    Err(e) => warn!("DebugConfigChanged NOTIFY decode failed: {}", e),
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -115,11 +137,14 @@ impl MasterStatsReporter {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         self.shutdown_tx = Some(shutdown_tx);
 
-        // Install the notification handler so server-pushed
-        // `TopologyChanged` frames mark the topology stale.
+        // Install the combined notification handler so server-pushed
+        // `TopologyChanged` frames mark the topology stale, and
+        // `DebugConfigChanged` frames apply pushed debug config immediately.
+        let node_id = self.config.client_id.clone();
         let handler: Arc<dyn NotificationHandler + Send + Sync> =
-            Arc::new(TopologyChangedHandler {
-                dirty: self.topology_dirty.clone(),
+            Arc::new(ClusterEventHandler {
+                topology_dirty: self.topology_dirty.clone(),
+                node_id,
             });
         self.master_client.set_notification_handler(handler);
 
@@ -168,6 +193,19 @@ async fn run_reporter_loop(
         config.mount_point,
         config.report_interval.as_secs()
     );
+
+    // Pull debug config once at startup so the process doesn't have to
+    // wait for the first `DebugConfigChanged` NOTIFY (which only fires
+    // on Admin PUT changes).  Subsequent updates arrive via push NOTIFY.
+    match master_client.fetch_debug_config(&config.client_id).await {
+        Ok(cfg) => {
+            powerfs_common::debug_config_poller::apply_config(&cfg, &config.client_id);
+        }
+        Err(e) => warn!(
+            "MasterStatsReporter: initial GetDebugConfig pull failed: {} (will wait for NOTIFY)",
+            e
+        ),
+    }
 
     let mut interval = tokio::time::interval(config.report_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

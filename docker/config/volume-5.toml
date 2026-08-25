@@ -18,3 +18,8 @@ initial_volume_count = 4
 advertise_addr = "172.30.0.25"
 lease_enabled = false            # 方案A: 使用inode metadata lease，Volume跳过range lease验证
 registration_token = "powerfs-cluster-test"  # 节点注册认证令牌 (必须与master一致)
+
+# Certificate paths for production node authentication
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/volume-server-5.crt"
+client_key = "/etc/powerfs/certs/volume-server-5.key"

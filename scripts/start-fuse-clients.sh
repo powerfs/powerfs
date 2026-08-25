@@ -34,6 +34,11 @@ COLLECTION="${COLLECTION:-default}"
 REPLICATION="${REPLICATION:-000}"
 RUST_LOG_LEVEL="${RUST_LOG_LEVEL:-debug}"
 NETWORK_NAME="docker_powerfs-network"
+# 证书目录 (host 路径) 和客户端证书名。
+# 非空时 docker run 挂载证书目录并附加 --ca-crt/--client-crt/--client-key CLI 参数。
+# 空时跳过证书 (兼容 dev mode 无 CA 的旧环境)。
+CERT_DIR="${CERT_DIR:-}"
+CLIENT_CRT_NAME="${CLIENT_CRT_NAME:-}"
 
 log_info() {
     echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') $*"
@@ -125,7 +130,20 @@ start_fuse_client() {
     fi
     
     log_info "Starting FUSE client $container_name (IP: $ip)..."
-    
+
+    # 证书参数: CERT_DIR + CLIENT_CRT_NAME 非空时附加
+    local cert_opts=""
+    local cert_vol=""
+    if [ -n "$CERT_DIR" ] && [ -n "$CLIENT_CRT_NAME" ]; then
+        cert_vol="-v ${CERT_DIR}:/etc/powerfs/certs:ro"
+        cert_opts="--ca-crt /etc/powerfs/certs/ca.crt \
+            --client-crt /etc/powerfs/certs/${CLIENT_CRT_NAME}.crt \
+            --client-key /etc/powerfs/certs/${CLIENT_CRT_NAME}.key"
+        log_info "  Certificate: $CLIENT_CRT_NAME (from $CERT_DIR)"
+    else
+        log_warn "  No certificate configured — master CA enforcement will reject"
+    fi
+
     docker run -d \
         --name "$container_name" \
         --network "$NETWORK_NAME" \
@@ -137,14 +155,15 @@ start_fuse_client() {
         --privileged \
         --restart unless-stopped \
         --label "powerfs=fuse-client" \
+        $cert_vol \
         powerfs:latest \
         bash -c "RUST_LOG=$RUST_LOG_LEVEL /app/powerfs-fuse \
-            --master $MASTER_ADDRESS \
+            --config /app/config/fuse.toml \
             --mount-point $MOUNT_POINT \
             --collection $COLLECTION \
             --replication $REPLICATION \
-            --threads 8 \
-            --verbose 2>&1 || sleep 30"
+            --verbose \
+            $cert_opts 2>&1 || sleep 30"
     
     if [ $? -eq 0 ]; then
         log_info "  Started: $container_name (IP: $ip)"

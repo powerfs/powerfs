@@ -299,6 +299,9 @@ pub struct MasterClientConfig {
     pub max_retries: u32,
     /// 熔断器配置
     pub circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig,
+    /// 可选：客户端证书 PEM 原文（生产模式必填，master 有 CA 时强制校验）。
+    /// 会通过 TLV FieldId::ClientCert (0xD4) 嵌入 RegisterClient/DeregisterClient 请求。
+    pub client_cert_pem: Option<String>,
 }
 
 impl Default for MasterClientConfig {
@@ -308,6 +311,7 @@ impl Default for MasterClientConfig {
             request_timeout: std::time::Duration::from_secs(5),
             max_retries: 3,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
+            client_cert_pem: None,
         }
     }
 }
@@ -356,6 +360,7 @@ impl MasterClient {
             connect_timeout: config.request_timeout,
             request_timeout: config.request_timeout,
             max_retries: config.max_retries,
+            client_cert_pem: config.client_cert_pem,
             ..Default::default()
         };
 
@@ -633,6 +638,28 @@ impl MasterClient {
             .deregister_client(client_uuid, assigned_client_id)
             .await
             .map_err(Into::into)
+    }
+
+    /// 从 Master 拉取当前全局调试配置。
+    ///
+    /// 用于客户端启动时获取初值，避免等待下一次 `DebugConfigChanged` NOTIFY。
+    /// 之后配置变更通过 NOTIFY push 通道（见 [`Self::set_notification_handler`]）送达。
+    pub async fn fetch_debug_config(
+        &self,
+        node_id: &str,
+    ) -> Result<powerfs_net::serialize::DebugConfig, MasterClientError> {
+        use powerfs_net::serialize::{decode_get_debug_config_resp, encode_get_debug_config_req};
+
+        let body = encode_get_debug_config_req(node_id)
+            .map_err(|e| MasterClientError::ConnectionFailed(format!("encode GetDebugConfig req: {}", e)))?;
+
+        let resp = self
+            .tlv_client
+            .submit_request(net::MsgType::GetDebugConfig, &body)
+            .await?;
+
+        decode_get_debug_config_resp(&resp.body)
+            .map_err(|e| MasterClientError::ConnectionFailed(format!("decode GetDebugConfig resp: {}", e)))
     }
 
     /// 断开连接

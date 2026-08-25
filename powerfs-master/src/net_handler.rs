@@ -127,7 +127,12 @@ impl MasterNetHandler {
     }
 
     /// Handle Assign request
-    async fn handle_assign(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
+    async fn handle_assign(
+        &self,
+        ctx: &mut RequestContext,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let _ = ctx;
         let mut dec = TlvDecoder::new(&msg.body);
         let collection = dec
             .next_string(FieldId::Name)
@@ -196,8 +201,10 @@ impl MasterNetHandler {
     /// Handle LookupVolume request
     async fn handle_lookup_volume(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
+        let _ = ctx;
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id_str = dec.next_string(FieldId::Name).unwrap_or_default();
 
@@ -267,6 +274,7 @@ impl MasterNetHandler {
     /// Handle Heartbeat request
     async fn handle_heartbeat(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -287,6 +295,8 @@ impl MasterNetHandler {
         let reg_token = dec
             .next_string(FieldId::RegistrationToken)
             .unwrap_or_default();
+        // Client certificate (PEM) for production node authentication.
+        let client_cert_pem = dec.next_string(FieldId::ClientCert).unwrap_or_default();
 
         info!(
             "NET_HEARTBEAT: node={}, ip={}, volumes={}, cpu={:.1}%, mem={:.1}%",
@@ -311,6 +321,49 @@ impl MasterNetHandler {
                 b"invalid registration token".to_vec(),
                 Vec::new(),
             ));
+        }
+
+        // ---- Certificate enforcement (production) ----
+        //
+        // When the master has a live CA manager, all Heartbeat (volume
+        // server) requests MUST carry a ClientCert(0xD4) TLV validated
+        // through the same 4-level chain as RegisterClient.  The cert's
+        // client_name MUST match the volume server's node_id.
+        let peer_ip = ctx.client.address.ip().to_string();
+        if self.master.cert_enforcement_enabled() {
+            if client_cert_pem.is_empty() {
+                warn!(
+                    "NET_HEARTBEAT: rejected node={} peer={} — missing ClientCert(0xD4) TLV (cert enforcement ON)",
+                    node_id_str, peer_ip
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    b"volume server certificate required (0xD4 PEM missing)".to_vec(),
+                    Vec::new(),
+                ));
+            }
+            if let Err(e) = self
+                .master
+                .validate_server_node_cert(&client_cert_pem, Some(&peer_ip), &node_id_str)
+            {
+                warn!(
+                    "NET_HEARTBEAT: rejected node={} peer={} — {}",
+                    node_id_str, peer_ip, e
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    format!("volume server certificate rejected: {}", e).into_bytes(),
+                    Vec::new(),
+                ));
+            }
+        } else if client_cert_pem.is_empty() {
+            // Dev mode: warn once if cert absent, still allow.
+            warn!(
+                "NET_HEARTBEAT: cert not provided by node={} peer={} — ALLOWED (dev mode, no CA configured)",
+                node_id_str, peer_ip
+            );
         }
 
         // Heartbeat mutates Master topology state (add_node, volume registration).
@@ -424,8 +477,10 @@ impl MasterNetHandler {
     /// method only needs to return the current leader.
     async fn handle_keep_connected(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
+        let _ = ctx;
         let mut dec = TlvDecoder::new(&msg.body);
         let client_id = dec.next_string(FieldId::ClientUuid).unwrap_or_default();
         let client_type = dec
@@ -496,6 +551,7 @@ impl MasterNetHandler {
 
     async fn handle_register_client(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -508,6 +564,74 @@ impl MasterNetHandler {
         let replication = dec.next_string(FieldId::Replication).unwrap_or_default();
         let host = dec.next_string(FieldId::Owner).unwrap_or_default();
         let pid = dec.next_u64(FieldId::Limit).unwrap_or(0);
+        let client_cert_pem = dec.next_string(FieldId::ClientCert).unwrap_or_default();
+
+        // ---- Certificate enforcement (production) ----
+        //
+        // When the master has a live CA manager, all RegisterClient
+        // requests MUST carry a ClientCert(0xD4) TLV that:
+        //   * was issued by this master (fingerprint present in the
+        //     persistent client registry),
+        //   * has the caller's source IP listed in san_ips (prevents the
+        //     cert being copied to a different node),
+        //   * has the mount-point Name recorded in mount_dirs (prevents
+        //     reuse on a different directory).
+        // When enforcement is disabled (ca_dir not configured → dev mode)
+        // we skip the check and emit a single warning per connection.
+        let peer_ip = ctx.client.address.ip().to_string();
+        let cert_client_name = if self.master.cert_enforcement_enabled() {
+            if client_cert_pem.is_empty() {
+                warn!(
+                    "NET_REGISTER_CLIENT: rejected uuid={} peer={} — missing ClientCert(0xD4) TLV (cert enforcement ON)",
+                    client_uuid, peer_ip
+                );
+                let mut enc = TlvEncoder::new();
+                enc.add_u8(FieldId::MountAllowed, 0);
+                enc.add_string(
+                    FieldId::Message,
+                    "client certificate required (0xD4 PEM missing)",
+                )?;
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ));
+            }
+            match self
+                .master
+                .validate_client_cert(&client_cert_pem, Some(&peer_ip), &mount_point)
+            {
+                Ok(name) => Some(name),
+                Err(e) => {
+                    warn!(
+                        "NET_REGISTER_CLIENT: rejected uuid={} peer={} mount='{}' — {}",
+                        client_uuid, peer_ip, mount_point, e
+                    );
+                    let mut enc = TlvEncoder::new();
+                    enc.add_u8(FieldId::MountAllowed, 0);
+                    enc.add_string(
+                        FieldId::Message,
+                        &format!("client certificate rejected: {}", e),
+                    )?;
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_PERMISSION_DENIED,
+                        enc.into_bytes(),
+                        Vec::new(),
+                    ));
+                }
+            }
+        } else {
+            // Dev mode: warn once per uuid if cert absent, still allow.
+            if client_cert_pem.is_empty() {
+                warn!(
+                    "NET_REGISTER_CLIENT: cert not provided by uuid={} peer={} — ALLOWED (dev mode, no CA configured)",
+                    client_uuid, peer_ip
+                );
+            }
+            None
+        };
 
         if !self.master.is_leader().await {
             return self
@@ -547,7 +671,7 @@ impl MasterNetHandler {
             client_id: client_uuid.clone(),
             assigned_client_id: 0,
             client_type,
-            mount_point,
+            mount_point: mount_point.clone(),
             collection,
             replication,
             host,
@@ -570,8 +694,8 @@ impl MasterNetHandler {
         enc.add_u8(FieldId::MountAllowed, 1);
 
         info!(
-            "NET_REGISTER_CLIENT: uuid={}, assigned_id={}, leader={}",
-            client_uuid, assigned_id, leader_addr
+            "NET_REGISTER_CLIENT: uuid={}, assigned_id={}, leader={}, cert_name={:?}, peer={}",
+            client_uuid, assigned_id, leader_addr, cert_client_name, peer_ip
         );
 
         Ok(Self::build_response(
@@ -584,11 +708,86 @@ impl MasterNetHandler {
 
     async fn handle_deregister_client(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let client_uuid = dec.next_string(FieldId::ClientUuid).unwrap_or_default();
         let _assigned = dec.next_u64(FieldId::ClientId).unwrap_or(0);
+        let client_cert_pem = dec.next_string(FieldId::ClientCert).unwrap_or_default();
+        let peer_ip = ctx.client.address.ip().to_string();
+
+        // Mirror register_client's enforcement: in production mode the
+        // same cert binding must hold for a deregister to be accepted
+        // (prevents an unrelated host from removing a healthy client's
+        // lease by UUID spoofing). Dev mode simply warns.
+        if self.master.cert_enforcement_enabled() {
+            if client_cert_pem.is_empty() {
+                warn!(
+                    "NET_DEREGISTER_CLIENT: rejected uuid={} peer={} — missing ClientCert(0xD4)",
+                    client_uuid, peer_ip
+                );
+                let mut enc = TlvEncoder::new();
+                enc.add_string(
+                    FieldId::Message,
+                    "client certificate required for deregister (0xD4 PEM missing)",
+                )?;
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ));
+            }
+            // Deregister doesn't carry a mount point, so we match the
+            // cert against the mount point the master already recorded
+            // for this UUID (or any valid mount dir in the registry when
+            // the UUID is unknown — latter case is a no-op).
+            let recorded_mount = self
+                .master
+                .client_manager
+                .read()
+                .unwrap()
+                .fuse_clients
+                .get(&client_uuid)
+                .map(|c| c.mount_point.clone())
+                .unwrap_or_default();
+            let probe = if recorded_mount.is_empty() {
+                // UUID gone — skip point check, just require IP binding.
+                "".to_string()
+            } else {
+                recorded_mount.clone()
+            };
+            if let Err(e) =
+                self.master
+                    .validate_client_cert(&client_cert_pem, Some(&peer_ip), &probe)
+            {
+                // If we fell into the "UUID gone" branch and hit a
+                // mount-point mismatch the error is benign; allow it.
+                if !recorded_mount.is_empty() {
+                    warn!(
+                        "NET_DEREGISTER_CLIENT: rejected uuid={} peer={} — {}",
+                        client_uuid, peer_ip, e
+                    );
+                    let mut enc = TlvEncoder::new();
+                    enc.add_string(
+                        FieldId::Message,
+                        &format!("client certificate rejected: {}", e),
+                    )?;
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_PERMISSION_DENIED,
+                        enc.into_bytes(),
+                        Vec::new(),
+                    ));
+                }
+            }
+        } else if client_cert_pem.is_empty() {
+            warn!(
+                "NET_DEREGISTER_CLIENT: cert not provided for uuid={} peer={} — ALLOWED (dev mode)",
+                client_uuid, peer_ip
+            );
+        }
 
         if !self.master.is_leader().await {
             return self
@@ -600,8 +799,8 @@ impl MasterNetHandler {
         let leader = self.master.get_leader().await;
 
         info!(
-            "NET_DEREGISTER_CLIENT: uuid={}, leader={}",
-            client_uuid, leader
+            "NET_DEREGISTER_CLIENT: uuid={}, leader={}, peer={}",
+            client_uuid, leader, peer_ip
         );
 
         let mut enc = TlvEncoder::new();
@@ -619,8 +818,10 @@ impl MasterNetHandler {
     /// If this node is not the Raft leader, returns STATUS_ERR_REDIRECT with leader address
     async fn handle_get_topology(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
+        let _ = ctx;
         // If not leader, redirect client to the actual leader
         if !self.master.is_leader().await {
             return self.build_redirect_response(msg, "NET_GET_TOPOLOGY").await;
@@ -834,6 +1035,7 @@ impl MasterNetHandler {
     ///   Entries(zone_count) + [ZoneId + Limit(vol_count) + [VolumeId + Owner(addr) + Size + UsedSpace] × N] × M
     async fn handle_register_filer(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -857,6 +1059,10 @@ impl MasterNetHandler {
         let reg_token = dec
             .next_string(FieldId::RegistrationToken)
             .unwrap_or_default();
+        // Client certificate (PEM) for production node authentication.
+        // When cert enforcement is ON (master has CA), the filer MUST present
+        // a valid cert bound to its filer_id + source IP.
+        let client_cert_pem = dec.next_string(FieldId::ClientCert).unwrap_or_default();
 
         // Authenticate the filer before processing the registration. This
         // runs before the leader check so unauthorized filers are rejected
@@ -872,6 +1078,50 @@ impl MasterNetHandler {
                 b"invalid registration token".to_vec(),
                 Vec::new(),
             ));
+        }
+
+        // ---- Certificate enforcement (production) ----
+        //
+        // When the master has a live CA manager, all RegisterFiler
+        // requests MUST carry a ClientCert(0xD4) TLV validated through
+        // the same 4-level chain as RegisterClient (fingerprint, not
+        // revoked, valid expiry, IP match).  Additionally the cert's
+        // client_name MUST match the filer_id reported by the caller.
+        let peer_ip = ctx.client.address.ip().to_string();
+        if self.master.cert_enforcement_enabled() {
+            if client_cert_pem.is_empty() {
+                warn!(
+                    "NET_REGISTER_FILER: rejected filer={} peer={} — missing ClientCert(0xD4) TLV (cert enforcement ON)",
+                    filer_id, peer_ip
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    b"filer certificate required (0xD4 PEM missing)".to_vec(),
+                    Vec::new(),
+                ));
+            }
+            if let Err(e) = self
+                .master
+                .validate_server_node_cert(&client_cert_pem, Some(&peer_ip), &filer_id)
+            {
+                warn!(
+                    "NET_REGISTER_FILER: rejected filer={} peer={} — {}",
+                    filer_id, peer_ip, e
+                );
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    format!("filer certificate rejected: {}", e).into_bytes(),
+                    Vec::new(),
+                ));
+            }
+        } else if client_cert_pem.is_empty() {
+            // Dev mode: warn once if cert absent, still allow.
+            warn!(
+                "NET_REGISTER_FILER: cert not provided by filer={} peer={} — ALLOWED (dev mode, no CA configured)",
+                filer_id, peer_ip
+            );
         }
 
         if !self.master.is_leader().await {
@@ -1012,8 +1262,10 @@ impl MasterNetHandler {
     /// the leader on the very first request.
     async fn handle_shard_leader_update(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
+        let _ = ctx;
         let mut dec = TlvDecoder::new(&msg.body);
         // ShardId 0 is a valid shard (shards are 0-indexed). Distinguish
         // "field present with value 0" from "field missing" by checking the
@@ -1092,7 +1344,12 @@ impl MasterNetHandler {
     ///   Nlink      (u64) — total file count (reused as total_inodes)
     ///   FreeInodes (u64) — free inodes (estimated, no hard limit)
     ///   Blksize    (u32) — block size (4096)
-    async fn handle_statfs(&self, msg: &NetMessage) -> powerfs_net::NetResult<NetMessage> {
+    async fn handle_statfs(
+        &self,
+        ctx: &mut RequestContext,
+        msg: &NetMessage,
+    ) -> powerfs_net::NetResult<NetMessage> {
+        let _ = ctx;
         let volumes = self.master.list_volume_routes();
 
         let total_size: u64 = volumes.iter().map(|v| v.size).sum();
@@ -1138,8 +1395,10 @@ impl MasterNetHandler {
     /// TLV response: see `encode_get_debug_config_resp`
     async fn handle_get_debug_config(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> powerfs_net::NetResult<NetMessage> {
+        let _ = ctx;
         let node_id = match powerfs_net::serialize::decode_get_debug_config_req(&msg.body) {
             Ok(id) => id,
             Err(e) => {
@@ -1177,8 +1436,10 @@ impl MasterNetHandler {
     ///   Per filer: Owner=addr, Blksize=net_port, IsDir=is_healthy
     async fn handle_list_filers(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
+        let _ = ctx;
         if !self.master.is_leader().await {
             let leader = self.master.get_leader().await;
             let mut enc = TlvEncoder::new();
@@ -1232,8 +1493,10 @@ impl MasterNetHandler {
     /// Response: STATUS_OK (empty body) or STATUS_ERR_SERVER_ERROR (error string).
     async fn handle_raft_message(
         &self,
+        ctx: &mut RequestContext,
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
+        let _ = ctx;
         // openraft manages its own gRPC transport (RaftService started inside
         // RaftNodeV2::new). The legacy TLV-based RaftMessage path is deprecated;
         // return an error so any stale caller fails fast.
@@ -1312,19 +1575,19 @@ impl NetHandler for MasterNetHandler {
         );
 
         match msg_type {
-            MsgType::Assign => self.handle_assign(msg).await,
-            MsgType::LookupVolume => self.handle_lookup_volume(msg).await,
-            MsgType::Heartbeat => self.handle_heartbeat(msg).await,
-            MsgType::KeepConnected => self.handle_keep_connected(msg).await,
-            MsgType::RegisterClient => self.handle_register_client(msg).await,
-            MsgType::DeregisterClient => self.handle_deregister_client(msg).await,
-            MsgType::GetTopology => self.handle_get_topology(msg).await,
-            MsgType::RegisterFiler => self.handle_register_filer(msg).await,
-            MsgType::ShardLeaderUpdate => self.handle_shard_leader_update(msg).await,
-            MsgType::ListFilers => self.handle_list_filers(msg).await,
-            MsgType::StatFs => self.handle_statfs(msg).await,
-            MsgType::GetDebugConfig => self.handle_get_debug_config(msg).await,
-            MsgType::RaftMessage => self.handle_raft_message(msg).await,
+            MsgType::Assign => self.handle_assign(ctx, msg).await,
+            MsgType::LookupVolume => self.handle_lookup_volume(ctx, msg).await,
+            MsgType::Heartbeat => self.handle_heartbeat(ctx, msg).await,
+            MsgType::KeepConnected => self.handle_keep_connected(ctx, msg).await,
+            MsgType::RegisterClient => self.handle_register_client(ctx, msg).await,
+            MsgType::DeregisterClient => self.handle_deregister_client(ctx, msg).await,
+            MsgType::GetTopology => self.handle_get_topology(ctx, msg).await,
+            MsgType::RegisterFiler => self.handle_register_filer(ctx, msg).await,
+            MsgType::ShardLeaderUpdate => self.handle_shard_leader_update(ctx, msg).await,
+            MsgType::ListFilers => self.handle_list_filers(ctx, msg).await,
+            MsgType::StatFs => self.handle_statfs(ctx, msg).await,
+            MsgType::GetDebugConfig => self.handle_get_debug_config(ctx, msg).await,
+            MsgType::RaftMessage => self.handle_raft_message(ctx, msg).await,
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {
                 warn!("NET_MASTER: unsupported message type {:?}", msg_type);

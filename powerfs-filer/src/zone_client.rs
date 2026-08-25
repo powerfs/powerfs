@@ -41,6 +41,10 @@ pub struct FilerNodeRegistration {
     /// Registration token for master authentication. None = dev mode (no
     /// token sent, master must also be in dev mode to accept).
     pub registration_token: Option<String>,
+    /// Client certificate PEM content for production authentication.
+    /// When non-empty, sent via TLV FieldId::ClientCert(0xD4) and validated
+    /// by the master's CA.  Empty in dev mode (master without CA configured).
+    pub client_cert_pem: String,
 }
 
 /// 向 Master 发送 RegisterFiler 请求，获取 Zone 分配 (多 Zone)。
@@ -96,6 +100,11 @@ pub async fn register_filer(
             if !token.is_empty() {
                 let _ = enc.add_string(FieldId::RegistrationToken, token);
             }
+        }
+        // Client certificate (PEM) for production node authentication.
+        // When non-empty, the master validates it against the CA.
+        if !reg.client_cert_pem.is_empty() {
+            let _ = enc.add_string(FieldId::ClientCert, &reg.client_cert_pem);
         }
         let body = enc.into_bytes();
 

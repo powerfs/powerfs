@@ -10,6 +10,7 @@ use powerfs_common::traits::EventProvider;
 use powerfs_common::{collect_system_metrics, Event, NodeStatusEvent, NullEventProvider};
 use powerfs_master::s3::master_client::S3MasterClient;
 use powerfs_master::s3::MasterApi;
+use powerfs_master_net::{TlvMasterClient, TlvMasterClientConfig};
 
 use powerfs_filer::raft_group_manager_v2::RaftGroupManagerV2;
 use powerfs_filer::{
@@ -17,7 +18,7 @@ use powerfs_filer::{
     MetaShardManager, MetadataStore, S3Handler, ShardId, ShardScheduler, ShardStrategy,
     TlvVolumeClient, VolumeRouter,
 };
-use powerfs_net::{ClientConnPool, ClientPoolConfig, PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::{ClientConnPool, ClientPoolConfig, MsgType, NetMessage, NotificationHandler, PowerFsNetServer, ServerConnectionManager};
 
 #[derive(Parser)]
 #[command(name = "powerfs-filer")]
@@ -131,25 +132,111 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     };
 
     let node_id = format!("filer-{}", filer_cfg.raft_id);
+
+    // ── DebugConfig Push 客户端 (替代 legacy 2s poller) ──────────────────
+    // 建立与 Master 的常驻 TLV 长连接, 接收 `DebugConfigChanged(0x008A)`
+    // NOTIFY 即时应用, 启动时拉一次初值. 失败仅 warn, 不阻塞 Filer 启动.
+    {
+        let push_node_id = node_id.clone();
+        let push_master_net_port = filer_cfg.master_net_port;
+        let push_master_net_addrs: Vec<(String, u16)> = filer_cfg
+            .master_addresses
+            .iter()
+            .map(|addr| {
+                let ip = addr.rfind(':').map(|i| &addr[..i]).unwrap_or(addr).to_string();
+                (ip, push_master_net_port)
+            })
+            .collect();
+        let push_client_cert = match &filer_cfg.client_crt {
+            Some(path) if !path.is_empty() => match std::fs::read_to_string(path) {
+                Ok(pem) => Some(pem),
+                Err(e) => {
+                    warn!("FILER_DEBUG_PUSH: failed to read client cert {}: {}", path, e);
+                    None
+                }
+            },
+            _ => None,
+        };
+
+        tokio::spawn(async move {
+            // Handler: 只处理 DebugConfigChanged NOTIFY, 解码后本地 apply.
+            struct DebugConfigPushHandler {
+                node_id: String,
+            }
+            impl NotificationHandler for DebugConfigPushHandler {
+                fn handle_notification(&self, msg: &NetMessage) {
+                    if msg.msg_type() == Some(MsgType::DebugConfigChanged) {
+                        match powerfs_net::serialize::decode_get_debug_config_resp(&msg.body) {
+                            Ok(cfg) => {
+                                powerfs_common::debug_config_poller::apply_config(&cfg, &self.node_id);
+                            }
+                            Err(e) => warn!("FILER_DEBUG_PUSH: DebugConfigChanged decode err: {}", e),
+                        }
+                    }
+                }
+            }
+
+            let tlv_config = TlvMasterClientConfig {
+                client_type: powerfs_net::ClientType::Filer,
+                client_cert_pem: push_client_cert,
+                ..Default::default()
+            };
+            let tlv_client = match TlvMasterClient::new(push_master_net_addrs.clone(), tlv_config) {
+                c => Arc::new(c),
+            };
+
+            let handler: Arc<dyn NotificationHandler + Send + Sync> =
+                Arc::new(DebugConfigPushHandler {
+                    node_id: push_node_id.clone(),
+                });
+            tlv_client.set_notification_handler(handler);
+
+            // 尽力而为: 初始拉一次 DebugConfig, 不等 NOTIFY.
+            match powerfs_net::serialize::encode_get_debug_config_req(&push_node_id) {
+                Ok(body) => {
+                    match tlv_client
+                        .submit_request(MsgType::GetDebugConfig, &body)
+                        .await
+                    {
+                        Ok(resp) => {
+                            match powerfs_net::serialize::decode_get_debug_config_resp(&resp.body)
+                            {
+                                Ok(cfg) => {
+                                    powerfs_common::debug_config_poller::apply_config(
+                                        &cfg, &push_node_id,
+                                    );
+                                }
+                                Err(e) => warn!(
+                                    "FILER_DEBUG_PUSH: initial GetDebugConfig decode err: {}",
+                                    e
+                                ),
+                            }
+                        }
+                        Err(e) => warn!(
+                            "FILER_DEBUG_PUSH: initial GetDebugConfig pull failed: {}",
+                            e
+                        ),
+                    }
+                }
+                Err(e) => warn!(
+                    "FILER_DEBUG_PUSH: encode GetDebugConfig req failed: {}",
+                    e
+                ),
+            }
+
+            info!(
+                "FILER_DEBUG_PUSH: push client started (masters={:?}, node_id={})",
+                push_master_net_addrs, push_node_id
+            );
+            // 保持 task 存活, 让 handler 引用和 TLV 长连接不被 drop.
+            std::future::pending::<()>().await;
+        });
+    }
+
     let grpc_port_for_event = grpc_port;
     let event_bind_ip = bind_ip.clone();
     let event_provider_clone = event_provider.clone();
     let data_dir_for_event = filer_cfg.data_dir.clone();
-
-    // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
-    {
-        let poller_node_id = node_id.clone();
-        let poller_masters: Vec<(String, u16)> = filer_cfg
-            .master_addresses
-            .iter()
-            .map(|a| {
-                let ip = a.split(':').next().unwrap_or(a).to_string();
-                (ip, filer_cfg.master_net_port)
-            })
-            .collect();
-        powerfs_common::debug_config_poller::DebugConfigPoller::new(poller_node_id, poller_masters)
-            .start();
-    }
 
     tokio::spawn(async move {
         let mut sys = sysinfo::System::new_all();
@@ -606,6 +693,27 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let shard_count = filer_cfg.shard_count as u64;
             let force_register = filer_cfg.force_register;
             let registration_token_for_reg = filer_cfg.registration_token.clone();
+            // Load client certificate PEM for production node authentication.
+            // When the master has a CA configured, the filer MUST present this
+            // cert during RegisterFiler; empty in dev mode (no cert configured).
+            let client_cert_pem_for_reg =
+                match &filer_cfg.client_crt {
+                    Some(path) if !path.is_empty() => {
+                        match std::fs::read_to_string(path) {
+                            Ok(pem) => {
+                                info!("FILER: loaded client cert from {} ({}B)", path, pem.len());
+                                pem
+                            }
+                            Err(e) => {
+                                error!("FILER: failed to read client cert {}: {}. \
+                                       Master cert enforcement will reject this filer.",
+                                       path, e);
+                                String::new()
+                            }
+                        }
+                    }
+                    _ => String::new(),
+                };
             let net_port_for_reg = net_port;
             // S3 HTTP port (filer_cfg.port). The S3 server also serves the
             // /admin/shards endpoint, so the Master needs this port to
@@ -630,6 +738,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     shard_ids,
                     force: force_register,
                     registration_token: registration_token_for_reg,
+                    client_cert_pem: client_cert_pem_for_reg,
                 };
 
                 // 从 master_addresses ("ip:http_port") 提取 IP, 拼接 master_net_port

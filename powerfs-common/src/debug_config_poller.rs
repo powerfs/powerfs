@@ -132,8 +132,14 @@ async fn fetch_config(
         .map_err(|e| NetError::Protocol(format!("decode GetDebugConfig resp: {}", e)))
 }
 
-/// 本地应用调试配置
-fn apply_config(config: &DebugConfig, node_id: &str) {
+/// 本地应用调试配置.
+///
+/// 被两处调用:
+///   1. (legacy poller path) `DebugConfigPoller::start` 每 2s 拉取配置后;
+///   2. (push model) 各端 NotificationHandler 收到 Master 推送的
+///      `DebugConfigChanged(0x008A)` NOTIFY 后, 反序列化 body 直接调用本函数.
+/// 两条路径共享同一份应用逻辑, 不需要区分 node_id (纯日志/标记).
+pub fn apply_config(config: &powerfs_net::serialize::DebugConfig, node_id: &str) {
     let mut changes = Vec::new();
 
     if let Some(level) = &config.log_level {

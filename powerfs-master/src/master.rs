@@ -65,7 +65,7 @@ pub struct MasterNode {
     /// Shared across all clones so that FUSE clients registered via the
     /// TLV handler are visible to the gRPC monitor/frontend and vice
     /// versa.
-    client_manager: Arc<RwLock<ClientManager>>,
+    pub client_manager: Arc<RwLock<ClientManager>>,
     notify_tx: mpsc::Sender<VolumeLocationUpdate>,
     /// Shared `ServerConnectionManager` used to push NOTIFY frames
     /// (e.g. VolumeLocation updates) to TLV clients.  Set when the net
@@ -116,10 +116,61 @@ pub struct MasterNode {
     admin_token: Option<String>,
     /// Directory where the CA certificate and key are persisted.
     ca_dir: Option<String>,
+    /// Live CA manager instance. If `None`, the master is running with
+    /// certificate enforcement disabled (legacy/dev mode). In production
+    /// this is always `Some` once the master has initialised its CA
+    /// directory.
+    ca_manager: Option<Arc<crate::ca_manager::CaManager>>,
     /// Registration token for authenticating Volume/Filer node registrations.
     /// When `None` or empty, registrations are open (dev mode). When set,
     /// Volume/Filer must send a matching token in their TLV requests.
     registration_token: Option<String>,
+}
+
+impl MasterNode {
+    /// Validate a client PEM certificate against the issued registry.
+    ///
+    /// Returns `Ok(client_name)` when the certificate was issued by this
+    /// master, the peer IP is in `san_ips`, and the mount point is in
+    /// `mount_dirs`.  When the master is running without a configured CA
+    /// manager (dev mode) it returns `Err` — callers must interpret this
+    /// as "cert enforcement disabled" or "cert required" depending on
+    /// their semantics.
+    pub fn validate_client_cert(
+        &self,
+        client_pem: &str,
+        peer_ip: Option<&str>,
+        mount_point: &str,
+    ) -> std::result::Result<String, String> {
+        let ca = self.ca_manager.as_ref().ok_or_else(|| {
+            "cert enforcement required but CA manager not initialised".to_string()
+        })?;
+        ca.validate_client_pem(client_pem, peer_ip, mount_point)
+    }
+
+    /// Validate a **filer/volume** certificate (PEM) presented by a
+    /// storage node during RegisterFiler / KeepConnected.
+    ///
+    /// Same 4-level chain as `validate_client_cert` but checks `node_id`
+    /// instead of `mount_point` (storage nodes have no mount points).
+    pub fn validate_server_node_cert(
+        &self,
+        client_pem: &str,
+        peer_ip: Option<&str>,
+        node_id: &str,
+    ) -> std::result::Result<String, String> {
+        let ca = self.ca_manager.as_ref().ok_or_else(|| {
+            "cert enforcement required but CA manager not initialised".to_string()
+        })?;
+        ca.validate_server_node_pem(client_pem, peer_ip, node_id)
+    }
+
+    /// Returns `true` when the master has a live CA manager, meaning
+    /// RegisterClient / RegisterFiler / KeepConnected requests MUST carry
+    /// a valid ClientCert (0xD4) TLV.
+    pub fn cert_enforcement_enabled(&self) -> bool {
+        self.ca_manager.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -203,7 +254,7 @@ pub struct FuseClientInfo {
 
 pub struct ClientManager {
     clients: HashMap<String, mpsc::Sender<VolumeLocationUpdate>>,
-    fuse_clients: HashMap<String, FuseClientInfo>,
+    pub fuse_clients: HashMap<String, FuseClientInfo>,
     next_assigned_client_id: AtomicU64,
     client_blacklist: RwLock<HashSet<String>>,
     uuid_to_assigned: RwLock<HashMap<String, u64>>,
@@ -460,7 +511,7 @@ impl MasterNode {
             }
         };
 
-        let master = MasterNode {
+        let mut master = MasterNode {
             id: node_id.clone(),
             address: addr,
             net_port,
@@ -503,9 +554,34 @@ impl MasterNode {
             placement_strategy: RwLock::new("least_loaded".to_string()),
             debug_config: crate::debug_config::DebugConfigStore::new(),
             admin_token,
-            ca_dir,
+            ca_dir: ca_dir.clone(),
+            ca_manager: None,
             registration_token,
         };
+
+        // Initialize the CA manager eagerly (if ca_dir provided) so the
+        // self-signed CA and client registry are available before any
+        // RegisterClient request arrives. Even in dev environments where
+        // no TLS listener is configured yet, register_client must still
+        // validate the 0xD4 ClientCert TLV against the binding registry.
+        if let Some(ref dir) = ca_dir {
+            match crate::ca_manager::CaManager::new(dir, master.admin_token.clone()) {
+                Ok(ca) => {
+                    info!("MasterNode: CaManager initialised (ca_dir={})", dir);
+                    master.ca_manager = Some(Arc::new(ca));
+                }
+                Err(e) => {
+                    error!(
+                        "MasterNode: failed to initialise CaManager at dir={}: {}",
+                        dir, e
+                    );
+                }
+            }
+        } else {
+            warn!(
+                "MasterNode: ca_dir not configured — certificate enforcement on RegisterClient is DISABLED (dev mode)."
+            );
+        }
 
         // P1.3: Replay Zone commands from Raft log to restore zone_registry.
         // Raft sets cfg.applied = commit_index, so already-applied entries
@@ -888,6 +964,40 @@ impl MasterNode {
         } else {
             0
         }
+    }
+
+    /// Broadcast a DebugConfigChanged NOTIFY to ALL connected TLV clients
+    /// (FUSE / Filer / Volume / Admin). Replaces the old GetDebugConfig
+    /// 2s polling model for zero-latency debug config propagation.
+    ///
+    /// Payload: TLV-encoded effective "all" config (same schema as
+    /// GetDebugConfig response), clients deserialize via
+    /// `decode_get_debug_config_resp` and apply locally via `apply_config()`.
+    ///
+    /// Returns `(clients_notified, encode_error)` — `clients_notified=0`
+    /// means no currently connected channels (nothing to do, non-fatal).
+    /// Encoding error is rare (OOM on TLV encode) and logged by caller.
+    pub fn broadcast_debug_config_changed(&self) -> (usize, Option<String>) {
+        use powerfs_net::serialize::{encode_get_debug_config_resp, DebugConfig};
+
+        let effective_all: DebugConfig = self.debug_config.effective_config("all");
+        let body = match encode_get_debug_config_resp(&effective_all) {
+            Ok(b) => b,
+            Err(e) => return (0, Some(format!("encode_debug_config failed: {e}"))),
+        };
+
+        let net_mgr_opt = self.net_manager.read().unwrap().clone();
+        let Some(net_mgr) = net_mgr_opt else {
+            return (0, None);
+        };
+
+        let notify_msg = powerfs_net::NetMessage::notification(
+            powerfs_net::MsgType::DebugConfigChanged,
+            body,
+            Vec::new(),
+        );
+        let n = net_mgr.broadcast_notification(&notify_msg);
+        (n, None)
     }
 
     /// 获取集中式调试配置存储（用于 HTTP 端点和 GetDebugConfig handler 共享）
@@ -3657,31 +3767,36 @@ impl MasterNode {
             let metrics_addr = format!("{}:{}", self.address.ip(), metrics_port);
             info!("Starting metrics + cert API server on {}", metrics_addr);
 
-            // CA dir: main.rs resolves this from `master.ca_dir` (default
-            // `{dir}/ca`) and passes it in. Fallback to "./ca" only if the
-            // caller somehow left it unset.
-            let ca_dir = self.ca_dir.clone().unwrap_or_else(|| "./ca".to_string());
-
-            match crate::ca_manager::CaManager::new(&ca_dir, self.admin_token.clone()) {
-                Ok(ca_manager) => {
-                    let ca_manager = std::sync::Arc::new(ca_manager);
-                    if let Err(e) =
-                        crate::metrics::start_metrics_server(&metrics_addr, ca_manager).await
-                    {
-                        error!(
-                            "Failed to start metrics/cert server on {}: {}",
-                            metrics_addr, e
-                        );
+            // Reuse the CA manager already initialised during `new()`. It
+            // already loaded (or generated) the CA cert from `ca_dir` plus
+            // the persisted client registry. If the caller left ca_dir
+            // unset the master runs without CA (dev mode) and we fall
+            // back to creating an ephemeral manager under "./ca" so the
+            // admin endpoints stay functional.
+            let ca_manager: Arc<crate::ca_manager::CaManager> = match self.ca_manager.clone() {
+                Some(ca) => ca,
+                None => {
+                    let ca_dir = self.ca_dir.clone().unwrap_or_else(|| "./ca".to_string());
+                    match crate::ca_manager::CaManager::new(&ca_dir, self.admin_token.clone()) {
+                        Ok(ca) => Arc::new(ca),
+                        Err(e) => {
+                            error!(
+                                "Failed to construct CA manager from {}: {}. \
+                                 Cert API endpoints will be unavailable; metrics endpoint is also \
+                                 served by the same server and will not start.",
+                                ca_dir, e
+                            );
+                            return Ok(());
+                        }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "Failed to construct CA manager from {}: {}. \
-                         Cert API endpoints will be unavailable; metrics endpoint is also \
-                         served by the same server and will not start.",
-                        ca_dir, e
-                    );
-                }
+            };
+
+            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca_manager).await {
+                error!(
+                    "Failed to start metrics/cert server on {}: {}",
+                    metrics_addr, e
+                );
             }
         }
 
@@ -3744,6 +3859,7 @@ impl Clone for MasterNode {
             debug_config: self.debug_config.clone(),
             admin_token: self.admin_token.clone(),
             ca_dir: self.ca_dir.clone(),
+            ca_manager: self.ca_manager.clone(),
             registration_token: self.registration_token.clone(),
         }
     }

@@ -69,29 +69,48 @@ impl DebugConfigStore {
         }
     }
 
-    /// 应用一个更新请求（来自 HTTP PUT /admin/debug）
-    pub fn apply_update(&self, update: DebugConfigUpdate) -> NodeDebugConfig {
-        let mut entry = self.configs.entry(update.node.clone()).or_default().clone();
+    /// 应用一个更新请求（来自 HTTP PUT /admin/debug）.
+    ///
+    /// 返回 `(merged_config, changed)`：
+    ///   - merged_config: 更新后的节点存储视图（可能和之前相同）
+    ///   - changed: 如果任一字段(log_level/target_filter/flags)和更新前
+    ///     的存储值不同则为 true, 否则 false. 调用方据此判断是否需要
+    ///     广播 DebugConfigChanged NOTIFY 到各连接客户端.
+    pub fn apply_update(&self, update: DebugConfigUpdate) -> (NodeDebugConfig, bool) {
+        let prev = self.configs.get(&update.node).map(|e| e.clone());
+        let mut entry = prev.clone().unwrap_or_default();
+        let mut changed = false;
 
         if let Some(level) = update.level {
+            if entry.log_level.as_deref() != Some(level.as_str()) {
+                changed = true;
+            }
             entry.log_level = Some(level);
         }
         if let Some(filter) = update.target_filter {
+            if entry.target_filter.as_deref() != Some(filter.as_str()) {
+                changed = true;
+            }
             entry.target_filter = Some(filter);
         }
         if let (Some(flag), Some(on)) = (update.flag, update.on) {
+            let prev_val = entry.flags.get(&flag).copied();
+            if prev_val != Some(on) {
+                changed = true;
+            }
             entry.flags.insert(flag, on);
         }
 
         self.configs.insert(update.node.clone(), entry.clone());
         info!(
-            "DEBUG_CONFIG: updated node='{}' level={:?} filter={:?} flags={}",
+            "DEBUG_CONFIG: updated node='{}' level={:?} filter={:?} flags={} changed={}",
             update.node,
             entry.log_level,
             entry.target_filter,
-            entry.flags.len()
+            entry.flags.len(),
+            changed
         );
-        entry
+        (entry, changed)
     }
 
     /// 获取节点的有效配置（合并 "all" 默认 + 节点覆盖）

@@ -110,6 +110,10 @@ pub struct FuseApp {
     request_timeout_secs: u64,
     /// Admin/debug HTTP server port (0 = disabled).
     admin_port: u16,
+    /// 可选：客户端证书 PEM 原文。由 CLI 从 `--client-crt` 路径读取。
+    /// Master 有 CA manager（生产模式）时该值必须为 Some，否则 RegisterClient
+    /// 会被拒绝。
+    client_cert_pem: Option<String>,
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -132,6 +136,7 @@ impl FuseApp {
         force_mount: bool,
         request_timeout_secs: u64,
         admin_port: u16,
+        client_cert_pem: Option<String>,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self> {
         // filer_addrs 为空且 filer_addr 也为空时，由 facade 从 master 拓扑发现。
@@ -162,6 +167,7 @@ impl FuseApp {
             force_mount,
             request_timeout_secs,
             admin_port,
+            client_cert_pem,
             runtime,
         })
     }
@@ -218,6 +224,7 @@ impl FuseApp {
             lease_duration_ms: self.lease_duration_ms,
             lease_renew_interval_ms: self.lease_renew_interval_ms,
             force_mount: self.force_mount,
+            client_cert_pem: self.client_cert_pem.clone(),
         };
 
         let facade = Arc::new(

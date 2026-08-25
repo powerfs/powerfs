@@ -30,6 +30,10 @@ pub struct MasterClient {
     /// TLV so the master can verify the node is authorized to join.
     /// `None` or empty = no token (dev mode, master must also be in dev mode).
     registration_token: Option<String>,
+    /// Client certificate PEM content for production node authentication.
+    /// Sent via TLV FieldId::ClientCert(0xD4) in every Heartbeat so the
+    /// master can validate it against the CA.  Empty in dev mode.
+    client_cert_pem: String,
 }
 
 #[derive(Clone)]
@@ -44,6 +48,9 @@ pub struct NewMasterClientParams<'a> {
     pub ip: &'a str,
     /// Registration token for master authentication. None = dev mode.
     pub registration_token: Option<&'a str>,
+    /// Client certificate PEM content for production authentication.
+    /// Empty = dev mode (no cert, master without CA configured).
+    pub client_cert_pem: &'a str,
 }
 
 impl MasterClient {
@@ -67,6 +74,7 @@ impl MasterClient {
             ip: params.ip.to_string(),
             heartbeat_running: Arc::new(AtomicBool::new(false)),
             registration_token: params.registration_token.map(|s| s.to_string()),
+            client_cert_pem: params.client_cert_pem.to_string(),
         }
     }
 
@@ -234,6 +242,10 @@ impl MasterClient {
             if !token.is_empty() {
                 let _ = enc.add_string(FieldId::RegistrationToken, token);
             }
+        }
+        // Client certificate (PEM) for production node authentication.
+        if !self.client_cert_pem.is_empty() {
+            let _ = enc.add_string(FieldId::ClientCert, &self.client_cert_pem);
         }
 
         for vol in volumes {

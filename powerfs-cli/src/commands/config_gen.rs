@@ -779,6 +779,9 @@ fn build_config(
             advertise_addr: Some(ip.to_string()),
             lease_enabled: true,
             registration_token: None,
+            ca_crt: None,
+            client_crt: None,
+            client_key: None,
         },
         filer: FilerConfig {
             port: cfg.filer_port,
@@ -799,6 +802,9 @@ fn build_config(
             force_register: false,
             metrics_port: cfg.filer_metrics_port,
             registration_token: None,
+            ca_crt: None,
+            client_crt: None,
+            client_key: None,
         },
         s3: S3Config {
             port: cfg.s3_port,
@@ -827,6 +833,9 @@ fn build_config(
             force_mount: false,
             request_timeout_secs: 15,
             admin_port: 0,
+            ca_crt: None,
+            client_crt: None,
+            client_key: None,
         },
         monitor: MonitorConfig {
             addr: format!("0.0.0.0:{}", cfg.monitor_port),
