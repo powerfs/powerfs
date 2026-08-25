@@ -219,6 +219,9 @@ pub struct FuseClientFacadeConfig {
     ///
     /// 设为 true 仅用于运维场景：master 临时不可达但需用配置中的 filer 列表挂载。
     pub force_mount: bool,
+    /// 可选：客户端证书 PEM 原文（master 有 CA manager 时必填）。
+    /// 透传到 MasterClient，通过 TLV FieldId::ClientCert(0xD4) 发送给 master。
+    pub client_cert_pem: Option<String>,
 }
 
 impl FuseClientFacadeConfig {
@@ -279,6 +282,7 @@ impl FuseClientFacadeConfig {
             lease_duration_ms: 30_000,
             lease_renew_interval_ms: 10_000,
             force_mount: false,
+            client_cert_pem: None,
         })
     }
 
@@ -377,6 +381,7 @@ impl FuseClientFacade {
             request_timeout: config.request_timeout,
             max_retries: 3,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
+            client_cert_pem: config.client_cert_pem.clone(),
         };
 
         let master_client = Arc::new(MasterClient::new(
@@ -449,6 +454,7 @@ impl FuseClientFacade {
             request_timeout: config.request_timeout,
             max_retries: 3,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
+            client_cert_pem: config.client_cert_pem.clone(),
         };
 
         let master_client = Arc::new(MasterClient::new(

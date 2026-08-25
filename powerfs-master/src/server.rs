@@ -1349,7 +1349,23 @@ impl MasterService for MasterGrpcServer {
             on,
         };
         let store = self.master.debug_config();
-        let updated = store.apply_update(update);
+        let (updated, changed) = store.apply_update(update);
+
+        // Master push model: apply_update → broadcast DebugConfigChanged
+        // NOTIFY. Replaces the old client-side 2s DebugConfigPoller pull.
+        if changed {
+            let (n_clients, err) = self.master.broadcast_debug_config_changed();
+            if let Some(e) = err {
+                warn!(
+                    "DEBUG_CONFIG: broadcast_debug_config_changed encode failed: {e}"
+                );
+            } else {
+                info!(
+                    "DEBUG_CONFIG: pushed DebugConfigChanged NOTIFY to {n_clients} connected clients"
+                );
+            }
+        }
+
         let entry = DebugConfigEntry {
             node: req.node,
             has_log_level: updated.log_level.is_some(),

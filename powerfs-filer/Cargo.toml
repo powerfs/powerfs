@@ -45,6 +45,7 @@ async-trait = "0.1"
 tokio = { version = "1.0", features = ["full"] }
 powerfs-common = { path = "../powerfs-common" }
 powerfs-master = { path = "../powerfs-master" }
+powerfs-master-net = { path = "../powerfs-master-net" }
 powerfs-net = { path = "../powerfs-net" }
 powerfs-coherence = { path = "../powerfs-coherence" }
 powerfs-layout = { path = "../powerfs-layout" }

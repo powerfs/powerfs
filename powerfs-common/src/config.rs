@@ -113,6 +113,17 @@ pub struct VolumeConfig {
     /// Must match the master's expected token; empty = no auth (dev only).
     #[serde(default)]
     pub registration_token: Option<String>,
+    /// CA 证书文件路径 (PEM)。生产模式下 master 有 CA 时必填。
+    #[serde(default)]
+    pub ca_crt: Option<String>,
+    /// 客户端证书文件路径 (PEM)。生产模式下 master 有 CA 时必填。
+    /// 内容读取后通过 TLV FieldId::ClientCert(0xD4) 嵌入 KeepConnected 请求。
+    #[serde(default)]
+    pub client_crt: Option<String>,
+    /// 客户端证书私钥文件路径 (PEM)。保留用于 TLS 升级；
+    /// 当前 TLV 0xD4 只发送公钥证书，私钥保存在本地即可。
+    #[serde(default)]
+    pub client_key: Option<String>,
 }
 
 /// Filer 节点配置 - 所有端口和地址必须显式配置
@@ -173,6 +184,17 @@ pub struct FilerConfig {
     /// Must match the master's expected token; empty = no auth (dev only).
     #[serde(default)]
     pub registration_token: Option<String>,
+    /// CA 证书文件路径 (PEM)。生产模式下 master 有 CA 时必填。
+    #[serde(default)]
+    pub ca_crt: Option<String>,
+    /// 客户端证书文件路径 (PEM)。生产模式下 master 有 CA 时必填。
+    /// 内容读取后通过 TLV FieldId::ClientCert(0xD4) 嵌入 RegisterFiler 请求。
+    #[serde(default)]
+    pub client_crt: Option<String>,
+    /// 客户端证书私钥文件路径 (PEM)。保留用于 TLS 升级；
+    /// 当前 TLV 0xD4 只发送公钥证书，私钥保存在本地即可。
+    #[serde(default)]
+    pub client_key: Option<String>,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置
@@ -244,6 +266,20 @@ pub struct FuseConfig {
     /// Query via `powerfs-cli fuse-stats --addr <host>:<port>`.
     #[serde(default)]
     pub admin_port: u16,
+    /// CA 证书文件路径 (PEM)。用于验证 master 返回的服务端证书；
+    /// 当前保留用于未来 9334 TLS 升级。CLI `--ca-crt` 优先于此配置项。
+    #[serde(default)]
+    pub ca_crt: Option<String>,
+    /// 客户端证书文件路径 (PEM)。生产模式下 master 有 CA 时必填。
+    /// 内容读取后通过 TLV FieldId::ClientCert(0xD4) 嵌入 RegisterClient 请求。
+    /// CLI `--client-crt` 优先于此配置项。
+    #[serde(default)]
+    pub client_crt: Option<String>,
+    /// 客户端证书私钥文件路径 (PEM)。保留用于 9334 端口 TLS 升级；
+    /// 当前 TLV 0xD4 只发送公钥证书，私钥保存在本地即可。
+    /// CLI `--client-key` 优先于此配置项。
+    #[serde(default)]
+    pub client_key: Option<String>,
 }
 
 /// Lease 模式配置 — §13 Capability model 是唯一生产模式.

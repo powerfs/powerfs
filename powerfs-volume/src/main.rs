@@ -6,7 +6,8 @@ use powerfs_common::{
     types::{NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
-use powerfs_net::PowerFsNetServer;
+use powerfs_master_net::{TlvMasterClient, TlvMasterClientConfig};
+use powerfs_net::{MsgType, NetMessage, NotificationHandler, PowerFsNetServer};
 use powerfs_volume::{
     master_client::MasterClient, master_client::NewMasterClientParams, server::VolumeServer,
 };
@@ -121,20 +122,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Data Dir: {}", data_dir);
     info!("  Initial Volume Count: {}", initial_volume_count);
     info!("  Volume Size: {}", volume_size);
-
-    // 启动 debug config poller：每 2s 从 master 拉取调试配置并本地应用
-    {
-        let poller_node_id = node_id.clone();
-        let poller_masters: Vec<(String, u16)> = master_address
-            .iter()
-            .map(|a| {
-                let ip = a.split(':').next().unwrap_or(a).to_string();
-                (ip, volume_cfg.master_net_port)
-            })
-            .collect();
-        powerfs_common::debug_config_poller::DebugConfigPoller::new(poller_node_id, poller_masters)
-            .start();
-    }
 
     let node_id = NodeId(node_id);
     let storage_manager = Arc::new(
@@ -276,6 +263,112 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let master_addrs: Vec<&str> = master_address.iter().map(|s| s.as_str()).collect();
+    // Load client certificate PEM for production node authentication.
+    let client_cert_pem = match &volume_cfg.client_crt {
+        Some(path) if !path.is_empty() => match std::fs::read_to_string(path) {
+            Ok(pem) => {
+                info!("VOLUME: loaded client cert from {} ({}B)", path, pem.len());
+                pem
+            }
+            Err(e) => {
+                error!("VOLUME: failed to read client cert {}: {}. \
+                       Master cert enforcement will reject this volume server.",
+                       path, e);
+                String::new()
+            }
+        },
+        _ => String::new(),
+    };
+
+    // ── DebugConfig Push 客户端 (替代 legacy 2s poller) ──────────────────
+    // 建立与 Master 的常驻 TLV 长连接, 接收 `DebugConfigChanged(0x008A)`
+    // NOTIFY 即时应用, 启动时拉一次初值. 失败仅 warn, 不阻塞启动.
+    {
+        let push_node_id = node_id.0.clone();
+        let push_master_net_port = volume_cfg.master_net_port;
+        let push_master_net_addrs: Vec<(String, u16)> = master_address
+            .iter()
+            .map(|addr| {
+                let ip = addr.rfind(':').map(|i| &addr[..i]).unwrap_or(addr).to_string();
+                (ip, push_master_net_port)
+            })
+            .collect();
+        let push_cert = if client_cert_pem.is_empty() {
+            None
+        } else {
+            Some(client_cert_pem.clone())
+        };
+
+        tokio::spawn(async move {
+            struct DebugConfigPushHandler {
+                node_id: String,
+            }
+            impl NotificationHandler for DebugConfigPushHandler {
+                fn handle_notification(&self, msg: &NetMessage) {
+                    if msg.msg_type() == Some(MsgType::DebugConfigChanged) {
+                        match powerfs_net::serialize::decode_get_debug_config_resp(&msg.body) {
+                            Ok(cfg) => {
+                                powerfs_common::debug_config_poller::apply_config(&cfg, &self.node_id);
+                            }
+                            Err(e) => warn!("VOLUME_DEBUG_PUSH: DebugConfigChanged decode err: {}", e),
+                        }
+                    }
+                }
+            }
+
+            let tlv_config = TlvMasterClientConfig {
+                client_type: powerfs_net::ClientType::Volume,
+                client_cert_pem: push_cert,
+                ..Default::default()
+            };
+            let tlv_client = Arc::new(TlvMasterClient::new(push_master_net_addrs.clone(), tlv_config));
+
+            let handler: Arc<dyn NotificationHandler + Send + Sync> =
+                Arc::new(DebugConfigPushHandler {
+                    node_id: push_node_id.clone(),
+                });
+            tlv_client.set_notification_handler(handler);
+
+            match powerfs_net::serialize::encode_get_debug_config_req(&push_node_id) {
+                Ok(body) => {
+                    match tlv_client
+                        .submit_request(MsgType::GetDebugConfig, &body)
+                        .await
+                    {
+                        Ok(resp) => {
+                            match powerfs_net::serialize::decode_get_debug_config_resp(&resp.body)
+                            {
+                                Ok(cfg) => {
+                                    powerfs_common::debug_config_poller::apply_config(
+                                        &cfg, &push_node_id,
+                                    );
+                                }
+                                Err(e) => warn!(
+                                    "VOLUME_DEBUG_PUSH: initial GetDebugConfig decode err: {}",
+                                    e
+                                ),
+                            }
+                        }
+                        Err(e) => warn!(
+                            "VOLUME_DEBUG_PUSH: initial GetDebugConfig pull failed: {}",
+                            e
+                        ),
+                    }
+                }
+                Err(e) => warn!(
+                    "VOLUME_DEBUG_PUSH: encode GetDebugConfig req failed: {}",
+                    e
+                ),
+            }
+
+            info!(
+                "VOLUME_DEBUG_PUSH: push client started (masters={:?}, node_id={})",
+                push_master_net_addrs, push_node_id
+            );
+            std::future::pending::<()>().await;
+        });
+    }
+
     let master_client = MasterClient::new(NewMasterClientParams {
         master_addresses: &master_addrs,
         master_net_port: volume_cfg.master_net_port,
@@ -284,6 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         net_port: net_port as u32,
         ip: &ip,
         registration_token: volume_cfg.registration_token.as_deref(),
+        client_cert_pem: &client_cert_pem,
     });
 
     let register = args.register_with_master.unwrap_or(true);

@@ -25,6 +25,11 @@ volume_addresses = ["172.30.0.21", "172.30.0.22", "172.30.0.23",
                     "172.30.0.24", "172.30.0.25", "172.30.0.26"]
 request_timeout_secs = 10
 admin_port = 9998
+# 客户端证书: master 有 CA 时必填。由 powerfs-cli cert sign-client 签发。
+# san_ip 必须包含本节点 IP 172.30.0.41, mount_dir 必须包含 /mnt/powerfs。
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/fuse-client-1.crt"
+client_key = "/etc/powerfs/certs/fuse-client-1.key"
 
 [fuse.lease]
 mode = "cap"                            # §13: Cap 模型，通过 cap_open_grant + CapRecallNotify 实现强一致互斥

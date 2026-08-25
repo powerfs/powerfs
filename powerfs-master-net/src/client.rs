@@ -48,6 +48,12 @@ pub struct TlvMasterClientConfig {
     pub max_redirects: u32,
     /// Backoff between retries.
     pub retry_backoff: Duration,
+    /// Optional client certificate PEM content. When present, embedded
+    /// in RegisterClient/DeregisterClient requests as FieldId::ClientCert
+    /// (0xD4) so the Master can enforce binding-based access control.
+    /// When absent the Master will either reject (production CA mode) or
+    /// warn-and-accept (dev mode, no CA manager initialised).
+    pub client_cert_pem: Option<String>,
 }
 
 impl Default for TlvMasterClientConfig {
@@ -59,6 +65,7 @@ impl Default for TlvMasterClientConfig {
             max_retries: 3,
             max_redirects: 5,
             retry_backoff: Duration::from_millis(5),
+            client_cert_pem: None,
         }
     }
 }
@@ -479,6 +486,9 @@ impl TlvMasterClient {
         let _ = enc.add_string(FieldId::Replication, replication);
         let _ = enc.add_string(FieldId::Owner, host);
         let _ = enc.add_u64(FieldId::Limit, pid);
+        if let Some(ref pem) = self.config.client_cert_pem {
+            let _ = enc.add_string(FieldId::ClientCert, pem);
+        }
         let payload = enc.into_bytes();
 
         let resp = self
@@ -521,6 +531,9 @@ impl TlvMasterClient {
         let mut enc = TlvEncoder::new();
         let _ = enc.add_string(FieldId::ClientUuid, client_uuid);
         let _ = enc.add_u64(FieldId::ClientId, assigned_client_id);
+        if let Some(ref pem) = self.config.client_cert_pem {
+            let _ = enc.add_string(FieldId::ClientCert, pem);
+        }
         let payload = enc.into_bytes();
 
         let resp = self

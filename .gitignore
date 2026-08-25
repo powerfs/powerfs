@@ -65,3 +65,18 @@ build
 
 # node.js
 node_modules
+
+# Production TLS/X.509 certificates and private keys.
+# Certs must be generated at deploy time (see powerfs-cli cert commands),
+# never committed to the repository — pushing to public remote would leak
+# production secrets.
+docker/certs/
+*.crt
+*.key
+*.pem
+!**/test-fixtures/**/*.crt
+!**/test-fixtures/**/*.key
+!**/test-fixtures/**/*.pem
+
+# Temporary kernel-debug notes / scratch markdown
+debug-kernel-*.md

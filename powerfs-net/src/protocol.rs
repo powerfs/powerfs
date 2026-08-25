@@ -512,6 +512,24 @@ impl FrameHeader {
             ),
         };
         if !hdr.verify_crc() {
+            let expected = hdr.calc_header_crc();
+            eprintln!(
+                "CRC_DEBUG master: received 24 bytes = {}",
+                buf[0..24]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            eprintln!(
+                "CRC_DEBUG master: received header_crc = 0x{:08x}, expected (calc) = 0x{:08x}",
+                hdr.header_crc, expected
+            );
+            eprintln!(
+                "CRC_DEBUG master: magic={:?} version={} flags={} seq={} msg_type={} status={} data_len={} body_len={} route_hash={} proto_ver={}",
+                hdr.magic, hdr.version, hdr.flags, hdr.seq, hdr.msg_type, hdr.status,
+                hdr.data_len, hdr.body_len, hdr.route_hash, hdr.protocol_ver
+            );
             return Err("header CRC mismatch");
         }
         hdr.validate()?;
@@ -727,6 +745,21 @@ pub enum MsgType {
     /// `powerfs_common::dynamic_log`.
     GetDebugConfig = 0x0089,
 
+    /// Master → Clients (FUSE/Filer/Volume/Kernel): push notification that
+    /// the centralized debug config has changed (via HTTP PUT /admin/debug).
+    /// Replaces the old GetDebugConfig 2s polling model for lower latency
+    /// and zero Admin-connection noise.
+    ///
+    /// Notification TLV body: same schema as GetDebugConfig response —
+    ///   LogLevel(string) + TargetFilter(string) + FlagCount(u32)
+    ///   + [FlagName(string) + FlagOn(u8)] * FlagCount
+    ///
+    /// Master always broadcasts to ALL currently-connected TCP clients
+    /// (Client/Admin channel) via `ServerConnectionManager::broadcast_notification`.
+    /// Upon receipt, clients deserialize the body and apply locally via
+    /// the same `apply_config()` path used by the poller.
+    DebugConfigChanged = 0x008A,
+
     // ===== Capability (Cap) model — §13 Capability 模型 =====
     // Client → Filer: request caps for an open() call. Always succeeds
     // (open never blocks). Response carries granted caps + token + epoch.
@@ -827,6 +860,7 @@ impl MsgType {
             0x0087 => Some(Self::RenewInodeLease),
             0x0088 => Some(Self::RevokeInodeLeaseAck),
             0x0089 => Some(Self::GetDebugConfig),
+            0x008A => Some(Self::DebugConfigChanged),
             0x0091 => Some(Self::CapOpenGrant),
             0x0092 => Some(Self::CapRecallAck),
             0x0093 => Some(Self::CapRelease),
@@ -1240,6 +1274,15 @@ pub enum FieldId {
     /// RegisterFiler TLV requests so the Master can authenticate the node
     /// before accepting it into the cluster. Empty/absent = no auth (dev).
     RegistrationToken = 0xD3,
+    /// Client certificate PEM (string). Required on RegisterClient /
+    /// DeregisterClient / ClientHeartbeat requests; the Master validates
+    /// the chain against its CA, checks that the peer's source IP is in
+    /// the SAN IP list, the mount-point Name matches one of the SAN URI
+    /// mount directories, and the CN equals the registered client-name.
+    ClientCert = 0xD4,
+    /// Optional client-certificate signature over the request body (bytes).
+    /// Reserved for future HMAC-based replay protection; currently unused.
+    ClientCertSignature = 0xD5,
 }
 
 impl FieldId {
@@ -1368,6 +1411,8 @@ impl FieldId {
             0xD1 => Some(Self::RCtimeNsec),
             0xD2 => Some(Self::MountAllowed),
             0xD3 => Some(Self::RegistrationToken),
+            0xD4 => Some(Self::ClientCert),
+            0xD5 => Some(Self::ClientCertSignature),
             _ => None,
         }
     }
