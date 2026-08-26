@@ -99,7 +99,7 @@ services:
       timeout: 3s
       retries: 3
     depends_on:
-      master-1:
+      redis:
         condition: service_healthy
 
   master-3:
@@ -130,7 +130,7 @@ services:
       timeout: 3s
       retries: 3
     depends_on:
-      master-2:
+      redis:
         condition: service_healthy
 
   volume-1:

@@ -294,10 +294,7 @@ fn main() {
         .client_crt
         .as_deref()
         .or(fuse_cfg.client_crt.as_deref());
-    let ca_crt_path: Option<&str> = args
-        .ca_crt
-        .as_deref()
-        .or(fuse_cfg.ca_crt.as_deref());
+    let ca_crt_path: Option<&str> = args.ca_crt.as_deref().or(fuse_cfg.ca_crt.as_deref());
     let client_key_path: Option<&str> = args
         .client_key
         .as_deref()
@@ -319,8 +316,10 @@ fn main() {
             }
         },
         None => {
-            warn!("client_crt not provided (checked CLI --client-crt and config) — \
-                  if master has CA manager enabled, RegisterClient will be denied");
+            warn!(
+                "client_crt not provided (checked CLI --client-crt and config) — \
+                  if master has CA manager enabled, RegisterClient will be denied"
+            );
             None
         }
     };

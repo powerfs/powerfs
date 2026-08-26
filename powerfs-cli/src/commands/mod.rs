@@ -1,3 +1,4 @@
+mod admin;
 mod assign;
 mod cert;
 mod cluster_add;
@@ -24,6 +25,7 @@ mod topology;
 mod volume_list;
 mod write;
 
+pub use admin::{admin, AdminSubcommand};
 pub use assign::{assign, AssignArgs};
 pub use cert::{cert, CertSubcommand};
 pub use cluster_add::{cluster_add, ClusterAddArgs};

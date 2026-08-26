@@ -6103,8 +6103,18 @@ impl FileSystem for PowerFsFs {
                 for ((chunk_idx, chunk_offset, read_size), result) in
                     missing_chunks.iter().zip(results.iter())
                 {
+                    // 诊断日志: 打印每个 chunk 的 needle_id 和返回数据 md5
+                    let diag_needle_id = chunk_map
+                        .get(chunk_offset)
+                        .map(|(n, _)| *n)
+                        .unwrap_or_else(|| fid.file_key.saturating_add(*chunk_idx));
                     match result {
                         Ok(data) => {
+                            let diag_md5 = crc32fast::hash(data);
+                            info!(
+                                "READ_BLOB_DIAG: inode={} chunk_idx={} chunk_offset={} needle_id={} data_len={} crc32={:#010x}",
+                                inode, chunk_idx, chunk_offset, diag_needle_id, data.len(), diag_md5
+                            );
                             debug!(
                                 "read_blob: inode={}, chunk_offset={}, data_len={}",
                                 inode,

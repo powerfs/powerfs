@@ -203,6 +203,60 @@ pub struct RaftNodeV2 {
     db: Arc<DB>,
 }
 
+/// 等待所有 peer 的 Raft gRPC 端口可达，确保 bootstrap 时 quorum 可用。
+///
+/// 多节点集群启动时，bootstrap 节点（id=1）必须等待所有 peer 的 Raft
+/// 服务端口 TCP 可达后才能调用 `raft.initialize()`。否则单节点成为 leader
+/// 后因 quorum 不足在 election_timeout 后下台，引发 "forward None" 死循环
+/// 和 CPU 飙升，干扰 filer 正常处理请求（SLOW_REQ 根因）。
+async fn wait_for_peers_ready(peers: &[Peer], timeout_secs: u64) {
+    if peers.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs);
+    info!(
+        "RaftNodeV2: waiting for {} peers ready (timeout={}s)",
+        peers.len(),
+        timeout_secs
+    );
+    for peer in peers {
+        let addr: SocketAddr = match peer.address.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    "RaftNodeV2: invalid peer {} address '{}': {}; skipping readiness check",
+                    peer.id, peer.address, e
+                );
+                continue;
+            }
+        };
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    "RaftNodeV2: timed out waiting for peer {} at {}; proceeding anyway",
+                    peer.id, peer.address
+                );
+                break;
+            }
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(2),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!("RaftNodeV2: peer {} ready at {}", peer.id, peer.address);
+                    break;
+                }
+                _ => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+    info!("RaftNodeV2: all peers ready, proceeding with initialize");
+}
+
 impl RaftNodeV2 {
     /// 创建新的 Raft 节点并启动 gRPC 服务。
     ///
@@ -267,6 +321,13 @@ impl RaftNodeV2 {
         // - 单节点模式（无 peers）：立即初始化为单节点集群
         // - 多节点模式：仅 id=1 的节点 bootstrap 整个集群（含所有 peers），
         //   其他节点不调用 initialize，等待 leader 推送初始配置
+        //
+        // 关键: bootstrap 节点必须等待所有 peer 的 Raft 端口可达后再
+        // initialize, 否则单节点 leader 因 quorum 不足下台 → forward None
+        // 死循环 → CPU 飙升 → filer 受干扰 → SLOW_REQ (根因修复)
+        if id == 1 && !peers.is_empty() {
+            wait_for_peers_ready(&peers, 120).await;
+        }
         let should_bootstrap = peers.is_empty() || id == 1;
         if should_bootstrap {
             let mut members: BTreeMap<String, BasicNode> = BTreeMap::new();

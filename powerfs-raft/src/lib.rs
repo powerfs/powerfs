@@ -35,6 +35,7 @@ use std::io::Cursor;
 // 重新导出 openraft 的公共类型，方便上层（含集成测试）引用。
 pub use openraft::BasicNode;
 pub use openraft::Raft;
+pub use openraft::SnapshotPolicy;
 
 // =============================================================================
 // TypeConfig
@@ -142,11 +143,22 @@ pub type FilerEntry = <FilerTypeConfig as openraft::RaftTypeConfig>::Entry;
 /// 构建适用于 PowerFS 的 openraft `Config`。
 ///
 /// 心跳/超时沿用 raft-rs 时期的默认量级，迁移期保持参数一致以便对比行为。
+///
+/// `enable_pre_vote`: 防止网络分区或重启的节点 term 膨胀扰乱健康 leader
+/// （节点 election timeout 后先 pre-vote 探测，quorum 同意才真正参选）。
+///
+/// `snapshot_policy`: 默认 5000 条日志触发快照，filer 高吞吐下（250+ entries/s）
+/// 每 20s 一次快照 → RocksDB 写停顿 → SLOW_REQ 尖峰。改为 50000 条（~3min 一次）。
+/// `purge_batch_size`: 默认 1，快照后逐条 purge 日志产生大量 I/O；改为 100 批量 purge。
 pub fn default_config() -> openraft::Config {
     openraft::Config {
         heartbeat_interval: 250,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        enable_pre_vote: Some(true),
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(50000),
+        max_in_snapshot_log_to_keep: 5000,
+        purge_batch_size: 100,
         ..Default::default()
     }
 }

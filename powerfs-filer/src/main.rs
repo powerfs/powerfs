@@ -18,7 +18,10 @@ use powerfs_filer::{
     MetaShardManager, MetadataStore, S3Handler, ShardId, ShardScheduler, ShardStrategy,
     TlvVolumeClient, VolumeRouter,
 };
-use powerfs_net::{ClientConnPool, ClientPoolConfig, MsgType, NetMessage, NotificationHandler, PowerFsNetServer, ServerConnectionManager};
+use powerfs_net::{
+    ClientConnPool, ClientPoolConfig, MsgType, NetMessage, NotificationHandler, PowerFsNetServer,
+    ServerConnectionManager,
+};
 
 #[derive(Parser)]
 #[command(name = "powerfs-filer")]
@@ -143,7 +146,11 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             .master_addresses
             .iter()
             .map(|addr| {
-                let ip = addr.rfind(':').map(|i| &addr[..i]).unwrap_or(addr).to_string();
+                let ip = addr
+                    .rfind(':')
+                    .map(|i| &addr[..i])
+                    .unwrap_or(addr)
+                    .to_string();
                 (ip, push_master_net_port)
             })
             .collect();
@@ -151,7 +158,10 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             Some(path) if !path.is_empty() => match std::fs::read_to_string(path) {
                 Ok(pem) => Some(pem),
                 Err(e) => {
-                    warn!("FILER_DEBUG_PUSH: failed to read client cert {}: {}", path, e);
+                    warn!(
+                        "FILER_DEBUG_PUSH: failed to read client cert {}: {}",
+                        path, e
+                    );
                     None
                 }
             },
@@ -168,9 +178,14 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     if msg.msg_type() == Some(MsgType::DebugConfigChanged) {
                         match powerfs_net::serialize::decode_get_debug_config_resp(&msg.body) {
                             Ok(cfg) => {
-                                powerfs_common::debug_config_poller::apply_config(&cfg, &self.node_id);
+                                powerfs_common::debug_config_poller::apply_config(
+                                    &cfg,
+                                    &self.node_id,
+                                );
                             }
-                            Err(e) => warn!("FILER_DEBUG_PUSH: DebugConfigChanged decode err: {}", e),
+                            Err(e) => {
+                                warn!("FILER_DEBUG_PUSH: DebugConfigChanged decode err: {}", e)
+                            }
                         }
                     }
                 }
@@ -199,11 +214,11 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                         .await
                     {
                         Ok(resp) => {
-                            match powerfs_net::serialize::decode_get_debug_config_resp(&resp.body)
-                            {
+                            match powerfs_net::serialize::decode_get_debug_config_resp(&resp.body) {
                                 Ok(cfg) => {
                                     powerfs_common::debug_config_poller::apply_config(
-                                        &cfg, &push_node_id,
+                                        &cfg,
+                                        &push_node_id,
                                     );
                                 }
                                 Err(e) => warn!(
@@ -218,10 +233,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                         ),
                     }
                 }
-                Err(e) => warn!(
-                    "FILER_DEBUG_PUSH: encode GetDebugConfig req failed: {}",
-                    e
-                ),
+                Err(e) => warn!("FILER_DEBUG_PUSH: encode GetDebugConfig req failed: {}", e),
             }
 
             info!(
@@ -696,24 +708,23 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             // Load client certificate PEM for production node authentication.
             // When the master has a CA configured, the filer MUST present this
             // cert during RegisterFiler; empty in dev mode (no cert configured).
-            let client_cert_pem_for_reg =
-                match &filer_cfg.client_crt {
-                    Some(path) if !path.is_empty() => {
-                        match std::fs::read_to_string(path) {
-                            Ok(pem) => {
-                                info!("FILER: loaded client cert from {} ({}B)", path, pem.len());
-                                pem
-                            }
-                            Err(e) => {
-                                error!("FILER: failed to read client cert {}: {}. \
-                                       Master cert enforcement will reject this filer.",
-                                       path, e);
-                                String::new()
-                            }
-                        }
+            let client_cert_pem_for_reg = match &filer_cfg.client_crt {
+                Some(path) if !path.is_empty() => match std::fs::read_to_string(path) {
+                    Ok(pem) => {
+                        info!("FILER: loaded client cert from {} ({}B)", path, pem.len());
+                        pem
                     }
-                    _ => String::new(),
-                };
+                    Err(e) => {
+                        error!(
+                            "FILER: failed to read client cert {}: {}. \
+                                       Master cert enforcement will reject this filer.",
+                            path, e
+                        );
+                        String::new()
+                    }
+                },
+                _ => String::new(),
+            };
             let net_port_for_reg = net_port;
             // S3 HTTP port (filer_cfg.port). The S3 server also serves the
             // /admin/shards endpoint, so the Master needs this port to

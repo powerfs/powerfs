@@ -1356,9 +1356,7 @@ impl MasterService for MasterGrpcServer {
         if changed {
             let (n_clients, err) = self.master.broadcast_debug_config_changed();
             if let Some(e) = err {
-                warn!(
-                    "DEBUG_CONFIG: broadcast_debug_config_changed encode failed: {e}"
-                );
+                warn!("DEBUG_CONFIG: broadcast_debug_config_changed encode failed: {e}");
             } else {
                 info!(
                     "DEBUG_CONFIG: pushed DebugConfigChanged NOTIFY to {n_clients} connected clients"
