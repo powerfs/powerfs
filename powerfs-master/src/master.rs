@@ -461,6 +461,10 @@ impl MasterNode {
 
         // openraft is self-driven (internal tick + network threads); no run() loop needed.
 
+        // 启动 Raft 状态健康监控: 长时间无 leader 时自动退出进程,
+        // 交由 Docker restart policy 重启, 防止异常节点 forward None 死循环.
+        raft_v2.spawn_health_monitor(!peer_list.is_empty());
+
         let mut collections = HashMap::new();
         collections.insert(
             "default".to_string(),

@@ -377,6 +377,10 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         info!("Shard {} initialized", i);
     }
 
+    // 启动 Raft 状态健康监控: 所有 shard 长时间无 leader 时自动退出进程,
+    // 交由 Docker restart policy 重启, 防止异常节点干扰集群.
+    raft_group_manager.spawn_health_monitor().await;
+
     // Spawn per-shard leader-change notifiers: when this filer gains/loses
     // leadership of a shard, notify the Master via ShardLeaderUpdate so it
     // maintains the shard_id → leader_addr table. This enables the
