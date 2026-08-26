@@ -680,6 +680,121 @@ impl RaftGroupManagerV2 {
         });
     }
 
+    /// 启动 Raft 状态健康监控后台任务（监控所有 shard）。
+    ///
+    /// 当节点长时间无法确定任何 shard 的 leader（连续处于 Candidate 状态或无 leader）
+    /// 时，说明集群已不健康（网络分区 / quorum 丢失 / 状态腐化）。
+    ///
+    /// 容错策略（参考 SLOW_REQ 根因教训）：
+    /// - **warn 阈值**（15s = 5×election_timeout_max）：打印 warn 日志
+    /// - **fatal 阈值**（30s = 10×election_timeout_max）：打印 error 日志并触发进程退出,
+    ///   交由 Docker restart policy 重启容器。
+    ///   异常节点持续运行会消耗 CPU 干扰其他健康节点。
+    ///
+    /// **注意**：只监控有 peers 的 shard（单节点 shard 永远是 Leader）。
+    /// 只要有一个 shard 恢复健康（有 leader），就重置计时器。
+    pub async fn spawn_health_monitor(&self) {
+        let groups = self.groups.read().await;
+        if groups.is_empty() {
+            info!("RaftGroupManagerV2: no shards to monitor");
+            return;
+        }
+
+        // 收集所有有 peers 的 shard 的 metrics receiver
+        let mut watchers: Vec<(
+            u64,
+            WatchReceiver<openraft::raft::RaftMetrics<FilerTypeConfig>>,
+        )> = Vec::new();
+        for (shard_id, group) in groups.iter() {
+            if group.peers.is_empty() {
+                continue;
+            }
+            watchers.push((shard_id.0, group.raft.metrics()));
+        }
+
+        if watchers.is_empty() {
+            info!("RaftGroupManagerV2: skip health monitor (no multi-node shards)");
+            return;
+        }
+
+        let node_id = self.node_id;
+
+        tokio::spawn(async move {
+            let check_interval = tokio::time::Duration::from_secs(1);
+            let warn_threshold = tokio::time::Duration::from_secs(15);
+            let fatal_threshold = tokio::time::Duration::from_secs(30);
+
+            let mut all_unhealthy_since: Option<tokio::time::Instant> = None;
+
+            loop {
+                tokio::time::sleep(check_interval).await;
+
+                // 检查所有 shard 的状态
+                let mut any_healthy = false;
+                let mut unhealthy_shards = Vec::new();
+
+                for (sid, rx) in &watchers {
+                    let metrics = rx.borrow_watched().clone();
+                    let has_leader = metrics.current_leader.is_some();
+                    let is_candidate = metrics.state == ServerState::Candidate;
+
+                    if has_leader && !is_candidate {
+                        any_healthy = true;
+                    } else {
+                        unhealthy_shards.push((
+                            *sid,
+                            metrics.state,
+                            metrics.current_term,
+                            metrics.current_leader.clone(),
+                        ));
+                    }
+                }
+
+                if any_healthy {
+                    // 至少一个 shard 健康, 重置计时器
+                    if all_unhealthy_since.is_some() {
+                        info!(
+                            "RaftGroupManagerV2: node={} recovered — at least one shard has leader",
+                            node_id
+                        );
+                        all_unhealthy_since = None;
+                    }
+                } else {
+                    // 所有 shard 都不健康
+                    let now = tokio::time::Instant::now();
+                    if all_unhealthy_since.is_none() {
+                        all_unhealthy_since = Some(now);
+                        warn!(
+                            "RaftGroupManagerV2: node={} ALL shards unhealthy: {:?}",
+                            node_id, unhealthy_shards
+                        );
+                    }
+
+                    let elapsed = now.duration_since(all_unhealthy_since.unwrap());
+                    if elapsed >= fatal_threshold {
+                        log::error!(
+                            "RaftGroupManagerV2: FATAL — node={} all shards leaderless for {:?} \
+                             (unhealthy={:?}); exiting process to trigger container restart",
+                            node_id,
+                            elapsed,
+                            unhealthy_shards
+                        );
+                        std::process::exit(1);
+                    } else if elapsed >= warn_threshold {
+                        log::warn!(
+                            "RaftGroupManagerV2: node={} all shards leaderless for {:?} \
+                             (unhealthy={:?}); will exit in {:?} if not resolved",
+                            node_id,
+                            elapsed,
+                            unhealthy_shards,
+                            fatal_threshold - elapsed
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// Spawn a background task that watches for leadership changes on the
     /// given shard and notifies the Master via `ShardLeaderUpdate` RPC.
     ///

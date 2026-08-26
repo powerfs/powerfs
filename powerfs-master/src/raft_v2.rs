@@ -548,6 +548,101 @@ impl RaftNodeV2 {
         self.raft.metrics().borrow_watched().state == ServerState::Leader
     }
 
+    /// 启动 Raft 状态健康监控后台任务。
+    ///
+    /// 当节点长时间无法确定集群 leader（连续处于 Candidate 状态或无 leader）
+    /// 时，说明集群已不健康（网络分区 / quorum 丢失 / 状态腐化）。
+    ///
+    /// 容错策略（参考 SLOW_REQ 根因教训）：
+    /// - **warn 阈值**（15s = 5×election_timeout_max）：打印 warn 日志，标记 unhealthy
+    /// - **fatal 阈值**（30s = 10×election_timeout_max）：打印 error 日志并触发进程退出,
+    ///   交由 Docker restart policy 重启容器（restart: unless-stopped）。
+    ///   这比让异常节点持续运行更好——异常节点会因 "forward None" 死循环消耗 CPU,
+    ///   干扰其他健康节点处理请求。
+    ///
+    /// **注意**：单节点集群（无 peers）不会触发此监控，因为单节点永远是 Leader。
+    pub fn spawn_health_monitor(&self, has_peers: bool) {
+        if !has_peers {
+            info!("RaftNodeV2: skip health monitor for single-node cluster");
+            return;
+        }
+
+        let raft = self.raft.clone();
+        let node_id = self.node_id.clone();
+
+        tokio::spawn(async move {
+            let check_interval = tokio::time::Duration::from_secs(1);
+            let warn_threshold = tokio::time::Duration::from_secs(15);
+            let fatal_threshold = tokio::time::Duration::from_secs(30);
+
+            let mut no_leader_since: Option<tokio::time::Instant> = None;
+            let mut last_state = ServerState::Leader; // dummy init
+
+            loop {
+                tokio::time::sleep(check_interval).await;
+
+                let metrics = raft.metrics().borrow_watched().clone();
+                let current_state = metrics.state;
+                let has_leader = metrics.current_leader.is_some();
+
+                // 状态变化时打印 info 日志
+                if current_state != last_state {
+                    info!(
+                        "RaftNodeV2: node={} state changed {:?} -> {:?} (term={}, leader={:?})",
+                        node_id,
+                        last_state,
+                        current_state,
+                        metrics.current_term,
+                        metrics.current_leader
+                    );
+                    last_state = current_state;
+                }
+
+                // 检查是否无 leader
+                if !has_leader || current_state == ServerState::Candidate {
+                    let now = tokio::time::Instant::now();
+                    if no_leader_since.is_none() {
+                        no_leader_since = Some(now);
+                    }
+
+                    let elapsed = now.duration_since(no_leader_since.unwrap());
+                    if elapsed >= fatal_threshold {
+                        log::error!(
+                            "RaftNodeV2: FATAL — node={} has been leaderless for {:?} \
+                             (state={:?}, term={}); exiting process to trigger container restart",
+                            node_id,
+                            elapsed,
+                            current_state,
+                            metrics.current_term
+                        );
+                        // 退出进程, 让 Docker restart policy 处理.
+                        // 比 continue 运行更好: 异常节点会 forward None 死循环消耗 CPU.
+                        std::process::exit(1);
+                    } else if elapsed >= warn_threshold {
+                        log::warn!(
+                            "RaftNodeV2: node={} leaderless for {:?} (state={:?}, term={}); \
+                             will exit in {:?} if not resolved",
+                            node_id,
+                            elapsed,
+                            current_state,
+                            metrics.current_term,
+                            fatal_threshold - elapsed
+                        );
+                    }
+                } else {
+                    // 有 leader, 重置计时器
+                    if no_leader_since.is_some() {
+                        info!(
+                            "RaftNodeV2: node={} recovered — leader now known (state={:?}, leader={:?})",
+                            node_id, current_state, metrics.current_leader
+                        );
+                        no_leader_since = None;
+                    }
+                }
+            }
+        });
+    }
+
     /// 获取当前 leader 的 NodeId（`None` 如果无 leader）。
     pub async fn current_leader(&self) -> Option<String> {
         self.raft.current_leader().await
