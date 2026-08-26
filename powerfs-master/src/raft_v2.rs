@@ -14,13 +14,17 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use log::debug;
 use log::info;
 use log::warn;
 use openraft::async_runtime::WatchReceiver;
 use openraft::type_config::TypeConfigExt;
 use openraft::Raft;
+use openraft::ReadPolicy;
 use openraft::ServerState;
 use powerfs_raft::grpc::RaftServiceImpl;
 use powerfs_raft::network::Network;
@@ -550,18 +554,20 @@ impl RaftNodeV2 {
 
     /// 启动 Raft 状态健康监控后台任务。
     ///
-    /// 当节点长时间无法确定集群 leader（连续处于 Candidate 状态或无 leader）
-    /// 时，说明集群已不健康（网络分区 / quorum 丢失 / 状态腐化）。
+    /// **设计目标**：检测 SLOW_REQ 根因——master 节点假 Leader 状态（Leader 身份
+    /// 丢失 + `forward to: None, None` 死循环 + CPU 465%）。
     ///
-    /// 容错策略（参考 SLOW_REQ 根因教训）：
-    /// - **warn 阈值**（15s = 5×election_timeout_max）：打印 warn 日志，标记 unhealthy
-    /// - **fatal 阈值**（30s = 10×election_timeout_max）：打印 error 日志并触发进程退出,
-    ///   交由 Docker restart policy 重启容器（restart: unless-stopped）。
-    ///   这比让异常节点持续运行更好——异常节点会因 "forward None" 死循环消耗 CPU,
-    ///   干扰其他健康节点处理请求。
+    /// **方案 C：停止服务，不退出进程**
+    /// - 检测假 Leader 后设置 `raft_unavailable = true`，net_handler 拒绝 raft 请求
+    /// - quorum 恢复后 `ensure_linearizable` 成功，清除标志，立即恢复服务
+    /// - 保持内存状态，避免重启循环，类似 Ceph MDS STANDBY 状态
     ///
-    /// **注意**：单节点集群（无 peers）不会触发此监控，因为单节点永远是 Leader。
-    pub fn spawn_health_monitor(&self, has_peers: bool) {
+    /// **关键区分**（不能误杀的正常状态）：
+    /// - **Follower/Candidate 无 leader**：quorum 丢失后正常行为，等待恢复。
+    /// - **Leader 但 lease 未过期**：`ensure_linearizable` 可能短暂失败，等待 lease 过期。
+    /// - **假 Leader（lease 过期后仍 Leader）**：openraft 设计上 Leader 不主动下台，
+    ///   等待其他节点选举。但若其他节点都停止，Leader 永远卡住 → 停止服务。
+    pub fn spawn_health_monitor(&self, has_peers: bool, raft_unavailable: Arc<AtomicBool>) {
         if !has_peers {
             info!("RaftNodeV2: skip health monitor for single-node cluster");
             return;
@@ -571,19 +577,20 @@ impl RaftNodeV2 {
         let node_id = self.node_id.clone();
 
         tokio::spawn(async move {
-            let check_interval = tokio::time::Duration::from_secs(1);
-            let warn_threshold = tokio::time::Duration::from_secs(15);
-            let fatal_threshold = tokio::time::Duration::from_secs(30);
+            let check_interval = tokio::time::Duration::from_secs(5);
+            // lease 过期时间约 election_timeout_max (3s). 给 3 倍余量 (9s).
+            // 超过 9s 仍是 Leader 但 propose 失败 → 假 Leader, 停止服务.
+            let fake_leader_threshold = tokio::time::Duration::from_secs(9);
 
-            let mut no_leader_since: Option<tokio::time::Instant> = None;
+            let mut fake_leader_since: Option<tokio::time::Instant> = None;
             let mut last_state = ServerState::Leader; // dummy init
+            let mut was_unavailable = false;
 
             loop {
                 tokio::time::sleep(check_interval).await;
 
                 let metrics = raft.metrics().borrow_watched().clone();
                 let current_state = metrics.state;
-                let has_leader = metrics.current_leader.is_some();
 
                 // 状态变化时打印 info 日志
                 if current_state != last_state {
@@ -598,45 +605,96 @@ impl RaftNodeV2 {
                     last_state = current_state;
                 }
 
-                // 检查是否无 leader
-                if !has_leader || current_state == ServerState::Candidate {
-                    let now = tokio::time::Instant::now();
-                    if no_leader_since.is_none() {
-                        no_leader_since = Some(now);
-                    }
+                // 检测 1: running_state Fatal → openraft 内部错误, 立即退出
+                // 这是不可恢复的内部错误, 只能重启进程.
+                if metrics.running_state.is_err() {
+                    log::error!(
+                        "RaftNodeV2: FATAL — node={} raft running_state error: {:?}; exiting",
+                        node_id,
+                        metrics.running_state
+                    );
+                    std::process::exit(1);
+                }
 
-                    let elapsed = now.duration_since(no_leader_since.unwrap());
-                    if elapsed >= fatal_threshold {
-                        log::error!(
-                            "RaftNodeV2: FATAL — node={} has been leaderless for {:?} \
-                             (state={:?}, term={}); exiting process to trigger container restart",
-                            node_id,
-                            elapsed,
-                            current_state,
-                            metrics.current_term
-                        );
-                        // 退出进程, 让 Docker restart policy 处理.
-                        // 比 continue 运行更好: 异常节点会 forward None 死循环消耗 CPU.
-                        std::process::exit(1);
-                    } else if elapsed >= warn_threshold {
-                        log::warn!(
-                            "RaftNodeV2: node={} leaderless for {:?} (state={:?}, term={}); \
-                             will exit in {:?} if not resolved",
-                            node_id,
-                            elapsed,
-                            current_state,
-                            metrics.current_term,
-                            fatal_threshold - elapsed
-                        );
+                // 检测 2: 假 Leader (Leader 状态但 ensure_linearizable 持续失败)
+                // SLOW_REQ 根因: Leader lease 过期后 openraft 不主动下台,
+                // 但 propose 返回 "forward to: None, None" → CPU 消耗 + 日志刷屏.
+                //
+                // 方案 C: 超过阈值后设置 raft_unavailable=true,
+                // net_handler 拒绝需要 raft 的请求 (返回 UNAVAILABLE).
+                // 不退出进程, 保持内存状态, quorum 恢复后立即恢复服务.
+                if current_state == ServerState::Leader {
+                    let propose_ok = match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!(
+                                "RaftNodeV2: node={} Leader but ensure_linearizable failed: \
+                                 {:?} (may be transient quorum loss)",
+                                node_id, e
+                            );
+                            false
+                        }
+                    };
+
+                    if !propose_ok {
+                        let now = tokio::time::Instant::now();
+                        if fake_leader_since.is_none() {
+                            fake_leader_since = Some(now);
+                        }
+                        let elapsed = now.duration_since(fake_leader_since.unwrap());
+
+                        if elapsed >= fake_leader_threshold {
+                            // 假 Leader 超过阈值 → 停止服务
+                            if !was_unavailable {
+                                log::warn!(
+                                    "RaftNodeV2: node={} fake Leader for {:?} \
+                                     (lease expired, propose failing); \
+                                     marking raft UNAVAILABLE — stopping service",
+                                    node_id,
+                                    elapsed
+                                );
+                                raft_unavailable.store(true, Ordering::Relaxed);
+                                was_unavailable = true;
+                            } else {
+                                // 已停止服务, 每 60s 打一次日志
+                                if elapsed.as_secs() % 60 < check_interval.as_secs() {
+                                    log::warn!(
+                                        "RaftNodeV2: node={} still fake Leader, \
+                                         raft UNAVAILABLE for {:?}; \
+                                         waiting for quorum recovery",
+                                        node_id,
+                                        elapsed
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        // propose 成功 → 恢复服务
+                        if was_unavailable {
+                            info!(
+                                "RaftNodeV2: node={} raft recovered — propose working again, \
+                                 resuming service",
+                                node_id
+                            );
+                            raft_unavailable.store(false, Ordering::Relaxed);
+                            was_unavailable = false;
+                        }
+                        fake_leader_since = None;
                     }
                 } else {
-                    // 有 leader, 重置计时器
-                    if no_leader_since.is_some() {
+                    // 非 Leader 状态 (Follower/Candidate) — 重置假 Leader 计时器
+                    if fake_leader_since.is_some() {
                         info!(
-                            "RaftNodeV2: node={} recovered — leader now known (state={:?}, leader={:?})",
-                            node_id, current_state, metrics.current_leader
+                            "RaftNodeV2: node={} left Leader state (now {:?}); \
+                             fake Leader timer cleared",
+                            node_id, current_state
                         );
-                        no_leader_since = None;
+                        fake_leader_since = None;
+                    }
+                    // Follower 的 raft 请求由 Leader 处理, 不需要停止服务
+                    if was_unavailable {
+                        raft_unavailable.store(false, Ordering::Relaxed);
+                        was_unavailable = false;
                     }
                 }
             }

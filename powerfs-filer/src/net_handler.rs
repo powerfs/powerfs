@@ -1177,7 +1177,7 @@ impl FilerNetHandler {
             let mut parsed: Option<ShardId> = None;
             if let Some(rest) = err.strip_prefix("not_leader:") {
                 // grab the next token after whitespace, expect "shard"
-                let mut tok = rest.trim().split_whitespace();
+                let mut tok = rest.split_whitespace();
                 if let (Some(k), Some(num)) = (tok.next(), tok.next()) {
                     if k == "shard" {
                         if let Ok(n) = num.parse::<u64>() {
@@ -3878,6 +3878,69 @@ impl FilerNetHandler {
         ))
     }
 
+    /// Handle `MsgType::FilerRaftStatus` — Master control-plane query.
+    ///
+    /// Returns this filer node's Raft health for every shard so the Master
+    /// can detect fake Leaders (Leader state but `is_lease_valid=false`) and
+    /// remove the node from the routing table. See
+    /// `docs/raft_fault_tolerance_design.md` §filer-side.
+    ///
+    /// **Important**: this handler must NOT depend on the local node being
+    /// Raft Leader — it is a read-only status query and must succeed even
+    /// when the node is a fake Leader (so the Master can detect it). The
+    /// `is_lease_valid` probe uses `ensure_linearizable(ReadIndex)` which is
+    /// the canonical Openraft fake-Leader detector.
+    async fn handle_filer_raft_status(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let report = self.meta_shard_manager.get_raft_status_report().await;
+
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_u64(FieldId::Limit, report.len() as u64);
+
+        for s in &report {
+            // Manual ServerState → u8 mapping (openraft enum has no repr):
+            //   1=Learner 2=Follower 3=Candidate 4=Leader 5=Shutdown
+            let state_u8: u8 = match s.state {
+                openraft::ServerState::Learner => 1,
+                openraft::ServerState::Follower => 2,
+                openraft::ServerState::Candidate => 3,
+                openraft::ServerState::Leader => 4,
+                openraft::ServerState::Shutdown => 5,
+            };
+
+            // flags: bit0=has_peers, bit1=running_state_ok, bit2=is_lease_valid
+            let mut flags: u64 = 0;
+            if s.has_peers {
+                flags |= 1 << 0;
+            }
+            if s.running_state_ok {
+                flags |= 1 << 1;
+            }
+            if s.is_lease_valid {
+                flags |= 1 << 2;
+            }
+
+            let _ = enc.add_u64(FieldId::Ino, s.shard_id);
+            let _ = enc.add_u8(FieldId::Mode, state_u8);
+            let _ = enc.add_string(FieldId::Owner, &s.leader_addr);
+            let _ = enc.add_u64(FieldId::Cookie, s.current_term);
+            let _ = enc.add_u64(FieldId::Entries, flags);
+            let _ = enc.add_u64(FieldId::FileKey, s.commit_index);
+            let _ = enc.add_u64(FieldId::UsedSpace, s.last_applied);
+        }
+
+        debug!(
+            "FILER_RAFT_STATUS: returning {} shard statuses (fake-leader shards: {:?})",
+            report.len(),
+            report
+                .iter()
+                .filter(|s| s.is_leader && !s.is_lease_valid && s.has_peers)
+                .map(|s| s.shard_id)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+    }
+
     // ===== §13 Capability model handlers =====
 
     /// Handle CapOpenGrant (§13 — open never blocks).
@@ -4377,6 +4440,11 @@ impl NetHandler for FilerNetHandler {
             MsgType::RenewInodeLease => self.handle_renew_inode_lease(msg).await,
             MsgType::RevokeInodeLeaseAck => self.handle_revoke_ack_inode_lease(msg).await,
             MsgType::RaftMessage => self.handle_raft_message(msg).await,
+            // Master control-plane query: returns this filer's Raft health
+            // (shard state + lease validity) so the Master can detect fake
+            // Leaders and remove them from the routing table. See
+            // `docs/raft_fault_tolerance_design.md`.
+            MsgType::FilerRaftStatus => self.handle_filer_raft_status(msg).await,
             // §13 Capability model — open_grant 需要 ctx 填充双向 client_id 映射
             MsgType::CapOpenGrant => self.handle_cap_open_grant(ctx, msg).await,
             MsgType::CapRecallAck => self.handle_cap_recall_ack(msg).await,

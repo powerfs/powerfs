@@ -57,6 +57,7 @@ fn test_facade_config_custom_values() {
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
         force_mount: false,
+        client_cert_pem: None,
     };
 
     assert_eq!(config.master_addrs.len(), 2);

@@ -35,6 +35,16 @@ use log::{debug, warn};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Result of evicting a client from the lock arbiter:
+/// `(changed_inodes, promote_tasks)` where
+/// - `changed_inodes`: `Vec<(inode, LockType)>` — locks the client held
+/// - `promote_tasks`: `Vec<(inode, LockType, surviving_client, new_sn, upgraded_caps)>`
+///   — single remaining holder to be promoted to LONER
+pub type EvictClientResult = (
+    Vec<(u64, LockType)>,
+    Vec<(u64, LockType, String, u64, CapSet)>,
+);
 use tokio::sync::oneshot;
 
 /// 锁状态机类别 — 对齐  4 套锁状态机
@@ -536,6 +546,7 @@ impl MdLock {
     /// - `unlock` 后只剩 1 个 holder
     /// - `tick` 过期清理后只剩 1 个 holder
     /// - `evict_client` 清理后只剩 1 个 holder
+    ///
     /// 调用方需在调用后通过 `wake_waiters`/通知机制下发新 cap 给客户端。
     ///
     /// 选择策略: 在多 holder 共存场景下 (LONER writer + readers),
@@ -699,9 +710,7 @@ impl LockArbiter {
         lock.holders.push(holder);
 
         // 状态转移
-        if lock.state == LockState::Available {
-            lock.state = LockState::Shared;
-        } else if lock.state == LockState::Loner {
+        if lock.state == LockState::Available || lock.state == LockState::Loner {
             lock.state = LockState::Shared;
         }
 
@@ -1107,10 +1116,8 @@ impl LockArbiter {
                     lock.state = LockState::Available;
                     wake_needed = true;
                 }
-                LockState::Dscatter => {
-                    if lock.holders.is_empty() {
-                        lock.state = LockState::Inactive;
-                    }
+                LockState::Dscatter if lock.holders.is_empty() => {
+                    lock.state = LockState::Inactive;
                 }
                 _ => {}
             }
@@ -1800,13 +1807,7 @@ impl LockArbiter {
     /// 对齐  session 销毁时 Locker 清理该 session 全部 cap/lease
     /// 遍历所有 inode 的所有锁类型, 移除该 client 的 holder
     /// 返回 (inode, LockType) 列表供调用方触发 wake_waiters + Loner 升级通知
-    pub fn evict_client(
-        &self,
-        client_id: &str,
-    ) -> (
-        Vec<(u64, LockType)>,
-        Vec<(u64, LockType, String, u64, CapSet)>,
-    ) {
+    pub fn evict_client(&self, client_id: &str) -> EvictClientResult {
         let mut locks = self.locks.lock().unwrap();
         let mut changed_inodes: Vec<(u64, LockType)> = Vec::new();
         // (inode, lock_type, surviving_client, new_sn, upgraded_caps)
@@ -2060,8 +2061,8 @@ impl LockArbiter {
     // ==================== 内部辅助 ====================
 
     fn ensure_init_locked(locks: &mut HashMap<u64, [MdLock; LockType::NUM_TYPES]>, inode: u64) {
-        if !locks.contains_key(&inode) {
-            let arr: [MdLock; LockType::NUM_TYPES] = [
+        locks.entry(inode).or_insert_with(|| {
+            [
                 MdLock::new(LockType::Auth),
                 MdLock::new(LockType::Link),
                 MdLock::new(LockType::Xattr),
@@ -2070,9 +2071,8 @@ impl LockArbiter {
                 MdLock::new(LockType::File),
                 MdLock::new(LockType::Dft),
                 MdLock::new(LockType::Nest),
-            ];
-            locks.insert(inode, arr);
-        }
+            ]
+        });
     }
 }
 
