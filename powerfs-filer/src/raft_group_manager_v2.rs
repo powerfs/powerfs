@@ -21,6 +21,7 @@ use log::{debug, info, warn};
 use openraft::alias::LogIdOf;
 use openraft::async_runtime::WatchReceiver;
 use openraft::Raft;
+use openraft::ReadPolicy;
 use openraft::ServerState;
 use powerfs_raft::multi::MultiRaftRouter;
 use powerfs_raft::multi::MultiRaftServiceImpl;
@@ -593,6 +594,36 @@ impl RaftGroupManagerV2 {
         } else {
             false
         }
+    }
+
+    /// Ensure linearizable read on the local node for `shard_id`.
+    ///
+    /// When the local node is a **follower** of this shard, its RocksDB state
+    /// machine may lag behind the leader's committed log. A read issued
+    /// immediately after a leader-side propose (e.g. `unlink` on the leader
+    /// followed by `rmdir` on a different shard leader that reads this shard
+    /// as a follower) can observe a stale dir entry and wrongly return
+    /// ENOTEMPTY.
+    ///
+    /// `ensure_linearizable()` blocks until the local Raft state machine has
+    /// applied up to the leader's current commit index, guaranteeing the
+    /// subsequent local read reflects all committed writes. On the leader it
+    /// is effectively a no-op (leader apply is already up-to-date).
+    ///
+    /// Returns `Ok(())` if the local state is linearizable, or `Err` if the
+    /// shard is unknown / Raft unavailable (caller should treat as "cannot
+    /// confirm empty" and let the strict check proceed with its own logic).
+    pub async fn ensure_linearizable(&self, shard_id: ShardId) -> Result<(), String> {
+        let group = self
+            .get_group(shard_id)
+            .await
+            .ok_or_else(|| format!("shard {} not found", shard_id.0))?;
+        group
+            .raft
+            .ensure_linearizable(ReadPolicy::ReadIndex)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("ensure_linearizable shard {}: {}", shard_id.0, e))
     }
 
     /// Spawn a background task that watches for leadership changes on the

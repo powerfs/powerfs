@@ -141,11 +141,10 @@ impl MasterStatsReporter {
         // `TopologyChanged` frames mark the topology stale, and
         // `DebugConfigChanged` frames apply pushed debug config immediately.
         let node_id = self.config.client_id.clone();
-        let handler: Arc<dyn NotificationHandler + Send + Sync> =
-            Arc::new(ClusterEventHandler {
-                topology_dirty: self.topology_dirty.clone(),
-                node_id,
-            });
+        let handler: Arc<dyn NotificationHandler + Send + Sync> = Arc::new(ClusterEventHandler {
+            topology_dirty: self.topology_dirty.clone(),
+            node_id,
+        });
         self.master_client.set_notification_handler(handler);
 
         let config = self.config.clone();

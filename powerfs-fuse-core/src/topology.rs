@@ -650,16 +650,18 @@ impl MasterClient {
     ) -> Result<powerfs_net::serialize::DebugConfig, MasterClientError> {
         use powerfs_net::serialize::{decode_get_debug_config_resp, encode_get_debug_config_req};
 
-        let body = encode_get_debug_config_req(node_id)
-            .map_err(|e| MasterClientError::ConnectionFailed(format!("encode GetDebugConfig req: {}", e)))?;
+        let body = encode_get_debug_config_req(node_id).map_err(|e| {
+            MasterClientError::ConnectionFailed(format!("encode GetDebugConfig req: {}", e))
+        })?;
 
         let resp = self
             .tlv_client
             .submit_request(net::MsgType::GetDebugConfig, &body)
             .await?;
 
-        decode_get_debug_config_resp(&resp.body)
-            .map_err(|e| MasterClientError::ConnectionFailed(format!("decode GetDebugConfig resp: {}", e)))
+        decode_get_debug_config_resp(&resp.body).map_err(|e| {
+            MasterClientError::ConnectionFailed(format!("decode GetDebugConfig resp: {}", e))
+        })
     }
 
     /// 断开连接

@@ -343,10 +343,11 @@ impl MasterNetHandler {
                     Vec::new(),
                 ));
             }
-            if let Err(e) = self
-                .master
-                .validate_server_node_cert(&client_cert_pem, Some(&peer_ip), &node_id_str)
-            {
+            if let Err(e) = self.master.validate_server_node_cert(
+                &client_cert_pem,
+                Some(&peer_ip),
+                &node_id_str,
+            ) {
                 warn!(
                     "NET_HEARTBEAT: rejected node={} peer={} — {}",
                     node_id_str, peer_ip, e
@@ -1101,9 +1102,9 @@ impl MasterNetHandler {
                     Vec::new(),
                 ));
             }
-            if let Err(e) = self
-                .master
-                .validate_server_node_cert(&client_cert_pem, Some(&peer_ip), &filer_id)
+            if let Err(e) =
+                self.master
+                    .validate_server_node_cert(&client_cert_pem, Some(&peer_ip), &filer_id)
             {
                 warn!(
                     "NET_REGISTER_FILER: rejected filer={} peer={} — {}",

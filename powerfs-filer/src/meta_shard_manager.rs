@@ -1675,7 +1675,32 @@ impl MetaShardManager {
         // `list_directory` (reads from in-memory cache) to avoid stale
         // entries from OR-Set sync re-adding deleted dir entries via
         // `create_inode_atomic`, which would cause spurious ENOTEMPTY.
-        if !self.is_directory_empty_strict(child_inode) {
+        //
+        // CRITICAL: Retry on ENOTEMPTY. This rmdir runs on the parent-shard
+        // leader (e.g. filer-3 for root), but `is_directory_empty_strict`
+        // reads the *child* dir's shard, whose leader may be a different
+        // node (e.g. filer-1). The local RocksDB is a follower replica for
+        // the child shard, and its apply lags behind the leader. A prior
+        // `unlink(child)` committed on the child-shard leader may not yet be
+        // applied locally, so the strict check sees a stale dir entry and
+        // wrongly returns "not empty".
+        //
+        // openraft's `ensure_linearizable()` cannot help here: on a follower
+        // it returns ForwardToLeader (it does not block for local apply).
+        // The standard Raft remedy for read-your-writes across shards on a
+        // follower replica is to retry briefly until the local apply catches
+        // up. This mirrors Ceph MDS client retry on cross-MDS metadata
+        // forward. Total worst-case wait 30ms (15 × 2ms); typical follower
+        // apply lag is <5ms.
+        let mut last_empty = self.is_directory_empty_strict(child_inode);
+        for _ in 0..15 {
+            if last_empty {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+            last_empty = self.is_directory_empty_strict(child_inode);
+        }
+        if !last_empty {
             return Err("directory not empty".to_string());
         }
 
@@ -2241,7 +2266,17 @@ impl MetaShardManager {
 
         // Resolve each inode and check if any are live (not tombstoned)
         let stores = self.shard_stores.read().unwrap();
-        for (_name, inode) in pairs {
+        for (name, inode) in pairs {
+            // MetaCache filter: a dir entry staged as Deleted by a prior
+            // unlink/rename (Raft proposed but not yet applied to RocksDB)
+            // must be treated as gone. Without this, `unlink(file)` followed
+            // immediately by `rmdir(parent_dir)` reads the stale RocksDB
+            // dir entry and returns ENOTEMPTY (T3-3f / rm -rf regression).
+            // get_direntry returns Some(None) for staged-deleted entries.
+            if let Some(None) = self.meta_cache.get_direntry(parent_inode, &name) {
+                continue;
+            }
+
             let inode_shard = self.shard_strategy.calculate_shard(inode);
             if let Some(shard_store) = stores.get(&inode_shard) {
                 if let Some(info) = shard_store.get_inode(inode) {

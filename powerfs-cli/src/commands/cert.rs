@@ -312,14 +312,32 @@ fn sign_node(args: &SignNodeArgs) -> CommandResult {
     }
 
     println!("Storage node certificate saved to {}", cert_path.display());
-    println!("Storage node private key saved to  {} (mode 0600)", key_path.display());
+    println!(
+        "Storage node private key saved to  {} (mode 0600)",
+        key_path.display()
+    );
     println!();
-    println!("Deploy these files to the {} node.  Add to its config:", args.node_id);
-    println!("  [filer]   client_crt = {}  (path inside the node)", cert_path.display());
-    println!("  [volume]   client_crt = {}  (path inside the node)", cert_path.display());
+    println!(
+        "Deploy these files to the {} node.  Add to its config:",
+        args.node_id
+    );
+    println!(
+        "  [filer]   client_crt = {}  (path inside the node)",
+        cert_path.display()
+    );
+    println!(
+        "  [volume]   client_crt = {}  (path inside the node)",
+        cert_path.display()
+    );
     println!();
-    println!("The master will validate this cert against node_id='{}' and", args.node_id);
-    println!("the caller's source IP ({:?}).  A cert stolen to a different", args.san_ips);
+    println!(
+        "The master will validate this cert against node_id='{}' and",
+        args.node_id
+    );
+    println!(
+        "the caller's source IP ({:?}).  A cert stolen to a different",
+        args.san_ips
+    );
     println!("IP or used with a different node_id will be rejected.");
 
     Ok(())

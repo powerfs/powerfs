@@ -271,9 +271,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pem
             }
             Err(e) => {
-                error!("VOLUME: failed to read client cert {}: {}. \
+                error!(
+                    "VOLUME: failed to read client cert {}: {}. \
                        Master cert enforcement will reject this volume server.",
-                       path, e);
+                    path, e
+                );
                 String::new()
             }
         },
@@ -289,7 +291,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let push_master_net_addrs: Vec<(String, u16)> = master_address
             .iter()
             .map(|addr| {
-                let ip = addr.rfind(':').map(|i| &addr[..i]).unwrap_or(addr).to_string();
+                let ip = addr
+                    .rfind(':')
+                    .map(|i| &addr[..i])
+                    .unwrap_or(addr)
+                    .to_string();
                 (ip, push_master_net_port)
             })
             .collect();
@@ -308,9 +314,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if msg.msg_type() == Some(MsgType::DebugConfigChanged) {
                         match powerfs_net::serialize::decode_get_debug_config_resp(&msg.body) {
                             Ok(cfg) => {
-                                powerfs_common::debug_config_poller::apply_config(&cfg, &self.node_id);
+                                powerfs_common::debug_config_poller::apply_config(
+                                    &cfg,
+                                    &self.node_id,
+                                );
                             }
-                            Err(e) => warn!("VOLUME_DEBUG_PUSH: DebugConfigChanged decode err: {}", e),
+                            Err(e) => {
+                                warn!("VOLUME_DEBUG_PUSH: DebugConfigChanged decode err: {}", e)
+                            }
                         }
                     }
                 }
@@ -321,7 +332,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 client_cert_pem: push_cert,
                 ..Default::default()
             };
-            let tlv_client = Arc::new(TlvMasterClient::new(push_master_net_addrs.clone(), tlv_config));
+            let tlv_client = Arc::new(TlvMasterClient::new(
+                push_master_net_addrs.clone(),
+                tlv_config,
+            ));
 
             let handler: Arc<dyn NotificationHandler + Send + Sync> =
                 Arc::new(DebugConfigPushHandler {
@@ -336,11 +350,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .await
                     {
                         Ok(resp) => {
-                            match powerfs_net::serialize::decode_get_debug_config_resp(&resp.body)
-                            {
+                            match powerfs_net::serialize::decode_get_debug_config_resp(&resp.body) {
                                 Ok(cfg) => {
                                     powerfs_common::debug_config_poller::apply_config(
-                                        &cfg, &push_node_id,
+                                        &cfg,
+                                        &push_node_id,
                                     );
                                 }
                                 Err(e) => warn!(
@@ -355,10 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                     }
                 }
-                Err(e) => warn!(
-                    "VOLUME_DEBUG_PUSH: encode GetDebugConfig req failed: {}",
-                    e
-                ),
+                Err(e) => warn!("VOLUME_DEBUG_PUSH: encode GetDebugConfig req failed: {}", e),
             }
 
             info!(

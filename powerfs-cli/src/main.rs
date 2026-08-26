@@ -8,10 +8,11 @@ mod kv_client;
 mod volume_client;
 
 use commands::{
-    AssignArgs, CertSubcommand, ClusterAddArgs, ClusterRemoveArgs, ClusterStatusArgs,
-    ClusterTransferArgs, CollectionArgs, CompactArgs, ConfigGenArgs, ConflictsArgs, DebugArgs,
-    FilerStatsArgs, FsckArgs, FuseStatsArgs, GrowArgs, HeartbeatArgs, KvArgs, LookupArgs,
-    ManageArgs, MountArgs, ReadArgs, StatusArgs, TopologyArgs, VolumeListArgs, WriteArgs,
+    AdminSubcommand, AssignArgs, CertSubcommand, ClusterAddArgs, ClusterRemoveArgs,
+    ClusterStatusArgs, ClusterTransferArgs, CollectionArgs, CompactArgs, ConfigGenArgs,
+    ConflictsArgs, DebugArgs, FilerStatsArgs, FsckArgs, FuseStatsArgs, GrowArgs, HeartbeatArgs,
+    KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs, StatusArgs, TopologyArgs, VolumeListArgs,
+    WriteArgs,
 };
 
 /// `powerfs-cli config` subcommands.
@@ -117,6 +118,13 @@ enum Commands {
     /// Allocator management API (placement strategy, volume pin, node maintenance, migrations)
     Manage(ManageArgs),
 
+    /// Admin helpers (token generation for cluster bootstrap). Pure-local,
+    /// no master network round-trip required.
+    Admin {
+        #[command(subcommand)]
+        command: AdminSubcommand,
+    },
+
     /// Certificate management (init-ca, sign-client, sign-server)
     /// Connects to master CA API, requires admin token.
     Cert {
@@ -138,9 +146,10 @@ async fn main() {
     };
     env_logger::Builder::new().filter_level(log_level).init();
 
-    // `config` and `cert` subcommands do not require a master gRPC connection;
-    // they use local file I/O (config) or raw HTTP to the master admin API
-    // (cert). Handle them before creating the MasterClient.
+    // `config`, `cert`, and `admin` subcommands do not require a master
+    // gRPC connection: they use local file I/O (config), raw HTTP to the
+    // master admin API (cert), or pure local computation (admin
+    // generate-token). Handle them before creating the MasterClient.
     if let Commands::Config { command } = cli.command {
         match command {
             ConfigSubcommand::Gen(args) => {
@@ -154,6 +163,13 @@ async fn main() {
     }
     if let Commands::Cert { command } = cli.command {
         if let Err(e) = commands::cert(command) {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Commands::Admin { command } = cli.command {
+        if let Err(e) = commands::admin(command) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -194,6 +210,7 @@ async fn main() {
         Commands::FilerStats(args) => commands::filer_stats(client, args).await,
         Commands::Config { .. } => unreachable!("handled above"),
         Commands::Cert { .. } => unreachable!("handled above"),
+        Commands::Admin { .. } => unreachable!("handled above"),
         Commands::Manage(args) => commands::manage(client, args).await,
     };
 
