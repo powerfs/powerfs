@@ -57,6 +57,11 @@ pub struct MasterNode {
     raft_id: u64,
     raft_address: String,
     is_leader: Arc<AtomicBool>,
+    /// Raft 不可用标志（方案 C：假 Leader 时停止服务，不退出进程）
+    /// 当 Leader lease 过期但状态仍为 Leader（假 Leader）时设为 true，
+    /// net_handler 拒绝需要 raft 的请求（返回 UNAVAILABLE）。
+    /// quorum 恢复后 health monitor 清除此标志，立即恢复服务。
+    raft_unavailable: Arc<AtomicBool>,
     leader_address: Arc<StdRwLock<String>>,
     raft_term: RwLock<u64>,
     next_volume_id: RwLock<u64>,
@@ -461,9 +466,10 @@ impl MasterNode {
 
         // openraft is self-driven (internal tick + network threads); no run() loop needed.
 
-        // 启动 Raft 状态健康监控: 长时间无 leader 时自动退出进程,
-        // 交由 Docker restart policy 重启, 防止异常节点 forward None 死循环.
-        raft_v2.spawn_health_monitor(!peer_list.is_empty());
+        // 启动 Raft 状态健康监控 (方案 C: 假 Leader 时停止服务, 不退出进程).
+        // raft_unavailable 标志由 health monitor 设置, net_handler 检查后拒绝 raft 请求.
+        let raft_unavailable = Arc::new(AtomicBool::new(false));
+        raft_v2.spawn_health_monitor(!peer_list.is_empty(), raft_unavailable.clone());
 
         let mut collections = HashMap::new();
         collections.insert(
@@ -533,6 +539,7 @@ impl MasterNode {
             raft_id,
             raft_address: raft_address.to_string(),
             is_leader: leader_state,
+            raft_unavailable,
             leader_address,
             raft_term: RwLock::new(1),
             next_volume_id: RwLock::new(1),
@@ -911,6 +918,93 @@ impl MasterNode {
         Self::calculate_shard(inode)
     }
 
+    /// Mark a registered filer as healthy / unhealthy and update the routing
+    /// table accordingly. Called by the control-plane fake-Leader monitor
+    /// (`filer_raft_monitor::spawn_filer_raft_monitor`).
+    ///
+    /// **unhealthy = true**: the filer's `is_healthy` flag is cleared and all
+    /// its shard routes are removed from `shard_mapping`, so
+    /// `get_filer_for_inode` stops returning this filer's address. Clients
+    /// connected via `list_filers` see `is_healthy=false` and route around it.
+    ///
+    /// **unhealthy = false**: the filer's `is_healthy` flag is set and its
+    /// shard routes are restored in `shard_mapping`.
+    ///
+    /// In both cases a `TopologyChanged` notification is broadcast so
+    /// connected FUSE/kernel clients re-fetch the topology immediately.
+    ///
+    /// **Quorum-safety**: this does NOT modify `shard_leaders` (Raft leader
+    /// table) — that table is owned by `ShardLeaderUpdate` notifications
+    /// from the filers themselves. Marking a filer unhealthy only affects
+    /// the Master's routing advertisement, not Raft membership.
+    pub fn set_filer_unhealthy(&self, node_id: &str, unhealthy: bool) {
+        let mut filer_nodes = self.filer_nodes.write().unwrap();
+        let mut shard_mapping = self.shard_mapping.write().unwrap();
+
+        let Some(info) = filer_nodes.get_mut(node_id) else {
+            warn!(
+                "set_filer_unhealthy: filer {} not registered (already removed?)",
+                node_id
+            );
+            return;
+        };
+
+        let changed = info.is_healthy != !unhealthy;
+        if !changed {
+            debug!(
+                "set_filer_unhealthy: filer={} already {} (no-op)",
+                node_id,
+                if unhealthy { "unhealthy" } else { "healthy" }
+            );
+            return;
+        }
+
+        info.is_healthy = !unhealthy;
+        let address = info.address.clone();
+        let shard_ids = info.shard_ids.clone();
+
+        if unhealthy {
+            // Remove this filer's shard routes so clients stop routing to it.
+            let mut removed = Vec::new();
+            for &sid in &shard_ids {
+                let was = shard_mapping.get(&sid).cloned();
+                if was.as_deref() == Some(address.as_str()) {
+                    shard_mapping.remove(&sid);
+                    removed.push(sid);
+                }
+            }
+            warn!(
+                "set_filer_unhealthy: filer={} marked UNHEALTHY — removed {} shard routes: {:?}",
+                node_id,
+                removed.len(),
+                removed
+            );
+        } else {
+            // Restore this filer's shard routes.
+            let mut restored = Vec::new();
+            for &sid in &shard_ids {
+                shard_mapping.insert(sid, address.clone());
+                restored.push(sid);
+            }
+            info!(
+                "set_filer_unhealthy: filer={} marked HEALTHY — restored {} shard routes: {:?}",
+                node_id,
+                restored.len(),
+                restored
+            );
+        }
+
+        drop(filer_nodes);
+        drop(shard_mapping);
+
+        // Broadcast TopologyChanged so clients re-fetch routing immediately.
+        let n = self.broadcast_topology_changed();
+        info!(
+            "set_filer_unhealthy: broadcast TopologyChanged to {} clients (filer={}, unhealthy={})",
+            n, node_id, unhealthy
+        );
+    }
+
     pub fn list_filers(&self) -> Vec<FilerNodeInfo> {
         self.filer_nodes.read().unwrap().values().cloned().collect()
     }
@@ -1043,6 +1137,16 @@ impl MasterNode {
         self.is_leader.store(is_leader, Ordering::Relaxed);
     }
 
+    /// 检查 Raft 是否可用（非假 Leader 状态）
+    pub fn is_raft_available(&self) -> bool {
+        !self.raft_unavailable.load(Ordering::Relaxed)
+    }
+
+    /// 设置 Raft 不可用标志（health monitor 调用）
+    pub fn set_raft_unavailable(&self, unavailable: bool) {
+        self.raft_unavailable.store(unavailable, Ordering::Relaxed);
+    }
+
     /// Propose a command to the Raft cluster
     ///
     /// The command is applied directly to the local state machine for immediate
@@ -1053,6 +1157,13 @@ impl MasterNode {
     pub async fn propose_command(&self, cmd: RaftCommand) -> Result<u64> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
+        }
+        // 方案 C: 假 Leader 时 raft_unavailable=true, 拒绝 propose
+        // 避免 "forward to: None, None" 死循环 + CPU 消耗
+        if !self.is_raft_available() {
+            return Err(PowerFsError::Unavailable(
+                "raft temporarily unavailable (fake Leader — lease expired)".to_string(),
+            ));
         }
 
         // Apply directly to local state machine for immediate visibility.
@@ -3762,6 +3873,31 @@ impl MasterNode {
             }
         }
 
+        // Start the filer fake-Leader control-plane monitor.
+        //
+        // Only the Raft leader should run the monitor: followers do not own
+        // the routing table and cannot serve `list_filers` authoritatively.
+        // The monitor self-gates on `is_leader`/`is_raft_available` (it calls
+        // `set_filer_unhealthy` which is harmless on a follower, but to avoid
+        // split-brain we skip polling entirely when not the leader).
+        //
+        // The `ClientConnPool` is built per-master and reused for the
+        // lifetime of the process. Connections to filers are lazy — only
+        // established when the first poll runs.
+        {
+            // Use a stable client_id for the control-plane pool: the master's
+            // own node id (parsed to u64) keeps it distinct from FUSE clients.
+            let cp_client_id: u64 = self
+                .raft_id
+                .to_string()
+                .parse()
+                .unwrap_or(0xDEAD_BEEF_0000_0001);
+            let pool = crate::filer_raft_monitor::build_filer_control_pool(cp_client_id);
+            let master_for_monitor = self.clone();
+            crate::filer_raft_monitor::spawn_filer_raft_monitor(master_for_monitor, pool);
+            info!("Filer fake-Leader control-plane monitor started");
+        }
+
         // Start HTTP metrics + cert API server.
         // Port is read explicitly from config metrics_port, no port arithmetic.
         // Exposes: GET /metrics (Prometheus scrape endpoint) and the
@@ -3837,6 +3973,7 @@ impl Clone for MasterNode {
             raft_id: self.raft_id,
             raft_address: self.raft_address.clone(),
             is_leader: self.is_leader.clone(),
+            raft_unavailable: self.raft_unavailable.clone(),
             leader_address: self.leader_address.clone(),
             raft_term: RwLock::new(*self.raft_term.read().unwrap()),
             next_volume_id: RwLock::new(*self.next_volume_id.read().unwrap()),

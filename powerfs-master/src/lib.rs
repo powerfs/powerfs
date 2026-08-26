@@ -4,6 +4,7 @@ pub mod collection;
 pub mod debug_config;
 pub mod filer_client;
 pub mod filer_proto;
+pub mod filer_raft_monitor;
 pub mod kv_cache_service;
 pub mod lock_manager;
 pub mod master;

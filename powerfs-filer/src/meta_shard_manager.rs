@@ -3872,6 +3872,14 @@ impl MetaShardManager {
         self.raft_group_manager.get_node_address().to_string()
     }
 
+    /// Collect Raft status for all shards (Master control-plane fake-Leader
+    /// detection). See `RaftGroupManagerV2::get_raft_status_report`.
+    pub async fn get_raft_status_report(
+        &self,
+    ) -> Vec<crate::raft_group_manager_v2::ShardRaftStatus> {
+        self.raft_group_manager.get_raft_status_report().await
+    }
+
     /// 批量分配 inode 区间（leader 单点 + CF_METADATA 持久化，§4 1.4）。
     /// fuse 在区间内本地分配，写路径零等待。
     pub async fn alloc_inode_batch(

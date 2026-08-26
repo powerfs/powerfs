@@ -15,10 +15,13 @@ use std::time::Duration;
 
 // ==================== 测试辅助: 捕获 recall 推送的 CapRevoker ====================
 
+/// Record of a single recall invocation: `(inode, client_id, net_addr, recalled_caps, remaining_caps, sn)`.
+type RecallRecord = (u64, String, String, CapSet, CapSet, u64);
+
 /// 测试用 CapRevoker — 记录所有 recall 调用供断言.
 #[derive(Debug, Default)]
 struct CapturingRevoker {
-    recalls: Mutex<Vec<(u64, String, String, CapSet, CapSet, u64)>>,
+    recalls: Mutex<Vec<RecallRecord>>,
 }
 
 impl CapturingRevoker {

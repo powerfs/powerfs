@@ -329,6 +329,7 @@ async fn test_facade_end_to_end_with_mock_servers() {
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
         force_mount: false,
+        client_cert_pem: None,
     };
 
     let facade = FuseClientFacade::new(config)
@@ -597,6 +598,7 @@ async fn test_facade_volume_provider_with_mock() {
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
         force_mount: false,
+        client_cert_pem: None,
     };
 
     let facade = Arc::new(FuseClientFacade::new(config).await.unwrap());
@@ -724,6 +726,7 @@ async fn test_facade_metadata_provider_with_mock() {
         lease_duration_ms: 30_000,
         lease_renew_interval_ms: 10_000,
         force_mount: false,
+        client_cert_pem: None,
     };
 
     let facade = Arc::new(FuseClientFacade::new(config).await.unwrap());

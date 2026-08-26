@@ -24,7 +24,7 @@
 //! - `SnAllocator` / 全局 `epoch` / 全局 `cap_id_alloc` (由 `LockArbiter` 内部维护)
 //! - `logical_state` / `holder_count` / `validate_cap` (基于旧状态机的观察 API)
 
-use crate::lock_arbiter::{LockArbiter, LockType};
+use crate::lock_arbiter::{EvictClientResult, LockArbiter, LockType};
 use crate::meta_cache::MetaCache;
 use std::collections::HashSet;
 use std::ops::BitOr;
@@ -542,13 +542,7 @@ impl CapManager {
     /// **Stage 4 重构**: 删除旧 `close_session(Vec<(u64,u64)>)` 占位契约,
     /// 只保留此完整版 — 调用方必须处理 promote_tasks (Stage 4 net_handler
     /// 的 `on_disconnect` 负责下发).
-    pub fn evict_session_full(
-        &self,
-        client_id: &str,
-    ) -> (
-        Vec<(u64, LockType)>,
-        Vec<(u64, LockType, String, u64, CapSet)>,
-    ) {
+    pub fn evict_session_full(&self, client_id: &str) -> EvictClientResult {
         let (changed_inodes, promote_tasks) = self.arbiter.evict_client(client_id);
 
         for (inode, lt) in &changed_inodes {

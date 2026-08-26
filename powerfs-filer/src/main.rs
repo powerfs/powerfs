@@ -196,9 +196,10 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 client_cert_pem: push_client_cert,
                 ..Default::default()
             };
-            let tlv_client = match TlvMasterClient::new(push_master_net_addrs.clone(), tlv_config) {
-                c => Arc::new(c),
-            };
+            let tlv_client = Arc::new(TlvMasterClient::new(
+                push_master_net_addrs.clone(),
+                tlv_config,
+            ));
 
             let handler: Arc<dyn NotificationHandler + Send + Sync> =
                 Arc::new(DebugConfigPushHandler {
@@ -377,8 +378,10 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         info!("Shard {} initialized", i);
     }
 
-    // 启动 Raft 状态健康监控: 所有 shard 长时间无 leader 时自动退出进程,
-    // 交由 Docker restart policy 重启, 防止异常节点干扰集群.
+    // 启动 Raft 状态健康监控: 只检测 Openraft running_state Fatal 错误
+    // (存储损坏 / apply panic), 立即退出由 Docker restart policy 重启.
+    // 假 Leader 检测已移交 Master 控制面 (见 filer_raft_monitor +
+    // docs/raft_fault_tolerance_design.md), filer 不再因假 Leader 退出.
     raft_group_manager.spawn_health_monitor().await;
 
     // Spawn per-shard leader-change notifiers: when this filer gains/loses

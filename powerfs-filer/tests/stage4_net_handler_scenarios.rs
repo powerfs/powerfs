@@ -23,11 +23,13 @@ use std::time::Duration;
 
 // ==================== 测试辅助: 捕获 recall + upgrade 推送 ====================
 
-/// 测试用 CapRevoker — 记录所有 recall 调用供断言.
+/// Record of a single recall invocation: `(inode, client_id, net_addr, recalled_caps, remaining_caps, sn)`.
+type RecallRecord = (u64, String, String, CapSet, CapSet, u64);
+
 /// 模拟 net_handler 的 NetCapRevoker (实际推 CapRecallNotify 给客户端).
 #[derive(Debug, Default)]
 struct CapturingRevoker {
-    recalls: Mutex<Vec<(u64, String, String, CapSet, CapSet, u64)>>,
+    recalls: Mutex<Vec<RecallRecord>>,
 }
 
 impl CapturingRevoker {
@@ -387,10 +389,8 @@ fn s4_6_on_disconnect_multi_inode_promote_dispatch() {
 
     // 模拟 push_cap_upgrade_notify: 对 File 锁的 promote 下发
     for (inode, lt, survivor, new_sn, caps) in &promote_tasks {
-        if *lt == LockType::File {
-            if map.lookup_net(survivor).is_some() {
-                notify_cap.push(*inode, survivor, *new_sn, *caps);
-            }
+        if *lt == LockType::File && map.lookup_net(survivor).is_some() {
+            notify_cap.push(*inode, survivor, *new_sn, *caps);
         }
     }
     assert_eq!(notify_cap.count(), 2, "2 CapUpgradeNotify pushed");

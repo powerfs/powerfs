@@ -342,6 +342,26 @@ struct ShardGroup {
     peers: Vec<Peer>,
 }
 
+/// 单个 shard 的 Raft 状态快照，供 Master 控制面查询假 Leader。
+///
+/// `is_lease_valid` 仅在 `state == Leader` 时通过 `ensure_linearizable`
+/// 探测（500ms 超时），用于识别"假 Leader"——即 Raft metrics 报告
+/// Leader 但 Quorum 已不认可（lease 失效）的状态。非 Leader 状态直接
+/// 返回 `true`（无 lease 概念，无需探测）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShardRaftStatus {
+    pub shard_id: u64,
+    pub state: ServerState,
+    pub is_leader: bool,
+    pub leader_addr: String,
+    pub current_term: u64,
+    pub has_peers: bool,
+    pub running_state_ok: bool,
+    pub is_lease_valid: bool,
+    pub commit_index: u64,
+    pub last_applied: u64,
+}
+
 /// openraft v2 多组管理器，替代旧 `RaftGroupManager`。
 pub struct RaftGroupManagerV2 {
     /// 服务端路由：`group_id -> Raft` 映射（入站 RPC 路由）。
@@ -682,17 +702,25 @@ impl RaftGroupManagerV2 {
 
     /// 启动 Raft 状态健康监控后台任务（监控所有 shard）。
     ///
-    /// 当节点长时间无法确定任何 shard 的 leader（连续处于 Candidate 状态或无 leader）
-    /// 时，说明集群已不健康（网络分区 / quorum 丢失 / 状态腐化）。
+    /// **职责（修订）**：只检测 Openraft 内部 `running_state` Fatal 错误——
+    /// 这是 Raft 引擎自身的不可恢复故障（如存储损坏、状态机 apply panic），
+    /// 进程必须退出由 Docker `restart: unless-stopped` 重启。
     ///
-    /// 容错策略（参考 SLOW_REQ 根因教训）：
-    /// - **warn 阈值**（15s = 5×election_timeout_max）：打印 warn 日志
-    /// - **fatal 阈值**（30s = 10×election_timeout_max）：打印 error 日志并触发进程退出,
-    ///   交由 Docker restart policy 重启容器。
-    ///   异常节点持续运行会消耗 CPU 干扰其他健康节点。
+    /// **不再检测假 Leader**：假 Leader（Leader 状态但 lease 失效）的检测
+    /// 与隔离已移交 Master 控制面（见 `filer_raft_monitor::spawn_filer_raft_monitor`
+    /// 与 `docs/raft_fault_tolerance_design.md`）。filer 自身不再因假 Leader 退出，
+    /// 因为：
+    /// 1. Master 检测到假 Leader 后会从路由表摘除该 filer，客户端不再发请求，
+    ///    死循环已在源头阻断。
+    /// 2. filer 退出反而会让 Raft Quorum 更难恢复——保留进程让 Openraft
+    ///    内部的 lease 续约 / 选举机制自愈。
+    /// 3. filer 自检假 Leader 不可靠：filer 自己的 Raft 已损坏时，自检逻辑
+    ///    本身可能也跑不动。
     ///
-    /// **注意**：只监控有 peers 的 shard（单节点 shard 永远是 Leader）。
-    /// 只要有一个 shard 恢复健康（有 leader），就重置计时器。
+    /// **关键区分**（不能误杀的正常状态）：
+    /// - **shard 无 leader / Candidate**：quorum 丢失后的正常行为，应等待恢复。
+    /// - **假 Leader**：由 Master 控制面检测，filer 仅暴露状态（`FilerRaftStatus`）。
+    /// - **running_state Fatal**：本方法检测，立即退出。
     pub async fn spawn_health_monitor(&self) {
         let groups = self.groups.read().await;
         if groups.is_empty() {
@@ -700,95 +728,35 @@ impl RaftGroupManagerV2 {
             return;
         }
 
-        // 收集所有有 peers 的 shard 的 metrics receiver
-        let mut watchers: Vec<(
-            u64,
-            WatchReceiver<openraft::raft::RaftMetrics<FilerTypeConfig>>,
-        )> = Vec::new();
+        // 收集所有 shard 的 Raft 句柄（包括单节点 shard — running_state
+        // Fatal 在单节点上同样需要检测）。
+        let mut watched_shards: Vec<(u64, Arc<ShardGroup>)> = Vec::new();
         for (shard_id, group) in groups.iter() {
-            if group.peers.is_empty() {
-                continue;
-            }
-            watchers.push((shard_id.0, group.raft.metrics()));
-        }
-
-        if watchers.is_empty() {
-            info!("RaftGroupManagerV2: skip health monitor (no multi-node shards)");
-            return;
+            watched_shards.push((shard_id.0, group.clone()));
         }
 
         let node_id = self.node_id;
 
         tokio::spawn(async move {
-            let check_interval = tokio::time::Duration::from_secs(1);
-            let warn_threshold = tokio::time::Duration::from_secs(15);
-            let fatal_threshold = tokio::time::Duration::from_secs(30);
-
-            let mut all_unhealthy_since: Option<tokio::time::Instant> = None;
+            let check_interval = tokio::time::Duration::from_secs(10);
 
             loop {
                 tokio::time::sleep(check_interval).await;
 
-                // 检查所有 shard 的状态
-                let mut any_healthy = false;
-                let mut unhealthy_shards = Vec::new();
+                for (sid, group) in &watched_shards {
+                    let metrics = group.raft.metrics().borrow_watched().clone();
 
-                for (sid, rx) in &watchers {
-                    let metrics = rx.borrow_watched().clone();
-                    let has_leader = metrics.current_leader.is_some();
-                    let is_candidate = metrics.state == ServerState::Candidate;
-
-                    if has_leader && !is_candidate {
-                        any_healthy = true;
-                    } else {
-                        unhealthy_shards.push((
-                            *sid,
-                            metrics.state,
-                            metrics.current_term,
-                            metrics.current_leader.clone(),
-                        ));
-                    }
-                }
-
-                if any_healthy {
-                    // 至少一个 shard 健康, 重置计时器
-                    if all_unhealthy_since.is_some() {
-                        info!(
-                            "RaftGroupManagerV2: node={} recovered — at least one shard has leader",
-                            node_id
-                        );
-                        all_unhealthy_since = None;
-                    }
-                } else {
-                    // 所有 shard 都不健康
-                    let now = tokio::time::Instant::now();
-                    if all_unhealthy_since.is_none() {
-                        all_unhealthy_since = Some(now);
-                        warn!(
-                            "RaftGroupManagerV2: node={} ALL shards unhealthy: {:?}",
-                            node_id, unhealthy_shards
-                        );
-                    }
-
-                    let elapsed = now.duration_since(all_unhealthy_since.unwrap());
-                    if elapsed >= fatal_threshold {
+                    // running_state Fatal = Openraft 内部不可恢复错误
+                    // (存储损坏 / apply panic / 网络层 fatal). 进程必须退出.
+                    if metrics.running_state.is_err() {
                         log::error!(
-                            "RaftGroupManagerV2: FATAL — node={} all shards leaderless for {:?} \
-                             (unhealthy={:?}); exiting process to trigger container restart",
+                            "RaftGroupManagerV2: FATAL — node={} shard={} \
+                             raft running_state error: {:?}; exiting",
                             node_id,
-                            elapsed,
-                            unhealthy_shards
+                            sid,
+                            metrics.running_state
                         );
                         std::process::exit(1);
-                    } else if elapsed >= warn_threshold {
-                        log::warn!(
-                            "RaftGroupManagerV2: node={} all shards leaderless for {:?} \
-                             (unhealthy={:?}); will exit in {:?} if not resolved",
-                            node_id,
-                            elapsed,
-                            unhealthy_shards,
-                            fatal_threshold - elapsed
-                        );
                     }
                 }
             }
@@ -1096,6 +1064,63 @@ impl RaftGroupManagerV2 {
         let commit_index = metrics.local_committed.map(|l| l.index()).unwrap_or(0);
         let last_applied = metrics.last_applied.map(|l| l.index()).unwrap_or(0);
         Some((is_leader, term, commit_index, last_applied))
+    }
+
+    /// 收集所有 shard 的 Raft 状态报告。
+    ///
+    /// 用途：Master 控制面通过 `MsgType::FilerRaftStatus` 查询 filer 节点
+    /// 的 Raft 健康度。Master 据此判定假 Leader 并从路由表摘除问题节点。
+    ///
+    /// 注意：探测 `is_lease_valid` 时会向 quorum 发 ReadIndex 请求。若
+    /// 节点已是假 Leader，该调用会很快失败（quorum 不响应或拒绝 lease），
+    /// 因此用 500ms 超时保护，避免 Master 长时间等待。
+    pub async fn get_raft_status_report(&self) -> Vec<ShardRaftStatus> {
+        let groups = self.groups.read().await;
+        let mut report = Vec::with_capacity(groups.len());
+
+        for (shard_id, group) in groups.iter() {
+            let metrics = group.raft.metrics().borrow_watched().clone();
+            let is_leader = metrics.state == ServerState::Leader;
+            let running_state_ok = metrics.running_state.is_ok();
+            let has_peers = !group.peers.is_empty();
+
+            // 仅 Leader 节点探测 lease；非 Leader 直接 true（无 lease 概念）
+            let is_lease_valid = if is_leader && has_peers {
+                let probe = group.raft.ensure_linearizable(ReadPolicy::ReadIndex);
+                // 500ms 超时：假 Leader 时 quorum 不响应，必须快速失败
+                match tokio::time::timeout(std::time::Duration::from_millis(500), probe).await {
+                    Ok(Ok(_)) => true,
+                    Ok(Err(_)) => false,
+                    Err(_) => false, // 超时 = 假 Leader
+                }
+            } else {
+                true
+            };
+
+            let leader_addr = if is_leader {
+                self.node_address.clone()
+            } else {
+                self.get_shard_leader(*shard_id).await.unwrap_or_default()
+            };
+
+            let commit_index = metrics.local_committed.map(|l| l.index()).unwrap_or(0);
+            let last_applied = metrics.last_applied.map(|l| l.index()).unwrap_or(0);
+
+            report.push(ShardRaftStatus {
+                shard_id: shard_id.0,
+                state: metrics.state,
+                is_leader,
+                leader_addr,
+                current_term: metrics.current_term,
+                has_peers,
+                running_state_ok,
+                is_lease_valid,
+                commit_index,
+                last_applied,
+            });
+        }
+
+        report
     }
 
     /// 获取指定 shard 的对端列表（创建时的快照）。

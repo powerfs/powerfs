@@ -1846,7 +1846,7 @@ impl MetadataCache {
             // The source entry still has oldname, so this is safe.
             let children = self.list_children(newdir);
             for (target_ino, name, _) in children {
-                if name == newname && entry.as_ref().map_or(true, |e| target_ino != e.inode) {
+                if name == newname && entry.as_ref().is_none_or(|e| target_ino != e.inode) {
                     let _ = self.remove_entry_only(target_ino);
                     break;
                 }

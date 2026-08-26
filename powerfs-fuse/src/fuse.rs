@@ -4053,10 +4053,14 @@ impl FileSystem for PowerFsFs {
                 }
                 if total_failed > 0 {
                     let err = match first_rpc_err {
-                        Some(msg) => std::io::Error::new(std::io::ErrorKind::Other,
-                            format!("batch_unlink sync: {}/{} entries failed (rpc_error: {})", total_failed, total_entries, msg)),
-                        None => std::io::Error::new(std::io::ErrorKind::Other,
-                            format!("batch_unlink sync: {}/{} entries returned non-OK status from filer", total_failed, total_entries)),
+                        Some(msg) => std::io::Error::other(format!(
+                            "batch_unlink sync: {}/{} entries failed (rpc_error: {})",
+                            total_failed, total_entries, msg
+                        )),
+                        None => std::io::Error::other(format!(
+                            "batch_unlink sync: {}/{} entries returned non-OK status from filer",
+                            total_failed, total_entries
+                        )),
                     };
                     warn!("unlink sync batch failed: {}", err);
                     sync_flush_result = Some(Err(err));
@@ -5144,7 +5148,7 @@ impl FileSystem for PowerFsFs {
                 }
             }
         };
-        let placement_is_stripe = entry.placement.as_ref().map_or(false, |p| {
+        let placement_is_stripe = entry.placement.as_ref().is_some_and(|p| {
             use powerfs_layout::placement::Placement;
             matches!(p, Placement::Stripe { .. } | Placement::WideStripe { .. })
         });
@@ -5256,7 +5260,7 @@ impl FileSystem for PowerFsFs {
                                     self.cache.get_inode(inode).map(|e| e.fid.is_some()).unwrap_or(false),
                                     self.cache.get_inode(inode).map(|e| e.chunks.len()).unwrap_or(0),
                                     attr.size,
-                                    attr.placement.as_ref().map(|pl| std::mem::discriminant(pl))
+                                    attr.placement.as_ref().map(std::mem::discriminant)
                                 );
                                 (true, 0)
                             }

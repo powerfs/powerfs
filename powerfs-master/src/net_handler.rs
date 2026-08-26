@@ -147,8 +147,8 @@ impl MasterNetHandler {
             collection, replication, stripe_count
         );
 
-        if !self.master.is_leader().await {
-            return self.build_redirect_response(msg, "NET_ASSIGN").await;
+        if let Err(resp) = self.check_raft_available(msg, "NET_ASSIGN").await {
+            return resp;
         }
 
         let result = self.master.assign_volume(&replication, &collection).await;
@@ -212,8 +212,8 @@ impl MasterNetHandler {
 
         // Volume lookup reads topology state. Redirect non-leader requests
         // to ensure the client gets up-to-date volume routing from the leader.
-        if !self.master.is_leader().await {
-            return self.build_redirect_response(msg, "NET_LOOKUP_VOLUME").await;
+        if let Err(resp) = self.check_raft_available(msg, "NET_LOOKUP_VOLUME").await {
+            return resp;
         }
 
         let original_id: u64 = volume_id_str.parse().unwrap_or(0);
@@ -369,8 +369,8 @@ impl MasterNetHandler {
 
         // Heartbeat mutates Master topology state (add_node, volume registration).
         // Only the Raft leader should process it; followers return REDIRECT.
-        if !self.master.is_leader().await {
-            return self.build_redirect_response(msg, "NET_HEARTBEAT").await;
+        if let Err(resp) = self.check_raft_available(msg, "NET_HEARTBEAT").await {
+            return resp;
         }
 
         let node_id = powerfs_common::types::NodeId(node_id_str);
@@ -496,10 +496,8 @@ impl MasterNetHandler {
         // KeepConnected registers/refreshes FUSE client info on the Master.
         // Only the leader should process this to maintain a consistent client
         // registry; followers return REDIRECT.
-        if !self.master.is_leader().await {
-            return self
-                .build_redirect_response(msg, "NET_KEEP_CONNECTED")
-                .await;
+        if let Err(resp) = self.check_raft_available(msg, "NET_KEEP_CONNECTED").await {
+            return resp;
         }
 
         if client_id.is_empty() {
@@ -634,10 +632,8 @@ impl MasterNetHandler {
             None
         };
 
-        if !self.master.is_leader().await {
-            return self
-                .build_redirect_response(msg, "NET_REGISTER_CLIENT")
-                .await;
+        if let Err(resp) = self.check_raft_available(msg, "NET_REGISTER_CLIENT").await {
+            return resp;
         }
 
         if client_uuid.is_empty() {
@@ -790,10 +786,11 @@ impl MasterNetHandler {
             );
         }
 
-        if !self.master.is_leader().await {
-            return self
-                .build_redirect_response(msg, "NET_DEREGISTER_CLIENT")
-                .await;
+        if let Err(resp) = self
+            .check_raft_available(msg, "NET_DEREGISTER_CLIENT")
+            .await
+        {
+            return resp;
         }
 
         self.master.deregister_client_by_uuid(&client_uuid);
@@ -824,8 +821,8 @@ impl MasterNetHandler {
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let _ = ctx;
         // If not leader, redirect client to the actual leader
-        if !self.master.is_leader().await {
-            return self.build_redirect_response(msg, "NET_GET_TOPOLOGY").await;
+        if let Err(resp) = self.check_raft_available(msg, "NET_GET_TOPOLOGY").await {
+            return resp;
         }
 
         // Leader path: fetch own leader address (self) for the response body
@@ -1125,10 +1122,8 @@ impl MasterNetHandler {
             );
         }
 
-        if !self.master.is_leader().await {
-            return self
-                .build_redirect_response(msg, "NET_REGISTER_FILER")
-                .await;
+        if let Err(resp) = self.check_raft_available(msg, "NET_REGISTER_FILER").await {
+            return resp;
         }
 
         // Register filer node for ListFilers discovery (replaces gRPC RegisterFiler).
@@ -1298,10 +1293,8 @@ impl MasterNetHandler {
         }
 
         // Not leader? Redirect to the master leader.
-        if !self.master.is_leader().await {
-            return self
-                .build_redirect_response(msg, "SHARD_LEADER_UPDATE")
-                .await;
+        if let Err(resp) = self.check_raft_available(msg, "SHARD_LEADER_UPDATE").await {
+            return resp;
         }
 
         // Gained leadership → update entry with leader_addr.
@@ -1441,16 +1434,8 @@ impl MasterNetHandler {
         msg: &NetMessage,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let _ = ctx;
-        if !self.master.is_leader().await {
-            let leader = self.master.get_leader().await;
-            let mut enc = TlvEncoder::new();
-            enc.add_string(FieldId::Owner, &leader)?;
-            return Ok(Self::build_response(
-                msg,
-                STATUS_ERR_REDIRECT,
-                enc.into_bytes(),
-                Vec::new(),
-            ));
+        if let Err(resp) = self.check_raft_available(msg, "NET_LIST_FILERS").await {
+            return resp;
         }
 
         let filers = self.master.list_filers();
@@ -1553,6 +1538,52 @@ impl MasterNetHandler {
             enc.into_bytes(),
             Vec::new(),
         ))
+    }
+
+    /// Build a SERVER_ERROR response when Raft is unavailable (fake Leader).
+    ///
+    /// Returns SERVER_ERROR (not REDIRECT) intentionally: a fake Leader has no
+    /// valid leader to redirect to (`current_leader()` returns None because
+    /// Quorum does not acknowledge it). Redirecting to None would cause the
+    /// client-side `forward to: None, None` infinite loop. SERVER_ERROR lets
+    /// the client retry with backoff and pick up a new leader via topology
+    /// refresh once one is re-elected.
+    async fn build_unavailable_response(
+        &self,
+        msg: &NetMessage,
+        ctx: &str,
+    ) -> NetResult<NetMessage> {
+        warn!(
+            "{}: raft unavailable (fake Leader — lease expired); returning SERVER_ERROR to \
+             break client retry loop. is_leader=true but is_raft_available=false",
+            ctx
+        );
+        Ok(Self::build_response(
+            msg,
+            STATUS_ERR_SERVER_ERROR,
+            Vec::new(),
+            Vec::new(),
+        ))
+    }
+
+    /// Unified gate for Raft-write requests: must be leader AND raft must be
+    /// available (not in fake-Leader state). Returns `Ok(())` when the request
+    /// can proceed, otherwise builds the appropriate error response.
+    ///
+    /// - Not leader → REDIRECT to actual leader (or SERVER_ERROR if no leader).
+    /// - Leader but `raft_unavailable` → SERVER_ERROR (breaks forward-None loop).
+    async fn check_raft_available(
+        &self,
+        msg: &NetMessage,
+        ctx: &str,
+    ) -> Result<(), NetResult<NetMessage>> {
+        if !self.master.is_leader().await {
+            return Err(self.build_redirect_response(msg, ctx).await);
+        }
+        if !self.master.is_raft_available() {
+            return Err(self.build_unavailable_response(msg, ctx).await);
+        }
+        Ok(())
     }
 }
 

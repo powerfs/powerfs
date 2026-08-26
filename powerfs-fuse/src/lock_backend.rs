@@ -143,6 +143,12 @@ impl FuseLockBackend for FacadeLockBackend {
 /// This struct is kept for `LeaseReleaser` trait compatibility.
 pub struct FacadeLeaseReleaser;
 
+impl Default for FacadeLeaseReleaser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FacadeLeaseReleaser {
     pub fn new() -> Self {
         Self
@@ -275,10 +281,10 @@ impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
                 .await;
                 let flush_result = match flush_result {
                     Ok(res) => res,
-                    Err(join_err) => Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("spawn_blocking panicked: {}", join_err),
-                    )),
+                    Err(join_err) => Err(std::io::Error::other(format!(
+                        "spawn_blocking panicked: {}",
+                        join_err
+                    ))),
                 };
                 match flush_result {
                     Ok(()) => {
@@ -326,7 +332,7 @@ impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
             if let Some(recall_locks) = handler.upgrade() {
                 if Arc::strong_count(&lock) == 1 {
                     let mut g = recall_locks.lock().unwrap();
-                    if g.get(&inode).map(|e| Arc::strong_count(e)) == Some(1) {
+                    if g.get(&inode).map(Arc::strong_count) == Some(1) {
                         g.remove(&inode);
                     }
                 }
@@ -373,7 +379,7 @@ impl crate::invalidate_handler::CapHandler for FacadeCapHandler {
             if let Some(recall_locks) = handler.upgrade() {
                 if Arc::strong_count(&lock) == 1 {
                     let mut g = recall_locks.lock().unwrap();
-                    if g.get(&inode).map(|e| Arc::strong_count(e)) == Some(1) {
+                    if g.get(&inode).map(Arc::strong_count) == Some(1) {
                         g.remove(&inode);
                     }
                 }

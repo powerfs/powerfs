@@ -712,6 +712,38 @@ pub enum MsgType {
     ///           broadcasts TopologyChanged to all connected clients).
     ShardLeaderUpdate = 0x0075,
 
+    /// Master → Filer: query the filer node's Raft health for **fake-Leader
+    /// detection by the control plane**.
+    ///
+    /// The Master (control plane) periodically polls each registered filer
+    /// to detect nodes that report `ServerState::Leader` in their Raft
+    /// metrics but whose lease is no longer acknowledged by a quorum (i.e.
+    /// "fake Leader" — root cause of `forward to: None, None` loops and
+    /// SLOW_REQ). Upon detection the Master removes the node from the
+    /// routing table so clients stop sending requests to the stale leader.
+    ///
+    /// Request TLV: (empty body — filer returns status for all shards)
+    ///
+    /// Response TLV (STATUS_OK):
+    ///   Limit           → count(u64) — number of shard status entries
+    ///   per entry:
+    ///     Ino            → shard_id(u64)
+    ///     Mode           → state(u8) — 1=Learner 2=Follower 3=Candidate
+    ///                                    4=Leader 5=Shutdown
+    ///                                    (manual mapping, see filer handler)
+    ///     Owner          → leader_addr(string)
+    ///     Cookie         → current_term(u64)
+    ///     Entries        → flags(u64) — bit0: has_peers
+    ///                                  bit1: running_state_ok
+    ///                                  bit2: is_lease_valid (Leader-only)
+    ///     FileKey        → commit_index(u64)
+    ///     UsedSpace      → last_applied(u64)
+    ///
+    /// `is_lease_valid` is `false` only when the shard is a multi-node
+    /// Leader and `ensure_linearizable(ReadIndex)` fails within 500ms —
+    /// this is the fake-Leader signal.
+    FilerRaftStatus = 0x0076,
+
     // Extended Lease operations
     AcquireLease = 0x0080,
     ReleaseLease = 0x0081,
@@ -850,6 +882,7 @@ impl MsgType {
             0x0073 => Some(Self::AssignVolumeV2),
             0x0074 => Some(Self::ListFilers),
             0x0075 => Some(Self::ShardLeaderUpdate),
+            0x0076 => Some(Self::FilerRaftStatus),
             0x0080 => Some(Self::AcquireLease),
             0x0081 => Some(Self::ReleaseLease),
             0x0082 => Some(Self::RenewLease),

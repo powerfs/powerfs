@@ -57,6 +57,9 @@ pub enum PowerFsError {
     #[error("not leader")]
     NotLeader,
 
+    #[error("raft unavailable: {0}")]
+    Unavailable(String),
+
     #[error("quorum not reached")]
     QuorumNotReached,
 
