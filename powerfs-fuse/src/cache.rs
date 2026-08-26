@@ -1862,12 +1862,25 @@ impl MetadataCache {
             }
         }
 
-        // If source not in cache, we're done — the old target has been
-        // removed, and the next lookup will re-fetch the correct state
-        // from the Filer.
+        // Source not in cache: the old target (if any) has already been
+        // removed above, but the rename itself cannot complete without the
+        // source entry. Return Err so callers can distinguish "source
+        // missing" from "rename done".
+        //
+        // In the Filer-committed path (fuse.rs `rename`), the Filer RPC has
+        // already succeeded before cache.rename is called, and the caller
+        // treats this Err as a non-fatal warn — the Filer's committed state
+        // is authoritative and the next lookup will re-fetch the correct
+        // state. In pure-local-cache contexts (e.g., unit tests), this Err
+        // correctly reflects POSIX ENOENT semantics.
         let entry = match entry {
             Some(e) => e,
-            None => return Ok(()),
+            None => {
+                return Err(format!(
+                    "rename: source not in cache ({}/{} not found)",
+                    olddir, oldname
+                ))
+            }
         };
 
         let inode = entry.inode;
