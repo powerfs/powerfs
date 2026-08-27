@@ -3905,20 +3905,37 @@ impl MasterNode {
         {
             let metrics_port = self.metrics_port;
             let metrics_addr = format!("{}:{}", self.address.ip(), metrics_port);
-            info!("Starting metrics + cert API server on {}", metrics_addr);
 
-            // Reuse the CA manager already initialised during `new()`. It
-            // already loaded (or generated) the CA cert from `ca_dir` plus
-            // the persisted client registry. If the caller left ca_dir
-            // unset the master runs without CA (dev mode) and we fall
-            // back to creating an ephemeral manager under "./ca" so the
-            // admin endpoints stay functional.
-            let ca_manager: Arc<crate::ca_manager::CaManager> = match self.ca_manager.clone() {
-                Some(ca) => ca,
-                None => {
-                    let ca_dir = self.ca_dir.clone().unwrap_or_else(|| "./ca".to_string());
+            // Reuse the CA manager already initialised during `new()`.
+            // Unlike the previous fallback, when ca_dir was never set
+            // (dev mode, None) we deliberately skip CA creation so the
+            // master advertises cert enforcement OFF — filer/FUSE clients
+            // that send no ClientCert are accepted via the "dev mode"
+            // codepath in net_handler. This avoids a silent bootstrap
+            // where start() retroactively enables CA and all storage
+            // nodes get rejected with "cert fp unknown".
+            match (self.ca_manager.clone(), self.ca_dir.clone()) {
+                (Some(ca), _) => {
+                    info!("Starting metrics + cert API server on {} (CA manager ready)", metrics_addr);
+                    if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca).await {
+                        error!(
+                            "Failed to start metrics/cert server on {}: {}",
+                            metrics_addr, e
+                        );
+                    }
+                }
+                (None, Some(ca_dir)) => {
+                    info!("Starting metrics + cert API server on {} (initialising CA from {})", metrics_addr, ca_dir);
                     match crate::ca_manager::CaManager::new(&ca_dir, self.admin_token.clone()) {
-                        Ok(ca) => Arc::new(ca),
+                        Ok(ca) => {
+                            let ca = Arc::new(ca);
+                            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca).await {
+                                error!(
+                                    "Failed to start metrics/cert server on {}: {}",
+                                    metrics_addr, e
+                                );
+                            }
+                        }
                         Err(e) => {
                             error!(
                                 "Failed to construct CA manager from {}: {}. \
@@ -3930,13 +3947,32 @@ impl MasterNode {
                         }
                     }
                 }
-            };
-
-            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca_manager).await {
-                error!(
-                    "Failed to start metrics/cert server on {}: {}",
-                    metrics_addr, e
-                );
+                (None, None) => {
+                    // Dev mode: ca_dir not set, no initial CA. Start the
+                    // metrics server with a freshly built CA only for the
+                    // HTTP cert-signing endpoints (so `powerfs-cli cert`
+                    // still works) but do NOT install it on self.ca_manager
+                    // — which would flip cert_enforcement_enabled=true.
+                    info!("Starting metrics + cert API server on {} (DEV MODE: CA disabled for RegisterClient/RegisterFiler; only HTTP /api/cert endpoints functional via ephemeral manager)", metrics_addr);
+                    match crate::ca_manager::CaManager::new("./ca_ephemeral_metrics", self.admin_token.clone()) {
+                        Ok(ca) => {
+                            let ca = Arc::new(ca);
+                            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca).await {
+                                error!(
+                                    "Failed to start metrics/cert server on {}: {}",
+                                    metrics_addr, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to construct ephemeral CA manager for metrics server: {}. \
+                                 Metrics endpoint will not start (cert enforcement stays off).",
+                                e
+                            );
+                        }
+                    }
+                }
             }
         }
 

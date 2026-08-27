@@ -13,5 +13,5 @@ advertise_addr = "172.20.0.12:9333"
 raft_id = 2
 raft_peers = ["172.20.0.11:9335", "172.20.0.12:9335", "172.20.0.13:9335"]
 admin_token = "powerfs-admin-test"
-ca_dir = "/data/master/ca"
+# ca_dir = "/data/master/ca"  # DISABLED for local dev testing
 registration_token = "powerfs-cluster-test"
