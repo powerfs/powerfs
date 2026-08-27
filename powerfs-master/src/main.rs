@@ -73,7 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meta_dir = master_cfg
         .meta_dir
         .unwrap_or_else(|| format!("{}/meta", dir));
-    let ca_dir = master_cfg.ca_dir.unwrap_or_else(|| format!("{}/ca", dir));
+    // ca_dir 只在配置显式设置时启用 CA manager（生产模式）。
+    // 未设置时保持 None（dev 模式），避免默默生成 {dir}/ca 导致下游 FUSE
+    // 客户端因无签名证书而被拒绝挂载。
+    let ca_dir_opt: Option<String> = master_cfg.ca_dir.clone();
     let admin_token = master_cfg.admin_token.clone();
     let registration_token = master_cfg.registration_token.clone();
 
@@ -152,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         net_port,
         metrics_port,
         admin_token,
-        Some(ca_dir),
+        ca_dir_opt,
         registration_token,
     )
     .await?;
