@@ -1,6 +1,8 @@
 networks:
   powerfs-network:
     driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: powerfs-br0
     ipam:
       config:
         - subnet: 172.30.0.0/16
