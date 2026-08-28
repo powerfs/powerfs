@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "PowerFS lightweight binary network protocol for metadata and data operations"
 
+[features]
+default = ["tcp"]
+tcp = []
+# RDMA feature: enables transport_rdma module. The actual ibverbs crate
+# dependency will be added in Phase 2 implementation. For now this is a
+# compile-time flag that enables the stub module.
+rdma = []
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 socket2 = { version = "0.5", features = ["all"] }
