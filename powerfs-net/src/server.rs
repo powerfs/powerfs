@@ -19,8 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{debug, error, info, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::Instant;
 
@@ -30,6 +29,8 @@ use crate::flow_control::{Channel, FlowController};
 use crate::io_loop::IoLoop;
 use crate::protocol::*;
 use crate::server_connection::{NetHandler, ServerConnectionManager};
+use crate::transport::{Transport, TransportListener, TransportStream};
+use crate::transport_tcp::TcpTransport;
 use crate::work::Work;
 use crate::worker::Worker;
 
@@ -72,7 +73,9 @@ fn num_cpus() -> usize {
 
 /// PowerFS Net Server (Acceptor + IoLoop + Worker 架构)
 pub struct PowerFsNetServer {
-    listener: TcpListener,
+    listener: Box<dyn TransportListener>,
+    /// 传输层 (保留引用, 供 acceptor 端记录传输类型; 当前 accept 仅依赖 listener)
+    transport: Arc<dyn Transport>,
     handler: Arc<dyn NetHandler>,
     manager: Option<Arc<ServerConnectionManager>>,
     registry: Arc<ConnRegistry>,
@@ -129,17 +132,58 @@ impl PowerFsNetServer {
         registry: Arc<ConnRegistry>,
         config: ServerConfig,
     ) -> NetResult<Self> {
+        let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+        Self::bind_with_registry_and_transport_inner(
+            addr,
+            port,
+            handler,
+            registry,
+            config,
+            transport,
+        )
+        .await
+    }
+
+    /// Bind with an externally-created `ConnRegistry`, custom config and
+    /// custom transport (e.g. RDMA / AutoTransport). This is the entry point
+    /// for production deployments that read transport config from TOML.
+    pub async fn bind_with_registry_and_transport(
+        addr: &str,
+        port: u16,
+        handler: Arc<dyn NetHandler>,
+        registry: Arc<ConnRegistry>,
+        config: ServerConfig,
+        transport: Arc<dyn Transport>,
+    ) -> NetResult<Self> {
+        Self::bind_with_registry_and_transport_inner(
+            addr, port, handler, registry, config, transport,
+        )
+        .await
+    }
+
+    /// Shared inner implementation for `bind_with_registry_and_config` and
+    /// `bind_with_registry_and_transport`. Uses the provided `transport` to
+    /// create the listener.
+    async fn bind_with_registry_and_transport_inner(
+        addr: &str,
+        port: u16,
+        handler: Arc<dyn NetHandler>,
+        registry: Arc<ConnRegistry>,
+        config: ServerConfig,
+        transport: Arc<dyn Transport>,
+    ) -> NetResult<Self> {
         let socket_addr: SocketAddr = format!("{}:{}", addr, port)
             .parse()
             .map_err(|e| NetError::Protocol(format!("invalid address: {}", e)))?;
 
-        let listener = TcpListener::bind(socket_addr).await?;
+        let listener = transport.bind(socket_addr).await?;
         let manager = Arc::new(ServerConnectionManager::new(registry.clone()));
 
         info!(
-            "PowerFS Net server listening on {}:{} (io_loops={}, workers={}, queue_cap={}, session_mgmt=enabled, shared_registry)",
+            "PowerFS Net server listening on {}:{} (transport={}, io_loops={}, workers={}, queue_cap={}, session_mgmt=enabled, shared_registry)",
             addr,
             port,
+            transport.name(),
             config.num_io_loops,
             config.num_workers,
             config.work_queue_capacity,
@@ -147,6 +191,7 @@ impl PowerFsNetServer {
 
         Ok(Self {
             listener,
+            transport,
             handler,
             manager: Some(manager),
             registry,
@@ -166,11 +211,25 @@ impl PowerFsNetServer {
         pipeline: Option<crate::middleware::RequestPipeline>,
         config: ServerConfig,
     ) -> NetResult<Self> {
+        let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
+        Self::bind_with_pipeline_and_transport(addr, port, handler, pipeline, config, transport).await
+    }
+
+    /// Bind with a custom middleware pipeline, server configuration and
+    /// custom transport. Production entry point for non-TCP deployments.
+    pub async fn bind_with_pipeline_and_transport(
+        addr: &str,
+        port: u16,
+        handler: Arc<dyn NetHandler>,
+        pipeline: Option<crate::middleware::RequestPipeline>,
+        config: ServerConfig,
+        transport: Arc<dyn Transport>,
+    ) -> NetResult<Self> {
         let socket_addr: SocketAddr = format!("{}:{}", addr, port)
             .parse()
             .map_err(|e| NetError::Protocol(format!("invalid address: {}", e)))?;
 
-        let listener = TcpListener::bind(socket_addr).await?;
+        let listener = transport.bind(socket_addr).await?;
         let registry = Arc::new(ConnRegistry::new());
 
         let manager = {
@@ -184,9 +243,10 @@ impl PowerFsNetServer {
         };
 
         info!(
-            "PowerFS Net server listening on {}:{} (io_loops={}, workers={}, queue_cap={}, session_mgmt=enabled)",
+            "PowerFS Net server listening on {}:{} (transport={}, io_loops={}, workers={}, queue_cap={}, session_mgmt=enabled)",
             addr,
             port,
+            transport.name(),
             config.num_io_loops,
             config.num_workers,
             config.work_queue_capacity,
@@ -194,6 +254,7 @@ impl PowerFsNetServer {
 
         Ok(Self {
             listener,
+            transport,
             handler,
             manager: Some(manager),
             registry,
@@ -215,21 +276,34 @@ impl PowerFsNetServer {
         Self::bind_with_pipeline(addr, port, handler, None, config).await
     }
 
+    /// Bind with custom server configuration and custom transport.
+    pub async fn bind_with_config_and_transport(
+        addr: &str,
+        port: u16,
+        handler: Arc<dyn NetHandler>,
+        config: ServerConfig,
+        transport: Arc<dyn Transport>,
+    ) -> NetResult<Self> {
+        Self::bind_with_pipeline_and_transport(addr, port, handler, None, config, transport).await
+    }
+
     async fn bind_inner(
         addr: &str,
         port: u16,
         handler: Arc<dyn NetHandler>,
         config: ServerConfig,
     ) -> NetResult<Self> {
+        let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
         let socket_addr: SocketAddr = format!("{}:{}", addr, port)
             .parse()
             .map_err(|e| NetError::Protocol(format!("invalid address: {}", e)))?;
 
-        let listener = TcpListener::bind(socket_addr).await?;
+        let listener = transport.bind(socket_addr).await?;
         info!(
-            "PowerFS Net server listening on {}:{} (io_loops={}, workers={}, queue_cap={}, session_mgmt=disabled)",
+            "PowerFS Net server listening on {}:{} (transport={}, io_loops={}, workers={}, queue_cap={}, session_mgmt=disabled)",
             addr,
             port,
+            transport.name(),
             config.num_io_loops,
             config.num_workers,
             config.work_queue_capacity,
@@ -237,6 +311,7 @@ impl PowerFsNetServer {
 
         Ok(Self {
             listener,
+            transport,
             handler,
             manager: None,
             registry: Arc::new(ConnRegistry::new()),
@@ -248,7 +323,17 @@ impl PowerFsNetServer {
 
     /// Get the local address
     pub fn local_addr(&self) -> NetResult<SocketAddr> {
-        self.listener.local_addr().map_err(NetError::Io)
+        self.listener.local_addr()
+    }
+
+    /// Get the transport name ("tcp" / "rdma" / "auto(rdma+tcp)")
+    pub fn transport_name(&self) -> &'static str {
+        self.transport.name()
+    }
+
+    /// Get the underlying transport (for admin/monitoring)
+    pub fn transport(&self) -> &Arc<dyn Transport> {
+        &self.transport
     }
 
     /// Get the connection manager, if session management is enabled
@@ -340,11 +425,12 @@ impl PowerFsNetServer {
                 }
             };
 
-            if let Some(Ok((stream, addr))) = accept_result {
+            if let Some(Ok(stream)) = accept_result {
+                let peer = stream.peer_addr();
                 if self.is_shutting_down().await {
                     break;
                 }
-                self.handle_new_connection(stream, addr, &io_loops).await;
+                self.handle_new_connection(stream, peer, &io_loops).await;
             }
         }
 
@@ -535,12 +621,13 @@ impl PowerFsNetServer {
             }
 
             match self.listener.accept().await {
-                Ok((stream, addr)) => {
+                Ok(stream) => {
+                    let peer = stream.peer_addr();
                     if self.is_shutting_down().await {
-                        info!("Rejecting new connection during shutdown from {}", addr);
+                        info!("Rejecting new connection during shutdown from {}", peer);
                         break;
                     }
-                    self.handle_new_connection(stream, addr, &io_loops).await;
+                    self.handle_new_connection(stream, peer, &io_loops).await;
                 }
                 Err(e) => {
                     error!("Accept error: {:?}", e);
@@ -554,7 +641,7 @@ impl PowerFsNetServer {
     /// 处理新连接: handshake → create ClientConn → register → assign IoLoop
     async fn handle_new_connection(
         &self,
-        stream: TcpStream,
+        stream: Box<dyn TransportStream>,
         addr: SocketAddr,
         io_loops: &[Arc<IoLoop>],
     ) {
@@ -564,9 +651,10 @@ impl PowerFsNetServer {
         let manager = self.manager.clone();
         let registry = self.registry.clone();
 
-        // handshake 需要读写 stream, 完成后返回 stream + client_id
+        // handshake 需要读写 stream, 完成后返回 (read_half, write_half, client_id, ...)
+        // read_half/write_half 直接交给 IoLoop 使用, 无需重组.
         let peer = addr;
-        let (stream, client_id, client_type, channel, features) =
+        let (read_half, write_half, client_id, client_type, channel, features) =
             match Self::handle_handshake(stream, handler.clone(), manager.clone(), peer).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -575,9 +663,6 @@ impl PowerFsNetServer {
                     return;
                 }
             };
-
-        // 发送 handshake response (在 handshake 内部已完成, 这里 stream 已可拆分)
-        stream.set_nodelay(true).ok();
 
         // 创建 outbound channel: Worker/notify → write_task
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -612,7 +697,7 @@ impl PowerFsNetServer {
 
         // IoLoop.manage 会 spawn task 管理该连接
         // 连接断开后 IoLoop 会自动执行断连清理 + decrement_connections
-        io_loop.manage(stream, conn, outbound_rx);
+        io_loop.manage(read_half, write_half, conn, outbound_rx);
 
         // IoLoop.manage 是 fire-and-forget, 但我们需要在断连时 decrement
         // 使用一个监控 task
@@ -646,15 +731,32 @@ impl PowerFsNetServer {
     // Handshake
     // ========================================================================
 
-    /// Handle handshake and return the stream along with (client_id, client_type, channel, features)
+    /// Handle handshake and return the read/write halves along with
+    /// (client_id, client_type, channel, features).
+    ///
+    /// `TransportStream::split` 在握手前调用, 握手期间分别用 read_half /
+    /// write_half 进行 IO, 完成后将两端原样返回给上层 `handle_new_connection`,
+    /// 由其直接交给 `IoLoop::manage`, 避免不必要的 rejoin.
     async fn handle_handshake(
-        mut stream: TcpStream,
+        stream: Box<dyn TransportStream>,
         handler: Arc<dyn NetHandler>,
         manager: Option<Arc<ServerConnectionManager>>,
         peer_addr: SocketAddr,
-    ) -> NetResult<(TcpStream, u64, ClientType, u8, u32)> {
+    ) -> NetResult<(
+        Box<dyn AsyncRead + Send + Unpin>,
+        Box<dyn AsyncWrite + Send + Unpin>,
+        u64,
+        ClientType,
+        u8,
+        u32,
+    )> {
+        let (mut read_half, mut write_half) = stream.split();
+
         let mut req_buf = vec![0u8; HandshakeRequest::SIZE];
-        stream.read_exact(&mut req_buf).await?;
+        read_half
+            .read_exact(&mut req_buf)
+            .await
+            .map_err(|e| NetError::Connection(format!("handshake read failed: {}", e)))?;
 
         let req = HandshakeRequest::decode(&req_buf)
             .ok_or_else(|| NetError::Protocol("invalid handshake request".into()))?;
@@ -682,7 +784,10 @@ impl PowerFsNetServer {
         let resp = HandshakeResponse::ok(0);
         let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
         resp.encode(&mut resp_buf);
-        stream.write_all(&resp_buf).await?;
+        write_half
+            .write_all(&resp_buf)
+            .await
+            .map_err(|e| NetError::Connection(format!("handshake write failed: {}", e)))?;
 
         let client_id = req.client_id;
 
@@ -690,7 +795,7 @@ impl PowerFsNetServer {
         // Notify handler — done by caller
         let _ = (handler, manager); // suppress unused warnings
 
-        Ok((stream, client_id, client_type, channel, req.features))
+        Ok((read_half, write_half, client_id, client_type, channel, req.features))
     }
 
     // ========================================================================

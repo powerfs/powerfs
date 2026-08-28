@@ -15,9 +15,7 @@
 use std::sync::Arc;
 
 use log::{debug, info, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::client_conn::{ClientConn, CloseHandle, ConnRegistry, ConnState};
@@ -90,12 +88,14 @@ impl IoLoop {
     /// 管理一个连接 (spawn 一个 tokio task)
     ///
     /// 参数:
-    ///   - stream: TCP 连接 (IoLoop 接管读写)
+    ///   - read: 读端 (TransportStream::split() 产生)
+    ///   - write: 写端 (TransportStream::split() 产生)
     ///   - conn: ClientConn (持有 outbound_tx, 供 Worker/notify 使用)
-    ///   - outbound_rx: 出站帧接收端 (write_task 消费, 写入 TCP)
+    ///   - outbound_rx: 出站帧接收端 (write_task 消费, 写入传输层)
     pub fn manage(
         self: Arc<Self>,
-        stream: TcpStream,
+        read: Box<dyn AsyncRead + Send + Unpin>,
+        write: Box<dyn AsyncWrite + Send + Unpin>,
         conn: Arc<ClientConn>,
         outbound_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     ) {
@@ -108,8 +108,6 @@ impl IoLoop {
 
         tokio::spawn(async move {
             let peer = conn.addr;
-            stream.set_nodelay(true).ok();
-            let (read_half, write_half) = stream.into_split();
 
             // 设置 close_handle: disconnect() 通过此通道通知 read_task 退出
             let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
@@ -118,8 +116,8 @@ impl IoLoop {
 
             Self::run_connection(
                 conn,
-                read_half,
-                write_half,
+                read,
+                write,
                 work_tx,
                 lock_work_tx,
                 shutdown_rx,
@@ -145,8 +143,8 @@ impl IoLoop {
     #[allow(clippy::too_many_arguments)]
     async fn run_connection(
         conn: Arc<ClientConn>,
-        mut read_half: OwnedReadHalf,
-        mut write_half: OwnedWriteHalf,
+        mut read_half: Box<dyn AsyncRead + Send + Unpin>,
+        mut write_half: Box<dyn AsyncWrite + Send + Unpin>,
         work_tx: mpsc::Sender<Work>,
         lock_work_tx: Option<crate::lock_priority::LockPriorityProducer>,
         mut shutdown_rx: mpsc::Receiver<()>,
@@ -326,7 +324,7 @@ impl IoLoop {
     }
 
     /// 读取一个完整的帧 (header + body + data)
-    async fn read_frame(reader: &mut OwnedReadHalf) -> NetResult<NetMessage> {
+    async fn read_frame(reader: &mut (dyn AsyncRead + Unpin + Send)) -> NetResult<NetMessage> {
         let mut hdr_buf = vec![0u8; FrameHeader::SIZE];
         reader.read_exact(&mut hdr_buf).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -446,7 +444,7 @@ mod tests {
         drop(client_stream);
 
         let (mut read_half, _write_half) = server_stream.into_split();
-        let result = IoLoop::read_frame(&mut read_half).await;
+        let result = IoLoop::read_frame(&mut read_half as &mut (dyn AsyncRead + Unpin + Send)).await;
         assert!(result.is_err(), "read_frame should fail on EOF");
         assert!(result.unwrap_err().is_eof(), "error should be EOF");
     }
@@ -480,7 +478,9 @@ mod tests {
         drop(client_stream);
 
         let (mut read_half, _write_half) = server_stream.into_split();
-        let msg = IoLoop::read_frame(&mut read_half).await.unwrap();
+        let msg = IoLoop::read_frame(&mut read_half as &mut (dyn AsyncRead + Unpin + Send))
+            .await
+            .unwrap();
         assert_eq!(msg.msg_type(), Some(MsgType::Handshake));
         assert_eq!(msg.body.len(), HandshakeRequest::SIZE);
         assert!(msg.data.is_empty());

@@ -10,13 +10,13 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 
 use crate::errors::{NetError, NetResult};
 use crate::protocol::*;
+use crate::transport::Transport;
+use crate::transport_tcp::TcpTransport;
 
 /// Drain all pending requests from a DashMap and notify each waiter with an
 /// error (empty-header) NetMessage.  Used by send_task/recv_loop/disconnect
@@ -201,8 +201,10 @@ pub trait NotificationHandler: Send + Sync {
 /// PowerFS Net Client
 pub struct PowerFsNetClient {
     pub config: ClientConfig,
-    write_half: Arc<Mutex<Option<OwnedWriteHalf>>>,
-    read_half: Arc<Mutex<Option<OwnedReadHalf>>>,
+    /// 传输层 (默认 TcpTransport, 可注入 RdmaTransport / AutoTransport)
+    transport: Arc<dyn Transport>,
+    write_half: Arc<Mutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>,
+    read_half: Arc<Mutex<Option<Box<dyn AsyncRead + Send + Unpin>>>>,
     seq_counter: AtomicU32,
     inflight_sem: Arc<Semaphore>,
     /// Connection state machine (replaces former `connected: bool`).
@@ -236,8 +238,15 @@ pub struct PowerFsNetClient {
 
 impl PowerFsNetClient {
     pub fn new(config: ClientConfig) -> Self {
+        Self::new_with_transport(config, Arc::new(TcpTransport))
+    }
+
+    /// Construct a client with a custom transport (e.g. RDMA / AutoTransport).
+    /// Production entry point for non-TCP deployments.
+    pub fn new_with_transport(config: ClientConfig, transport: Arc<dyn Transport>) -> Self {
         Self {
             inflight_sem: Arc::new(Semaphore::new(config.max_inflight_requests as usize)),
+            transport,
             config,
             write_half: Arc::new(Mutex::new(None)),
             read_half: Arc::new(Mutex::new(None)),
@@ -253,6 +262,16 @@ impl PowerFsNetClient {
             send_task_handle: Arc::new(Mutex::new(None)),
             reconnecting: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Get the transport name ("tcp" / "rdma" / "auto(rdma+tcp)")
+    pub fn transport_name(&self) -> &'static str {
+        self.transport.name()
+    }
+
+    /// Get the underlying transport (for admin/monitoring)
+    pub fn transport(&self) -> &Arc<dyn Transport> {
+        &self.transport
     }
 
     /// Set a notification handler to receive server-pushed messages
@@ -366,39 +385,27 @@ impl PowerFsNetClient {
             "data"
         };
         info!(
-            "Connecting to {}:{} (channel={}, client_id={}, client_type={:?})",
+            "Connecting to {}:{} (transport={}, channel={}, client_id={}, client_type={:?})",
             self.config.addr,
             self.config.port,
+            self.transport.name(),
             ch_str,
             self.config.client_id,
             self.config.client_type
         );
 
-        let connect_result =
-            tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr)).await;
+        // 通过 Transport 创建连接 (TCP keepalive 等传输层特定设置在
+        // TcpTransport::connect 内部完成, RDMA/AutoTransport 各自处理)
+        let connect_result = tokio::time::timeout(
+            self.config.connect_timeout,
+            self.transport.connect(addr),
+        )
+        .await;
 
-        let mut tcp_stream = connect_result.map_err(|_| NetError::Timeout)??;
-        tcp_stream.set_nodelay(true)?;
+        let stream = connect_result.map_err(|_| NetError::Timeout)??;
 
-        #[cfg(unix)]
-        {
-            use socket2::TcpKeepalive;
-            use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
-            let raw_fd = tcp_stream.as_raw_fd();
-            let sock2 = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
-            let ka = TcpKeepalive::new()
-                .with_time(Duration::from_secs(60))
-                .with_interval(Duration::from_secs(10))
-                .with_retries(3);
-            if let Err(e) = sock2.set_tcp_keepalive(&ka) {
-                warn!("failed to set TCP keepalive (continuing): {}", e);
-            }
-            let _ = sock2.into_raw_fd();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = socket2::TcpKeepalive::new();
-        }
+        // 握手需要读写两端, 先 split 再分别操作
+        let (mut read_half, mut write_half) = stream.split();
 
         // Send handshake (携带 channel 字段, 服务端据此登记连接类型)
         let req = HandshakeRequest::new(
@@ -408,7 +415,7 @@ impl PowerFsNetClient {
         );
         let mut buf = vec![0u8; HandshakeRequest::SIZE];
         req.encode(&mut buf);
-        tcp_stream.write_all(&buf).await?;
+        write_half.write_all(&buf).await?;
         debug!(
             "handshake: sent request channel={} (route_hash low bit), client_id={}",
             ch_str, self.config.client_id
@@ -416,7 +423,7 @@ impl PowerFsNetClient {
 
         // Receive handshake response
         let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
-        tcp_stream.read_exact(&mut resp_buf).await?;
+        read_half.read_exact(&mut resp_buf).await?;
 
         let resp = HandshakeResponse::decode(&resp_buf)
             .ok_or_else(|| NetError::Protocol("invalid handshake response".into()))?;
@@ -426,12 +433,15 @@ impl PowerFsNetClient {
         }
 
         info!(
-            "Connected to {}:{} server_id={} (channel={})",
-            self.config.addr, self.config.port, resp.server_id, ch_str
+            "Connected to {}:{} server_id={} (transport={}, channel={})",
+            self.config.addr,
+            self.config.port,
+            resp.server_id,
+            self.transport.name(),
+            ch_str
         );
 
-        // Split stream into read and write halves for pipeline mode
-        let (read_half, write_half) = tcp_stream.into_split();
+        // 保存 read/write half (已 split, send_task 拥有 write_half, recv_loop 拥有 read_half)
         *self.write_half.lock().await = Some(write_half);
         *self.read_half.lock().await = Some(read_half);
 

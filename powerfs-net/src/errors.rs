@@ -36,6 +36,12 @@ pub enum NetError {
 
     #[error("Unknown message type: {0}")]
     UnknownMsgType(u16),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    #[error("Transport error: {0}")]
+    Transport(String),
 }
 
 pub type NetResult<T> = Result<T, NetError>;
