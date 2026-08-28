@@ -7,10 +7,11 @@ description = "PowerFS lightweight binary network protocol for metadata and data
 [features]
 default = ["tcp"]
 tcp = []
-# RDMA feature: enables transport_rdma module. The actual ibverbs crate
-# dependency will be added in Phase 2 implementation. For now this is a
-# compile-time flag that enables the stub module.
-rdma = []
+# RDMA feature: enables transport_rdma module. The RDMA implementation uses
+# direct FFI bindings to libibverbs + librdmacm (via the `libc` crate), so no
+# external Rust RDMA crate is required. This keeps all IB code isolated in
+# transport_rdma.rs and avoids dependency conflicts (e.g. jemalloc).
+rdma = ["dep:libc"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -25,5 +26,9 @@ async-trait = "0.1"
 env_logger = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# libc is an optional dep used only by the RDMA module to provide FFI
+# bindings to libibverbs / librdmacm. Keeping it optional avoids pulling
+# in libc for TCP-only builds.
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
