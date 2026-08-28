@@ -373,7 +373,8 @@ mod ffi {
             comp_vector: c_int,
         ) -> *mut ibv_cq;
         pub fn ibv_destroy_cq(cq: *mut ibv_cq) -> c_int;
-        pub fn ibv_req_notify_cq(
+        // ibv_req_notify_cq is `static inline` in verbs.h — call C wrapper.
+        pub fn powerfs_ibv_req_notify_cq(
             cq: *mut ibv_cq,
             solicited_only: c_int,
         ) -> c_int;
@@ -383,7 +384,11 @@ mod ffi {
             cq_context: *mut *mut c_void,
         ) -> c_int;
         pub fn ibv_ack_cq_events(cq: *mut ibv_cq, nevents: c_uint);
-        pub fn ibv_poll_cq(
+        // NOTE: ibv_poll_cq, ibv_post_send, ibv_post_recv are `static inline`
+        // in <infiniband/verbs.h> and NOT exported from libibverbs.so.
+        // We call the C wrappers from rdma_wrapper.c (compiled by build.rs)
+        // instead.
+        pub fn powerfs_ibv_poll_cq(
             cq: *mut ibv_cq,
             num_wc: c_int,
             wc: *mut ibv_wc,
@@ -398,12 +403,12 @@ mod ffi {
             attr: *mut ibv_qp_attr,
             attr_mask: c_int,
         ) -> c_int;
-        pub fn ibv_post_send(
+        pub fn powerfs_ibv_post_send(
             qp: *mut ibv_qp,
             wr: *mut ibv_send_wr,
             bad_wr: *mut *mut ibv_send_wr,
         ) -> c_int;
-        pub fn ibv_post_recv(
+        pub fn powerfs_ibv_post_recv(
             qp: *mut ibv_qp,
             wr: *mut ibv_recv_wr,
             bad_wr: *mut *mut ibv_recv_wr,
@@ -793,7 +798,7 @@ impl IbvCq {
     /// Returns the number of completions placed in `wcs`.
     fn poll(&self, wcs: &mut [ibv_wc]) -> usize {
         unsafe {
-            let n = ffi::ibv_poll_cq(self.as_ptr(), wcs.len() as i32, wcs.as_mut_ptr());
+            let n = ffi::powerfs_ibv_poll_cq(self.as_ptr(), wcs.len() as i32, wcs.as_mut_ptr());
             if n < 0 {
                 0
             } else {
@@ -807,7 +812,7 @@ impl IbvCq {
     /// avoid missing events.
     fn req_notify(&self, solicited_only: bool) -> NetResult<()> {
         unsafe {
-            let rc = ffi::ibv_req_notify_cq(
+            let rc = ffi::powerfs_ibv_req_notify_cq(
                 self.as_ptr(),
                 if solicited_only { 1 } else { 0 },
             );
@@ -1014,7 +1019,7 @@ impl IbvQp {
             };
             let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
             let rc =
-                ffi::ibv_post_send(self.as_ptr(), &mut wr, &mut bad_wr);
+                ffi::powerfs_ibv_post_send(self.as_ptr(), &mut wr, &mut bad_wr);
             if rc != 0 {
                 Err(NetError::Connection(format!(
                     "ibv_post_send failed (rc={})",
@@ -1037,7 +1042,7 @@ impl IbvQp {
             };
             let mut bad_wr: *mut ibv_recv_wr = ptr::null_mut();
             let rc =
-                ffi::ibv_post_recv(self.as_ptr(), &wr as *const ibv_recv_wr as *mut ibv_recv_wr, &mut bad_wr);
+                ffi::powerfs_ibv_post_recv(self.as_ptr(), &wr as *const ibv_recv_wr as *mut ibv_recv_wr, &mut bad_wr);
             if rc != 0 {
                 Err(NetError::Connection(format!(
                     "ibv_post_recv failed (rc={})",
