@@ -1,0 +1,82 @@
+# PowerFS Master 节点配置 - 节点3
+# Master 配置保留完整段落作为集群参考模板
+
+[global]
+log_level = "info"
+redis_url = "redis://172.30.0.50:6379"
+
+[master]
+transport = "rdma"              # RDMA transport for powerfs-net listener + clients
+port = 9333
+raft_port = 9335
+metrics_port = 9300
+net_port = 9334
+dir = "/data/master"
+ip = "0.0.0.0"
+advertise_addr = "172.30.0.13:9333"
+raft_id = 3
+raft_peers = ["172.30.0.11:9335", "172.30.0.12:9335", "172.30.0.13:9335"]
+admin_token = "powerfs-admin-test"              # 管理API认证令牌 (CLI cert命令需要)
+#ca_dir = (DISABLED dev mode: no cert enforcement) "/data/master/ca"                      # CA证书存储目录 (Master作为集群CA)
+registration_token = "powerfs-cluster-test"     # 节点注册认证令牌 (Volume/Filer必须一致)
+
+[volume]
+grpc_port = 8080
+http_port = 8091
+net_port = 8901
+data_dir = "/data"
+master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+master_net_port = 9334
+node_id = "volume-server-1"
+max_volume_size = 107374182400
+initial_volume_count = 4
+advertise_addr = "172.30.0.21"
+registration_token = "powerfs-cluster-test"  # 节点注册认证令牌 (必须与master一致)
+
+[filer]
+port = 8888
+grpc_port = 8889
+metrics_port = 8900             # Metrics HTTP端口 (必须与port/grpc_port/net_port都不同, 禁用加减推导)
+net_port = 9334
+ip = "0.0.0.0"
+master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+master_net_port = 9334
+data_dir = "/data/filer"
+shard_count = 3
+raft_id = 1
+raft_peers = ["172.30.0.31:8889", "172.30.0.32:8889", "172.30.0.33:8889"]
+inline_max_size = 8192
+registration_token = "powerfs-cluster-test"  # 节点注册认证令牌 (必须与master一致)
+
+[s3]
+port = 9000
+master_address = "172.30.0.11:9333"
+master_endpoints = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+dir = "/data/s3"
+access_key = "powerfs"
+secret_key = "powerfs123"
+
+[fuse]
+mount_point = "/mnt/powerfs"
+master_addresses = ["172.30.0.11", "172.30.0.12", "172.30.0.13"]
+master_net_port = 9334
+volume_net_port = 8901
+filer_net_port = 9334
+collection = "default"
+replication = "000"
+threads = 8
+verbose = false
+container = false
+
+[fuse.lease]
+mode = "cap"
+lease_duration_ms = 30000
+renew_interval_ms = 10000
+
+[monitor]
+addr = "0.0.0.0:8081"
+redis_url = "redis://172.30.0.50:6379"
+s3_endpoint = "http://172.30.0.40:9000"
+s3_backend_endpoint = "http://172.30.0.40:9000"
+master_endpoint = "172.30.0.11:9333"
+master_endpoints = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]

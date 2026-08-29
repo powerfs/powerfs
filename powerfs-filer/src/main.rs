@@ -52,6 +52,27 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     let filer_cfg = cfg.filer.clone();
 
+    // Create transport (tcp/rdma/auto) based on filer config.
+    // Shared across net server + inter-service clients (TlvMasterClient, ClientConnPool).
+    let transport_cfg = powerfs_net::TransportConfig {
+        transport: filer_cfg.transport.clone().unwrap_or_else(|| "tcp".to_string()),
+        rdma_device: filer_cfg.rdma_device.clone(),
+        ..Default::default()
+    };
+    let net_transport: Arc<dyn powerfs_net::Transport> = match powerfs_net::create_transport(&transport_cfg) {
+        Ok(t) => {
+            info!("Net transport: {}", t.name());
+            t
+        }
+        Err(e) => {
+            error!("Failed to create transport '{}': {:?}", transport_cfg.transport, e);
+            return Err(PowerFsError::InvalidRequest(format!(
+                "transport '{}' init failed: {:?}",
+                transport_cfg.transport, e
+            )));
+        }
+    };
+
     info!("Starting PowerFS Filer with sharding");
 
     // 所有端口从配置文件获取 - 无硬编码默认值
@@ -142,6 +163,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     {
         let push_node_id = node_id.clone();
         let push_master_net_port = filer_cfg.master_net_port;
+        let push_transport = net_transport.clone();
         let push_master_net_addrs: Vec<(String, u16)> = filer_cfg
             .master_addresses
             .iter()
@@ -194,6 +216,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let tlv_config = TlvMasterClientConfig {
                 client_type: powerfs_net::ClientType::Filer,
                 client_cert_pem: push_client_cert,
+                transport: Some(push_transport),
                 ..Default::default()
             };
             let tlv_client = Arc::new(TlvMasterClient::new(
@@ -303,11 +326,14 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     ));
     // TLV volume client — 所有 Filer→Volume 业务通信走 powerfs-net TLV 协议 (非 gRPC),
     // 因为内核客户端没有 gRPC, 统一使用 TLV. 供 GC task, S3Handler, scrubber 共用.
-    let volume_client_pool = Arc::new(TlvVolumeClient::new(Arc::new(ClientConnPool::new(
-        filer_cfg.raft_id,
-        ClientPoolConfig::default(),
-        None,
-    ))));
+    let volume_client_pool = Arc::new(TlvVolumeClient::new(Arc::new(
+        ClientConnPool::new_with_transport(
+            filer_cfg.raft_id,
+            ClientPoolConfig::default(),
+            None,
+            Some(net_transport.clone()),
+        ),
+    )));
 
     let shard_strategy = Arc::new(ShardStrategy::new(filer_cfg.shard_count as u64));
 
@@ -405,6 +431,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         if !first_master_net.is_empty() {
             let filer_id = format!("filer-{}", filer_cfg.raft_id);
             let advertise_addr_for_notifier = format!("{}:{}", advertise_ip, net_port);
+            let notifier_transport = Some(net_transport.clone());
             let rgm = raft_group_manager.clone();
             for i in 0..filer_cfg.shard_count {
                 let shard_id = ShardId(i as u64);
@@ -413,6 +440,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     first_master_net.clone(),
                     filer_id.clone(),
                     advertise_addr_for_notifier.clone(),
+                    notifier_transport.clone(),
                 )
                 .await;
             }
@@ -712,6 +740,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let shard_count = filer_cfg.shard_count as u64;
             let force_register = filer_cfg.force_register;
             let registration_token_for_reg = filer_cfg.registration_token.clone();
+            let transport_for_zone = Some(net_transport.clone());
             // Load client certificate PEM for production node authentication.
             // When the master has a CA configured, the filer MUST present this
             // cert during RegisterFiler; empty in dev mode (no cert configured).
@@ -783,8 +812,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     let mut registered = false;
 
                     for master_addr in &master_net_addrs {
-                        match powerfs_filer::zone_client::register_filer(master_addr, &registration)
-                            .await
+                        match powerfs_filer::zone_client::register_filer(
+                            master_addr,
+                            &registration,
+                            transport_for_zone.clone(),
+                        )
+                        .await
                         {
                             Ok(zones) => {
                                 // 检查是否所有 Zone 都有物理 volume
@@ -939,9 +972,13 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
 
         let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
-        if let Ok(net_server) =
-            PowerFsNetServer::bind_with_registry(&bind_ip, net_port, net_handler, net_registry)
-                .await
+        // net_transport was created early in run_filer() and is shared with
+        // inter-service clients (TlvMasterClient, ClientConnPool).
+        if let Ok(net_server) = PowerFsNetServer::bind_with_registry_and_transport(
+            &bind_ip, net_port, net_handler, net_registry,
+            powerfs_net::ServerConfig::default(), net_transport.clone(),
+        )
+        .await
         {
             tokio::spawn(async move {
                 if let Err(e) = net_server.serve().await {

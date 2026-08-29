@@ -1,0 +1,22 @@
+# PowerFS Volume 节点配置 - RDMA host-network 单节点测试
+# 使用 172.30.0.1 作为服务地址, dev mode (无证书)
+
+[global]
+log_level = "info"
+redis_url = "redis://172.30.0.50:6379"
+
+[volume]
+transport = "rdma"
+rdma_device = "rxe0"
+grpc_port = 8080
+http_port = 8091
+net_port = 8901
+data_dir = "/data"
+master_addresses = ["172.30.0.1:9333"]
+master_net_port = 9334
+node_id = "volume-server-1"
+max_volume_size = 107374182400
+initial_volume_count = 4
+advertise_addr = "172.30.0.1"
+lease_enabled = false
+registration_token = "powerfs-cluster-test"

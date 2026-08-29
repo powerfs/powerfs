@@ -1,0 +1,24 @@
+# PowerFS Filer 节点配置 - RDMA host-network 单节点测试
+# 注: net_port 改为 9336 避免与 master 的 9334 冲突 (host 网络模式)
+# 使用 172.30.0.1 作为服务地址, dev mode (无证书)
+
+[global]
+log_level = "info"
+redis_url = "redis://172.30.0.50:6379"
+
+[filer]
+transport = "rdma"
+rdma_device = "rxe0"
+port = 8888
+grpc_port = 8889
+metrics_port = 8900
+net_port = 9336
+ip = "0.0.0.0"
+master_addresses = ["172.30.0.1:9333"]
+master_net_port = 9334
+data_dir = "/data/filer"
+shard_count = 1
+raft_id = 1
+raft_peers = ["172.30.0.1:8889"]
+inline_max_size = 8192
+registration_token = "powerfs-cluster-test"

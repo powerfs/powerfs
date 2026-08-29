@@ -2,6 +2,7 @@ use clap::Parser;
 use log::{error, info, warn};
 use powerfs_common::{
     config::{PowerFsConfig, ServiceType},
+    error::PowerFsError,
     system_metrics::collect_system_metrics,
     types::{NodeId, VolumeId},
 };
@@ -53,10 +54,17 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     let cfg = load_config(&args.config);
+
+    run_volume(cfg, args).await?;
+
+    Ok(())
+}
+
+async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Result<()> {
     let volume_cfg = cfg.volume.clone();
 
     // 使用 dynamic_log（支持运行时动态调整 + target 过滤 + 子系统开关）
@@ -201,6 +209,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_lease_enabled(cfg.volume.lease_enabled);
 
+    // Create transport (tcp/rdma/auto) based on volume config.
+    // Shared between net server and MasterClient heartbeats.
+    let net_transport: Option<Arc<dyn powerfs_net::Transport>> = if net_port > 0 {
+        let transport_cfg = powerfs_net::TransportConfig {
+            transport: cfg.volume.transport.clone().unwrap_or_else(|| "tcp".to_string()),
+            rdma_device: cfg.volume.rdma_device.clone(),
+            ..Default::default()
+        };
+        match powerfs_net::create_transport(&transport_cfg) {
+            Ok(t) => {
+                info!("Net transport: {}", t.name());
+                Some(t)
+            }
+            Err(e) => {
+                error!("Failed to create transport '{}': {:?}", transport_cfg.transport, e);
+                return Err(PowerFsError::InvalidRequest(format!(
+                    "transport '{}' init failed: {:?}",
+                    transport_cfg.transport, e
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
     // Start powerfs-net binary protocol server for Volume
     // (bind first so we can share its FlowController with the metrics server)
     let net_server = if net_port > 0 {
@@ -211,9 +244,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
         info!("Starting powerfs-net Volume server on {}", net_bind_addr);
-        PowerFsNetServer::bind_with_manager(&ip, net_port, net_handler)
-            .await
-            .ok()
+
+        let transport = net_transport.clone().expect("net_transport Some when net_port>0");
+
+        PowerFsNetServer::bind_with_manager_and_transport(
+            &ip, net_port, net_handler, transport,
+        )
+        .await
+        .ok()
     } else {
         None
     };
@@ -304,6 +342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Some(client_cert_pem.clone())
         };
+        let push_transport = net_transport.clone();
 
         tokio::spawn(async move {
             struct DebugConfigPushHandler {
@@ -330,6 +369,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let tlv_config = TlvMasterClientConfig {
                 client_type: powerfs_net::ClientType::Volume,
                 client_cert_pem: push_cert,
+                transport: push_transport,
                 ..Default::default()
             };
             let tlv_client = Arc::new(TlvMasterClient::new(
@@ -389,6 +429,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ip: &ip,
         registration_token: volume_cfg.registration_token.as_deref(),
         client_cert_pem: &client_cert_pem,
+        transport: net_transport.clone(),
     });
 
     let register = args.register_with_master.unwrap_or(true);

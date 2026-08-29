@@ -163,7 +163,12 @@ mod ffi {
 
     #[repr(C)]
     pub struct ibv_comp_channel {
+        /// Pad to reach `fd` at offset 8 (verified on rdma-core 28.0-1ubuntu1:
+        /// sizeof(struct ibv_comp_channel) = 16, offsetof(fd) = 8).
+        pub _pad_before_fd: [u8; 8],
         pub fd: c_int,
+        /// Trailing padding (fd is 4 bytes, struct size is 16 → 4 more bytes).
+        pub _pad_after_fd: [u8; 4],
     }
 
     /// Opaque type for `struct ibv_srq` (Shared Receive Queue).
@@ -194,6 +199,8 @@ mod ffi {
         pub slid: uint16_t,
         pub sl: uint8_t,
         pub dlid_path_bits: uint8_t,
+        /// Trailing padding (verified sizeof = 48 on rdma-core 28.0).
+        pub _pad_tail: [u8; 4],
     }
 
     pub type ibv_wc_status = int32_t;
@@ -270,6 +277,8 @@ mod ffi {
         pub is_global: uint8_t,
         /// Physical port number to use.
         pub port_num: uint8_t,
+        /// Trailing padding (verified sizeof = 32 on rdma-core 28.0).
+        pub _pad_tail: [u8; 1],
     }
 
     #[repr(C)]
@@ -607,8 +616,13 @@ mod ffi {
         pub retry_count: u8,
         pub rnr_retry_count: u8,
         pub srq: u8,
+        /// Padding to align qp_num at offset 16 (verified: offsetof(qp_num)=16,
+        /// sizeof(rdma_conn_param)=24 on rdma-core 28.0-1ubuntu1).
+        pub _pad_before_qp_num: [u8; 1],
         /// Peer's QPN, extracted from REQ/REP message by rdma_cm.
         pub qp_num: u32,
+        /// Trailing padding to reach 24 bytes total.
+        pub _pad_tail: [u8; 4],
     }
 
     /// rdma_cm event (must match `struct rdma_cm_event` in <rdma/rdma_cma.h>).
@@ -1104,6 +1118,13 @@ impl IbvCq {
         self.channel.as_ref().map(|ch| ch.fd())
     }
 
+    /// Returns the completion channel's raw pointer as `usize`, if the
+    /// CQ was created with one. Used by `spawn_blocking` closures that
+    /// need to call `ibv_get_cq_event` (which takes the channel pointer).
+    fn channel_ptr(&self) -> Option<usize> {
+        self.channel.as_ref().map(|ch| ch.as_ptr() as usize)
+    }
+
     /// Poll for up to `wcs.len()` completions (non-blocking).
     ///
     /// Returns the number of completions placed in `wcs`.
@@ -1529,6 +1550,8 @@ impl MrPool {
     }
 }
 
+// (removed blocking helpers — hardware RDMA uses AsyncFd, not spawn_blocking)
+
 // ============================================================================
 // RdmaChannel — QP + CQ + MR pool (一个连接的完整资源)
 // ============================================================================
@@ -1576,17 +1599,22 @@ impl RdmaChannel {
             slid: 0,
             sl: 0,
             dlid_path_bits: 0,
+            _pad_tail: [0; 4],
         }; 1]
     }
 
-    /// Wait for one CQ completion using AsyncFd-driven async polling.
+    /// Wait for a single CQ completion using AsyncFd (hardware RDMA).
     ///
-    /// 1. Arm the CQ (`ibv_req_notify_cq`) to get an event on the next
-    ///    completion.
-    /// 2. Poll the CQ — if a completion is already there, return it.
-    /// 3. If no completion, wait for the AsyncFd to signal readiness,
-    ///    then call `ibv_get_cq_event` + `ibv_ack_cq_events` to consume
-    ///    the event, and poll the CQ again.
+    /// For hardware RDMA, all verb calls are fast user-space operations:
+    /// - `ibv_poll_cq` is a memory read from the CQ ring buffer
+    /// - `ibv_req_notify_cq` arms the hardware interrupt
+    /// - `ibv_get_cq_event` reads from the channel fd (non-blocking after
+    ///   AsyncFd reports readability, because the hardware interrupt
+    ///   guarantees the event is ready)
+    ///
+    /// AsyncFd provides efficient epoll-based notification without
+    /// `spawn_blocking` overhead (5-10μs per call), preserving RDMA's
+    /// sub-microsecond latency advantage.
     async fn wait_cq_completion(
         cq: &IbvCq,
         async_fd: Option<&Arc<CqAsyncFd>>,
@@ -1606,10 +1634,11 @@ impl RdmaChannel {
             let async_fd = match async_fd {
                 Some(fd) => fd,
                 None => {
-                    // No completion channel: busy-poll fallback (should not
-                    // happen in production since CQs are always created with
-                    // channels in the AsyncFd path).
-                    std::hint::spin_loop();
+                    // No completion channel async-fd available (e.g.
+                    // AsyncFd registration failed for the underlying fd).
+                    // Yield back to the tokio runtime to avoid starving
+                    // other tasks on the worker thread.
+                    tokio::task::yield_now().await;
                     continue;
                 }
             };
@@ -1666,7 +1695,9 @@ impl RdmaChannel {
             lkey: mr.lkey(),
         };
         let wr_id = mr.addr() as u64; // identify completion by buffer addr
+        eprintln!("[RDMA_DBG] send: qp={} addr={:#x} len={} lkey={:#x}", self.qp.qp_num(), sge.addr, sge.length, sge.lkey);
         self.qp.post_send(&sge, wr_id)?;
+        eprintln!("[RDMA_DBG] send: post_send OK, waiting CQ...");
 
         // Wait for send completion via AsyncFd-driven async polling.
         let wc = Self::wait_cq_completion(&self.send_cq, self.send_async_fd.as_ref()).await;
@@ -1808,17 +1839,19 @@ impl Transport for RdmaTransport {
         }
         let channel = RdmaEventChannelPtr(channel);
 
-        let mut cm_id: *mut rdma_cm_id = ptr::null_mut();
-        let rc = unsafe {
-            ffi::rdma_create_id(channel.0, &mut cm_id, ptr::null_mut(), ffi::RDMA_PS_TCP)
+        let cm_id = {
+            let mut cm_id_raw: *mut rdma_cm_id = ptr::null_mut();
+            let rc = unsafe {
+                ffi::rdma_create_id(channel.0, &mut cm_id_raw, ptr::null_mut(), ffi::RDMA_PS_TCP)
+            };
+            if rc != 0 {
+                return Err(NetError::Connection(format!(
+                    "rdma_create_id failed (rc={})",
+                    rc
+                )));
+            }
+            RdmaCmIdPtr(cm_id_raw)
         };
-        if rc != 0 {
-            return Err(NetError::Connection(format!(
-                "rdma_create_id failed (rc={})",
-                rc
-            )));
-        }
-        let cm_id = RdmaCmIdPtr(cm_id);
         debug!("[client] cm_id created (ptr={:p})", cm_id.0);
 
         // 2. Resolve address
@@ -1840,7 +1873,7 @@ impl Transport for RdmaTransport {
         debug!("[client] rdma_resolve_addr called, waiting for ADDR_RESOLVED...");
 
         // Wait for ADDR_RESOLVED event
-        wait_cm_event(channel.0, ffi::RDMA_CM_EVENT_ADDR_RESOLVED)?;
+        wait_cm_event(channel.0 as usize, ffi::RDMA_CM_EVENT_ADDR_RESOLVED).await?;
         debug!("[client] ADDR_RESOLVED received");
 
         // 3. Resolve route
@@ -1854,7 +1887,7 @@ impl Transport for RdmaTransport {
             )));
         }
         debug!("[client] rdma_resolve_route called, waiting for ROUTE_RESOLVED...");
-        wait_cm_event(channel.0, ffi::RDMA_CM_EVENT_ROUTE_RESOLVED)?;
+        wait_cm_event(channel.0 as usize, ffi::RDMA_CM_EVENT_ROUTE_RESOLVED).await?;
         debug!("[client] ROUTE_RESOLVED received (cm_id ptr={:p})", cm_id.0);
 
         // 4. After route resolution, cm_id->verbs points to the device
@@ -1862,24 +1895,27 @@ impl Transport for RdmaTransport {
         //    (not the transport's pre-allocated one) for all per-connection
         //    resources — using a different context causes SIGSEGV in the
         //    RDMA driver.
-        let verbs_ptr = unsafe { (*cm_id.0).verbs };
-        if verbs_ptr.is_null() {
-            return Err(NetError::Connection(
-                "cm_id->verbs is null after ROUTE_RESOLVED".to_string(),
-            ));
-        }
-        let ctx = IbvContext::from_raw_borrowed(verbs_ptr);
-        debug!("[client] got device context from cm_id");
+        let (ctx, pd) = {
+            let verbs_ptr = unsafe { (*cm_id.0).verbs };
+            if verbs_ptr.is_null() {
+                return Err(NetError::Connection(
+                    "cm_id->verbs is null after ROUTE_RESOLVED".to_string(),
+                ));
+            }
+            let ctx = IbvContext::from_raw_borrowed(verbs_ptr);
+            debug!("[client] got device context from cm_id");
 
-        // 5. Allocate per-connection PD and create CQs from the cm_id's
-        //    device context.
-        let pd = IbvPd::alloc(&ctx)?;
-        // Debug: verify pd->context matches verbs_ptr
-        let pd_ctx = unsafe { (*pd.as_ptr()).context };
-        debug!(
-            "[client] pd->context={:p}, verbs_ptr={:p}, match={}",
-            pd_ctx, verbs_ptr, pd_ctx == verbs_ptr
-        );
+            // 5. Allocate per-connection PD and create CQs from the cm_id's
+            //    device context.
+            let pd = IbvPd::alloc(&ctx)?;
+            // Debug: verify pd->context matches verbs_ptr
+            let pd_ctx = unsafe { (*pd.as_ptr()).context };
+            debug!(
+                "[client] pd->context={:p}, verbs_ptr={:p}, match={}",
+                pd_ctx, verbs_ptr, pd_ctx == verbs_ptr
+            );
+            (ctx, pd)
+        };
         let send_comp_ch = IbvCompChannel::create(&ctx)?;
         let recv_comp_ch = IbvCompChannel::create(&ctx)?;
         let send_cq = IbvCq::create(&ctx, 32, Some(send_comp_ch))?;
@@ -1943,7 +1979,7 @@ impl Transport for RdmaTransport {
         // 8a. Wait for ESTABLISHED. rdma_cm auto-transitions the QP
         //     (RESET→INIT→RTR→RTS) based on connection events.
         loop {
-            let (event_type, _, _) = wait_for_any_cm_event(channel.0)?;
+            let (event_type, _, _) = wait_for_any_cm_event(channel.0 as usize).await?;
             if event_type == ffi::RDMA_CM_EVENT_ESTABLISHED {
                 debug!("[client] ESTABLISHED received, QP should be in RTS");
                 break;
@@ -2046,6 +2082,7 @@ impl Transport for RdmaTransport {
             context: self.context.clone(),
             pd: self.pd.clone(),
             config: self.config.clone(),
+            pending: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -2082,43 +2119,41 @@ impl Drop for RdmaCmIdPtr {
 unsafe impl Send for RdmaCmIdPtr {}
 unsafe impl Sync for RdmaCmIdPtr {}
 
-/// Wait for a specific rdma_cm event type on the channel (blocking).
-fn wait_cm_event(
-    channel: *mut rdma_event_channel,
-    expected: ffi::rdma_cm_event_type,
-) -> NetResult<()> {
-    wait_cm_event_with_id(channel, expected).map(|_| ())
-}
-
-/// Wait for a specific rdma_cm event type and return the event (for QPN extraction).
+/// Async wrapper for `poll(event_channel_fd) + rdma_get_cm_event`.
 ///
-/// Uses `poll()` on the event channel fd with a 5s timeout before each
-/// blocking `rdma_get_cm_event` call. This avoids hanging forever if an
-/// expected event never arrives (e.g. route resolution silently failing),
-/// and lets us surface a clear error instead of a test timeout.
-fn wait_cm_event_with_id(
-    channel: *mut rdma_event_channel,
-    expected: ffi::rdma_cm_event_type,
-) -> NetResult<*mut rdma_cm_event> {
-    let fd = if channel.is_null() {
+/// Uses `spawn_blocking` to avoid blocking the tokio worker thread.
+/// The event channel fd is polled with a 30s timeout. When an event is
+/// available, `rdma_get_cm_event` is called (which returns immediately
+/// because poll confirmed readability). The returned event is NOT acked;
+/// the caller is responsible for `rdma_ack_cm_event`.
+///
+/// Takes the channel pointer as `usize` (not `*mut`) because raw pointers
+/// are `!Send`, which would make the returned future `!Send` and break
+/// the `async_trait` `Send` bound on `Transport::connect`.
+///
+/// Returns the event pointer as `usize` for the same reason: `*mut` is
+/// `!Send` so it cannot be the return type of `spawn_blocking`.
+async fn async_get_cm_event(
+    channel_raw: usize,
+) -> NetResult<usize> {
+    if channel_raw == 0 {
         return Err(NetError::Connection("null event channel".to_string()));
-    } else {
-        unsafe { (*channel).fd }
-    };
+    }
 
-    loop {
-        // Poll the channel fd for readability (event pending) with a 5s timeout.
+    tokio::task::spawn_blocking(move || -> NetResult<usize> {
+        let channel = channel_raw as *mut rdma_event_channel;
+        let fd = unsafe { (*channel).fd };
+
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        let prc = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        let prc = unsafe { libc::poll(&mut pfd, 1, 30000) };
         if prc == 0 {
-            return Err(NetError::Connection(format!(
-                "rdma_cm: timeout waiting for event {} on channel fd {}",
-                expected, fd
-            )));
+            return Err(NetError::Connection(
+                "rdma_cm: timeout (30s) waiting for event".to_string(),
+            ));
         }
         if prc < 0 {
             let e = std::io::Error::last_os_error();
@@ -2137,8 +2172,36 @@ fn wait_cm_event_with_id(
             )));
         }
         if event.is_null() {
-            return Err(NetError::Connection("rdma_get_cm_event returned null".to_string()));
+            return Err(NetError::Connection(
+                "rdma_get_cm_event returned null".to_string(),
+            ));
         }
+        Ok(event as usize)
+    })
+    .await
+    .map_err(|e| NetError::Connection(format!("spawn_blocking join error: {}", e)))?
+}
+
+/// Wait for a specific rdma_cm event type on the channel (async, non-blocking).
+async fn wait_cm_event(
+    channel_raw: usize,
+    expected: ffi::rdma_cm_event_type,
+) -> NetResult<()> {
+    wait_cm_event_with_id(channel_raw, expected).await.map(|_| ())
+}
+
+/// Wait for a specific rdma_cm event type and return the event (async).
+///
+/// Uses `async_get_cm_event` (spawn_blocking) to avoid blocking the tokio
+/// worker thread. Acks unexpected events and retries. Error events cause
+/// immediate return.
+async fn wait_cm_event_with_id(
+    channel_raw: usize,
+    expected: ffi::rdma_cm_event_type,
+) -> NetResult<()> {
+    loop {
+        let event_raw = async_get_cm_event(channel_raw).await?;
+        let event = event_raw as *mut rdma_cm_event;
 
         let actual = unsafe { (*event).event };
         let status = unsafe { (*event).status };
@@ -2149,7 +2212,7 @@ fn wait_cm_event_with_id(
 
         if actual == expected {
             unsafe { ffi::rdma_ack_cm_event(event) };
-            return Ok(ptr::null_mut());
+            return Ok(());
         }
 
         debug!(
@@ -2178,48 +2241,13 @@ fn wait_cm_event_with_id(
 /// Acks the event before returning. The peer QPN is extracted from the
 /// event's `param.private_data` (where we put it in the conn_param) or
 /// from `param.qp_num` (populated by some rdma_cm implementations).
-fn wait_for_any_cm_event(
-    channel: *mut rdma_event_channel,
-) -> NetResult<(ffi::rdma_cm_event_type, u32, *mut rdma_cm_id)> {
-    let fd = if channel.is_null() {
-        return Err(NetError::Connection("null event channel".to_string()));
-    } else {
-        unsafe { (*channel).fd }
-    };
-
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let prc = unsafe { libc::poll(&mut pfd, 1, 5000) };
-    if prc == 0 {
-        return Err(NetError::Connection(format!(
-            "rdma_cm: timeout waiting for event on channel fd {}",
-            fd
-        )));
-    }
-    if prc < 0 {
-        let e = std::io::Error::last_os_error();
-        return Err(NetError::Connection(format!(
-            "rdma_cm: poll on channel fd {} failed: {}",
-            fd, e
-        )));
-    }
-
-    let mut event: *mut rdma_cm_event = ptr::null_mut();
-    let rc = unsafe { ffi::rdma_get_cm_event(channel, &mut event) };
-    if rc != 0 {
-        return Err(NetError::Connection(format!(
-            "rdma_get_cm_event failed (rc={})",
-            rc
-        )));
-    }
-    if event.is_null() {
-        return Err(NetError::Connection(
-            "rdma_get_cm_event returned null".to_string(),
-        ));
-    }
+///
+/// Returns cm_id as `usize` to avoid `!Send` raw pointer issues.
+async fn wait_for_any_cm_event(
+    channel_raw: usize,
+) -> NetResult<(ffi::rdma_cm_event_type, u32, usize)> {
+    let event_raw = async_get_cm_event(channel_raw).await?;
+    let event = event_raw as *mut rdma_cm_event;
 
     let event_type = unsafe { (*event).event };
     let status = unsafe { (*event).status };
@@ -2259,7 +2287,7 @@ fn wait_for_any_cm_event(
         )));
     }
 
-    Ok((event_type, peer_qpn, cm_id))
+    Ok((event_type, peer_qpn, cm_id as usize))
 }
 
 /// Convert a SocketAddr to a libc sockaddr (IPv4 or IPv6).
@@ -2321,7 +2349,6 @@ impl TransportStream for RdmaStream {
         };
         let writer = RdmaWriteHalf {
             channel,
-            send_buf: Vec::new(),
             pending_send: None,
         };
         (Box::new(reader), Box::new(writer))
@@ -2421,15 +2448,12 @@ impl Unpin for RdmaReadHalf {}
 /// Type alias for a pinned boxed future for the send operation.
 type SendFut = Pin<Box<dyn std::future::Future<Output = NetResult<()>> + Send>>;
 
-/// RDMA write half. Implements `AsyncWrite` by:
-/// 1. `poll_write`: append to the internal send buffer.
-/// 2. `poll_flush`: take the buffered data and post an RDMA send via a
-///    `'static` future. Poll the future to completion.
+/// RDMA write half. Implements `AsyncWrite` by posting an RDMA send
+/// directly in `poll_write` (no buffering). This matches TCP semantics
+/// where `poll_write` sends data immediately, so `write_all` works
+/// without requiring an explicit `flush()`.
 struct RdmaWriteHalf {
     channel: Arc<RdmaChannel>,
-    /// Pending bytes not yet sent. Stream emulation: caller may write a frame
-    /// in multiple poll_write calls; we flush on poll_flush.
-    send_buf: Vec<u8>,
     /// In-flight send future (if any). When `Some`, we are waiting for an
     /// async RDMA send to complete.
     pending_send: Option<SendFut>,
@@ -2438,18 +2462,9 @@ struct RdmaWriteHalf {
 impl AsyncWrite for RdmaWriteHalf {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        // Append to internal buffer; the actual RDMA send happens on flush.
-        self.send_buf.extend_from_slice(buf);
-        Poll::Ready(Ok(buf.len()))
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
         // If we have an in-flight send, poll it first.
         if let Some(pending) = self.pending_send.as_mut() {
             match pending.as_mut().poll(cx) {
@@ -2469,24 +2484,28 @@ impl AsyncWrite for RdmaWriteHalf {
             }
         }
 
-        // No in-flight send. If there's buffered data, start a new send.
-        if self.send_buf.is_empty() {
-            return Poll::Ready(Ok(()));
+        // No in-flight send. If buf is empty, nothing to do.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
         }
 
+        // Truncate to MR buffer size (partial write — write_all will retry).
+        let max_len = self.channel.mr_pool.buf_size();
+        let write_len = std::cmp::min(buf.len(), max_len);
+
         let channel = self.channel.clone();
-        let data = std::mem::take(&mut self.send_buf);
+        let data = buf[..write_len].to_vec();
         self.pending_send = Some(Box::pin(async move {
             channel.send(&data).await
         }));
 
-        // Poll the newly created future immediately (may complete fast path).
+        // Poll the newly created future (may complete fast path).
         let pending = self.pending_send.as_mut().unwrap();
         match pending.as_mut().poll(cx) {
             Poll::Ready(result) => {
                 self.pending_send = None;
                 match result {
-                    Ok(()) => Poll::Ready(Ok(())),
+                    Ok(()) => Poll::Ready(Ok(write_len)),
                     Err(e) => Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         e.to_string(),
@@ -2495,6 +2514,31 @@ impl AsyncWrite for RdmaWriteHalf {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // Wait for any in-flight send to complete.
+        if let Some(pending) = self.pending_send.as_mut() {
+            match pending.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    self.pending_send = None;
+                    match result {
+                        Ok(()) => {}
+                        Err(e) => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                e.to_string(),
+                            )));
+                        }
+                    }
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
@@ -2513,6 +2557,19 @@ impl Unpin for RdmaWriteHalf {}
 // RdmaListenerAdapter — TransportListener implementation
 // ============================================================================
 
+/// Accept-side state that was prepared during CONNECT_REQUEST processing,
+/// waiting for the matching ESTABLISHED event on the listener event channel.
+struct PendingAccepted {
+    pd: Arc<IbvPd>,
+    send_cq: Arc<IbvCq>,
+    recv_cq: Arc<IbvCq>,
+    send_async_fd: Option<Arc<AsyncFd<CqChannelFd>>>,
+    recv_async_fd: Option<Arc<AsyncFd<CqChannelFd>>>,
+    mr_pool: Arc<MrPool>,
+    qp: IbvQp,
+    cm_id: RdmaCmIdPtr,
+}
+
 /// RDMA listener adapter. Wraps rdma_cm listen id + event channel.
 pub struct RdmaListenerAdapter {
     channel: RdmaEventChannelPtr,
@@ -2521,25 +2578,19 @@ pub struct RdmaListenerAdapter {
     context: Arc<IbvContext>,
     pd: Arc<IbvPd>,
     config: TransportConfig,
+    /// Per-connection items built during CONNECT_REQUEST handling,
+    /// keyed by the child rdma_cm_id pointer cast to usize. These are
+    /// awaiting the matching ESTABLISHED event on the shared listener
+    /// event channel.
+    pending: parking_lot::Mutex<std::collections::HashMap<usize, PendingAccepted>>,
 }
 
 #[async_trait::async_trait]
 impl TransportListener for RdmaListenerAdapter {
     async fn accept(&self) -> NetResult<Box<dyn TransportStream>> {
         loop {
-            let mut event: *mut rdma_cm_event = ptr::null_mut();
-            let rc = unsafe { ffi::rdma_get_cm_event(self.channel.0, &mut event) };
-            if rc != 0 {
-                return Err(NetError::Connection(format!(
-                    "accept: rdma_get_cm_event failed (rc={})",
-                    rc
-                )));
-            }
-            if event.is_null() {
-                return Err(NetError::Connection(
-                    "accept: rdma_get_cm_event returned null".to_string(),
-                ));
-            }
+            let event_raw = async_get_cm_event(self.channel.0 as usize).await?;
+            let event = event_raw as *mut rdma_cm_event;
 
             let event_type = unsafe { (*event).event };
             let new_id = unsafe { (*event).id };
@@ -2560,6 +2611,8 @@ impl TransportListener for RdmaListenerAdapter {
                 "[server] event {} (param_qp={}, pd_len={}, peer_qpn={})",
                 event_type, param_qp_num, pd_len, peer_qpn
             );
+            // IMPORTANT: Ack the event AFTER reading all fields we need from it.
+            // rdma_ack_cm_event may free event memory.
             unsafe { ffi::rdma_ack_cm_event(event) };
 
             match event_type {
@@ -2570,9 +2623,8 @@ impl TransportListener for RdmaListenerAdapter {
                     }
 
                     // Use the new cm_id's device context (verbs) for all
-                    // per-connection resources, not the transport's pre-
-                    // allocated context. Using a different context causes
-                    // SIGSEGV in the RDMA driver.
+                    // per-connection resources; the listener's pre-allocated
+                    // context is only for the listen-id endpoint.
                     let verbs_ptr = unsafe { (*new_id).verbs };
                     if verbs_ptr.is_null() {
                         warn!("accept: new_id->verbs is null");
@@ -2582,11 +2634,46 @@ impl TransportListener for RdmaListenerAdapter {
                     let ctx = IbvContext::from_raw_borrowed(verbs_ptr);
 
                     // Per-connection PD + CQs from the cm_id's context.
-                    let pd = IbvPd::alloc(&ctx)?;
-                    let send_comp_ch = IbvCompChannel::create(&ctx)?;
-                    let recv_comp_ch = IbvCompChannel::create(&ctx)?;
-                    let send_cq = IbvCq::create(&ctx, 32, Some(send_comp_ch))?;
-                    let recv_cq = IbvCq::create(&ctx, 32, Some(recv_comp_ch))?;
+                    let pd = match IbvPd::alloc(&ctx) {
+                        Ok(p) => Arc::new(p),
+                        Err(e) => {
+                            warn!("accept: IbvPd::alloc failed: {}", e);
+                            unsafe { ffi::rdma_destroy_id(new_id) };
+                            continue;
+                        }
+                    };
+                    let send_comp_ch = match IbvCompChannel::create(&ctx) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("accept: IbvCompChannel::create(send) failed: {}", e);
+                            unsafe { ffi::rdma_destroy_id(new_id) };
+                            continue;
+                        }
+                    };
+                    let recv_comp_ch = match IbvCompChannel::create(&ctx) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("accept: IbvCompChannel::create(recv) failed: {}", e);
+                            unsafe { ffi::rdma_destroy_id(new_id) };
+                            continue;
+                        }
+                    };
+                    let send_cq = match IbvCq::create(&ctx, 32, Some(send_comp_ch)) {
+                        Ok(c) => Arc::new(c),
+                        Err(e) => {
+                            warn!("accept: IbvCq::create(send) failed: {}", e);
+                            unsafe { ffi::rdma_destroy_id(new_id) };
+                            continue;
+                        }
+                    };
+                    let recv_cq = match IbvCq::create(&ctx, 32, Some(recv_comp_ch)) {
+                        Ok(c) => Arc::new(c),
+                        Err(e) => {
+                            warn!("accept: IbvCq::create(recv) failed: {}", e);
+                            unsafe { ffi::rdma_destroy_id(new_id) };
+                            continue;
+                        }
+                    };
 
                     // Create QP via rdma_create_qp (C wrapper). This sets both
                     // cm_id->qp AND internal id_priv->qp, so rdma_cm correctly
@@ -2620,19 +2707,24 @@ impl TransportListener for RdmaListenerAdapter {
                     let qp = IbvQp::from_raw_non_owning(qp_ptr);
 
                     // Build MR pool from the per-connection PD.
-                    let mr_pool = MrPool::new(
+                    let mr_pool = match MrPool::new(
                         &pd,
                         self.config.rdma_buf_num,
                         self.config.rdma_buf_size,
-                    )?;
+                    ) {
+                        Ok(p) => Arc::new(p),
+                        Err(e) => {
+                            warn!("accept: MrPool::new failed: {}", e);
+                            unsafe { ffi::rdma_destroy_id(new_id) };
+                            continue;
+                        }
+                    };
 
-                    // Accept. Since rdma_create_qp was called, qp_num is
-                    // ignored — rdma_cm uses cm_id->qp->qp_num. C wrapper
-                    // avoids Rust struct layout issues.
+                    // Call rdma_accept; QP state is managed by rdma_cm.
+                    // The matching ESTABLISHED event will arrive asynchronously
+                    // on the shared listener event channel.
                     let rc = unsafe {
-                        ffi::powerfs_rdma_accept(
-                            new_id, 1, 1, 1, 7, 7, 0, 0,
-                        )
+                        ffi::powerfs_rdma_accept(new_id, 1, 1, 1, 7, 7, 0, 0)
                     };
                     if rc != 0 {
                         warn!("rdma_accept failed (rc={})", rc);
@@ -2640,48 +2732,11 @@ impl TransportListener for RdmaListenerAdapter {
                         continue;
                     }
                     debug!(
-                        "[server] rdma_accept called (local_qpn={}), waiting for ESTABLISHED",
+                        "[server] rdma_accept called (local_qpn={}), deferring ESTABLISHED to outer event loop",
                         qp.qp_num()
                     );
 
-                    // After rdma_accept, we MUST retrieve and ack the
-                    // ESTABLISHED event. Without this, rdma_cm's internal
-                    // state machine is incomplete and the connection is not
-                    // fully active on the server side, causing REM_ACCESS_ERR
-                    // when the client sends data.
-                    let mut est_event: *mut rdma_cm_event = ptr::null_mut();
-                    let rc = unsafe {
-                        ffi::rdma_get_cm_event(self.channel.0, &mut est_event)
-                    };
-                    if rc != 0 || est_event.is_null() {
-                        warn!(
-                            "accept: failed to get ESTABLISHED event after rdma_accept (rc={})",
-                            rc
-                        );
-                        unsafe { ffi::rdma_destroy_id(new_id) };
-                        continue;
-                    }
-                    let est_type = unsafe { (*est_event).event };
-                    debug!("[server] post-accept event {}", est_type);
-                    if est_type != ffi::RDMA_CM_EVENT_ESTABLISHED {
-                        warn!(
-                            "accept: expected ESTABLISHED ({}), got {}",
-                            ffi::RDMA_CM_EVENT_ESTABLISHED, est_type
-                        );
-                        unsafe { ffi::rdma_ack_cm_event(est_event) };
-                        unsafe { ffi::rdma_destroy_id(new_id) };
-                        continue;
-                    }
-                    unsafe { ffi::rdma_ack_cm_event(est_event) };
-                    debug!(
-                        "[server] ESTABLISHED received and acked (local_qpn={})",
-                        qp.qp_num()
-                    );
-
-                    // Wrap new_id in RdmaCmIdPtr to manage its lifetime.
-                    let cm_id = RdmaCmIdPtr(new_id);
-
-                    // Build AsyncFd for send/recv CQ completion channels.
+                    // Build AsyncFd wrappers now — they don't require QP in RTS yet.
                     let send_async_fd = match send_cq.channel_fd() {
                         Some(fd) => match AsyncFd::new(CqChannelFd(fd)) {
                             Ok(async_fd) => Some(Arc::new(async_fd)),
@@ -2703,17 +2758,59 @@ impl TransportListener for RdmaListenerAdapter {
                         None => None,
                     };
 
-                    let peer = self.bind_addr; // TODO: extract actual peer from event
-                    let channel = RdmaChannel {
-                        qp: Arc::new(qp),
-                        send_cq: Arc::new(send_cq),
-                        recv_cq: Arc::new(recv_cq),
-                        mr_pool: Arc::new(mr_pool),
-                        peer,
+                    // Wrap new_id for lifetime RAII; store everything into
+                    // pending map keyed by id pointer.
+                    let cm_id = RdmaCmIdPtr(new_id);
+                    let pending = PendingAccepted {
+                        pd,
+                        send_cq,
+                        recv_cq,
                         send_async_fd,
                         recv_async_fd,
-                        cm_id: Some(cm_id),
-                        pd: Some(Arc::new(pd)),
+                        mr_pool,
+                        qp,
+                        cm_id,
+                    };
+                    self.pending
+                        .lock()
+                        .insert(new_id as usize, pending);
+
+                    // Loop: outer accept() will either return ESTABLISHED for
+                    // this id on a future iteration, or pick up more
+                    // CONNECT_REQUESTs. Do NOT block here waiting for
+                    // ESTABLISHED inline — that starves concurrent connects.
+                    continue;
+                }
+                ffi::RDMA_CM_EVENT_ESTABLISHED => {
+                    // Match against our pending set.
+                    let key = new_id as usize;
+                    let pending = self.pending.lock().remove(&key);
+                    let pending = match pending {
+                        Some(p) => p,
+                        None => {
+                            debug!(
+                                "accept: ESTABLISHED event for unknown id {:p}, ignoring",
+                                new_id
+                            );
+                            continue;
+                        }
+                    };
+                    debug!(
+                        "[server] ESTABLISHED received and acked (local_qpn={})",
+                        pending.qp.qp_num()
+                    );
+
+                    let peer = self.bind_addr;
+                    let channel = RdmaChannel {
+                        qp: Arc::new(pending.qp),
+                        send_cq: pending.send_cq,
+                        recv_cq: pending.recv_cq,
+                        mr_pool: pending.mr_pool,
+                        peer,
+                        send_async_fd: pending.send_async_fd,
+                        recv_async_fd: pending.recv_async_fd,
+                        cm_id: Some(pending.cm_id),
+                        pd: Some(pending.pd),
                         event_channel: None,
                     };
                     info!("RdmaListenerAdapter: accepted connection from {}", peer);
@@ -2721,6 +2818,20 @@ impl TransportListener for RdmaListenerAdapter {
                         channel: Arc::new(channel),
                         peer,
                     }));
+                }
+                ffi::RDMA_CM_EVENT_DISCONNECTED
+                | ffi::RDMA_CM_EVENT_CONNECT_ERROR
+                | ffi::RDMA_CM_EVENT_REJECTED
+                | ffi::RDMA_CM_EVENT_UNREACHABLE => {
+                    // Clean up matching pending (if any).
+                    let key = new_id as usize;
+                    if self.pending.lock().remove(&key).is_some() {
+                        warn!(
+                            "accept: id {:p} error event {}, destroying pending connection",
+                            new_id, event_type
+                        );
+                    }
+                    continue;
                 }
                 other => {
                     debug!("RdmaListenerAdapter: ignoring cm event {}", other);

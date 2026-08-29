@@ -27,7 +27,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::errors::{NetError, NetResult};
@@ -35,6 +36,7 @@ use crate::protocol::{
     build_frame_with_route_hash, calc_route_hash, check_required_fields, check_resp_limits,
     check_resp_size, FrameFlags, FrameHeader, HandshakeRequest, HandshakeResponse,
 };
+use crate::transport::Transport;
 use crate::{ClientType, MsgType, STATUS_OK};
 
 /// Default timeouts for one-shot RPCs.
@@ -123,6 +125,23 @@ pub async fn call_once_with(
     opts: RpcOpts,
 ) -> NetResult<RpcReply> {
     let mut conn = RpcConnection::connect(addr, client_type, client_id, channel, &opts).await?;
+    conn.call(msg_type, body, &opts).await
+}
+
+/// Same as [`call_once_with`] but uses a custom transport (e.g. RDMA).
+pub async fn call_once_with_transport(
+    addr: &str,
+    client_type: ClientType,
+    client_id: u64,
+    channel: u8,
+    msg_type: MsgType,
+    body: &[u8],
+    opts: RpcOpts,
+    transport: Arc<dyn Transport>,
+) -> NetResult<RpcReply> {
+    let mut conn =
+        RpcConnection::connect_with_transport(addr, client_type, client_id, channel, &opts, transport)
+            .await?;
     conn.call(msg_type, body, &opts).await
 }
 
@@ -231,8 +250,8 @@ impl NetRpcClient {
 // ---------------------------------------------------------------------------
 
 struct RpcConnection {
-    writer: tokio::net::tcp::OwnedWriteHalf,
-    reader: tokio::net::tcp::OwnedReadHalf,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    reader: Box<dyn AsyncRead + Unpin + Send>,
     client_id: u64,
     channel: u8,
 }
@@ -252,13 +271,43 @@ impl RpcConnection {
         let (reader, writer) = stream.into_split();
 
         let mut conn = Self {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            client_id,
+            channel,
+        };
+
+        // 2. powerfs-net handshake (carries channel for server-side validation).
+        conn.handshake(client_type, client_id, channel, opts)
+            .await?;
+
+        Ok(conn)
+    }
+
+    /// Connect using a custom transport (e.g. RDMA) instead of TCP.
+    async fn connect_with_transport(
+        addr: &str,
+        client_type: ClientType,
+        client_id: u64,
+        channel: u8,
+        opts: &RpcOpts,
+        transport: Arc<dyn Transport>,
+    ) -> NetResult<Self> {
+        let socket_addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| NetError::Protocol(format!("invalid address {}: {}", addr, e)))?;
+        let stream = tokio::time::timeout(opts.connect_timeout, transport.connect(socket_addr))
+            .await
+            .map_err(|_| NetError::Timeout)??;
+        let (reader, writer) = stream.split();
+
+        let mut conn = Self {
             reader,
             writer,
             client_id,
             channel,
         };
 
-        // 2. powerfs-net handshake (carries channel for server-side validation).
         conn.handshake(client_type, client_id, channel, opts)
             .await?;
 

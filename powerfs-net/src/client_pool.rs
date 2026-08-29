@@ -35,6 +35,7 @@ use tokio::time::interval;
 use crate::client::{ClientConfig, NotificationHandler, PowerFsNetClient};
 use crate::errors::NetResult;
 use crate::protocol::{ClientType, NetMessage, CHANNEL_DATA, CHANNEL_META};
+use crate::transport::Transport;
 
 /// Describes a server endpoint to connect to.
 ///
@@ -181,6 +182,8 @@ pub struct ClientConnPool {
     notification_handler: parking_lot::RwLock<Option<Arc<dyn NotificationHandler + Send + Sync>>>,
     /// Running flag for background health-check task.
     running: Arc<AtomicBool>,
+    /// Optional transport (e.g. RDMA). When None, uses TCP (default).
+    transport: Option<Arc<dyn Transport>>,
 }
 
 impl ClientConnPool {
@@ -194,6 +197,17 @@ impl ClientConnPool {
         config: ClientPoolConfig,
         notification_handler: Option<Arc<dyn NotificationHandler + Send + Sync>>,
     ) -> Self {
+        Self::new_with_transport(client_id, config, notification_handler, None)
+    }
+
+    /// Create a connection pool with a custom transport (e.g. RDMA).
+    /// When `transport` is None, uses TCP (same as `new`).
+    pub fn new_with_transport(
+        client_id: u64,
+        config: ClientPoolConfig,
+        notification_handler: Option<Arc<dyn NotificationHandler + Send + Sync>>,
+        transport: Option<Arc<dyn Transport>>,
+    ) -> Self {
         Self {
             connections: DashMap::new(),
             per_key_locks: DashMap::new(),
@@ -201,6 +215,7 @@ impl ClientConnPool {
             config,
             notification_handler: parking_lot::RwLock::new(notification_handler),
             running: Arc::new(AtomicBool::new(false)),
+            transport,
         }
     }
 
@@ -376,7 +391,11 @@ impl ClientConnPool {
             max_inflight_requests: self.config.max_inflight_per_conn,
         };
 
-        let client = Arc::new(PowerFsNetClient::new(config));
+        let client = Arc::new(if let Some(tp) = &self.transport {
+            PowerFsNetClient::new_with_transport(config, tp.clone())
+        } else {
+            PowerFsNetClient::new(config)
+        });
 
         // Install notification handler if configured.
         if let Some(handler) = self.notification_handler.read().clone() {

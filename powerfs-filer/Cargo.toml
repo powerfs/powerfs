@@ -24,6 +24,8 @@ assets = [
 [features]
 default = ["redis-event"]
 redis-event = ["dep:redis", "powerfs-common/redis-event"]
+# RDMA transport: enables RdmaTransport in powerfs-net for net_port listener + client.
+rdma = ["powerfs-net/rdma"]
 
 [[bin]]
 name = "powerfs-filer"

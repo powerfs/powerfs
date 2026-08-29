@@ -783,6 +783,7 @@ impl RaftGroupManagerV2 {
         master_addr: String,
         filer_id: String,
         advertise_addr: String,
+        transport: Option<std::sync::Arc<dyn powerfs_net::Transport>>,
     ) {
         let group = match self.get_group(shard_id).await {
             Some(g) => g,
@@ -813,6 +814,7 @@ impl RaftGroupManagerV2 {
                     true,
                     &filer_id,
                     &advertise_addr,
+                    transport.clone(),
                 )
                 .await;
             }
@@ -834,6 +836,7 @@ impl RaftGroupManagerV2 {
                                 true,
                                 &filer_id,
                                 &advertise_addr,
+                                transport.clone(),
                             )
                             .await;
                         } else if was_leader && !is_leader {
@@ -848,6 +851,7 @@ impl RaftGroupManagerV2 {
                                 false,
                                 &filer_id,
                                 "",
+                                transport.clone(),
                             )
                             .await;
                         }

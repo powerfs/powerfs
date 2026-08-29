@@ -1,0 +1,27 @@
+# PowerFS Filer 节点配置 - 节点2
+# 精简配置：只需 [global] + [filer] 段
+
+[global]
+log_level = "info"
+redis_url = "redis://172.30.0.50:6379"
+
+[filer]
+transport = "rdma"              # RDMA transport for powerfs-net listener + clients
+port = 8888
+grpc_port = 8889
+metrics_port = 8900             # Metrics HTTP端口 (必须与port/grpc_port/net_port都不同, 禁用加减推导)
+net_port = 9334
+ip = "0.0.0.0"
+master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+master_net_port = 9334
+data_dir = "/data/filer"
+shard_count = 3
+raft_id = 2
+raft_peers = ["172.30.0.31:8889", "172.30.0.32:8889", "172.30.0.33:8889"]
+inline_max_size = 8192
+registration_token = "powerfs-cluster-test"  # 节点注册认证令牌 (必须与master一致)
+
+# Certificate paths for production node authentication
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/filer-2.crt"
+client_key = "/etc/powerfs/certs/filer-2.key"

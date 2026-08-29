@@ -415,7 +415,13 @@ impl PowerFsNetClient {
         );
         let mut buf = vec![0u8; HandshakeRequest::SIZE];
         req.encode(&mut buf);
+        eprintln!(
+            "[HS_DBG] client write handshake req ({} bytes): {}",
+            buf.len(),
+            buf.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+        );
         write_half.write_all(&buf).await?;
+        eprintln!("[HS_DBG] client write_all returned Ok, waiting for response...");
         debug!(
             "handshake: sent request channel={} (route_hash low bit), client_id={}",
             ch_str, self.config.client_id
@@ -423,7 +429,13 @@ impl PowerFsNetClient {
 
         // Receive handshake response
         let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
+        eprintln!("[HS_DBG] client calling read_exact for resp ({} bytes)...", resp_buf.len());
         read_half.read_exact(&mut resp_buf).await?;
+        eprintln!(
+            "[HS_DBG] client read handshake resp ({} bytes): {}",
+            resp_buf.len(),
+            resp_buf.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+        );
 
         let resp = HandshakeResponse::decode(&resp_buf)
             .ok_or_else(|| NetError::Protocol("invalid handshake response".into()))?;
