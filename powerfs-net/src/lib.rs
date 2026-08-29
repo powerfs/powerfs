@@ -67,7 +67,7 @@ pub use middleware::{
 };
 pub use protocol::*;
 pub use request_context::{ClientInfo, RequestContext, TraceId};
-pub use rpc_client::{call_once, call_once_with, NetRpcClient, RpcOpts, RpcReply};
+pub use rpc_client::{call_once, call_once_with, call_once_with_transport, NetRpcClient, RpcOpts, RpcReply};
 pub use serialize::{DirEntry, EntryInfo, TlvDecoder, TlvEncoder};
 pub use server::{PowerFsNetServer, ServerConfig};
 pub use server_connection::{

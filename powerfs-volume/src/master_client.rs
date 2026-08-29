@@ -34,6 +34,8 @@ pub struct MasterClient {
     /// Sent via TLV FieldId::ClientCert(0xD4) in every Heartbeat so the
     /// master can validate it against the CA.  Empty in dev mode.
     client_cert_pem: String,
+    /// Optional transport (e.g. RDMA). When None, uses TCP.
+    transport: Option<Arc<dyn powerfs_net::Transport>>,
 }
 
 #[derive(Clone)]
@@ -51,6 +53,8 @@ pub struct NewMasterClientParams<'a> {
     /// Client certificate PEM content for production authentication.
     /// Empty = dev mode (no cert, master without CA configured).
     pub client_cert_pem: &'a str,
+    /// Optional transport (e.g. RDMA). None = TCP.
+    pub transport: Option<Arc<dyn powerfs_net::Transport>>,
 }
 
 impl MasterClient {
@@ -75,6 +79,7 @@ impl MasterClient {
             heartbeat_running: Arc::new(AtomicBool::new(false)),
             registration_token: params.registration_token.map(|s| s.to_string()),
             client_cert_pem: params.client_cert_pem.to_string(),
+            transport: params.transport,
         }
     }
 
@@ -263,15 +268,29 @@ impl MasterClient {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1);
-        let reply = powerfs_net::call_once(
-            master_addr,
-            powerfs_net::ClientType::Volume,
-            client_id,
-            powerfs_net::CHANNEL_DATA,
-            powerfs_net::MsgType::Heartbeat,
-            &body,
-        )
-        .await
+        let reply = if let Some(tp) = &self.transport {
+            powerfs_net::call_once_with_transport(
+                master_addr,
+                powerfs_net::ClientType::Volume,
+                client_id,
+                powerfs_net::CHANNEL_DATA,
+                powerfs_net::MsgType::Heartbeat,
+                &body,
+                powerfs_net::RpcOpts::default(),
+                tp.clone(),
+            )
+            .await
+        } else {
+            powerfs_net::call_once(
+                master_addr,
+                powerfs_net::ClientType::Volume,
+                client_id,
+                powerfs_net::CHANNEL_DATA,
+                powerfs_net::MsgType::Heartbeat,
+                &body,
+            )
+            .await
+        }
         .map_err(|e| HeartbeatError::Connect(format!("transport to {}: {}", master_addr, e)))?;
 
         // 处理 REDIRECT

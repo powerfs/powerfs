@@ -25,6 +25,8 @@ assets = [
 default = ["kv", "redis-event"]
 kv = []
 redis-event = ["powerfs-common/redis-event"]
+# RDMA transport: enables RdmaTransport in powerfs-net for net_port listener + client.
+rdma = ["powerfs-net/rdma"]
 
 [build-dependencies]
 tonic-build = { version = "0.11" }

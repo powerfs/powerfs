@@ -1,0 +1,23 @@
+# PowerFS Master 节点配置 - RDMA host-network 单节点测试
+# 使用 172.30.0.1 (宿主机 powerfs-br0 IP) 作为服务地址
+# 单节点 Raft (无 peers), dev mode (无证书强制)
+
+[global]
+log_level = "info"
+redis_url = "redis://172.30.0.50:6379"
+
+[master]
+transport = "rdma"
+rdma_device = "rxe0"
+port = 9333
+raft_port = 9335
+metrics_port = 9300
+net_port = 9334
+dir = "/data/master"
+ip = "0.0.0.0"
+advertise_addr = "172.30.0.1:9333"
+raft_id = 1
+raft_peers = ["172.30.0.1:9335"]
+admin_token = "powerfs-admin-test"
+# ca_dir = (DISABLED dev mode: no cert enforcement)
+registration_token = "powerfs-cluster-test"

@@ -157,6 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_token,
         ca_dir_opt,
         registration_token,
+        master_cfg.transport.clone(),
+        master_cfg.rdma_device.clone(),
     )
     .await?;
 

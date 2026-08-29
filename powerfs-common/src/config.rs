@@ -76,6 +76,17 @@ pub struct MasterConfig {
     /// TLV requests. If empty/None, registrations are open (dev only).
     #[serde(default)]
     pub registration_token: Option<String>,
+    /// Transport type for powerfs-net: "tcp" (default) or "rdma".
+    /// When "rdma", the service's net_port listener uses RdmaTransport.
+    /// Inter-service clients also use this transport for connections.
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// RDMA device name for powerfs-net (e.g. "rxe0", "mlx5_0").
+    /// None = auto-select (picks the first ACTIVE port, preferring hardware
+    /// RDMA; for Soft-RoCE (rxe) bridged setups, set this to "rxe0" to avoid
+    /// choosing a hardware device whose subnet doesn't match the bind IP).
+    #[serde(default)]
+    pub rdma_device: Option<String>,
 }
 
 /// Volume 节点配置 - 所有端口和地址必须显式配置
@@ -124,6 +135,12 @@ pub struct VolumeConfig {
     /// 当前 TLV 0xD4 只发送公钥证书，私钥保存在本地即可。
     #[serde(default)]
     pub client_key: Option<String>,
+    /// Transport type for powerfs-net: "tcp" (default) or "rdma".
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// RDMA device name override. See MasterConfig.rdma_device for details.
+    #[serde(default)]
+    pub rdma_device: Option<String>,
 }
 
 /// Filer 节点配置 - 所有端口和地址必须显式配置
@@ -195,6 +212,12 @@ pub struct FilerConfig {
     /// 当前 TLV 0xD4 只发送公钥证书，私钥保存在本地即可。
     #[serde(default)]
     pub client_key: Option<String>,
+    /// Transport type for powerfs-net: "tcp" (default) or "rdma".
+    #[serde(default)]
+    pub transport: Option<String>,
+    /// RDMA device name override. See MasterConfig.rdma_device for details.
+    #[serde(default)]
+    pub rdma_device: Option<String>,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置

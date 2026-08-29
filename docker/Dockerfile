@@ -2,6 +2,8 @@ FROM ubuntu:20.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# NOTE: ibverbs-providers installs rxe/mlx5 provider .so files (e.g. librxe-rdmav25.so).
+# Without it, libibverbs reports "No IB devices found" even when kernel rxe is running.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
@@ -12,6 +14,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fio \
     python3 \
     bc \
+    # RDMA runtime — providers MUST be explicit (not recommends) so CI images see devices
+    libibverbs1 \
+    librdmacm1 \
+    ibverbs-providers \
+    rdma-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

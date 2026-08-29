@@ -109,6 +109,20 @@ impl PowerFsNetServer {
         Self::bind_with_pipeline(addr, port, handler, None, ServerConfig::default()).await
     }
 
+    /// Bind with automatic session management and custom transport (e.g. RDMA).
+    /// Like `bind_with_manager` but uses the provided transport instead of TCP.
+    pub async fn bind_with_manager_and_transport(
+        addr: &str,
+        port: u16,
+        handler: Arc<dyn NetHandler>,
+        transport: Arc<dyn Transport>,
+    ) -> NetResult<Self> {
+        Self::bind_with_pipeline_and_transport(
+            addr, port, handler, None, ServerConfig::default(), transport,
+        )
+        .await
+    }
+
     /// Bind with an externally-created `ConnRegistry`.
     ///
     /// Use this when other components (e.g. `InodeNotifier`) need to share
@@ -614,6 +628,15 @@ impl PowerFsNetServer {
 
     /// Acceptor 主循环: accept → handshake → create ClientConn → assign IoLoop
     async fn acceptor_loop(&self, io_loops: Vec<Arc<IoLoop>>) -> NetResult<()> {
+        // Pre-clone shared state so that each per-connection task can be
+        // spawned as `'static` without borrowing `self` (which would block
+        // the entire accept loop on a single slow/hung handshake).
+        let handler = self.handler.clone();
+        let manager = self.manager.clone();
+        let registry = self.registry.clone();
+        let shutdown = self.shutdown.clone();
+        let flow_ctrl = self.flow_ctrl.clone();
+
         loop {
             if self.is_shutting_down().await {
                 info!("Server is shutting down, stopping accept loop");
@@ -627,7 +650,22 @@ impl PowerFsNetServer {
                         info!("Rejecting new connection during shutdown from {}", peer);
                         break;
                     }
-                    self.handle_new_connection(stream, peer, &io_loops).await;
+                    // Spawn per-connection task so accept loop can continue
+                    // immediately. Critical: handshakes that block (e.g. RDMA
+                    // data path issues) must not freeze the listener.
+                    let handler = handler.clone();
+                    let manager = manager.clone();
+                    let registry = registry.clone();
+                    let shutdown = shutdown.clone();
+                    let flow_ctrl = flow_ctrl.clone();
+                    let io_loops = io_loops.clone();
+                    tokio::spawn(async move {
+                        Self::handle_new_connection_spawned(
+                            handler, manager, registry, shutdown, flow_ctrl, io_loops, stream,
+                            peer,
+                        )
+                        .await;
+                    });
                 }
                 Err(e) => {
                     error!("Accept error: {:?}", e);
@@ -638,28 +676,33 @@ impl PowerFsNetServer {
         Ok(())
     }
 
-    /// 处理新连接: handshake → create ClientConn → register → assign IoLoop
-    async fn handle_new_connection(
-        &self,
+    /// `handle_new_connection` variant runnable as a spawned `'static` task,
+    /// taking all shared components by owned Arc clone (no borrow of self).
+    /// Mirrors `handle_new_connection` semantics exactly.
+    async fn handle_new_connection_spawned(
+        handler: Arc<dyn NetHandler>,
+        manager: Option<Arc<ServerConnectionManager>>,
+        registry: Arc<ConnRegistry>,
+        shutdown: Arc<RwLock<ShutdownState>>,
+        flow_ctrl: Arc<FlowController>,
+        io_loops: Vec<Arc<IoLoop>>,
         stream: Box<dyn TransportStream>,
-        addr: SocketAddr,
-        io_loops: &[Arc<IoLoop>],
+        peer: SocketAddr,
     ) {
-        self.increment_connections().await;
-
-        let handler = self.handler.clone();
-        let manager = self.manager.clone();
-        let registry = self.registry.clone();
+        // Bump active_connections (matches handle_new_connection).
+        {
+            let mut s = shutdown.write().await;
+            s.active_connections = s.active_connections.saturating_add(1);
+        }
 
         // handshake 需要读写 stream, 完成后返回 (read_half, write_half, client_id, ...)
-        // read_half/write_half 直接交给 IoLoop 使用, 无需重组.
-        let peer = addr;
         let (read_half, write_half, client_id, client_type, channel, features) =
             match Self::handle_handshake(stream, handler.clone(), manager.clone(), peer).await {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Handshake failed from {}: {:?}", peer, e);
-                    self.decrement_connections().await;
+                    let mut s = shutdown.write().await;
+                    s.active_connections = s.active_connections.saturating_sub(1);
                     return;
                 }
             };
@@ -670,21 +713,16 @@ impl PowerFsNetServer {
         // 创建 ClientConn
         let conn = ClientConn::new(client_id, peer, client_type, channel, features, outbound_tx);
 
-        // 注册到 ConnRegistry (单一数据源: 状态/lease/统计/通知都在 ClientConn 中)
+        // 注册到 ConnRegistry
         registry.register(conn.clone()).await;
 
-        // 注册到 FlowController (流控统计: per-conn ConnStats)
-        self.flow_ctrl
-            .register_conn(client_id, peer.to_string(), Channel::from_u8(channel));
+        // 流控
+        flow_ctrl.register_conn(client_id, peer.to_string(), Channel::from_u8(channel));
 
-        // 注册到 ServerConnectionManager (仅日志, session 数据由 ConnRegistry 管理)
+        // 注册到 ServerConnectionManager
         if let Some(ref mgr) = manager {
             mgr.register_session(client_id, client_type, peer).await;
         }
-
-        // 通知推送: ServerConnectionManager.send_notification() 直接调用
-        // ConnRegistry::notify() → ClientConn::notify() → outbound_tx,
-        // 无需中间 channel 转发任务。
 
         // 通知 handler
         handler.on_connect(client_id, client_type).await;
@@ -696,26 +734,15 @@ impl PowerFsNetServer {
         debug!("Assigned client {} to IoLoop {}", client_id, io_loop_idx);
 
         // IoLoop.manage 会 spawn task 管理该连接
-        // 连接断开后 IoLoop 会自动执行断连清理 + decrement_connections
         io_loop.manage(read_half, write_half, conn, outbound_rx);
 
-        // IoLoop.manage 是 fire-and-forget, 但我们需要在断连时 decrement
-        // 使用一个监控 task
-        // 实际上 IoLoop 内部 spawn 了 task, 我们无法直接等待它
-        // 断连清理由 IoLoop 内部完成 (registry.unregister + handler.on_disconnect)
-        // active_connections 计数通过 registry.active_count() 获取, 不需要手动 decrement
-        // 但为兼容现有 shutdown 逻辑, 保留 active_connections 计数
-        // IoLoop 断连后 registry.unregister 会减少计数, 但 ShutdownState.active_connections
-        // 需要单独减少. 这里通过 registry 监控实现.
-        let registry_for_monitor = self.registry.clone();
-        let shutdown_for_monitor = self.shutdown.clone();
+        // 监控 task: 连接断开后 active_connections 计数
+        let registry_for_monitor = registry.clone();
+        let shutdown_for_monitor = shutdown.clone();
         let client_id_for_monitor = client_id;
         tokio::spawn(async move {
-            // 等待连接从 registry 消失
-            // (IoLoop 断连清理时会调用 registry.unregister)
             loop {
                 if registry_for_monitor.get(client_id_for_monitor).is_none() {
-                    // 连接已注销, 减少 active_connections
                     let mut state = shutdown_for_monitor.write().await;
                     state.active_connections = state.active_connections.saturating_sub(1);
                     break;
@@ -725,6 +752,28 @@ impl PowerFsNetServer {
         });
 
         info!("New connection from {} (client_id={})", peer, client_id);
+    }
+
+    /// 处理新连接: handshake → create ClientConn → register → assign IoLoop
+    #[allow(dead_code)]
+    async fn handle_new_connection(
+        &self,
+        stream: Box<dyn TransportStream>,
+        addr: SocketAddr,
+        io_loops: &[Arc<IoLoop>],
+    ) {
+        let io_loops_owned: Vec<Arc<IoLoop>> = io_loops.to_vec();
+        Self::handle_new_connection_spawned(
+            self.handler.clone(),
+            self.manager.clone(),
+            self.registry.clone(),
+            self.shutdown.clone(),
+            self.flow_ctrl.clone(),
+            io_loops_owned,
+            stream,
+            addr,
+        )
+        .await;
     }
 
     // ========================================================================
@@ -753,10 +802,16 @@ impl PowerFsNetServer {
         let (mut read_half, mut write_half) = stream.split();
 
         let mut req_buf = vec![0u8; HandshakeRequest::SIZE];
+        eprintln!("[HS_DBG] server calling read_exact for req ({} bytes)...", req_buf.len());
         read_half
             .read_exact(&mut req_buf)
             .await
             .map_err(|e| NetError::Connection(format!("handshake read failed: {}", e)))?;
+        eprintln!(
+            "[HS_DBG] server read handshake req ({} bytes): {}",
+            req_buf.len(),
+            req_buf.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+        );
 
         let req = HandshakeRequest::decode(&req_buf)
             .ok_or_else(|| NetError::Protocol("invalid handshake request".into()))?;
@@ -784,10 +839,16 @@ impl PowerFsNetServer {
         let resp = HandshakeResponse::ok(0);
         let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
         resp.encode(&mut resp_buf);
+        eprintln!(
+            "[HS_DBG] server write handshake resp ({} bytes): {}",
+            resp_buf.len(),
+            resp_buf.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+        );
         write_half
             .write_all(&resp_buf)
             .await
             .map_err(|e| NetError::Connection(format!("handshake write failed: {}", e)))?;
+        eprintln!("[HS_DBG] server write_all returned Ok");
 
         let client_id = req.client_id;
 

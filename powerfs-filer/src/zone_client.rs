@@ -10,7 +10,8 @@
 use log::{debug, warn};
 use powerfs_common::types::{make_needle_id, needle_counter, needle_zone_id, ZoneInfo, ZoneVolume};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
-use powerfs_net::{FieldId, STATUS_ERR_BAD_REQUEST, STATUS_ERR_REDIRECT, STATUS_OK};
+use powerfs_net::{FieldId, RpcOpts, Transport, STATUS_ERR_BAD_REQUEST, STATUS_ERR_REDIRECT, STATUS_OK};
+use std::sync::Arc;
 
 /// Filer 节点发现信息 (随 RegisterFiler 请求一起发送, 替代 gRPC RegisterFiler)
 #[derive(Debug, Clone)]
@@ -61,6 +62,7 @@ pub struct FilerNodeRegistration {
 pub async fn register_filer(
     master_addr: &str,
     reg: &FilerNodeRegistration,
+    transport: Option<Arc<dyn Transport>>,
 ) -> Result<Vec<ZoneInfo>, String> {
     let mut current_addr = master_addr.to_string();
     // 重定向深度限制: 防止 Master 持续返回 REDIRECT 导致无限循环
@@ -113,16 +115,33 @@ pub async fn register_filer(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1);
-        let reply = match powerfs_net::call_once(
-            &current_addr,
-            powerfs_net::ClientType::Filer,
-            client_id,
-            powerfs_net::CHANNEL_DATA,
-            powerfs_net::MsgType::RegisterFiler,
-            &body,
-        )
-        .await
-        {
+        let reply_result = match &transport {
+            Some(tp) => {
+                powerfs_net::call_once_with_transport(
+                    &current_addr,
+                    powerfs_net::ClientType::Filer,
+                    client_id,
+                    powerfs_net::CHANNEL_DATA,
+                    powerfs_net::MsgType::RegisterFiler,
+                    &body,
+                    RpcOpts::default(),
+                    tp.clone(),
+                )
+                .await
+            }
+            None => {
+                powerfs_net::call_once(
+                    &current_addr,
+                    powerfs_net::ClientType::Filer,
+                    client_id,
+                    powerfs_net::CHANNEL_DATA,
+                    powerfs_net::MsgType::RegisterFiler,
+                    &body,
+                )
+                .await
+            }
+        };
+        let reply = match reply_result {
             Ok(r) => r,
             Err(e) => {
                 return Err(format!("register_filer to {} failed: {}", current_addr, e));
@@ -259,6 +278,7 @@ pub async fn notify_shard_leader_change(
     is_leader: bool,
     filer_id: &str,
     leader_addr: &str,
+    transport: Option<Arc<dyn Transport>>,
 ) {
     let mut current_addr = master_addr.to_string();
     // Retry on connection failure (e.g. Master still starting up during
@@ -278,16 +298,33 @@ pub async fn notify_shard_leader_change(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(1);
-        let reply = match powerfs_net::call_once(
-            &current_addr,
-            powerfs_net::ClientType::Filer,
-            client_id,
-            powerfs_net::CHANNEL_DATA,
-            powerfs_net::MsgType::ShardLeaderUpdate,
-            &body,
-        )
-        .await
-        {
+        let reply_result = match &transport {
+            Some(tp) => {
+                powerfs_net::call_once_with_transport(
+                    &current_addr,
+                    powerfs_net::ClientType::Filer,
+                    client_id,
+                    powerfs_net::CHANNEL_DATA,
+                    powerfs_net::MsgType::ShardLeaderUpdate,
+                    &body,
+                    RpcOpts::default(),
+                    tp.clone(),
+                )
+                .await
+            }
+            None => {
+                powerfs_net::call_once(
+                    &current_addr,
+                    powerfs_net::ClientType::Filer,
+                    client_id,
+                    powerfs_net::CHANNEL_DATA,
+                    powerfs_net::MsgType::ShardLeaderUpdate,
+                    &body,
+                )
+                .await
+            }
+        };
+        let reply = match reply_result {
             Ok(r) => r,
             Err(e) => {
                 // Connection failure (e.g. Master still booting). Retry

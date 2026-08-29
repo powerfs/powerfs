@@ -1,0 +1,123 @@
+# =============================================================================
+# PowerFS RDMA 传输测试 — 独立 compose 文件 (非覆盖)
+# =============================================================================
+# 用法:
+#   # 1. 先停止 TCP 服务 (避免端口冲突)
+#   docker compose -f docker-compose.yml down
+#   # 2. 启动 RDMA 服务 (host 网络模式)
+#   docker compose -f docker-compose.rdma.yml up -d
+#
+# 架构:
+#   - 所有服务使用 network_mode: host (共享宿主机 netns)
+#   - Redis 复用 bridge 网络 (172.30.0.50), host 网络可直接访问
+#   - rxe0 在 powerfs-br0 上, host 网络的 RDMA_CM 可直接路由
+#   - 单节点 master/volume/filer (功能验证, 非 HA)
+#   - 服务地址: 172.30.0.1 (宿主机 powerfs-br0 IP)
+#
+# 前置条件:
+#   1. sudo modprobe rdma_rxe
+#   2. echo powerfs-br0 > /sys/module/rdma_rxe/parameters/add
+#   3. 验证: rdma link show (应显示 rxe0)
+#   4. 验证: ls /dev/infiniband/uverbs2 (rxe0 的 uverbs 设备)
+#
+# 注: kernel 5.15 的 rxe 不支持容器 netns 隔离,
+#     必须用 network_mode: host 才能让 RDMA_CM 正确路由
+# =============================================================================
+
+# Redis 复用 bridge 网络 (单独定义, 不受 host 网络影响)
+networks:
+  powerfs-network:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: powerfs-br0
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "3"
+
+# RDMA 设备映射 (uverbs + rdma_cm, rdma_cm 是 librdmacm 必需的)
+x-rdma-common: &rdma-common
+  devices:
+    - /dev/infiniband/uverbs0:/dev/infiniband/uverbs0
+    - /dev/infiniband/uverbs1:/dev/infiniband/uverbs1
+    - /dev/infiniband/uverbs2:/dev/infiniband/uverbs2
+    - /dev/infiniband/rdma_cm:/dev/infiniband/rdma_cm
+  cap_add:
+    - IPC_LOCK
+    - NET_ADMIN
+  ulimits:
+    memlock:
+      soft: -1
+      hard: -1
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks:
+      powerfs-network:
+        ipv4_address: 172.30.0.50
+    volumes:
+      - redis-data:/data
+    logging: *default-logging
+
+  master-1:
+    image: powerfs:latest
+    container_name: master-1
+    restart: unless-stopped
+    network_mode: host
+    <<: *rdma-common
+    volumes:
+      - master-rdma-data:/data/master
+      - ./config/rdma-host/master.toml:/app/config/master.toml:ro
+      - ../target/release/powerfs-master:/app/powerfs-master:ro
+    command: ["/app/powerfs-master", "--config", "/app/config/master.toml"]
+    depends_on:
+      - redis
+    logging: *default-logging
+
+  volume-1:
+    image: powerfs:latest
+    container_name: volume-1
+    restart: unless-stopped
+    network_mode: host
+    <<: *rdma-common
+    volumes:
+      - volume-rdma-data:/data
+      - ./config/rdma-host/volume.toml:/app/config/volume.toml:ro
+      - ../target/release/powerfs-volume:/app/powerfs-volume:ro
+    command: ["/app/powerfs-volume", "--config", "/app/config/volume.toml"]
+    depends_on:
+      - redis
+      - master-1
+    logging: *default-logging
+
+  filer-1:
+    image: powerfs:latest
+    container_name: filer-1
+    restart: unless-stopped
+    network_mode: host
+    <<: *rdma-common
+    volumes:
+      - filer-rdma-data:/data/filer
+      - ./config/rdma-host/filer.toml:/app/config/filer.toml:ro
+      - ../target/release/powerfs-filer:/app/powerfs-filer:ro
+    command: ["/app/powerfs-filer", "--config", "/app/config/filer.toml"]
+    depends_on:
+      - redis
+      - master-1
+      - volume-1
+    logging: *default-logging
+
+volumes:
+  redis-data:
+  master-rdma-data:
+  volume-rdma-data:
+  filer-rdma-data:

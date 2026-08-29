@@ -1,0 +1,26 @@
+# PowerFS Volume 节点配置 - 节点5
+# 精简配置：只需 [global] + [volume] 段
+
+[global]
+log_level = "info"
+redis_url = "redis://172.30.0.50:6379"
+
+[volume]
+transport = "rdma"              # RDMA transport for powerfs-net listener + clients
+grpc_port = 8080
+http_port = 8095
+net_port = 8901
+data_dir = "/data"
+master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
+master_net_port = 9334
+node_id = "volume-server-5"
+max_volume_size = 107374182400
+initial_volume_count = 4
+advertise_addr = "172.30.0.25"
+lease_enabled = false            # 方案A: 使用inode metadata lease，Volume跳过range lease验证
+registration_token = "powerfs-cluster-test"  # 节点注册认证令牌 (必须与master一致)
+
+# Certificate paths for production node authentication
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/volume-server-5.crt"
+client_key = "/etc/powerfs/certs/volume-server-5.key"

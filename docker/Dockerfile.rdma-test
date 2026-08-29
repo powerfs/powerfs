@@ -1,0 +1,16 @@
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 注意: ibverbs-providers 包含 rxe/mlx5 等 provider .so 文件,
+# 不能用 --no-install-recommends 跳过, 否则 libibverbs 无法检测任何设备
+RUN apt-get update && apt-get install -y \
+    rdma-core \
+    ibverbs-providers \
+    ibverbs-utils \
+    rdmacm-utils \
+    iproute2 \
+    net-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+CMD ["/bin/bash"]

@@ -8,7 +8,8 @@ use log::{info, warn};
 use parking_lot::RwLock;
 use powerfs_net::{
     ClientConfig, ClientType, FieldId, MsgType, NetMessage, NotificationHandler, PowerFsNetClient,
-    TlvDecoder, TlvEncoder, STATUS_ERR_PERMISSION_DENIED, STATUS_ERR_REDIRECT, STATUS_OK,
+    TlvDecoder, TlvEncoder, Transport, STATUS_ERR_PERMISSION_DENIED, STATUS_ERR_REDIRECT,
+    STATUS_OK,
 };
 
 use crate::error::{MasterNetError, MasterNetResult};
@@ -34,7 +35,7 @@ impl NotificationHandler for ArcNotificationHandler {
 }
 
 /// Configuration for [`TlvMasterClient`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TlvMasterClientConfig {
     /// Client type sent in the TLV handshake.
     pub client_type: ClientType,
@@ -54,6 +55,8 @@ pub struct TlvMasterClientConfig {
     /// When absent the Master will either reject (production CA mode) or
     /// warn-and-accept (dev mode, no CA manager initialised).
     pub client_cert_pem: Option<String>,
+    /// Optional transport (e.g. RDMA). When None, uses TCP.
+    pub transport: Option<std::sync::Arc<dyn Transport>>,
 }
 
 impl Default for TlvMasterClientConfig {
@@ -66,6 +69,7 @@ impl Default for TlvMasterClientConfig {
             max_redirects: 5,
             retry_backoff: Duration::from_millis(5),
             client_cert_pem: None,
+            transport: None,
         }
     }
 }
@@ -565,7 +569,11 @@ impl TlvMasterClient {
             heartbeat_interval: Duration::from_secs(30),
             max_inflight_requests: 256,
         };
-        PowerFsNetClient::new(net_cfg)
+        if let Some(tp) = &config.transport {
+            PowerFsNetClient::new_with_transport(net_cfg, tp.clone())
+        } else {
+            PowerFsNetClient::new(net_cfg)
+        }
     }
 
     fn current_endpoint_addr(&self) -> String {

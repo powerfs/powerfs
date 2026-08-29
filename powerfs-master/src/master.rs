@@ -41,6 +41,10 @@ pub struct MasterNode {
     address: SocketAddr,
     net_port: u16,
     metrics_port: u16,
+    /// Transport type: "tcp" (default) or "rdma". Used by net server bind.
+    transport: Option<String>,
+    /// RDMA device name override. None = auto-select (first ACTIVE port).
+    rdma_device: Option<String>,
     topology: RwLock<Topology>,
     volumes: RwLock<HashMap<VolumeId, VolumeInfo>>,
     volume_routes: RwLock<HashMap<u64, VolumeRoute>>,
@@ -397,6 +401,8 @@ impl MasterNode {
         admin_token: Option<String>,
         ca_dir: Option<String>,
         registration_token: Option<String>,
+        transport: Option<String>,
+        rdma_device: Option<String>,
     ) -> Result<Self> {
         let addr: SocketAddr = bind_address.parse()?;
 
@@ -526,6 +532,8 @@ impl MasterNode {
             address: addr,
             net_port,
             metrics_port,
+            transport,
+            rdma_device,
             topology: RwLock::new(Topology::new()),
             volumes: RwLock::new(HashMap::new()),
             volume_routes: RwLock::new(HashMap::new()),
@@ -3853,10 +3861,32 @@ impl MasterNode {
             let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
             info!("Starting powerfs-net server on {}", net_addr);
-            if let Ok(net_server) = PowerFsNetServer::bind_with_manager(
+
+            // Create transport (tcp/rdma/auto) based on master config.
+            let transport_cfg = powerfs_net::TransportConfig {
+                transport: self.transport.clone().unwrap_or_else(|| "tcp".to_string()),
+                rdma_device: self.rdma_device.clone(),
+                ..Default::default()
+            };
+            let net_transport = match powerfs_net::create_transport(&transport_cfg) {
+                Ok(t) => {
+                    info!("Net transport: {}", t.name());
+                    t
+                }
+                Err(e) => {
+                    error!("Failed to create transport '{}': {:?}", transport_cfg.transport, e);
+                    return Err(PowerFsError::InvalidRequest(format!(
+                        "transport '{}' init failed: {:?}",
+                        transport_cfg.transport, e
+                    )));
+                }
+            };
+
+            if let Ok(net_server) = PowerFsNetServer::bind_with_manager_and_transport(
                 &self.address.ip().to_string(),
                 net_port,
                 net_handler,
+                net_transport,
             )
             .await
             {
@@ -3996,6 +4026,8 @@ impl Clone for MasterNode {
             address: self.address,
             net_port: self.net_port,
             metrics_port: self.metrics_port,
+            transport: self.transport.clone(),
+            rdma_device: self.rdma_device.clone(),
             topology: RwLock::new(self.topology.read().unwrap().clone()),
             volumes: RwLock::new(self.volumes.read().unwrap().clone()),
             volume_routes: RwLock::new(self.volume_routes.read().unwrap().clone()),
