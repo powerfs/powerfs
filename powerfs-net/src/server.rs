@@ -118,7 +118,12 @@ impl PowerFsNetServer {
         transport: Arc<dyn Transport>,
     ) -> NetResult<Self> {
         Self::bind_with_pipeline_and_transport(
-            addr, port, handler, None, ServerConfig::default(), transport,
+            addr,
+            port,
+            handler,
+            None,
+            ServerConfig::default(),
+            transport,
         )
         .await
     }
@@ -148,12 +153,7 @@ impl PowerFsNetServer {
     ) -> NetResult<Self> {
         let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
         Self::bind_with_registry_and_transport_inner(
-            addr,
-            port,
-            handler,
-            registry,
-            config,
-            transport,
+            addr, port, handler, registry, config, transport,
         )
         .await
     }
@@ -226,7 +226,8 @@ impl PowerFsNetServer {
         config: ServerConfig,
     ) -> NetResult<Self> {
         let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
-        Self::bind_with_pipeline_and_transport(addr, port, handler, pipeline, config, transport).await
+        Self::bind_with_pipeline_and_transport(addr, port, handler, pipeline, config, transport)
+            .await
     }
 
     /// Bind with a custom middleware pipeline, server configuration and
@@ -661,8 +662,7 @@ impl PowerFsNetServer {
                     let io_loops = io_loops.clone();
                     tokio::spawn(async move {
                         Self::handle_new_connection_spawned(
-                            handler, manager, registry, shutdown, flow_ctrl, io_loops, stream,
-                            peer,
+                            handler, manager, registry, shutdown, flow_ctrl, io_loops, stream, peer,
                         )
                         .await;
                     });
@@ -802,16 +802,10 @@ impl PowerFsNetServer {
         let (mut read_half, mut write_half) = stream.split();
 
         let mut req_buf = vec![0u8; HandshakeRequest::SIZE];
-        eprintln!("[HS_DBG] server calling read_exact for req ({} bytes)...", req_buf.len());
         read_half
             .read_exact(&mut req_buf)
             .await
             .map_err(|e| NetError::Connection(format!("handshake read failed: {}", e)))?;
-        eprintln!(
-            "[HS_DBG] server read handshake req ({} bytes): {}",
-            req_buf.len(),
-            req_buf.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
-        );
 
         let req = HandshakeRequest::decode(&req_buf)
             .ok_or_else(|| NetError::Protocol("invalid handshake request".into()))?;
@@ -839,16 +833,10 @@ impl PowerFsNetServer {
         let resp = HandshakeResponse::ok(0);
         let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
         resp.encode(&mut resp_buf);
-        eprintln!(
-            "[HS_DBG] server write handshake resp ({} bytes): {}",
-            resp_buf.len(),
-            resp_buf.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
-        );
         write_half
             .write_all(&resp_buf)
             .await
             .map_err(|e| NetError::Connection(format!("handshake write failed: {}", e)))?;
-        eprintln!("[HS_DBG] server write_all returned Ok");
 
         let client_id = req.client_id;
 
@@ -856,7 +844,14 @@ impl PowerFsNetServer {
         // Notify handler — done by caller
         let _ = (handler, manager); // suppress unused warnings
 
-        Ok((read_half, write_half, client_id, client_type, channel, req.features))
+        Ok((
+            read_half,
+            write_half,
+            client_id,
+            client_type,
+            channel,
+            req.features,
+        ))
     }
 
     // ========================================================================
