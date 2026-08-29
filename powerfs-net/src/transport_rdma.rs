@@ -421,6 +421,13 @@ mod ffi {
     pub const IBV_ACCESS_REMOTE_READ: c_int = 1 << 2;
     pub const IBV_ACCESS_REMOTE_ATOMIC: c_int = 1 << 3;
 
+    /// Port states (from ibv_port_state enum).
+    pub const IBV_PORT_NOP: uint8_t = 0;
+    pub const IBV_PORT_DOWN: uint8_t = 1;
+    pub const IBV_PORT_INIT: uint8_t = 2;
+    pub const IBV_PORT_ARMED: uint8_t = 3;
+    pub const IBV_PORT_ACTIVE: uint8_t = 4;
+
     // --- librdmacm --------------------------------------------------------
 
     #[repr(C)]
@@ -504,8 +511,9 @@ mod ffi {
 
 // Re-export key FFI types for use in RAII wrappers
 use ffi::{
-    ibv_comp_channel, ibv_context, ibv_cq, ibv_mr, ibv_pd, ibv_qp, ibv_recv_wr, ibv_send_wr,
-    ibv_sge, ibv_wc, ibv_wc_opcode, rdma_cm_event, rdma_cm_id, rdma_event_channel,
+    ibv_comp_channel, ibv_context, ibv_cq, ibv_device, ibv_mr, ibv_pd, ibv_port_attr, ibv_qp,
+    ibv_recv_wr, ibv_send_wr, ibv_sge, ibv_wc, ibv_wc_opcode, rdma_cm_event, rdma_cm_id,
+    rdma_event_channel,
 };
 
 // ============================================================================
@@ -533,8 +541,10 @@ impl IbvContext {
             }
 
             let devices = std::slice::from_raw_parts(device_list, num_devices as usize);
-            let chosen = match device_name {
-                Some(name) => devices.iter().find(|&&dev| {
+
+            // If a specific device name is requested, find it directly.
+            if let Some(name) = device_name {
+                let dev = devices.iter().find(|&&dev| {
                     let cname = ffi::ibv_get_device_name(dev);
                     if cname.is_null() {
                         false
@@ -542,40 +552,96 @@ impl IbvContext {
                         let cstr = std::ffi::CStr::from_ptr(cname);
                         cstr.to_string_lossy() == name
                     }
-                }),
-                None => devices.first(),
-            };
-
-            let dev = match chosen {
-                Some(&d) => d,
-                None => {
-                    ffi::ibv_free_device_list(device_list);
-                    return Err(NetError::Config(format!(
-                        "RDMA device '{}' not found",
-                        device_name.unwrap_or("?")
+                });
+                let dev = match dev {
+                    Some(&d) => d,
+                    None => {
+                        ffi::ibv_free_device_list(device_list);
+                        return Err(NetError::Config(format!(
+                            "RDMA device '{}' not found",
+                            name
+                        )));
+                    }
+                };
+                let ctx = ffi::ibv_open_device(dev);
+                ffi::ibv_free_device_list(device_list);
+                if ctx.is_null() {
+                    return Err(NetError::Connection(format!(
+                        "ibv_open_device({}) failed",
+                        name
                     )));
                 }
-            };
+                info!("IbvContext: opened RDMA device {}", name);
+                return Ok(IbvContext { raw: ctx });
+            }
 
-            let dev_name_str = {
-                let n = ffi::ibv_get_device_name(dev);
-                if n.is_null() {
+            // No specific device requested — scan all devices and prefer
+            // one with an Active port (avoids mlx5_0 with port Down).
+            let mut best_dev: Option<*mut ibv_device> = None;
+            let mut best_name = String::new();
+            let mut fallback_dev: Option<*mut ibv_device> = None;
+            let mut fallback_name = String::new();
+
+            for &dev in devices {
+                let cname = ffi::ibv_get_device_name(dev);
+                let name_str = if cname.is_null() {
                     "<unknown>".to_string()
                 } else {
-                    std::ffi::CStr::from_ptr(n).to_string_lossy().into_owned()
+                    std::ffi::CStr::from_ptr(cname).to_string_lossy().into_owned()
+                };
+
+                let ctx = ffi::ibv_open_device(dev);
+                if ctx.is_null() {
+                    debug!("IbvContext: ibv_open_device({}) failed, skipping", name_str);
+                    continue;
+                }
+
+                // Query port 1 state.
+                let mut port_attr: ibv_port_attr = std::mem::zeroed();
+                let rc = ffi::ibv_query_port(ctx, 1, &mut port_attr);
+                if rc == 0 && port_attr.state == ffi::IBV_PORT_ACTIVE {
+                    info!("IbvContext: found device {} with Active port", name_str);
+                    ffi::ibv_close_device(ctx);
+                    best_dev = Some(dev);
+                    best_name = name_str;
+                    break;
+                }
+
+                // Remember first opened device as fallback.
+                if fallback_dev.is_none() {
+                    fallback_dev = Some(dev);
+                    fallback_name = name_str.clone();
+                }
+                ffi::ibv_close_device(ctx);
+            }
+
+            ffi::ibv_free_device_list(device_list);
+
+            let (dev, name_str) = match (best_dev, fallback_dev) {
+                (Some(d), _) => (d, best_name),
+                (None, Some(d)) => (d, fallback_name),
+                (None, None) => {
+                    // All ibv_open_device calls failed — try first device raw.
+                    let dev = devices[0];
+                    let n = ffi::ibv_get_device_name(dev);
+                    let name = if n.is_null() {
+                        "<unknown>".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(n).to_string_lossy().into_owned()
+                    };
+                    (dev, name)
                 }
             };
 
             let ctx = ffi::ibv_open_device(dev);
-            ffi::ibv_free_device_list(device_list);
             if ctx.is_null() {
                 return Err(NetError::Connection(format!(
                     "ibv_open_device({}) failed",
-                    dev_name_str
+                    name_str
                 )));
             }
 
-            info!("IbvContext: opened RDMA device {}", dev_name_str);
+            info!("IbvContext: opened RDMA device {}", name_str);
             Ok(IbvContext { raw: ctx })
         }
     }
@@ -2030,27 +2096,25 @@ unsafe impl Sync for RdmaListenerAdapter {}
 mod tests {
     use super::*;
 
-    /// Verify that RdmaTransport::new fails gracefully when no RDMA hardware
-    /// is present (typical in CI / dev environments without RNIC).
-    ///
-    /// This test is `#[ignore]` by default because:
-    /// - On systems without any RDMA hardware, `ibv_get_device_list` returns 0
-    ///   devices and `new()` returns `Err(NetError::Config)`.
-    /// - On systems with RDMA hardware but driver issues (e.g. missing
-    ///   provider .so files), the C library may SIGSEGV inside
-    ///   `ibv_open_device` / `ibv_alloc_pd`, which Rust cannot catch.
-    ///   Running the test on such systems would crash the test runner.
-    ///
-    /// To run on hardware with working drivers: `cargo test --features rdma -- --ignored`
+    /// Verify that RdmaTransport::new either succeeds (hardware present)
+    /// or returns a Config error (no hardware). With the Active-port
+    /// selection logic, it should prefer mlx5_1 (port Active) over
+    /// mlx5_0 (port Down).
     #[test]
-    #[ignore]
-    fn test_rdma_transport_new_without_hardware() {
+    fn test_rdma_transport_init() {
         let config = TransportConfig::default();
-        let result = RdmaTransport::new(config);
-        match result {
-            Ok(_) => { /* Hardware present — test passes trivially. */ }
-            Err(NetError::Config(_)) => { /* No hardware — expected. */ }
-            Err(e) => { panic!("unexpected error: {:?}", e); }
+        match RdmaTransport::new(config) {
+            Ok(transport) => {
+                // Hardware present and initialized successfully.
+                // The transport should be usable for connect/bind.
+                assert_eq!(transport.name(), "rdma");
+            }
+            Err(NetError::Config(_)) => {
+                // No RDMA hardware — expected in CI.
+            }
+            Err(e) => {
+                panic!("unexpected error: {:?}", e);
+            }
         }
     }
 }
