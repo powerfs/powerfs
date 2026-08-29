@@ -27,6 +27,7 @@
 
 use std::collections::VecDeque;
 use std::ffi::CString;
+use std::ffi::c_void;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
@@ -98,37 +99,59 @@ mod ffi {
         pub _padding: [u8; 64],
     }
 
+    /// `struct ibv_port_attr` from /usr/include/infiniband/verbs.h.
+    /// Field order and types MUST match the C definition.
+    /// Note: enum fields (state, max_mtu, active_mtu) are `int` (4 bytes)
+    /// in C, NOT uint8_t.
     #[repr(C)]
+    #[derive(Copy, Clone)]
     pub struct ibv_port_attr {
-        pub state: uint8_t,
-        pub max_mtu: uint8_t,
-        pub active_mtu: uint8_t,
-        pub gid_tbl_len: uint8_t,
+        /// enum ibv_port_state (int, 4 bytes)
+        pub state: int32_t,
+        /// enum ibv_mtu (int, 4 bytes)
+        pub max_mtu: int32_t,
+        /// enum ibv_mtu (int, 4 bytes)
+        pub active_mtu: int32_t,
+        pub gid_tbl_len: int32_t,
         pub port_cap_flags: uint32_t,
         pub max_msg_sz: uint32_t,
-        pub bad_pkey_cntr: uint16_t,
-        pub qkey_viol_cntr: uint16_t,
+        pub bad_pkey_cntr: uint32_t,
+        pub qkey_viol_cntr: uint32_t,
+        pub pkey_tbl_len: uint16_t,
+        /// Local Identifier assigned by the subnet manager.
+        pub lid: uint16_t,
         pub sm_lid: uint16_t,
-        pub sm_sl: uint8_t,
-        pub subnet_prefix: u64,
-        pub init_type_reply: uint8_t,
         pub lmc: uint8_t,
         pub max_vl_num: uint8_t,
-        pub sm_sl1: uint8_t,
-        pub _reserved: [u8; 4],
+        pub sm_sl: uint8_t,
+        pub subnet_timeout: uint8_t,
+        pub init_type_reply: uint8_t,
+        pub active_width: uint8_t,
+        pub active_speed: uint8_t,
+        pub phys_state: uint8_t,
+        pub link_layer: uint8_t,
+        pub flags: uint8_t,
+        pub port_cap_flags2: uint16_t,
+        pub active_speed_ex: uint32_t,
     }
 
     // --- ibv_pd ------------------------------------------------------------
 
+    /// `struct ibv_pd` from /usr/include/infiniband/verbs.h.
     #[repr(C)]
     pub struct ibv_pd {
-        pub _opaque: [u8; 0],
+        pub context: *mut ibv_context,
+        pub handle: uint32_t,
     }
 
     // --- ibv_mr ------------------------------------------------------------
 
+    /// `struct ibv_mr` from /usr/include/infiniband/verbs.h.
+    /// Field order MUST match the C struct.
     #[repr(C)]
     pub struct ibv_mr {
+        pub context: *mut ibv_context,
+        pub pd: *mut ibv_pd,
         pub addr: *mut c_void,
         pub length: size_t,
         pub handle: uint32_t,
@@ -141,6 +164,13 @@ mod ffi {
     #[repr(C)]
     pub struct ibv_comp_channel {
         pub fd: c_int,
+    }
+
+    /// Opaque type for `struct ibv_srq` (Shared Receive Queue).
+    /// Not used directly; only needed as a pointer in `rdma_cm_id`.
+    #[repr(C)]
+    pub struct ibv_srq {
+        _opaque: [u8; 0],
     }
 
     #[repr(C)]
@@ -177,7 +207,12 @@ mod ffi {
 
     #[repr(C)]
     pub struct ibv_qp {
-        pub _opaque: [u8; 0],
+        /// Padding to reach qp_num at offset 52.
+        /// Fields: context(8), qp_context(8), pd(8), send_cq(8), recv_cq(8),
+        /// srq(8), qp_type(4) = 52 bytes.
+        _opaque: [u8; 52],
+        /// Local QP number (assigned by hardware at QP creation).
+        pub qp_num: u32,
     }
 
     #[repr(C)]
@@ -194,15 +229,16 @@ mod ffi {
     pub    qp_context: *mut c_void,
     pub    send_cq: *mut ibv_cq,
     pub    recv_cq: *mut ibv_cq,
-    pub    srq: *mut c_void,
+    pub srq: *mut ibv_srq,
     pub    cap: ibv_qp_cap,
     pub    qp_type: int32_t,
     pub    sq_sig_all: c_int,
     }
 
     /// Global Route Header (GRH) fields (used for RoCE / IB routing).
-    /// Kept as a raw byte buffer since most RC QP setups on a single L2
-    /// segment don't require explicit GRH programming.
+    /// Must match `struct ibv_global_route` in /usr/include/infiniband/verbs.h.
+    /// Do NOT add a `_reserved` field: `#[repr(C)]` inserts the correct
+    /// trailing padding (1 byte → 24 bytes total) automatically.
     #[repr(C)]
     #[derive(Copy, Clone)]
     pub struct ibv_global_route {
@@ -212,11 +248,12 @@ mod ffi {
         pub sgid_index: uint8_t,
         pub hop_limit: uint8_t,
         pub traffic_class: uint8_t,
-        pub _reserved: [u8; 3],
     }
 
     /// Address handle attributes. Used by `ibv_modify_qp` when transitioning
     /// to RTR to program the path to the peer (port, LID, etc.).
+    /// Field order MUST match `struct ibv_ah_attr` in
+    /// /usr/include/infiniband/verbs.h: is_global comes BEFORE port_num.
     #[repr(C)]
     #[derive(Copy, Clone)]
     pub struct ibv_ah_attr {
@@ -229,11 +266,10 @@ mod ffi {
         pub src_path_bits: uint8_t,
         /// Static rate (0 = full line rate).
         pub static_rate: uint8_t,
-        /// Physical port number to use.
-        pub port_num: uint8_t,
         /// Whether global routing (GRH) is used.
         pub is_global: uint8_t,
-        pub _reserved: [u8; 2],
+        /// Physical port number to use.
+        pub port_num: uint8_t,
     }
 
     #[repr(C)]
@@ -270,21 +306,29 @@ mod ffi {
         pub rnr_retry: uint8_t,
         pub alt_port_num: uint8_t,
         pub alt_timeout: uint8_t,
-        pub _reserved: [u8; 4],
+        /// Rate limit in kbps (last field of `struct ibv_qp_attr` in verbs.h).
+        pub rate_limit: uint32_t,
     }
 
-    pub const IBV_QP_STATE: c_int = 1;
-    pub const IBV_QP_RQ_PSN: c_int = 0x40;
-    pub const IBV_QP_SQ_PSN: c_int = 0x80;
-    pub const IBV_QP_DEST_QPN: c_int = 0x10;
-    pub const IBV_QP_PATH_MTU: c_int = 0x04;
-    pub const IBV_QP_QKEY: c_int = 0x100;
-    pub const IBV_QP_AV: c_int = 0x02;
-    pub const IBV_QP_RETRY_CNT: c_int = 0x400;
-    pub const IBV_QP_RNR_RETRY: c_int = 0x800;
-    pub const IBV_QP_MIN_RNR_TIMER: c_int = 0x1000;
-    pub const IBV_QP_MAX_QP_RD_ATOMIC: c_int = 0x2000;
-    pub const IBV_QP_MAX_DEST_RD_ATOMIC: c_int = 0x4000;
+    // ibv_qp_attr_mask — values MUST match enum ibv_qp_attr_mask in
+    // /usr/include/infiniband/verbs.h. Using `1 << N` makes the bit index
+    // obvious and keeps the source in sync with the system header.
+    pub const IBV_QP_STATE: c_int = 1 << 0; // 1
+    pub const IBV_QP_ACCESS_FLAGS: c_int = 1 << 3; // 8
+    pub const IBV_QP_PKEY_INDEX: c_int = 1 << 4; // 16
+    pub const IBV_QP_PORT: c_int = 1 << 5; // 32
+    pub const IBV_QP_QKEY: c_int = 1 << 6; // 64
+    pub const IBV_QP_AV: c_int = 1 << 7; // 128
+    pub const IBV_QP_PATH_MTU: c_int = 1 << 8; // 256
+    pub const IBV_QP_TIMEOUT: c_int = 1 << 9; // 512
+    pub const IBV_QP_RETRY_CNT: c_int = 1 << 10; // 1024
+    pub const IBV_QP_RNR_RETRY: c_int = 1 << 11; // 2048
+    pub const IBV_QP_RQ_PSN: c_int = 1 << 12; // 4096
+    pub const IBV_QP_MAX_QP_RD_ATOMIC: c_int = 1 << 13; // 8192
+    pub const IBV_QP_MIN_RNR_TIMER: c_int = 1 << 15; // 32768
+    pub const IBV_QP_SQ_PSN: c_int = 1 << 16; // 65536
+    pub const IBV_QP_MAX_DEST_RD_ATOMIC: c_int = 1 << 17; // 131072
+    pub const IBV_QP_DEST_QPN: c_int = 1 << 20; // 1048576
 
     pub const IBV_QPS_RESET: int32_t = 0;
     pub const IBV_QPS_INIT: int32_t = 1;
@@ -302,28 +346,51 @@ mod ffi {
         pub lkey: uint32_t,
     }
 
+    /// `struct ibv_send_wr` from <infiniband/verbs.h>.
+    ///
+    /// CRITICAL: The C struct is 128 bytes. It has fields:
+    ///   imm_data (u32, offset 36), wr (union, offset 40, 32 bytes),
+    ///   qp_type (union, offset 72), bind_mw/tso (union, offset 80, 48 bytes).
+    /// We use opaque padding for unused trailing fields to match the size.
     #[repr(C)]
     pub struct ibv_send_wr {
-        pub wr_id: u64,
-        pub next: *mut ibv_send_wr,
-        pub sg_list: *mut ibv_sge,
-        pub num_sge: c_int,
-        pub opcode: int32_t,
-        pub send_flags: uint32_t,
-        pub wr: ibv_send_wr_wr,
+        pub wr_id: u64,                    // offset 0
+        pub next: *mut ibv_send_wr,        // offset 8
+        pub sg_list: *mut ibv_sge,         // offset 16
+        pub num_sge: c_int,                // offset 24
+        pub opcode: int32_t,               // offset 28
+        pub send_flags: uint32_t,          // offset 32
+        pub imm_data: uint32_t,            // offset 36 (union: imm_data/invalidate_rkey)
+        pub wr: ibv_send_wr_wr,             // offset 40 (32 bytes, union)
+        pub qp_type_xrc_remote_srqn: uint32_t, // offset 72
+        pub _qp_type_pad: [u8; 4],         // offset 76 (padding for bind_mw alignment)
+        pub _bind_mw_tso: [u8; 48],        // offset 80 (bind_mw/tso union, 48 bytes)
+        // Total: 128 bytes
     }
 
     #[repr(C)]
     #[derive(Copy, Clone)]
+    /// `wr` union in `struct ibv_send_wr`. The C union is 32 bytes (max of
+    /// atomic variant). We use a flat layout with enough padding to match.
     pub struct ibv_send_wr_wr {
-        pub rdma_remote: u64, // remote_addr (simplified)
+        // rdma variant: remote_addr (8) + rkey (4) + reserved (4) = 16
+        pub rdma_remote: u64,
         pub rdma_rkey: uint32_t,
-        pub _padding: uint32_t,
+        // atomic variant extends to 32 bytes:
+        //   remote_addr(8) + compare_add(4) + swap_add(4) +
+        //   rkey(4) + reserved(4) + compare_mask(8) = 32
+        pub _atomic_pad: [u32; 5], // 20 bytes padding to 32 total
     }
 
-    pub const IBV_WR_SEND: int32_t = 0;
-    pub const IBV_SEND_SIGNALED: uint32_t = 0x01;
-    pub const IBV_SEND_INLINE: uint32_t = 0x08;
+    pub const IBV_WR_RDMA_WRITE: int32_t = 0;
+    pub const IBV_WR_RDMA_WRITE_WITH_IMM: int32_t = 1;
+    pub const IBV_WR_SEND: int32_t = 2;
+    pub const IBV_WR_SEND_WITH_IMM: int32_t = 3;
+    pub const IBV_WR_RDMA_READ: int32_t = 4;
+    pub const IBV_SEND_FENCE: uint32_t = 1 << 0;
+    pub const IBV_SEND_SIGNALED: uint32_t = 1 << 1;
+    pub const IBV_SEND_SOLICITED: uint32_t = 1 << 2;
+    pub const IBV_SEND_INLINE: uint32_t = 1 << 3;
 
     #[repr(C)]
     pub struct ibv_recv_wr {
@@ -348,6 +415,16 @@ mod ffi {
             attr: *mut ibv_device_attr,
         ) -> c_int;
         pub fn ibv_query_port(
+            context: *mut ibv_context,
+            port_num: uint8_t,
+            attr: *mut ibv_port_attr,
+        ) -> c_int;
+
+        // C wrapper for ibv_query_port (which is a macro, not a direct
+        // symbol — the exported symbol is the OLD compat version with a
+        // smaller struct layout). This wrapper uses the macro to call
+        // ___ibv_query_port which handles struct size detection correctly.
+        pub fn powerfs_ibv_query_port(
             context: *mut ibv_context,
             port_num: uint8_t,
             attr: *mut ibv_port_attr,
@@ -413,6 +490,43 @@ mod ffi {
             wr: *mut ibv_recv_wr,
             bad_wr: *mut *mut ibv_recv_wr,
         ) -> c_int;
+
+        // C wrappers for rdma_cm functions (avoid Rust struct layout issues)
+        pub fn powerfs_rdma_create_qp(
+            id: *mut rdma_cm_id,
+            pd: *mut ibv_pd,
+            qp_context: *mut c_void,
+            send_cq: *mut ibv_cq,
+            recv_cq: *mut ibv_cq,
+            srq: *mut ibv_srq,
+            max_send_wr: uint32_t,
+            max_recv_wr: uint32_t,
+            max_send_sge: uint32_t,
+            max_recv_sge: uint32_t,
+            max_inline_data: uint32_t,
+            qp_type: c_int,
+            sq_sig_all: c_int,
+        ) -> c_int;
+        pub fn powerfs_rdma_connect(
+            id: *mut rdma_cm_id,
+            responder_resources: u8,
+            initiator_depth: u8,
+            flow_control: u8,
+            retry_count: u8,
+            rnr_retry_count: u8,
+            srq: u8,
+            qp_num: uint32_t,
+        ) -> c_int;
+        pub fn powerfs_rdma_accept(
+            id: *mut rdma_cm_id,
+            responder_resources: u8,
+            initiator_depth: u8,
+            flow_control: u8,
+            retry_count: u8,
+            rnr_retry_count: u8,
+            srq: u8,
+            qp_num: uint32_t,
+        ) -> c_int;
     }
 
     // MR access flags
@@ -422,11 +536,12 @@ mod ffi {
     pub const IBV_ACCESS_REMOTE_ATOMIC: c_int = 1 << 3;
 
     /// Port states (from ibv_port_state enum).
-    pub const IBV_PORT_NOP: uint8_t = 0;
-    pub const IBV_PORT_DOWN: uint8_t = 1;
-    pub const IBV_PORT_INIT: uint8_t = 2;
-    pub const IBV_PORT_ARMED: uint8_t = 3;
-    pub const IBV_PORT_ACTIVE: uint8_t = 4;
+    // Port states — match `enum ibv_port_state` (int, 4 bytes)
+    pub const IBV_PORT_NOP: int32_t = 0;
+    pub const IBV_PORT_DOWN: int32_t = 1;
+    pub const IBV_PORT_INIT: int32_t = 2;
+    pub const IBV_PORT_ARMED: int32_t = 3;
+    pub const IBV_PORT_ACTIVE: int32_t = 4;
 
     // --- librdmacm --------------------------------------------------------
 
@@ -435,17 +550,87 @@ mod ffi {
         pub fd: c_int,
     }
 
+    /// `struct rdma_cm_id` from /usr/include/rdma/rdma_cma.h.
+    /// MUST be 416 bytes (verified via sizeof in C). Field order and
+    /// alignment match the C definition exactly.
     #[repr(C)]
     pub struct rdma_cm_id {
-        pub _opaque: [u8; 0],
+        /// Device context (ibv_context*). Set by rdma_cm after addr resolution.
+        pub verbs: *mut ibv_context,
+        /// Event channel this id belongs to.
+        pub channel: *mut rdma_event_channel,
+        /// User-supplied context pointer (opaque).
+        pub context: *mut c_void,
+        /// QP bound by `rdma_create_qp` or manually set after `ibv_create_qp`.
+        pub qp: *mut ibv_qp,
+        /// Resolved route (rdma_route, 312 bytes). We skip the full definition
+        /// and use padding to advance to `ps`.
+        _route_pad: [u8; 312], // sizeof(rdma_route) = 312 on 64-bit
+        /// Port space (RDMA_PS_TCP etc.).
+        pub ps: c_int,
+        /// Physical port number resolved by rdma_cm. Used for QP path programming.
+        pub port_num: u8,
+        // 3 bytes padding to align `event` (pointer) to 8 bytes.
+        _pad1: [u8; 3],
+        /// Pending event (set by rdma_cm internally).
+        pub event: *mut rdma_cm_event,
+        /// Completion channel for send CQ (set by rdma_create_qp).
+        pub send_cq_channel: *mut ibv_comp_channel,
+        /// Send CQ (set by rdma_create_qp).
+        pub send_cq: *mut ibv_cq,
+        /// Completion channel for recv CQ (set by rdma_create_qp).
+        pub recv_cq_channel: *mut ibv_comp_channel,
+        /// Recv CQ (set by rdma_create_qp).
+        pub recv_cq: *mut ibv_cq,
+        /// Shared Receive Queue (NULL if not using SRQ).
+        pub srq: *mut ibv_srq,
+        /// Protection Domain (set by rdma_create_qp).
+        pub pd: *mut ibv_pd,
+        /// QP type (IBV_QPT_RC etc.).
+        pub qp_type: int32_t,
+        // 4 bytes padding to reach 416 bytes total.
+        _pad2: [u8; 4],
     }
 
+    /// `struct rdma_conn_param` from <rdma/rdma_cma.h>.
+    ///
+    /// Used in `rdma_cm_event.param.conn` to extract the peer's QPN from
+    /// CONNECT_REQUEST (server) and CONNECT_RESPONSE (client) events.
+    /// `qp_num` at offset 16 within the struct.
+    #[repr(C)]
+    pub struct rdma_conn_param {
+        pub private_data: *const c_void,
+        pub private_data_len: u8,
+        pub responder_resources: u8,
+        pub initiator_depth: u8,
+        pub flow_control: u8,
+        pub retry_count: u8,
+        pub rnr_retry_count: u8,
+        pub srq: u8,
+        /// Peer's QPN, extracted from REQ/REP message by rdma_cm.
+        pub qp_num: u32,
+    }
+
+    /// rdma_cm event (must match `struct rdma_cm_event` in <rdma/rdma_cma.h>).
+    ///
+    /// CRITICAL: the `listen_id` field at offset 8 is easy to miss. If it
+    /// is omitted, `event` would be read at offset 8 (the listen_id bytes)
+    /// instead of offset 16, causing every non-ADDR_RESOLVED event to be
+    /// misread. For ADDR_RESOLVED listen_id is NULL (== 0 == ADDR_RESOLVED),
+    /// so the bug masquerades as "duplicate ADDR_RESOLVED".
+    ///
+    /// The `param` union is 56 bytes (sizeof(rdma_ud_param) > sizeof(rdma_conn_param));
+    /// we define `rdma_conn_param` (24 bytes) + 32 bytes padding = 56.
     #[repr(C)]
     pub struct rdma_cm_event {
         pub id: *mut rdma_cm_id,
+        pub listen_id: *mut rdma_cm_id,
         pub event: rdma_cm_event_type,
         pub status: c_int,
-        pub _padding: [u8; 32],
+        /// Connection parameters from peer (for CONNECT_REQUEST/CONNECT_RESPONSE).
+        /// In C this is a union; we use the conn variant + padding to match size.
+        pub param: rdma_conn_param,
+        _param_pad: [u8; 32], // pad to 80-byte total (56-byte union - 24 conn = 32)
     }
 
     pub type rdma_cm_event_type = int32_t;
@@ -462,7 +647,7 @@ mod ffi {
     pub const RDMA_CM_EVENT_ESTABLISHED: rdma_cm_event_type = 9;
     pub const RDMA_CM_EVENT_DISCONNECTED: rdma_cm_event_type = 11;
 
-    pub const RDMA_PS_TCP: c_int = 2;
+    pub const RDMA_PS_TCP: c_int = 0x0106;
 
     extern "C" {
         pub fn rdma_create_event_channel() -> *mut rdma_event_channel;
@@ -481,15 +666,20 @@ mod ffi {
             timeout_ms: c_int,
         ) -> c_int;
         pub fn rdma_resolve_route(id: *mut rdma_cm_id, timeout_ms: c_int) -> c_int;
+        pub fn rdma_init_qp_attr(
+            id: *mut rdma_cm_id,
+            qp_attr: *mut ibv_qp_attr,
+            qp_attr_mask: *mut c_int,
+        ) -> c_int;
         pub fn rdma_bind_addr(id: *mut rdma_cm_id, addr: *const libc::sockaddr) -> c_int;
         pub fn rdma_listen(id: *mut rdma_cm_id, backlog: c_int) -> c_int;
         pub fn rdma_connect(
             id: *mut rdma_cm_id,
-            conn_param: *const c_void,
+            conn_param: *const rdma_conn_param,
         ) -> c_int;
         pub fn rdma_accept(
             id: *mut rdma_cm_id,
-            conn_param: *const c_void,
+            conn_param: *const rdma_conn_param,
         ) -> c_int;
         pub fn rdma_disconnect(id: *mut rdma_cm_id) -> c_int;
         pub fn rdma_get_cm_event(
@@ -502,6 +692,7 @@ mod ffi {
             pd: *mut ibv_pd,
             init: *mut ibv_qp_init,
         ) -> c_int;
+        pub fn rdma_destroy_qp(id: *mut rdma_cm_id);
         pub fn rdma_get_devices(
             num_devices: *mut c_int,
         ) -> *mut *mut c_void;
@@ -512,8 +703,8 @@ mod ffi {
 // Re-export key FFI types for use in RAII wrappers
 use ffi::{
     ibv_comp_channel, ibv_context, ibv_cq, ibv_device, ibv_mr, ibv_pd, ibv_port_attr, ibv_qp,
-    ibv_recv_wr, ibv_send_wr, ibv_sge, ibv_wc, ibv_wc_opcode, rdma_cm_event, rdma_cm_id,
-    rdma_event_channel,
+    ibv_qp_attr, ibv_qp_cap, ibv_recv_wr, ibv_send_wr, ibv_sge, ibv_wc, ibv_wc_opcode,
+    rdma_cm_event, rdma_cm_id, rdma_event_channel,
 };
 
 // ============================================================================
@@ -521,8 +712,14 @@ use ffi::{
 // ============================================================================
 
 /// RAII wrapper for ibv_context (device handle).
+///
+/// When `owned` is true (created via `open()`), the context is closed in
+/// Drop. When `owned` is false (created via `from_raw_borrowed()`), the
+/// context belongs to rdma_cm and must NOT be closed — it is destroyed
+/// when the owning `rdma_cm_id` is destroyed.
 struct IbvContext {
     raw: *mut ibv_context,
+    owned: bool,
 }
 
 impl IbvContext {
@@ -572,7 +769,10 @@ impl IbvContext {
                     )));
                 }
                 info!("IbvContext: opened RDMA device {}", name);
-                return Ok(IbvContext { raw: ctx });
+                return Ok(IbvContext {
+                    raw: ctx,
+                    owned: true,
+                });
             }
 
             // No specific device requested — scan all devices and prefer
@@ -598,7 +798,7 @@ impl IbvContext {
 
                 // Query port 1 state.
                 let mut port_attr: ibv_port_attr = std::mem::zeroed();
-                let rc = ffi::ibv_query_port(ctx, 1, &mut port_attr);
+                let rc = ffi::powerfs_ibv_query_port(ctx, 1, &mut port_attr);
                 if rc == 0 && port_attr.state == ffi::IBV_PORT_ACTIVE {
                     info!("IbvContext: found device {} with Active port", name_str);
                     ffi::ibv_close_device(ctx);
@@ -642,18 +842,63 @@ impl IbvContext {
             }
 
             info!("IbvContext: opened RDMA device {}", name_str);
-            Ok(IbvContext { raw: ctx })
+            Ok(IbvContext {
+                raw: ctx,
+                owned: true,
+            })
+        }
+    }
+
+    /// Create a non-owning wrapper around a context pointer borrowed from
+    /// rdma_cm (e.g. `cm_id->verbs`). The context will NOT be closed in
+    /// Drop — it is owned by the rdma_cm_id.
+    fn from_raw_borrowed(raw: *mut ibv_context) -> Self {
+        IbvContext {
+            raw,
+            owned: false,
         }
     }
 
     fn as_ptr(&self) -> *mut ibv_context {
         self.raw
     }
+
+    /// Query the port's LID (Local Identifier) assigned by the subnet manager.
+    ///
+    /// Used to set `ah_attr.dlid` in `ibv_modify_qp` when transitioning a
+    /// manually-created QP to RTR. For loopback connections (same machine),
+    /// the peer's LID equals the local port's LID.
+    fn query_port_lid(&self, port_num: u8) -> NetResult<u16> {
+        let mut port_attr: ibv_port_attr = unsafe { std::mem::zeroed() };
+        // Use the C wrapper (powerfs_ibv_query_port) which correctly invokes
+        // the macro → ___ibv_query_port, handling struct size detection.
+        // The direct ibv_query_port symbol is the OLD compat version with
+        // a smaller struct layout that would read lid at wrong offsets.
+        let rc = unsafe { ffi::powerfs_ibv_query_port(self.raw, port_num, &mut port_attr) };
+        if rc != 0 {
+            return Err(NetError::Connection(format!(
+                "ibv_query_port(port={}) failed (rc={})",
+                port_num, rc
+            )));
+        }
+        let lid = port_attr.lid;
+        if lid == 0 || lid == 0xFFFF {
+            return Err(NetError::Connection(format!(
+                "ibv_query_port(port={}) returned invalid lid=0x{:04x}",
+                port_num, lid
+            )));
+        }
+        debug!(
+            "[ctx] port {} lid=0x{:04x} state={} active_speed={}",
+            port_num, lid, port_attr.state, port_attr.active_speed
+        );
+        Ok(lid)
+    }
 }
 
 impl Drop for IbvContext {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
+        if self.owned && !self.raw.is_null() {
             unsafe {
                 ffi::ibv_close_device(self.raw);
             }
@@ -941,8 +1186,14 @@ unsafe impl Send for IbvCq {}
 unsafe impl Sync for IbvCq {}
 
 /// RAII wrapper for ibv_qp (queue pair).
+///
+/// When `owned` is true (created via `create()`), `ibv_destroy_qp` is
+/// called in Drop. When `owned` is false (created via
+/// `from_raw_non_owning()`), the QP is managed by rdma_cm and destroyed
+/// when the owning `rdma_cm_id` is destroyed.
 struct IbvQp {
     raw: *mut ibv_qp,
+    owned: bool,
 }
 
 impl IbvQp {
@@ -977,8 +1228,34 @@ impl IbvQp {
                     "ibv_create_qp failed".to_string(),
                 ));
             }
-            Ok(IbvQp { raw: qp })
+            Ok(IbvQp {
+                raw: qp,
+                owned: true,
+            })
         }
+    }
+
+    /// Wrap a QP created by `rdma_create_qp` (non-owning — the QP is
+    /// destroyed by `rdma_destroy_id`, not by this wrapper's Drop).
+    fn from_raw_non_owning(raw: *mut ibv_qp) -> Self {
+        IbvQp {
+            raw,
+            owned: false,
+        }
+    }
+
+    /// Wrap a QP created by `ibv_create_qp` (owning — this wrapper calls
+    /// `ibv_destroy_qp` in Drop). Used when `cm_id->qp` is NOT set.
+    fn from_raw_owned(raw: *mut ibv_qp) -> Self {
+        IbvQp {
+            raw,
+            owned: true,
+        }
+    }
+
+    /// Read the local QP number assigned by hardware.
+    fn qp_num(&self) -> u32 {
+        unsafe { (*self.raw).qp_num }
     }
 
     fn as_ptr(&self) -> *mut ibv_qp {
@@ -996,7 +1273,11 @@ impl IbvQp {
                 | ffi::IBV_ACCESS_REMOTE_WRITE
                 | ffi::IBV_ACCESS_REMOTE_READ
                 | ffi::IBV_ACCESS_REMOTE_ATOMIC;
-            let mask = ffi::IBV_QP_STATE | (1 << 5) /* IBV_QP_PORT */ | (1 << 7) /* IBV_QP_ACCESS_FLAGS */;
+            attr.pkey_index = 0;
+            let mask = ffi::IBV_QP_STATE
+                | ffi::IBV_QP_PKEY_INDEX
+                | ffi::IBV_QP_PORT
+                | ffi::IBV_QP_ACCESS_FLAGS;
             let rc = ffi::ibv_modify_qp(self.as_ptr(), &mut attr, mask);
             if rc != 0 {
                 Err(NetError::Connection(format!(
@@ -1009,8 +1290,19 @@ impl IbvQp {
         }
     }
 
-    /// Transition QP to RTR (Ready to Receive). Requires peer QPN.
-    fn modify_to_rtr(&self, dest_qp_num: u32, port_num: u8) -> NetResult<()> {
+    /// Transition QP to RTR (Ready to Receive). Requires peer QPN and
+    /// the peer's LID (Local Identifier) for the address handle.
+    ///
+    /// `peer_lid` is the destination LID to set in `ah_attr.dlid`. For
+    /// loopback (same machine), this equals the local port's LID. For
+    /// multi-host, it should be the peer's LID obtained from route
+    /// resolution.
+    fn modify_to_rtr(
+        &self,
+        dest_qp_num: u32,
+        port_num: u8,
+        peer_lid: u16,
+    ) -> NetResult<()> {
         unsafe {
             let mut attr: ffi::ibv_qp_attr = std::mem::zeroed();
             attr.qp_state = ffi::IBV_QPS_RTR;
@@ -1020,12 +1312,15 @@ impl IbvQp {
             attr.max_dest_rd_atomic = 1;
             attr.min_rnr_timer = 12; // ~0.5s
             attr.ah_attr.port_num = port_num;
+            attr.ah_attr.dlid = peer_lid;
+            // is_global=0 by default (zeroed). For IB (non-RoCE), LID-only
+            // routing is sufficient; GRH is not needed.
             let mask = ffi::IBV_QP_STATE
                 | ffi::IBV_QP_PATH_MTU
                 | ffi::IBV_QP_DEST_QPN
                 | ffi::IBV_QP_RQ_PSN
-                | (1 << 6) /* IBV_QP_MAX_DEST_RD_ATOMIC */
-                | (1 << 4) /* IBV_QP_MIN_RNR_TIMER */
+                | ffi::IBV_QP_MAX_DEST_RD_ATOMIC
+                | ffi::IBV_QP_MIN_RNR_TIMER
                 | ffi::IBV_QP_AV;
             let rc = ffi::ibv_modify_qp(self.as_ptr(), &mut attr, mask);
             if rc != 0 {
@@ -1051,10 +1346,10 @@ impl IbvQp {
             attr.max_rd_atomic = 1;
             let mask = ffi::IBV_QP_STATE
                 | ffi::IBV_QP_SQ_PSN
-                | (1 << 3) /* IBV_QP_TIMEOUT */
+                | ffi::IBV_QP_TIMEOUT
                 | ffi::IBV_QP_RETRY_CNT
                 | ffi::IBV_QP_RNR_RETRY
-                | (1 << 2) /* IBV_QP_MAX_QP_RD_ATOMIC */;
+                | ffi::IBV_QP_MAX_QP_RD_ATOMIC;
             let rc = ffi::ibv_modify_qp(self.as_ptr(), &mut attr, mask);
             if rc != 0 {
                 Err(NetError::Connection(format!(
@@ -1067,6 +1362,32 @@ impl IbvQp {
         }
     }
 
+    /// Transition QP from INIT → RTR → RTS using explicit peer QPN, port,
+    /// and peer LID (Local Identifier).
+    ///
+    /// Used after `rdma_connect`/`rdma_accept` when the QP was created via
+    /// `ibv_create_qp` (not `rdma_create_qp`). The peer QPN is extracted from
+    /// the rdma_cm event's `param.conn.qp_num` field (populated by rdma_cm
+    /// from the REQ/REP message). The port_num comes from `cm_id->port_num`.
+    /// The peer_lid is the peer's LID for the address handle (dlid). For
+    /// loopback connections (same machine), it equals the local port LID.
+    fn transition_to_rtr_rts(
+        &self,
+        peer_qpn: u32,
+        port_num: u8,
+        peer_lid: u16,
+    ) -> NetResult<()> {
+        debug!(
+            "[qp] transition_to_rtr_rts: peer_qpn={}, port_num={}, peer_lid={}",
+            peer_qpn, port_num, peer_lid
+        );
+        self.modify_to_rtr(peer_qpn, port_num, peer_lid)?;
+        debug!("[qp] RTR transition succeeded (dlid={})", peer_lid);
+        self.modify_to_rts()?;
+        debug!("[qp] RTS transition succeeded");
+        Ok(())
+    }
+
     /// Post a send work request (RDMA send).
     fn post_send(&self, sge: &ibv_sge, wr_id: u64) -> NetResult<()> {
         unsafe {
@@ -1077,11 +1398,15 @@ impl IbvQp {
                 num_sge: 1,
                 opcode: ffi::IBV_WR_SEND,
                 send_flags: ffi::IBV_SEND_SIGNALED,
+                imm_data: 0,
                 wr: ffi::ibv_send_wr_wr {
                     rdma_remote: 0,
                     rdma_rkey: 0,
-                    _padding: 0,
+                    _atomic_pad: [0; 5],
                 },
+                qp_type_xrc_remote_srqn: 0,
+                _qp_type_pad: [0; 4],
+                _bind_mw_tso: [0; 48],
             };
             let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
             let rc =
@@ -1123,7 +1448,7 @@ impl IbvQp {
 
 impl Drop for IbvQp {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
+        if self.owned && !self.raw.is_null() {
             unsafe {
                 ffi::ibv_destroy_qp(self.raw);
             }
@@ -1224,6 +1549,14 @@ struct RdmaChannel {
     send_async_fd: Option<Arc<CqAsyncFd>>,
     /// AsyncFd for the recv CQ completion channel.
     recv_async_fd: Option<Arc<CqAsyncFd>>,
+    /// Owned rdma_cm_id — keeps the QP (and borrowed context) alive.
+    /// When None, the connection was created without rdma_cm (raw ibv only).
+    cm_id: Option<RdmaCmIdPtr>,
+    /// Per-connection PD (when created via rdma_cm). Must outlive the MR pool.
+    pd: Option<Arc<IbvPd>>,
+    /// Event channel for the connect side. Must outlive cm_id. For accepted
+    /// connections this is None (the listener owns the shared channel).
+    event_channel: Option<RdmaEventChannelPtr>,
 }
 
 impl RdmaChannel {
@@ -1465,7 +1798,7 @@ impl RdmaTransport {
 #[async_trait::async_trait]
 impl Transport for RdmaTransport {
     async fn connect(&self, addr: SocketAddr) -> NetResult<Box<dyn TransportStream>> {
-        debug!("RdmaTransport::connect to {}", addr);
+        debug!("[client] connect to {}", addr);
         // 1. Create rdma_cm event channel + id
         let channel = unsafe { ffi::rdma_create_event_channel() };
         if channel.is_null() {
@@ -1486,6 +1819,7 @@ impl Transport for RdmaTransport {
             )));
         }
         let cm_id = RdmaCmIdPtr(cm_id);
+        debug!("[client] cm_id created (ptr={:p})", cm_id.0);
 
         // 2. Resolve address
         let (sa, sa_len) = sockaddr_to_libc(addr);
@@ -1503,58 +1837,122 @@ impl Transport for RdmaTransport {
                 addr, rc
             )));
         }
+        debug!("[client] rdma_resolve_addr called, waiting for ADDR_RESOLVED...");
 
         // Wait for ADDR_RESOLVED event
         wait_cm_event(channel.0, ffi::RDMA_CM_EVENT_ADDR_RESOLVED)?;
+        debug!("[client] ADDR_RESOLVED received");
+
         // 3. Resolve route
         let rc = unsafe { ffi::rdma_resolve_route(cm_id.0, 3000) };
+        debug!("[client] rdma_resolve_route rc={}", rc);
         if rc != 0 {
+            let errno = std::io::Error::last_os_error();
             return Err(NetError::Connection(format!(
-                "rdma_resolve_route failed (rc={})",
-                rc
+                "rdma_resolve_route failed (rc={}, errno={})",
+                rc, errno
             )));
         }
+        debug!("[client] rdma_resolve_route called, waiting for ROUTE_RESOLVED...");
         wait_cm_event(channel.0, ffi::RDMA_CM_EVENT_ROUTE_RESOLVED)?;
+        debug!("[client] ROUTE_RESOLVED received (cm_id ptr={:p})", cm_id.0);
 
-        // 4. Create QP using our PD (so we can use the pre-registered MR pool).
-        // Each CQ gets its own completion channel for AsyncFd-driven async
-        // completion polling (avoids busy-polling the tokio worker).
-        let mr_pool = self.build_mr_pool()?;
-        let send_comp_ch = IbvCompChannel::create(&self.context)?;
-        let recv_comp_ch = IbvCompChannel::create(&self.context)?;
-        let send_cq = IbvCq::create(&self.context, 32, Some(send_comp_ch))?;
-        let recv_cq = IbvCq::create(&self.context, 32, Some(recv_comp_ch))?;
-        let qp = IbvQp::create(&self.pd, &send_cq, &recv_cq, 16, 16, 1)?;
-        // rdma_create_qp would create its own PD; we already have one. Instead,
-        // we modify the QP states manually.
-        // Note: We do NOT call rdma_create_qp; we use ibv_create_qp + manual
-        // state transitions. This is a design choice to share the pre-registered
-        // MR pool's PD across all connections.
-        qp.modify_to_init(1)?;
-        // After connect event we'll know dest_qp_num and can transition to RTR/RTS.
+        // 4. After route resolution, cm_id->verbs points to the device
+        //    context that rdma_cm resolved to. We MUST use this context
+        //    (not the transport's pre-allocated one) for all per-connection
+        //    resources — using a different context causes SIGSEGV in the
+        //    RDMA driver.
+        let verbs_ptr = unsafe { (*cm_id.0).verbs };
+        if verbs_ptr.is_null() {
+            return Err(NetError::Connection(
+                "cm_id->verbs is null after ROUTE_RESOLVED".to_string(),
+            ));
+        }
+        let ctx = IbvContext::from_raw_borrowed(verbs_ptr);
+        debug!("[client] got device context from cm_id");
 
-        // 5. Connect
-        let rc = unsafe { ffi::rdma_connect(cm_id.0, ptr::null()) };
+        // 5. Allocate per-connection PD and create CQs from the cm_id's
+        //    device context.
+        let pd = IbvPd::alloc(&ctx)?;
+        // Debug: verify pd->context matches verbs_ptr
+        let pd_ctx = unsafe { (*pd.as_ptr()).context };
+        debug!(
+            "[client] pd->context={:p}, verbs_ptr={:p}, match={}",
+            pd_ctx, verbs_ptr, pd_ctx == verbs_ptr
+        );
+        let send_comp_ch = IbvCompChannel::create(&ctx)?;
+        let recv_comp_ch = IbvCompChannel::create(&ctx)?;
+        let send_cq = IbvCq::create(&ctx, 32, Some(send_comp_ch))?;
+        let recv_cq = IbvCq::create(&ctx, 32, Some(recv_comp_ch))?;
+
+        // 6. Create QP via rdma_create_qp (C wrapper). This sets both
+        //    cm_id->qp AND the internal id_priv->qp, so rdma_cm correctly
+        //    manages QP state transitions (RESET→INIT→RTR→RTS) during
+        //    rdma_connect. The C wrapper avoids Rust struct layout issues.
+        let rc = unsafe {
+            ffi::powerfs_rdma_create_qp(
+                cm_id.0,
+                pd.as_ptr(),
+                ptr::null_mut(),
+                send_cq.as_ptr(),
+                recv_cq.as_ptr(),
+                ptr::null_mut(),
+                16, 16, 1, 1, 0,
+                ffi::IBV_QPT_RC,
+                1,
+            )
+        };
         if rc != 0 {
+            let errno = std::io::Error::last_os_error();
             return Err(NetError::Connection(format!(
-                "rdma_connect failed (rc={})",
-                rc
+                "rdma_create_qp failed (rc={}, errno={})", rc, errno
             )));
         }
-        let event = wait_cm_event_with_id(channel.0, ffi::RDMA_CM_EVENT_ESTABLISHED)?;
-        // dest_qp_num from event... For RC QP via rdma_cm, the dest QPN is
-        // negotiated. For the initial implementation we read it from the
-        // event (in practice, rdma_cm handles this internally when using
-        // rdma_create_qp; with manual QP we need to extract it).
-        let _ = event;
+        let qp_ptr = unsafe { (*cm_id.0).qp };
+        let local_qpn = unsafe { (*qp_ptr).qp_num };
+        debug!(
+            "[client] rdma_create_qp succeeded (local_qpn={}), rdma_cm will manage QP transitions",
+            local_qpn
+        );
+        // Use non-owning wrapper: rdma_destroy_id will destroy the QP.
+        let qp = IbvQp::from_raw_non_owning(qp_ptr);
 
-        // 6. Transition QP to RTR + RTS (dest_qp_num=0 is a placeholder;
-        // for production this needs the actual peer QPN, which rdma_cm
-        // exposes via the event).
-        qp.modify_to_rtr(0, 1)?;
-        qp.modify_to_rts()?;
+        // 7. Build MR pool from the per-connection PD.
+        let mr_pool = MrPool::new(
+            &pd,
+            self.config.rdma_buf_num,
+            self.config.rdma_buf_size,
+        )?;
 
-        // 7. Build AsyncFd for send/recv CQ completion channels.
+        // 8. Connect. Since rdma_create_qp was called, qp_num is ignored
+        //    — rdma_cm uses cm_id->qp->qp_num and handles QP state
+        //    transitions (RESET→INIT→RTR→RTS) automatically. C wrapper
+        //    avoids Rust struct layout issues.
+        let rc = unsafe {
+            ffi::powerfs_rdma_connect(
+                cm_id.0, 1, 1, 1, 7, 7, 0, 0,
+            )
+        };
+        if rc != 0 {
+            return Err(NetError::Connection(format!(
+                "rdma_connect failed (rc={})", rc
+            )));
+        }
+        debug!("[client] rdma_connect called (local_qpn={})", qp.qp_num());
+
+        // 8a. Wait for ESTABLISHED. rdma_cm auto-transitions the QP
+        //     (RESET→INIT→RTR→RTS) based on connection events.
+        loop {
+            let (event_type, _, _) = wait_for_any_cm_event(channel.0)?;
+            if event_type == ffi::RDMA_CM_EVENT_ESTABLISHED {
+                debug!("[client] ESTABLISHED received, QP should be in RTS");
+                break;
+            }
+            // Other events are handled by wait_for_any_cm_event (errors)
+            // or looped over (repeated ADDR_RESOLVED etc.)
+        }
+
+        // 9. Build AsyncFd for send/recv CQ completion channels.
         let send_async_fd = match send_cq.channel_fd() {
             Some(fd) => match AsyncFd::new(CqChannelFd(fd)) {
                 Ok(async_fd) => Some(Arc::new(async_fd)),
@@ -1580,10 +1978,13 @@ impl Transport for RdmaTransport {
             qp: Arc::new(qp),
             send_cq: Arc::new(send_cq),
             recv_cq: Arc::new(recv_cq),
-            mr_pool,
+            mr_pool: Arc::new(mr_pool),
             peer: addr,
             send_async_fd,
             recv_async_fd,
+            cm_id: Some(cm_id),
+            pd: Some(Arc::new(pd)),
+            event_channel: Some(channel),
         };
 
         info!("RdmaTransport: connected to {}", addr);
@@ -1690,10 +2091,122 @@ fn wait_cm_event(
 }
 
 /// Wait for a specific rdma_cm event type and return the event (for QPN extraction).
+///
+/// Uses `poll()` on the event channel fd with a 5s timeout before each
+/// blocking `rdma_get_cm_event` call. This avoids hanging forever if an
+/// expected event never arrives (e.g. route resolution silently failing),
+/// and lets us surface a clear error instead of a test timeout.
 fn wait_cm_event_with_id(
     channel: *mut rdma_event_channel,
     expected: ffi::rdma_cm_event_type,
 ) -> NetResult<*mut rdma_cm_event> {
+    let fd = if channel.is_null() {
+        return Err(NetError::Connection("null event channel".to_string()));
+    } else {
+        unsafe { (*channel).fd }
+    };
+
+    loop {
+        // Poll the channel fd for readability (event pending) with a 5s timeout.
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let prc = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        if prc == 0 {
+            return Err(NetError::Connection(format!(
+                "rdma_cm: timeout waiting for event {} on channel fd {}",
+                expected, fd
+            )));
+        }
+        if prc < 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(NetError::Connection(format!(
+                "rdma_cm: poll on channel fd {} failed: {}",
+                fd, e
+            )));
+        }
+
+        let mut event: *mut rdma_cm_event = ptr::null_mut();
+        let rc = unsafe { ffi::rdma_get_cm_event(channel, &mut event) };
+        if rc != 0 {
+            return Err(NetError::Connection(format!(
+                "rdma_get_cm_event failed (rc={})",
+                rc
+            )));
+        }
+        if event.is_null() {
+            return Err(NetError::Connection("rdma_get_cm_event returned null".to_string()));
+        }
+
+        let actual = unsafe { (*event).event };
+        let status = unsafe { (*event).status };
+        debug!(
+            "[rdma_cm] got event {} (status={}), expected {}",
+            actual, status, expected
+        );
+
+        if actual == expected {
+            unsafe { ffi::rdma_ack_cm_event(event) };
+            return Ok(ptr::null_mut());
+        }
+
+        debug!(
+            "[rdma_cm] unexpected event {} (expected {}), acking and retrying",
+            actual, expected
+        );
+        unsafe { ffi::rdma_ack_cm_event(event) };
+
+        // If it's an error event, return error instead of looping forever.
+        if actual == ffi::RDMA_CM_EVENT_ADDR_ERROR
+            || actual == ffi::RDMA_CM_EVENT_ROUTE_ERROR
+            || actual == ffi::RDMA_CM_EVENT_CONNECT_ERROR
+            || actual == ffi::RDMA_CM_EVENT_UNREACHABLE
+            || actual == ffi::RDMA_CM_EVENT_REJECTED
+        {
+            return Err(NetError::Connection(format!(
+                "rdma_cm: received error event {} (status={}, expected {})",
+                actual, status, expected
+            )));
+        }
+    }
+}
+
+/// Wait for the next rdma_cm event and return (event_type, peer_qpn, cm_id).
+///
+/// Acks the event before returning. The peer QPN is extracted from the
+/// event's `param.private_data` (where we put it in the conn_param) or
+/// from `param.qp_num` (populated by some rdma_cm implementations).
+fn wait_for_any_cm_event(
+    channel: *mut rdma_event_channel,
+) -> NetResult<(ffi::rdma_cm_event_type, u32, *mut rdma_cm_id)> {
+    let fd = if channel.is_null() {
+        return Err(NetError::Connection("null event channel".to_string()));
+    } else {
+        unsafe { (*channel).fd }
+    };
+
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let prc = unsafe { libc::poll(&mut pfd, 1, 5000) };
+    if prc == 0 {
+        return Err(NetError::Connection(format!(
+            "rdma_cm: timeout waiting for event on channel fd {}",
+            fd
+        )));
+    }
+    if prc < 0 {
+        let e = std::io::Error::last_os_error();
+        return Err(NetError::Connection(format!(
+            "rdma_cm: poll on channel fd {} failed: {}",
+            fd, e
+        )));
+    }
+
     let mut event: *mut rdma_cm_event = ptr::null_mut();
     let rc = unsafe { ffi::rdma_get_cm_event(channel, &mut event) };
     if rc != 0 {
@@ -1703,24 +2216,50 @@ fn wait_cm_event_with_id(
         )));
     }
     if event.is_null() {
-        return Err(NetError::Connection("rdma_get_cm_event returned null".to_string()));
+        return Err(NetError::Connection(
+            "rdma_get_cm_event returned null".to_string(),
+        ));
     }
 
-    let actual = unsafe { (*event).event };
-    if actual != expected {
-        let msg = format!(
-            "rdma_cm: expected event {}, got {}",
-            expected, actual
-        );
-        unsafe { ffi::rdma_ack_cm_event(event) };
-        return Err(NetError::Connection(msg));
-    }
+    let event_type = unsafe { (*event).event };
+    let status = unsafe { (*event).status };
+    let cm_id = unsafe { (*event).id };
 
-    // Note: caller is responsible for ack. For the simple wait_cm_event
-    // variant we ack here; for wait_cm_event_with_id we return the event
-    // pointer (caller acks). To keep this simple, ack here and return null.
+    // Extract peer QPN: first try param.qp_num, then private_data.
+    let param_qp_num = unsafe { (*event).param.qp_num };
+    let pd_ptr = unsafe { (*event).param.private_data };
+    let pd_len = unsafe { (*event).param.private_data_len };
+    let peer_qpn = if param_qp_num != 0 {
+        param_qp_num
+    } else if !pd_ptr.is_null() && pd_len >= 4 {
+        // Extract QPN from private_data (first 4 bytes, native endian).
+        let bytes = unsafe { std::slice::from_raw_parts(pd_ptr as *const u8, 4) };
+        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    } else {
+        0
+    };
+
+    debug!(
+        "[rdma_cm] got event {} (status={}, param_qp={}, pd_len={}, peer_qpn={})",
+        event_type, status, param_qp_num, pd_len, peer_qpn
+    );
+
     unsafe { ffi::rdma_ack_cm_event(event) };
-    Ok(ptr::null_mut())
+
+    // Check for error events
+    if event_type == ffi::RDMA_CM_EVENT_ADDR_ERROR
+        || event_type == ffi::RDMA_CM_EVENT_ROUTE_ERROR
+        || event_type == ffi::RDMA_CM_EVENT_CONNECT_ERROR
+        || event_type == ffi::RDMA_CM_EVENT_UNREACHABLE
+        || event_type == ffi::RDMA_CM_EVENT_REJECTED
+    {
+        return Err(NetError::Connection(format!(
+            "rdma_cm: received error event {} (status={})",
+            event_type, status
+        )));
+    }
+
+    Ok((event_type, peer_qpn, cm_id))
 }
 
 /// Convert a SocketAddr to a libc sockaddr (IPv4 or IPv6).
@@ -2004,32 +2543,143 @@ impl TransportListener for RdmaListenerAdapter {
 
             let event_type = unsafe { (*event).event };
             let new_id = unsafe { (*event).id };
+
+            // Extract peer QPN: first try param.qp_num, then private_data.
+            let param_qp_num = unsafe { (*event).param.qp_num };
+            let pd_ptr = unsafe { (*event).param.private_data };
+            let pd_len = unsafe { (*event).param.private_data_len };
+            let peer_qpn = if param_qp_num != 0 {
+                param_qp_num
+            } else if !pd_ptr.is_null() && pd_len >= 4 {
+                let bytes = unsafe { std::slice::from_raw_parts(pd_ptr as *const u8, 4) };
+                u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            } else {
+                0
+            };
+            debug!(
+                "[server] event {} (param_qp={}, pd_len={}, peer_qpn={})",
+                event_type, param_qp_num, pd_len, peer_qpn
+            );
             unsafe { ffi::rdma_ack_cm_event(event) };
 
             match event_type {
                 ffi::RDMA_CM_EVENT_CONNECT_REQUEST => {
-                    // Build a new RdmaChannel for the incoming connection.
-                    // Create CQs with completion channels for AsyncFd polling.
+                    if new_id.is_null() {
+                        warn!("accept: CONNECT_REQUEST with null id");
+                        continue;
+                    }
+
+                    // Use the new cm_id's device context (verbs) for all
+                    // per-connection resources, not the transport's pre-
+                    // allocated context. Using a different context causes
+                    // SIGSEGV in the RDMA driver.
+                    let verbs_ptr = unsafe { (*new_id).verbs };
+                    if verbs_ptr.is_null() {
+                        warn!("accept: new_id->verbs is null");
+                        unsafe { ffi::rdma_destroy_id(new_id) };
+                        continue;
+                    }
+                    let ctx = IbvContext::from_raw_borrowed(verbs_ptr);
+
+                    // Per-connection PD + CQs from the cm_id's context.
+                    let pd = IbvPd::alloc(&ctx)?;
+                    let send_comp_ch = IbvCompChannel::create(&ctx)?;
+                    let recv_comp_ch = IbvCompChannel::create(&ctx)?;
+                    let send_cq = IbvCq::create(&ctx, 32, Some(send_comp_ch))?;
+                    let recv_cq = IbvCq::create(&ctx, 32, Some(recv_comp_ch))?;
+
+                    // Create QP via rdma_create_qp (C wrapper). This sets both
+                    // cm_id->qp AND internal id_priv->qp, so rdma_cm correctly
+                    // manages QP state transitions during rdma_accept.
+                    let rc = unsafe {
+                        ffi::powerfs_rdma_create_qp(
+                            new_id,
+                            pd.as_ptr(),
+                            ptr::null_mut(),
+                            send_cq.as_ptr(),
+                            recv_cq.as_ptr(),
+                            ptr::null_mut(),
+                            16, 16, 1, 1, 0,
+                            ffi::IBV_QPT_RC,
+                            1,
+                        )
+                    };
+                    if rc != 0 {
+                        let errno = std::io::Error::last_os_error();
+                        warn!("rdma_create_qp failed (rc={}, errno={})", rc, errno);
+                        unsafe { ffi::rdma_destroy_id(new_id) };
+                        continue;
+                    }
+                    let qp_ptr = unsafe { (*new_id).qp };
+                    let local_qpn = unsafe { (*qp_ptr).qp_num };
+                    debug!(
+                        "[server] rdma_create_qp succeeded (local_qpn={}), rdma_cm will manage QP transitions",
+                        local_qpn
+                    );
+                    // Use non-owning wrapper: rdma_destroy_id will destroy the QP.
+                    let qp = IbvQp::from_raw_non_owning(qp_ptr);
+
+                    // Build MR pool from the per-connection PD.
                     let mr_pool = MrPool::new(
-                        &self.pd,
+                        &pd,
                         self.config.rdma_buf_num,
                         self.config.rdma_buf_size,
                     )?;
-                    let send_comp_ch = IbvCompChannel::create(&self.context)?;
-                    let recv_comp_ch = IbvCompChannel::create(&self.context)?;
-                    let send_cq = IbvCq::create(&self.context, 32, Some(send_comp_ch))?;
-                    let recv_cq = IbvCq::create(&self.context, 32, Some(recv_comp_ch))?;
-                    let qp = IbvQp::create(&self.pd, &send_cq, &recv_cq, 16, 16, 1)?;
-                    qp.modify_to_init(1)?;
-                    // Accept the connection
-                    let rc = unsafe { ffi::rdma_accept(new_id, ptr::null()) };
+
+                    // Accept. Since rdma_create_qp was called, qp_num is
+                    // ignored — rdma_cm uses cm_id->qp->qp_num. C wrapper
+                    // avoids Rust struct layout issues.
+                    let rc = unsafe {
+                        ffi::powerfs_rdma_accept(
+                            new_id, 1, 1, 1, 7, 7, 0, 0,
+                        )
+                    };
                     if rc != 0 {
                         warn!("rdma_accept failed (rc={})", rc);
+                        unsafe { ffi::rdma_destroy_id(new_id) };
                         continue;
                     }
-                    // Transition QP to RTR + RTS (dest_qp_num=0 placeholder)
-                    qp.modify_to_rtr(0, 1)?;
-                    qp.modify_to_rts()?;
+                    debug!(
+                        "[server] rdma_accept called (local_qpn={}), waiting for ESTABLISHED",
+                        qp.qp_num()
+                    );
+
+                    // After rdma_accept, we MUST retrieve and ack the
+                    // ESTABLISHED event. Without this, rdma_cm's internal
+                    // state machine is incomplete and the connection is not
+                    // fully active on the server side, causing REM_ACCESS_ERR
+                    // when the client sends data.
+                    let mut est_event: *mut rdma_cm_event = ptr::null_mut();
+                    let rc = unsafe {
+                        ffi::rdma_get_cm_event(self.channel.0, &mut est_event)
+                    };
+                    if rc != 0 || est_event.is_null() {
+                        warn!(
+                            "accept: failed to get ESTABLISHED event after rdma_accept (rc={})",
+                            rc
+                        );
+                        unsafe { ffi::rdma_destroy_id(new_id) };
+                        continue;
+                    }
+                    let est_type = unsafe { (*est_event).event };
+                    debug!("[server] post-accept event {}", est_type);
+                    if est_type != ffi::RDMA_CM_EVENT_ESTABLISHED {
+                        warn!(
+                            "accept: expected ESTABLISHED ({}), got {}",
+                            ffi::RDMA_CM_EVENT_ESTABLISHED, est_type
+                        );
+                        unsafe { ffi::rdma_ack_cm_event(est_event) };
+                        unsafe { ffi::rdma_destroy_id(new_id) };
+                        continue;
+                    }
+                    unsafe { ffi::rdma_ack_cm_event(est_event) };
+                    debug!(
+                        "[server] ESTABLISHED received and acked (local_qpn={})",
+                        qp.qp_num()
+                    );
+
+                    // Wrap new_id in RdmaCmIdPtr to manage its lifetime.
+                    let cm_id = RdmaCmIdPtr(new_id);
 
                     // Build AsyncFd for send/recv CQ completion channels.
                     let send_async_fd = match send_cq.channel_fd() {
@@ -2062,6 +2712,9 @@ impl TransportListener for RdmaListenerAdapter {
                         peer,
                         send_async_fd,
                         recv_async_fd,
+                        cm_id: Some(cm_id),
+                        pd: Some(Arc::new(pd)),
+                        event_channel: None,
                     };
                     info!("RdmaListenerAdapter: accepted connection from {}", peer);
                     return Ok(Box::new(RdmaStream {
@@ -2105,16 +2758,107 @@ mod tests {
         let config = TransportConfig::default();
         match RdmaTransport::new(config) {
             Ok(transport) => {
-                // Hardware present and initialized successfully.
-                // The transport should be usable for connect/bind.
                 assert_eq!(transport.name(), "rdma");
             }
-            Err(NetError::Config(_)) => {
-                // No RDMA hardware — expected in CI.
-            }
-            Err(e) => {
-                panic!("unexpected error: {:?}", e);
-            }
+            Err(NetError::Config(_)) => {}
+            Err(e) => panic!("unexpected error: {:?}", e),
         }
+    }
+
+    /// RDMA local loopback test: bind + connect + send + recv on the same
+    /// machine via the IPoIB interface (192.168.100.3 = mlx5_1).
+    ///
+    /// rdma_get_cm_event is blocking, so server and client must run on
+    /// separate OS threads to avoid deadlock.
+    ///
+    /// Requires: Mellanox mlx5_1 with Active port and IPoIB configured.
+    #[test]
+    #[ignore = "requires RDMA hardware with IPoIB"]
+    fn test_rdma_loopback_send_recv() {
+        let ip = std::env::var("POWERFS_RDMA_TEST_IP")
+            .unwrap_or_else(|_| "192.168.100.3".to_string());
+        let port: u16 = 18900;
+        let addr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
+
+        let config = TransportConfig::default();
+        let transport = match RdmaTransport::new(config) {
+            Ok(t) => t,
+            Err(NetError::Config(_)) => {
+                eprintln!("skipping: no RDMA hardware");
+                return;
+            }
+            Err(e) => panic!("RdmaTransport::new failed: {:?}", e),
+        };
+
+        let transport = std::sync::Arc::new(transport);
+
+        // --- Server thread: bind + accept + read ---
+        let server_transport = transport.clone();
+        let server_handle = std::thread::Builder::new()
+            .name("rdma-test-server".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async move {
+                    // Bind and listen
+                    let listener = server_transport.bind(addr)
+                        .await
+                        .expect("bind failed");
+                    eprintln!("[server] listening on {}", addr);
+
+                    // Accept one connection
+                    let stream = listener.accept()
+                        .await
+                        .expect("accept failed");
+                    eprintln!("[server] accepted connection");
+
+                    // Read data from client
+                    use tokio::io::AsyncReadExt;
+                    let (mut read_half, _write_half) = stream.split();
+                    let mut buf = vec![0u8; 64];
+                    let n = read_half.read(&mut buf)
+                        .await
+                        .expect("read failed");
+                    eprintln!("[server] read {} bytes: {:?}", n, &buf[..n]);
+                    assert_eq!(&buf[..n], b"hello rdma!");
+                    eprintln!("[server] data verified OK");
+                });
+            })
+            .expect("failed to spawn server thread");
+
+        // Give server time to bind + listen
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // --- Client: connect + write ---
+        let client_transport = transport.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let stream = client_transport.connect(addr)
+                .await
+                .expect("connect failed");
+            eprintln!("[client] connected to {}", addr);
+
+            // Write data to server
+            use tokio::io::AsyncWriteExt;
+            let (_read_half, mut write_half) = stream.split();
+            write_half.write_all(b"hello rdma!")
+                .await
+                .expect("write failed");
+            write_half.flush()
+                .await
+                .expect("flush failed");
+            eprintln!("[client] sent 'hello rdma!'");
+        });
+
+        // Wait for server to finish
+        server_handle.join().expect("server thread panicked");
+        eprintln!("test_rdma_loopback_send_recv: PASSED");
     }
 }
