@@ -26,8 +26,8 @@
 #![cfg(feature = "rdma")]
 
 use std::collections::VecDeque;
-use std::ffi::CString;
 use std::ffi::c_void;
+use std::ffi::CString;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
@@ -36,8 +36,8 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use log::{debug, error, info, warn};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
 use crate::errors::{NetError, NetResult};
@@ -72,7 +72,9 @@ type CqAsyncFd = AsyncFd<CqChannelFd>;
 /// All functions are declared here to keep the RDMA code self-contained.
 /// They link against system-installed `libibverbs.so` and `librdmacm.so`.
 mod ffi {
-    use libc::{c_char, c_int, c_uint, c_void, int16_t, int32_t, size_t, uint16_t, uint32_t, uint8_t};
+    use libc::{
+        c_char, c_int, c_uint, c_void, int16_t, int32_t, size_t, uint16_t, uint32_t, uint8_t,
+    };
 
     // --- ibv_context / ibv_device ------------------------------------------
 
@@ -233,13 +235,13 @@ mod ffi {
 
     #[repr(C)]
     pub struct ibv_qp_init {
-    pub    qp_context: *mut c_void,
-    pub    send_cq: *mut ibv_cq,
-    pub    recv_cq: *mut ibv_cq,
-    pub srq: *mut ibv_srq,
-    pub    cap: ibv_qp_cap,
-    pub    qp_type: int32_t,
-    pub    sq_sig_all: c_int,
+        pub qp_context: *mut c_void,
+        pub send_cq: *mut ibv_cq,
+        pub recv_cq: *mut ibv_cq,
+        pub srq: *mut ibv_srq,
+        pub cap: ibv_qp_cap,
+        pub qp_type: int32_t,
+        pub sq_sig_all: c_int,
     }
 
     /// Global Route Header (GRH) fields (used for RoCE / IB routing).
@@ -363,18 +365,18 @@ mod ffi {
     /// We use opaque padding for unused trailing fields to match the size.
     #[repr(C)]
     pub struct ibv_send_wr {
-        pub wr_id: u64,                    // offset 0
-        pub next: *mut ibv_send_wr,        // offset 8
-        pub sg_list: *mut ibv_sge,         // offset 16
-        pub num_sge: c_int,                // offset 24
-        pub opcode: int32_t,               // offset 28
-        pub send_flags: uint32_t,          // offset 32
-        pub imm_data: uint32_t,            // offset 36 (union: imm_data/invalidate_rkey)
-        pub wr: ibv_send_wr_wr,             // offset 40 (32 bytes, union)
+        pub wr_id: u64,                        // offset 0
+        pub next: *mut ibv_send_wr,            // offset 8
+        pub sg_list: *mut ibv_sge,             // offset 16
+        pub num_sge: c_int,                    // offset 24
+        pub opcode: int32_t,                   // offset 28
+        pub send_flags: uint32_t,              // offset 32
+        pub imm_data: uint32_t,                // offset 36 (union: imm_data/invalidate_rkey)
+        pub wr: ibv_send_wr_wr,                // offset 40 (32 bytes, union)
         pub qp_type_xrc_remote_srqn: uint32_t, // offset 72
-        pub _qp_type_pad: [u8; 4],         // offset 76 (padding for bind_mw alignment)
-        pub _bind_mw_tso: [u8; 48],        // offset 80 (bind_mw/tso union, 48 bytes)
-        // Total: 128 bytes
+        pub _qp_type_pad: [u8; 4],             // offset 76 (padding for bind_mw alignment)
+        pub _bind_mw_tso: [u8; 48],            // offset 80 (bind_mw/tso union, 48 bytes)
+                                               // Total: 128 bytes
     }
 
     #[repr(C)]
@@ -412,17 +414,12 @@ mod ffi {
     // --- libibverbs function declarations ----------------------------------
 
     extern "C" {
-        pub fn ibv_get_device_list(
-            num_devices: *mut c_int,
-        ) -> *mut *mut ibv_device;
+        pub fn ibv_get_device_list(num_devices: *mut c_int) -> *mut *mut ibv_device;
         pub fn ibv_free_device_list(list: *mut *mut ibv_device);
         pub fn ibv_get_device_name(device: *mut ibv_device) -> *const c_char;
         pub fn ibv_open_device(device: *mut ibv_device) -> *mut ibv_context;
         pub fn ibv_close_device(context: *mut ibv_context) -> c_int;
-        pub fn ibv_query_device(
-            context: *mut ibv_context,
-            attr: *mut ibv_device_attr,
-        ) -> c_int;
+        pub fn ibv_query_device(context: *mut ibv_context, attr: *mut ibv_device_attr) -> c_int;
         pub fn ibv_query_port(
             context: *mut ibv_context,
             port_num: uint8_t,
@@ -447,9 +444,7 @@ mod ffi {
             access: c_int,
         ) -> *mut ibv_mr;
         pub fn ibv_dereg_mr(mr: *mut ibv_mr) -> c_int;
-        pub fn ibv_create_comp_channel(
-            context: *mut ibv_context,
-        ) -> *mut ibv_comp_channel;
+        pub fn ibv_create_comp_channel(context: *mut ibv_context) -> *mut ibv_comp_channel;
         pub fn ibv_destroy_comp_channel(channel: *mut ibv_comp_channel) -> c_int;
         pub fn ibv_create_cq(
             context: *mut ibv_context,
@@ -460,10 +455,7 @@ mod ffi {
         ) -> *mut ibv_cq;
         pub fn ibv_destroy_cq(cq: *mut ibv_cq) -> c_int;
         // ibv_req_notify_cq is `static inline` in verbs.h — call C wrapper.
-        pub fn powerfs_ibv_req_notify_cq(
-            cq: *mut ibv_cq,
-            solicited_only: c_int,
-        ) -> c_int;
+        pub fn powerfs_ibv_req_notify_cq(cq: *mut ibv_cq, solicited_only: c_int) -> c_int;
         pub fn ibv_get_cq_event(
             channel: *mut ibv_comp_channel,
             cq: *mut *mut ibv_cq,
@@ -474,21 +466,10 @@ mod ffi {
         // in <infiniband/verbs.h> and NOT exported from libibverbs.so.
         // We call the C wrappers from rdma_wrapper.c (compiled by build.rs)
         // instead.
-        pub fn powerfs_ibv_poll_cq(
-            cq: *mut ibv_cq,
-            num_wc: c_int,
-            wc: *mut ibv_wc,
-        ) -> c_int;
-        pub fn ibv_create_qp(
-            pd: *mut ibv_pd,
-            init: *mut ibv_qp_init,
-        ) -> *mut ibv_qp;
+        pub fn powerfs_ibv_poll_cq(cq: *mut ibv_cq, num_wc: c_int, wc: *mut ibv_wc) -> c_int;
+        pub fn ibv_create_qp(pd: *mut ibv_pd, init: *mut ibv_qp_init) -> *mut ibv_qp;
         pub fn ibv_destroy_qp(qp: *mut ibv_qp) -> c_int;
-        pub fn ibv_modify_qp(
-            qp: *mut ibv_qp,
-            attr: *mut ibv_qp_attr,
-            attr_mask: c_int,
-        ) -> c_int;
+        pub fn ibv_modify_qp(qp: *mut ibv_qp, attr: *mut ibv_qp_attr, attr_mask: c_int) -> c_int;
         pub fn powerfs_ibv_post_send(
             qp: *mut ibv_qp,
             wr: *mut ibv_send_wr,
@@ -687,14 +668,8 @@ mod ffi {
         ) -> c_int;
         pub fn rdma_bind_addr(id: *mut rdma_cm_id, addr: *const libc::sockaddr) -> c_int;
         pub fn rdma_listen(id: *mut rdma_cm_id, backlog: c_int) -> c_int;
-        pub fn rdma_connect(
-            id: *mut rdma_cm_id,
-            conn_param: *const rdma_conn_param,
-        ) -> c_int;
-        pub fn rdma_accept(
-            id: *mut rdma_cm_id,
-            conn_param: *const rdma_conn_param,
-        ) -> c_int;
+        pub fn rdma_connect(id: *mut rdma_cm_id, conn_param: *const rdma_conn_param) -> c_int;
+        pub fn rdma_accept(id: *mut rdma_cm_id, conn_param: *const rdma_conn_param) -> c_int;
         pub fn rdma_disconnect(id: *mut rdma_cm_id) -> c_int;
         pub fn rdma_get_cm_event(
             channel: *mut rdma_event_channel,
@@ -707,9 +682,7 @@ mod ffi {
             init: *mut ibv_qp_init,
         ) -> c_int;
         pub fn rdma_destroy_qp(id: *mut rdma_cm_id);
-        pub fn rdma_get_devices(
-            num_devices: *mut c_int,
-        ) -> *mut *mut c_void;
+        pub fn rdma_get_devices(num_devices: *mut c_int) -> *mut *mut c_void;
         pub fn rdma_free_devices(devices: *mut *mut c_void);
     }
 }
@@ -801,7 +774,9 @@ impl IbvContext {
                 let name_str = if cname.is_null() {
                     "<unknown>".to_string()
                 } else {
-                    std::ffi::CStr::from_ptr(cname).to_string_lossy().into_owned()
+                    std::ffi::CStr::from_ptr(cname)
+                        .to_string_lossy()
+                        .into_owned()
                 };
 
                 let ctx = ffi::ibv_open_device(dev);
@@ -867,10 +842,7 @@ impl IbvContext {
     /// rdma_cm (e.g. `cm_id->verbs`). The context will NOT be closed in
     /// Drop — it is owned by the rdma_cm_id.
     fn from_raw_borrowed(raw: *mut ibv_context) -> Self {
-        IbvContext {
-            raw,
-            owned: false,
-        }
+        IbvContext { raw, owned: false }
     }
 
     fn as_ptr(&self) -> *mut ibv_context {
@@ -988,10 +960,7 @@ impl IbvMr {
                     addr, len
                 )));
             }
-            Ok(IbvMr {
-                raw: mr,
-                _buf: buf,
-            })
+            Ok(IbvMr { raw: mr, _buf: buf })
         }
     }
 
@@ -1079,33 +1048,20 @@ struct IbvCq {
 }
 
 impl IbvCq {
-    fn create(
-        context: &IbvContext,
-        cqe: i32,
-        channel: Option<IbvCompChannel>,
-    ) -> NetResult<Self> {
+    fn create(context: &IbvContext, cqe: i32, channel: Option<IbvCompChannel>) -> NetResult<Self> {
         unsafe {
             let ch_ptr = match &channel {
                 Some(c) => c.as_ptr(),
                 None => ptr::null_mut(),
             };
-            let cq = ffi::ibv_create_cq(
-                context.as_ptr(),
-                cqe,
-                ptr::null_mut(),
-                ch_ptr,
-                0,
-            );
+            let cq = ffi::ibv_create_cq(context.as_ptr(), cqe, ptr::null_mut(), ch_ptr, 0);
             if cq.is_null() {
                 return Err(NetError::Connection(format!(
                     "ibv_create_cq(cqe={}) failed",
                     cqe
                 )));
             }
-            Ok(IbvCq {
-                raw: cq,
-                channel,
-            })
+            Ok(IbvCq { raw: cq, channel })
         }
     }
 
@@ -1144,10 +1100,8 @@ impl IbvCq {
     /// avoid missing events.
     fn req_notify(&self, solicited_only: bool) -> NetResult<()> {
         unsafe {
-            let rc = ffi::powerfs_ibv_req_notify_cq(
-                self.as_ptr(),
-                if solicited_only { 1 } else { 0 },
-            );
+            let rc =
+                ffi::powerfs_ibv_req_notify_cq(self.as_ptr(), if solicited_only { 1 } else { 0 });
             if rc != 0 {
                 Err(NetError::Connection(format!(
                     "ibv_req_notify_cq failed (rc={})",
@@ -1167,9 +1121,12 @@ impl IbvCq {
             let mut cq_ptr: *mut ibv_cq = ptr::null_mut();
             let mut ctx_ptr: *mut libc::c_void = ptr::null_mut();
             let rc = ffi::ibv_get_cq_event(
-                self.channel.as_ref().ok_or_else(|| {
-                    NetError::Connection("CQ has no completion channel".to_string())
-                })?.as_ptr(),
+                self.channel
+                    .as_ref()
+                    .ok_or_else(|| {
+                        NetError::Connection("CQ has no completion channel".to_string())
+                    })?
+                    .as_ptr(),
                 &mut cq_ptr,
                 &mut ctx_ptr,
             );
@@ -1245,9 +1202,7 @@ impl IbvQp {
             };
             let qp = ffi::ibv_create_qp(pd.as_ptr(), &mut init);
             if qp.is_null() {
-                return Err(NetError::Connection(
-                    "ibv_create_qp failed".to_string(),
-                ));
+                return Err(NetError::Connection("ibv_create_qp failed".to_string()));
             }
             Ok(IbvQp {
                 raw: qp,
@@ -1259,19 +1214,13 @@ impl IbvQp {
     /// Wrap a QP created by `rdma_create_qp` (non-owning — the QP is
     /// destroyed by `rdma_destroy_id`, not by this wrapper's Drop).
     fn from_raw_non_owning(raw: *mut ibv_qp) -> Self {
-        IbvQp {
-            raw,
-            owned: false,
-        }
+        IbvQp { raw, owned: false }
     }
 
     /// Wrap a QP created by `ibv_create_qp` (owning — this wrapper calls
     /// `ibv_destroy_qp` in Drop). Used when `cm_id->qp` is NOT set.
     fn from_raw_owned(raw: *mut ibv_qp) -> Self {
-        IbvQp {
-            raw,
-            owned: true,
-        }
+        IbvQp { raw, owned: true }
     }
 
     /// Read the local QP number assigned by hardware.
@@ -1318,12 +1267,7 @@ impl IbvQp {
     /// loopback (same machine), this equals the local port's LID. For
     /// multi-host, it should be the peer's LID obtained from route
     /// resolution.
-    fn modify_to_rtr(
-        &self,
-        dest_qp_num: u32,
-        port_num: u8,
-        peer_lid: u16,
-    ) -> NetResult<()> {
+    fn modify_to_rtr(&self, dest_qp_num: u32, port_num: u8, peer_lid: u16) -> NetResult<()> {
         unsafe {
             let mut attr: ffi::ibv_qp_attr = std::mem::zeroed();
             attr.qp_state = ffi::IBV_QPS_RTR;
@@ -1392,12 +1336,7 @@ impl IbvQp {
     /// from the REQ/REP message). The port_num comes from `cm_id->port_num`.
     /// The peer_lid is the peer's LID for the address handle (dlid). For
     /// loopback connections (same machine), it equals the local port LID.
-    fn transition_to_rtr_rts(
-        &self,
-        peer_qpn: u32,
-        port_num: u8,
-        peer_lid: u16,
-    ) -> NetResult<()> {
+    fn transition_to_rtr_rts(&self, peer_qpn: u32, port_num: u8, peer_lid: u16) -> NetResult<()> {
         debug!(
             "[qp] transition_to_rtr_rts: peer_qpn={}, port_num={}, peer_lid={}",
             peer_qpn, port_num, peer_lid
@@ -1430,8 +1369,7 @@ impl IbvQp {
                 _bind_mw_tso: [0; 48],
             };
             let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
-            let rc =
-                ffi::powerfs_ibv_post_send(self.as_ptr(), &mut wr, &mut bad_wr);
+            let rc = ffi::powerfs_ibv_post_send(self.as_ptr(), &mut wr, &mut bad_wr);
             if rc != 0 {
                 Err(NetError::Connection(format!(
                     "ibv_post_send failed (rc={})",
@@ -1453,8 +1391,11 @@ impl IbvQp {
                 num_sge: 1,
             };
             let mut bad_wr: *mut ibv_recv_wr = ptr::null_mut();
-            let rc =
-                ffi::powerfs_ibv_post_recv(self.as_ptr(), &wr as *const ibv_recv_wr as *mut ibv_recv_wr, &mut bad_wr);
+            let rc = ffi::powerfs_ibv_post_recv(
+                self.as_ptr(),
+                &wr as *const ibv_recv_wr as *mut ibv_recv_wr,
+                &mut bad_wr,
+            );
             if rc != 0 {
                 Err(NetError::Connection(format!(
                     "ibv_post_recv failed (rc={})",
@@ -1572,6 +1513,14 @@ struct RdmaChannel {
     send_async_fd: Option<Arc<CqAsyncFd>>,
     /// AsyncFd for the recv CQ completion channel.
     recv_async_fd: Option<Arc<CqAsyncFd>>,
+    /// Pre-posted recv buffers (always in-flight on the RQ).  This is the
+    /// standard RDMA pattern: the receiver must post recv WRs *before*
+    /// the sender sends, otherwise the sender exhausts RNR retries and
+    /// completes with `IBV_WC_RETRY_EXC_ERR`.  We pre-post N buffers at
+    /// connection time and replenish after each completion so there is
+    /// always a recv buffer available.  FIFO order is guaranteed for RC
+    /// QPs, so `pop_front` returns the buffer that just completed.
+    recv_pre_posted: tokio::sync::Mutex<std::collections::VecDeque<Arc<IbvMr>>>,
     /// Owned rdma_cm_id — keeps the QP (and borrowed context) alive.
     /// When None, the connection was created without rdma_cm (raw ibv only).
     cm_id: Option<RdmaCmIdPtr>,
@@ -1601,6 +1550,34 @@ impl RdmaChannel {
             dlid_path_bits: 0,
             _pad_tail: [0; 4],
         }; 1]
+    }
+
+    /// Pre-post N recv buffers onto the RQ.
+    ///
+    /// This is called once after the QP reaches RTS (READY_TO_SEND) state.
+    /// It acquires N buffers from the MR pool, posts N recv WRs, and stores
+    /// them in `recv_pre_posted`.  This ensures that when the remote side
+    /// sends data, a recv buffer is already available — preventing
+    /// `IBV_WC_RETRY_EXC_ERR` (RNR retry exhaustion).
+    async fn pre_post_recv(&self, n: usize) -> NetResult<()> {
+        let mut queue = self.recv_pre_posted.lock().await;
+        for i in 0..n {
+            let mr = self.mr_pool.try_acquire().await.ok_or_else(|| {
+                NetError::Connection(format!(
+                    "MR pool exhausted during pre-post recv ({}/{})",
+                    i, n
+                ))
+            })?;
+            let sge = ibv_sge {
+                addr: mr.addr() as u64,
+                length: self.mr_pool.buf_size() as u32,
+                lkey: mr.lkey(),
+            };
+            let wr_id = mr.addr() as u64;
+            self.qp.post_recv(&sge, wr_id)?;
+            queue.push_back(mr);
+        }
+        Ok(())
     }
 
     /// Wait for a single CQ completion using AsyncFd (hardware RDMA).
@@ -1644,12 +1621,10 @@ impl RdmaChannel {
             };
 
             // Wait for the channel fd to become readable.
-            let mut guard = async_fd.readable().await.map_err(|e| {
-                NetError::Connection(format!(
-                    "AsyncFd readable() failed: {}",
-                    e
-                ))
-            })?;
+            let mut guard = async_fd
+                .readable()
+                .await
+                .map_err(|e| NetError::Connection(format!("AsyncFd readable() failed: {}", e)))?;
 
             // The fd is readable — a CQ event is pending. Clear the
             // readiness so we don't get woken again for the same event.
@@ -1682,11 +1657,7 @@ impl RdmaChannel {
             .ok_or_else(|| NetError::Connection("MR pool exhausted".to_string()))?;
 
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                mr.addr() as *mut u8,
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), mr.addr() as *mut u8, data.len());
         }
 
         let sge = ibv_sge {
@@ -1695,9 +1666,7 @@ impl RdmaChannel {
             lkey: mr.lkey(),
         };
         let wr_id = mr.addr() as u64; // identify completion by buffer addr
-        eprintln!("[RDMA_DBG] send: qp={} addr={:#x} len={} lkey={:#x}", self.qp.qp_num(), sge.addr, sge.length, sge.lkey);
         self.qp.post_send(&sge, wr_id)?;
-        eprintln!("[RDMA_DBG] send: post_send OK, waiting CQ...");
 
         // Wait for send completion via AsyncFd-driven async polling.
         let wc = Self::wait_cq_completion(&self.send_cq, self.send_async_fd.as_ref()).await;
@@ -1721,51 +1690,61 @@ impl RdmaChannel {
         Ok(())
     }
 
-    /// Post a recv WR using a pool buffer and wait for completion via AsyncFd.
+    /// Receive data via RDMA recv using pre-posted buffers.
+    ///
+    /// Waits for a pre-posted recv WR to complete, copies the received
+    /// bytes into `out`, then immediately replenishes the RQ by posting
+    /// the same buffer again.  This ensures there is always a recv buffer
+    /// available for incoming sends.
     ///
     /// Returns the bytes received (copied into `out`).
     async fn recv(&self, out: &mut [u8]) -> NetResult<usize> {
-        let mr = self
-            .mr_pool
-            .try_acquire()
-            .await
-            .ok_or_else(|| NetError::Connection("MR pool exhausted".to_string()))?;
-
-        let sge = ibv_sge {
-            addr: mr.addr() as u64,
-            length: std::cmp::min(out.len(), self.mr_pool.buf_size()) as u32,
-            lkey: mr.lkey(),
-        };
-        let wr_id = mr.addr() as u64;
-        self.qp.post_recv(&sge, wr_id)?;
-
-        let wc = Self::wait_cq_completion(&self.recv_cq, self.recv_async_fd.as_ref()).await;
-        let wc = match wc {
-            Ok(w) => w,
-            Err(e) => {
-                self.mr_pool.release(mr).await;
-                return Err(e);
-            }
-        };
+        // Wait for a recv CQ completion (one of the pre-posted buffers).
+        let wc = Self::wait_cq_completion(&self.recv_cq, self.recv_async_fd.as_ref()).await?;
 
         if wc.status != ffi::IBV_WC_SUCCESS {
-            self.mr_pool.release(mr).await;
+            // On error, remove the failed buffer from the queue and return
+            // it to the pool.  The connection is likely dead anyway.
+            let mut queue = self.recv_pre_posted.lock().await;
+            if let Some(mr) = queue.pop_front() {
+                drop(queue);
+                self.mr_pool.release(mr).await;
+            }
             return Err(NetError::Connection(format!(
                 "RDMA recv completion error (status={})",
                 wc.status
             )));
         }
 
+        // Pop the completed buffer (FIFO: RC QP guarantees in-order
+        // completions, so the front of the queue is the one that just
+        // completed).
+        let mr = {
+            let mut queue = self.recv_pre_posted.lock().await;
+            queue
+                .pop_front()
+                .ok_or_else(|| NetError::Connection("recv: no pre-posted buffer".to_string()))?
+        };
+
+        // Copy received data from the MR buffer to the caller's buffer.
         let byte_len = wc.byte_len as usize;
         let copy_len = std::cmp::min(byte_len, out.len());
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                mr.addr() as *const u8,
-                out.as_mut_ptr(),
-                copy_len,
-            );
+            std::ptr::copy_nonoverlapping(mr.addr() as *const u8, out.as_mut_ptr(), copy_len);
         }
-        self.mr_pool.release(mr).await;
+
+        // Replenish: re-post the same buffer for the next recv.
+        let sge = ibv_sge {
+            addr: mr.addr() as u64,
+            length: self.mr_pool.buf_size() as u32,
+            lkey: mr.lkey(),
+        };
+        let wr_id = mr.addr() as u64;
+        self.qp.post_recv(&sge, wr_id)?;
+
+        // Push the buffer back to the pre-posted queue.
+        self.recv_pre_posted.lock().await.push_back(mr);
+
         Ok(copy_len)
     }
 
@@ -1912,7 +1891,9 @@ impl Transport for RdmaTransport {
             let pd_ctx = unsafe { (*pd.as_ptr()).context };
             debug!(
                 "[client] pd->context={:p}, verbs_ptr={:p}, match={}",
-                pd_ctx, verbs_ptr, pd_ctx == verbs_ptr
+                pd_ctx,
+                verbs_ptr,
+                pd_ctx == verbs_ptr
             );
             (ctx, pd)
         };
@@ -1933,7 +1914,11 @@ impl Transport for RdmaTransport {
                 send_cq.as_ptr(),
                 recv_cq.as_ptr(),
                 ptr::null_mut(),
-                16, 16, 1, 1, 0,
+                16,
+                16,
+                1,
+                1,
+                0,
                 ffi::IBV_QPT_RC,
                 1,
             )
@@ -1941,7 +1926,8 @@ impl Transport for RdmaTransport {
         if rc != 0 {
             let errno = std::io::Error::last_os_error();
             return Err(NetError::Connection(format!(
-                "rdma_create_qp failed (rc={}, errno={})", rc, errno
+                "rdma_create_qp failed (rc={}, errno={})",
+                rc, errno
             )));
         }
         let qp_ptr = unsafe { (*cm_id.0).qp };
@@ -1954,24 +1940,17 @@ impl Transport for RdmaTransport {
         let qp = IbvQp::from_raw_non_owning(qp_ptr);
 
         // 7. Build MR pool from the per-connection PD.
-        let mr_pool = MrPool::new(
-            &pd,
-            self.config.rdma_buf_num,
-            self.config.rdma_buf_size,
-        )?;
+        let mr_pool = MrPool::new(&pd, self.config.rdma_buf_num, self.config.rdma_buf_size)?;
 
         // 8. Connect. Since rdma_create_qp was called, qp_num is ignored
         //    — rdma_cm uses cm_id->qp->qp_num and handles QP state
         //    transitions (RESET→INIT→RTR→RTS) automatically. C wrapper
         //    avoids Rust struct layout issues.
-        let rc = unsafe {
-            ffi::powerfs_rdma_connect(
-                cm_id.0, 1, 1, 1, 7, 7, 0, 0,
-            )
-        };
+        let rc = unsafe { ffi::powerfs_rdma_connect(cm_id.0, 1, 1, 1, 7, 7, 0, 0) };
         if rc != 0 {
             return Err(NetError::Connection(format!(
-                "rdma_connect failed (rc={})", rc
+                "rdma_connect failed (rc={})",
+                rc
             )));
         }
         debug!("[client] rdma_connect called (local_qpn={})", qp.qp_num());
@@ -2018,10 +1997,15 @@ impl Transport for RdmaTransport {
             peer: addr,
             send_async_fd,
             recv_async_fd,
+            recv_pre_posted: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
             cm_id: Some(cm_id),
             pd: Some(Arc::new(pd)),
             event_channel: Some(channel),
         };
+
+        // Pre-post recv buffers so the server can send responses
+        // without hitting RNR (Receiver Not Ready) retry exhaustion.
+        channel_inner.pre_post_recv(4).await?;
 
         info!("RdmaTransport: connected to {}", addr);
         Ok(Box::new(RdmaStream {
@@ -2070,10 +2054,7 @@ impl Transport for RdmaTransport {
             )));
         }
 
-        info!(
-            "RdmaTransport: listening on {} (rdma_cm)",
-            addr
-        );
+        info!("RdmaTransport: listening on {} (rdma_cm)", addr);
 
         Ok(Box::new(RdmaListenerAdapter {
             channel,
@@ -2133,9 +2114,7 @@ unsafe impl Sync for RdmaCmIdPtr {}
 ///
 /// Returns the event pointer as `usize` for the same reason: `*mut` is
 /// `!Send` so it cannot be the return type of `spawn_blocking`.
-async fn async_get_cm_event(
-    channel_raw: usize,
-) -> NetResult<usize> {
+async fn async_get_cm_event(channel_raw: usize) -> NetResult<usize> {
     if channel_raw == 0 {
         return Err(NetError::Connection("null event channel".to_string()));
     }
@@ -2183,11 +2162,10 @@ async fn async_get_cm_event(
 }
 
 /// Wait for a specific rdma_cm event type on the channel (async, non-blocking).
-async fn wait_cm_event(
-    channel_raw: usize,
-    expected: ffi::rdma_cm_event_type,
-) -> NetResult<()> {
-    wait_cm_event_with_id(channel_raw, expected).await.map(|_| ())
+async fn wait_cm_event(channel_raw: usize, expected: ffi::rdma_cm_event_type) -> NetResult<()> {
+    wait_cm_event_with_id(channel_raw, expected)
+        .await
+        .map(|_| ())
 }
 
 /// Wait for a specific rdma_cm event type and return the event (async).
@@ -2339,7 +2317,10 @@ pub struct RdmaStream {
 impl TransportStream for RdmaStream {
     fn split(
         self: Box<Self>,
-    ) -> (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) {
+    ) -> (
+        Box<dyn AsyncRead + Send + Unpin>,
+        Box<dyn AsyncWrite + Send + Unpin>,
+    ) {
         let channel = self.channel.clone();
         let reader = RdmaReadHalf {
             channel: self.channel.clone(),
@@ -2408,9 +2389,7 @@ impl AsyncRead for RdmaReadHalf {
         // `Arc<RdmaChannel>` (no borrows of `self`), making it `'static`.
         if self.pending_recv.is_none() {
             let channel = self.channel.clone();
-            self.pending_recv = Some(Box::pin(async move {
-                channel.recv_owned().await
-            }));
+            self.pending_recv = Some(Box::pin(async move { channel.recv_owned().await }));
         }
 
         // Poll the in-flight future.
@@ -2495,9 +2474,7 @@ impl AsyncWrite for RdmaWriteHalf {
 
         let channel = self.channel.clone();
         let data = buf[..write_len].to_vec();
-        self.pending_send = Some(Box::pin(async move {
-            channel.send(&data).await
-        }));
+        self.pending_send = Some(Box::pin(async move { channel.send(&data).await }));
 
         // Poll the newly created future (may complete fast path).
         let pending = self.pending_send.as_mut().unwrap();
@@ -2686,7 +2663,11 @@ impl TransportListener for RdmaListenerAdapter {
                             send_cq.as_ptr(),
                             recv_cq.as_ptr(),
                             ptr::null_mut(),
-                            16, 16, 1, 1, 0,
+                            16,
+                            16,
+                            1,
+                            1,
+                            0,
                             ffi::IBV_QPT_RC,
                             1,
                         )
@@ -2707,25 +2688,21 @@ impl TransportListener for RdmaListenerAdapter {
                     let qp = IbvQp::from_raw_non_owning(qp_ptr);
 
                     // Build MR pool from the per-connection PD.
-                    let mr_pool = match MrPool::new(
-                        &pd,
-                        self.config.rdma_buf_num,
-                        self.config.rdma_buf_size,
-                    ) {
-                        Ok(p) => Arc::new(p),
-                        Err(e) => {
-                            warn!("accept: MrPool::new failed: {}", e);
-                            unsafe { ffi::rdma_destroy_id(new_id) };
-                            continue;
-                        }
-                    };
+                    let mr_pool =
+                        match MrPool::new(&pd, self.config.rdma_buf_num, self.config.rdma_buf_size)
+                        {
+                            Ok(p) => Arc::new(p),
+                            Err(e) => {
+                                warn!("accept: MrPool::new failed: {}", e);
+                                unsafe { ffi::rdma_destroy_id(new_id) };
+                                continue;
+                            }
+                        };
 
                     // Call rdma_accept; QP state is managed by rdma_cm.
                     // The matching ESTABLISHED event will arrive asynchronously
                     // on the shared listener event channel.
-                    let rc = unsafe {
-                        ffi::powerfs_rdma_accept(new_id, 1, 1, 1, 7, 7, 0, 0)
-                    };
+                    let rc = unsafe { ffi::powerfs_rdma_accept(new_id, 1, 1, 1, 7, 7, 0, 0) };
                     if rc != 0 {
                         warn!("rdma_accept failed (rc={})", rc);
                         unsafe { ffi::rdma_destroy_id(new_id) };
@@ -2771,9 +2748,7 @@ impl TransportListener for RdmaListenerAdapter {
                         qp,
                         cm_id,
                     };
-                    self.pending
-                        .lock()
-                        .insert(new_id as usize, pending);
+                    self.pending.lock().insert(new_id as usize, pending);
 
                     // Loop: outer accept() will either return ESTABLISHED for
                     // this id on a future iteration, or pick up more
@@ -2809,10 +2784,14 @@ impl TransportListener for RdmaListenerAdapter {
                         peer,
                         send_async_fd: pending.send_async_fd,
                         recv_async_fd: pending.recv_async_fd,
+                        recv_pre_posted: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
                         cm_id: Some(pending.cm_id),
                         pd: Some(pending.pd),
                         event_channel: None,
                     };
+                    // Pre-post recv buffers so the client can send data
+                    // without hitting RNR (Receiver Not Ready) retries.
+                    channel.pre_post_recv(4).await?;
                     info!("RdmaListenerAdapter: accepted connection from {}", peer);
                     return Ok(Box::new(RdmaStream {
                         channel: Arc::new(channel),
@@ -2886,8 +2865,8 @@ mod tests {
     #[test]
     #[ignore = "requires RDMA hardware with IPoIB"]
     fn test_rdma_loopback_send_recv() {
-        let ip = std::env::var("POWERFS_RDMA_TEST_IP")
-            .unwrap_or_else(|_| "192.168.100.3".to_string());
+        let ip =
+            std::env::var("POWERFS_RDMA_TEST_IP").unwrap_or_else(|_| "192.168.100.3".to_string());
         let port: u16 = 18900;
         let addr: SocketAddr = format!("{}:{}", ip, port).parse().unwrap();
 
@@ -2915,24 +2894,18 @@ mod tests {
 
                 rt.block_on(async move {
                     // Bind and listen
-                    let listener = server_transport.bind(addr)
-                        .await
-                        .expect("bind failed");
+                    let listener = server_transport.bind(addr).await.expect("bind failed");
                     eprintln!("[server] listening on {}", addr);
 
                     // Accept one connection
-                    let stream = listener.accept()
-                        .await
-                        .expect("accept failed");
+                    let stream = listener.accept().await.expect("accept failed");
                     eprintln!("[server] accepted connection");
 
                     // Read data from client
                     use tokio::io::AsyncReadExt;
                     let (mut read_half, _write_half) = stream.split();
                     let mut buf = vec![0u8; 64];
-                    let n = read_half.read(&mut buf)
-                        .await
-                        .expect("read failed");
+                    let n = read_half.read(&mut buf).await.expect("read failed");
                     eprintln!("[server] read {} bytes: {:?}", n, &buf[..n]);
                     assert_eq!(&buf[..n], b"hello rdma!");
                     eprintln!("[server] data verified OK");
@@ -2951,7 +2924,8 @@ mod tests {
             .unwrap();
 
         rt.block_on(async move {
-            let stream = client_transport.connect(addr)
+            let stream = client_transport
+                .connect(addr)
                 .await
                 .expect("connect failed");
             eprintln!("[client] connected to {}", addr);
@@ -2959,12 +2933,11 @@ mod tests {
             // Write data to server
             use tokio::io::AsyncWriteExt;
             let (_read_half, mut write_half) = stream.split();
-            write_half.write_all(b"hello rdma!")
+            write_half
+                .write_all(b"hello rdma!")
                 .await
                 .expect("write failed");
-            write_half.flush()
-                .await
-                .expect("flush failed");
+            write_half.flush().await.expect("flush failed");
             eprintln!("[client] sent 'hello rdma!'");
         });
 
