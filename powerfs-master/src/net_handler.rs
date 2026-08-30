@@ -286,17 +286,39 @@ impl MasterNetHandler {
 
         // P5: Parse node load metrics (basis points 0-10000 → ratio 0.0-1.0).
         // Absent for pre-P5 volume servers; defaults to 0.0.
-        let cpu_bps = dec.next_u64(FieldId::CpuUsage).unwrap_or(0);
-        let mem_bps = dec.next_u64(FieldId::MemoryUsage).unwrap_or(0);
+        //
+        // Use has_field() to peek at the next field before reading. Calling
+        // next_u64() on a mismatched field corrupts the decoder position
+        // (the header is consumed but the value is not), which cascades into
+        // garbled volume parsing downstream. has_field() checks without
+        // consuming, so absent optional fields leave the decoder aligned at
+        // the next present field.
+        let cpu_bps = if dec.has_field(FieldId::CpuUsage) {
+            dec.next_u64(FieldId::CpuUsage).unwrap_or(0)
+        } else {
+            0
+        };
+        let mem_bps = if dec.has_field(FieldId::MemoryUsage) {
+            dec.next_u64(FieldId::MemoryUsage).unwrap_or(0)
+        } else {
+            0
+        };
         let cpu_usage = (cpu_bps as f32) / 10000.0;
         let memory_usage = (mem_bps as f32) / 10000.0;
         // Registration token for node authentication. Absent on old clients
         // (dev mode allows empty token when master has no token configured).
-        let reg_token = dec
-            .next_string(FieldId::RegistrationToken)
-            .unwrap_or_default();
+        let reg_token = if dec.has_field(FieldId::RegistrationToken) {
+            dec.next_string(FieldId::RegistrationToken)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         // Client certificate (PEM) for production node authentication.
-        let client_cert_pem = dec.next_string(FieldId::ClientCert).unwrap_or_default();
+        let client_cert_pem = if dec.has_field(FieldId::ClientCert) {
+            dec.next_string(FieldId::ClientCert).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         info!(
             "NET_HEARTBEAT: node={}, ip={}, volumes={}, cpu={:.1}%, mem={:.1}%",

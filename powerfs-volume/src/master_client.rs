@@ -1,44 +1,40 @@
 //! Master Client - Volume → Master TLV 心跳客户端
 //!
-//! Phase A2: 从 gRPC SendHeartbeat 流式心跳迁移到 TLV MsgType::Heartbeat
-//! 请求-响应模式。每次心跳建立短连接发送 TLV 请求, 处理 REDIRECT 重定向
-//! 到 leader。移除了 gRPC 依赖 (MasterServiceClient, Channel, tonic) 和
-//! 死代码 grow() 函数。
+//! 基于 [`TlvMasterClient`] 长连接实现。`TlvMasterClient` 内部使用
+//! `PowerFsNetClient` 维护与 master 的持久 TCP 连接, 支持自动重连、
+//! leader 重定向和端点故障转移。
 //!
 //! 心跳间隔由调用方 (main.rs) 控制 (默认 5 秒), 本模块仅提供
-//! start_heartbeat (初始化标志) 和 send_heartbeat (发送 TLV 请求)。
+//! `start_heartbeat` (初始化) 和 `send_heartbeat` (发送 TLV 请求)。
+//! 连接生命周期由 `TlvMasterClient` 管理 — 首次 `send_heartbeat` 时
+//! 按需建立连接, 后续复用同一条连接。
 
-use log::{debug, info, warn};
+use log::{debug, info};
 use powerfs_common::types::NodeId;
 use powerfs_master::proto::VolumeShortInfo;
+use powerfs_master_net::{TlvMasterClient, TlvMasterClientConfig};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
-use powerfs_net::{FieldId, STATUS_ERR_REDIRECT, STATUS_OK};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use powerfs_net::{FieldId, MsgType, Transport, STATUS_OK};
 use std::sync::Arc;
+use std::time::Duration;
 
-#[derive(Clone)]
 pub struct MasterClient {
-    /// Master 的 TLV 地址列表 (ip:master_net_port)
-    master_net_addresses: Vec<String>,
-    current_master_index: Arc<AtomicUsize>,
     node_id: NodeId,
     http_port: u32,
     net_port: u32,
     ip: String,
-    heartbeat_running: Arc<AtomicBool>,
     /// Registration token for node authentication. Sent in every Heartbeat
-    /// TLV so the master can verify the node is authorized to join.
-    /// `None` or empty = no token (dev mode, master must also be in dev mode).
+    /// TLV body (FieldId::RegistrationToken) so the master can verify the
+    /// node is authorized to join.  None/empty = dev mode.
     registration_token: Option<String>,
     /// Client certificate PEM content for production node authentication.
-    /// Sent via TLV FieldId::ClientCert(0xD4) in every Heartbeat so the
-    /// master can validate it against the CA.  Empty in dev mode.
+    /// Sent via TLV FieldId::ClientCert(0xD4) in every Heartbeat body so
+    /// the master can validate it against the CA.  Empty in dev mode.
     client_cert_pem: String,
-    /// Optional transport (e.g. RDMA). When None, uses TCP.
-    transport: Option<Arc<dyn powerfs_net::Transport>>,
+    /// Long-lived TLV client — manages connection, redirect, failover.
+    tlv_client: Arc<TlvMasterClient>,
 }
 
-#[derive(Clone)]
 pub struct NewMasterClientParams<'a> {
     /// master_addresses 配置项 (ip:http_port 格式)
     pub master_addresses: &'a [&'a str],
@@ -54,181 +50,74 @@ pub struct NewMasterClientParams<'a> {
     /// Empty = dev mode (no cert, master without CA configured).
     pub client_cert_pem: &'a str,
     /// Optional transport (e.g. RDMA). None = TCP.
-    pub transport: Option<Arc<dyn powerfs_net::Transport>>,
+    pub transport: Option<Arc<dyn Transport>>,
 }
 
 impl MasterClient {
     pub fn new(params: NewMasterClientParams<'_>) -> Self {
         // 从 master_addresses ("ip:http_port") 提取 IP, 拼接 master_net_port
-        let master_net_addresses: Vec<String> = params
+        let endpoints: Vec<(String, u16)> = params
             .master_addresses
             .iter()
             .map(|addr| {
                 let ip = addr.rfind(':').map(|pos| &addr[..pos]).unwrap_or(addr);
-                format!("{}:{}", ip, params.master_net_port)
+                (ip.to_string(), params.master_net_port)
             })
             .collect();
 
+        let tlv_config = TlvMasterClientConfig {
+            client_type: powerfs_net::ClientType::Volume,
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(10),
+            max_retries: 3,
+            max_redirects: 5,
+            retry_backoff: Duration::from_millis(100),
+            client_cert_pem: if params.client_cert_pem.is_empty() {
+                None
+            } else {
+                Some(params.client_cert_pem.to_string())
+            },
+            transport: params.transport.clone(),
+        };
+
+        let tlv_client = Arc::new(TlvMasterClient::new(endpoints, tlv_config));
+
         MasterClient {
-            master_net_addresses,
-            current_master_index: Arc::new(AtomicUsize::new(0)),
             node_id: params.node_id,
             http_port: params.http_port,
             net_port: params.net_port,
             ip: params.ip.to_string(),
-            heartbeat_running: Arc::new(AtomicBool::new(false)),
             registration_token: params.registration_token.map(|s| s.to_string()),
             client_cert_pem: params.client_cert_pem.to_string(),
-            transport: params.transport,
+            tlv_client,
         }
     }
 
-    fn current_master(&self) -> String {
-        let idx = self.current_master_index.load(Ordering::Relaxed);
-        self.master_net_addresses
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| self.master_net_addresses[0].clone())
-    }
-
-    fn next_master(&self) {
-        let current = self.current_master_index.load(Ordering::Relaxed);
-        let next = (current + 1) % self.master_net_addresses.len();
-        self.current_master_index.store(next, Ordering::Relaxed);
-    }
-
-    /// 初始化心跳。TLV 模式下无需建立持久流, 仅标记运行状态。
-    /// 实际心跳由 main.rs 循环调用 send_heartbeat 发送。
+    /// 初始化心跳。长连接模式下无需显式建立连接 — 连接在首次
+    /// `send_heartbeat` 时按需建立 (lazy connect), 由 `TlvMasterClient`
+    /// 自动管理重连。此方法仅记录日志。
     pub async fn start_heartbeat(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !self
-            .heartbeat_running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            info!("VOLUME_HEARTBEAT: heartbeat already running, skipping");
-            return Ok(());
-        }
         info!(
-            "VOLUME_HEARTBEAT: TLV heartbeat initialized (master_net={:?})",
-            self.master_net_addresses
+            "VOLUME_HEARTBEAT: long-lived TLV heartbeat initialized (lazy connect on first send)"
         );
         Ok(())
     }
 
     /// 通过 TLV MsgType::Heartbeat 向 Master 发送心跳。
     ///
-    /// 流程:
-    ///   1. 连接当前 master (ip:master_net_port)
-    ///   2. powerfs-net 握手
-    ///   3. 发送 Heartbeat TLV 请求 (node_id, ip, ports, volumes)
-    ///   4. 读取响应:
-    ///      - STATUS_OK: 心跳成功, 记录 leader 地址
-    ///      - STATUS_ERR_REDIRECT: 切换到 leader 地址, 重试 (最多 MAX_REDIRECTS 次)
-    ///      - 其他错误: 切换到下一个 master, 由调用方重试
+    /// 使用 `TlvMasterClient::submit_request` 发送请求, 它自动处理:
+    ///   - 连接建立 (首次调用时 lazy connect)
+    ///   - 连接维持 (后续调用复用同一条 TCP 连接)
+    ///   - 自动重连 (连接断开时 `PowerFsNetClient` 内部重连)
+    ///   - leader 重定向 (STATUS_ERR_REDIRECT → 切换到 leader 重试)
+    ///   - 端点故障转移 (传输错误 → 切换到下一个 master)
     pub async fn send_heartbeat(
         &self,
         volumes: Vec<VolumeShortInfo>,
         cpu_usage: f32,
         memory_usage: f32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        const MAX_REDIRECTS: usize = 5;
-        let mut current_addr = self.current_master();
-
-        for depth in 0..MAX_REDIRECTS {
-            debug!(
-                "VOLUME_HEARTBEAT: sending to {} (depth={}, volumes={})",
-                current_addr,
-                depth,
-                volumes.len()
-            );
-
-            match self
-                .send_heartbeat_once(&current_addr, &volumes, cpu_usage, memory_usage)
-                .await
-            {
-                Ok(leader) => {
-                    // 心跳成功; 更新 current_master_index 指向实际处理心跳的 master。
-                    // 重定向后 current_addr 可能不同于 current_master() 返回的地址,
-                    // 即使 leader == current_addr (leader 返回自己的地址), 也需要
-                    // 更新索引以避免下次心跳再次经过重定向。
-                    let active_addr = if !leader.is_empty() {
-                        &leader
-                    } else {
-                        &current_addr
-                    };
-                    if let Some(idx) = self.master_net_addresses.iter().position(|a| {
-                        // 按主机匹配 (地址可能带不同端口)
-                        let active_host = active_addr.split(':').next().unwrap_or(active_addr);
-                        let addr_host = a.split(':').next().unwrap_or(a);
-                        active_host == addr_host
-                    }) {
-                        let current = self.current_master_index.load(Ordering::Relaxed);
-                        if idx != current {
-                            info!(
-                                "VOLUME_HEARTBEAT: switching to leader master: {} (index {})",
-                                active_addr, idx
-                            );
-                            self.current_master_index.store(idx, Ordering::Relaxed);
-                        }
-                    }
-                    return Ok(());
-                }
-                Err(HeartbeatError::Redirect { leader }) => {
-                    if leader.is_empty() {
-                        return Err("redirected to empty leader address".into());
-                    }
-                    if leader == current_addr {
-                        return Err(format!(
-                            "redirect loop: master {} points to itself",
-                            current_addr
-                        )
-                        .into());
-                    }
-                    warn!(
-                        "VOLUME_HEARTBEAT: redirected to leader: {} (depth={})",
-                        leader, depth
-                    );
-                    current_addr = leader;
-                    continue;
-                }
-                Err(HeartbeatError::Connect(e)) => {
-                    warn!(
-                        "VOLUME_HEARTBEAT: connect to {} failed: {}; trying next master",
-                        current_addr, e
-                    );
-                    self.next_master();
-                    current_addr = self.current_master();
-                    // 重置 depth 让新 master 有完整重试机会
-                    continue;
-                }
-                Err(HeartbeatError::Other(e)) => {
-                    warn!(
-                        "VOLUME_HEARTBEAT: heartbeat to {} failed: {}; trying next master",
-                        current_addr, e
-                    );
-                    self.next_master();
-                    current_addr = self.current_master();
-                    continue;
-                }
-            }
-        }
-
-        Err(format!(
-            "exceeded {} redirects while sending heartbeat",
-            MAX_REDIRECTS
-        )
-        .into())
-    }
-
-    /// 向指定 master 地址发送一次 Heartbeat TLV 请求。
-    async fn send_heartbeat_once(
-        &self,
-        master_addr: &str,
-        volumes: &[VolumeShortInfo],
-        cpu_usage: f32,
-        memory_usage: f32,
-    ) -> Result<String, HeartbeatError> {
-        // 构建 Heartbeat TLV 请求
+        // 构建 Heartbeat TLV 请求 body
         let mut enc = TlvEncoder::new();
         let _ = enc.add_string(FieldId::ClientId, &self.node_id.0);
         let _ = enc.add_string(FieldId::Owner, &self.ip);
@@ -263,48 +152,20 @@ impl MasterClient {
         }
         let body = enc.into_bytes();
 
-        // 统一 RPC 客户端 (Layer A): connect → handshake → send → read
-        let client_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1);
-        let reply = if let Some(tp) = &self.transport {
-            powerfs_net::call_once_with_transport(
-                master_addr,
-                powerfs_net::ClientType::Volume,
-                client_id,
-                powerfs_net::CHANNEL_DATA,
-                powerfs_net::MsgType::Heartbeat,
-                &body,
-                powerfs_net::RpcOpts::default(),
-                tp.clone(),
-            )
-            .await
-        } else {
-            powerfs_net::call_once(
-                master_addr,
-                powerfs_net::ClientType::Volume,
-                client_id,
-                powerfs_net::CHANNEL_DATA,
-                powerfs_net::MsgType::Heartbeat,
-                &body,
-            )
-            .await
-        }
-        .map_err(|e| HeartbeatError::Connect(format!("transport to {}: {}", master_addr, e)))?;
+        debug!(
+            "VOLUME_HEARTBEAT: sending via long-lived connection (volumes={})",
+            body.len()
+        );
 
-        // 处理 REDIRECT
-        if reply.status == STATUS_ERR_REDIRECT {
-            let mut dec = TlvDecoder::new(&reply.body);
-            let leader = dec.next_string(FieldId::Owner).unwrap_or_default();
-            return Err(HeartbeatError::Redirect { leader });
-        }
+        // TlvMasterClient 自动处理连接、重定向、故障转移
+        let reply = self
+            .tlv_client
+            .submit_request(MsgType::Heartbeat, &body)
+            .await
+            .map_err(|e| format!("heartbeat submit_request failed: {}", e))?;
 
-        if reply.status != STATUS_OK {
-            return Err(HeartbeatError::Other(format!(
-                "Heartbeat failed: status={:#06x}",
-                reply.status
-            )));
+        if reply.header.status != STATUS_OK {
+            return Err(format!("Heartbeat failed: status={:#06x}", reply.header.status).into());
         }
 
         // 解析成功响应 (leader + volume_size_limit)
@@ -317,16 +178,6 @@ impl MasterClient {
             leader, volume_size_limit
         );
 
-        Ok(leader)
+        Ok(())
     }
-}
-
-/// 心跳请求错误类型, 区分重定向和连接错误以便上层处理。
-enum HeartbeatError {
-    /// Master 返回 REDIRECT, 需要切换到 leader 地址重试
-    Redirect { leader: String },
-    /// 连接失败, 需要切换到下一个 master
-    Connect(String),
-    /// 其他错误
-    Other(String),
 }

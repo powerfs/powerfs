@@ -47,7 +47,10 @@ pub trait TransportStream: Send {
     /// 两个 half 独立使用, 不共享可变状态。
     fn split(
         self: Box<Self>,
-    ) -> (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>);
+    ) -> (
+        Box<dyn AsyncRead + Send + Unpin>,
+        Box<dyn AsyncWrite + Send + Unpin>,
+    );
 
     /// 对端地址 (用于日志和调试)
     fn peer_addr(&self) -> SocketAddr;
@@ -148,10 +151,7 @@ pub fn create_transport(config: &TransportConfig) -> NetResult<std::sync::Arc<dy
                         Ok(std::sync::Arc::new(auto))
                     }
                     Err(e) => {
-                        log::info!(
-                            "AutoTransport: RDMA not available ({}), using TCP only",
-                            e
-                        );
+                        log::info!("AutoTransport: RDMA not available ({}), using TCP only", e);
                         Ok(std::sync::Arc::new(crate::transport_tcp::TcpTransport))
                     }
                 }

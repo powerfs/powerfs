@@ -3874,7 +3874,10 @@ impl MasterNode {
                     t
                 }
                 Err(e) => {
-                    error!("Failed to create transport '{}': {:?}", transport_cfg.transport, e);
+                    error!(
+                        "Failed to create transport '{}': {:?}",
+                        transport_cfg.transport, e
+                    );
                     return Err(PowerFsError::InvalidRequest(format!(
                         "transport '{}' init failed: {:?}",
                         transport_cfg.transport, e
@@ -3946,7 +3949,10 @@ impl MasterNode {
             // nodes get rejected with "cert fp unknown".
             match (self.ca_manager.clone(), self.ca_dir.clone()) {
                 (Some(ca), _) => {
-                    info!("Starting metrics + cert API server on {} (CA manager ready)", metrics_addr);
+                    info!(
+                        "Starting metrics + cert API server on {} (CA manager ready)",
+                        metrics_addr
+                    );
                     if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca).await {
                         error!(
                             "Failed to start metrics/cert server on {}: {}",
@@ -3955,11 +3961,16 @@ impl MasterNode {
                     }
                 }
                 (None, Some(ca_dir)) => {
-                    info!("Starting metrics + cert API server on {} (initialising CA from {})", metrics_addr, ca_dir);
+                    info!(
+                        "Starting metrics + cert API server on {} (initialising CA from {})",
+                        metrics_addr, ca_dir
+                    );
                     match crate::ca_manager::CaManager::new(&ca_dir, self.admin_token.clone()) {
                         Ok(ca) => {
                             let ca = Arc::new(ca);
-                            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca).await {
+                            if let Err(e) =
+                                crate::metrics::start_metrics_server(&metrics_addr, ca).await
+                            {
                                 error!(
                                     "Failed to start metrics/cert server on {}: {}",
                                     metrics_addr, e
@@ -3984,10 +3995,15 @@ impl MasterNode {
                     // still works) but do NOT install it on self.ca_manager
                     // — which would flip cert_enforcement_enabled=true.
                     info!("Starting metrics + cert API server on {} (DEV MODE: CA disabled for RegisterClient/RegisterFiler; only HTTP /api/cert endpoints functional via ephemeral manager)", metrics_addr);
-                    match crate::ca_manager::CaManager::new("./ca_ephemeral_metrics", self.admin_token.clone()) {
+                    match crate::ca_manager::CaManager::new(
+                        "./ca_ephemeral_metrics",
+                        self.admin_token.clone(),
+                    ) {
                         Ok(ca) => {
                             let ca = Arc::new(ca);
-                            if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca).await {
+                            if let Err(e) =
+                                crate::metrics::start_metrics_server(&metrics_addr, ca).await
+                            {
                                 error!(
                                     "Failed to start metrics/cert server on {}: {}",
                                     metrics_addr, e

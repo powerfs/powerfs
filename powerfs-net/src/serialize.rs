@@ -473,6 +473,12 @@ impl<'a> TlvDecoder<'a> {
         match self.next_field() {
             Some((f, length)) => {
                 if f != field {
+                    // Skip the value of the mismatched field so the decoder
+                    // stays aligned for subsequent reads. Without this, the
+                    // decoder position would be left after the header but
+                    // before the value, corrupting all subsequent field reads.
+                    // This makes `unwrap_or_default()` safe for optional fields.
+                    let _ = self.skip(length);
                     return Err(NetError::Serialize(format!(
                         "expected field {:?}, got {:?}",
                         field, f
@@ -492,6 +498,12 @@ impl<'a> TlvDecoder<'a> {
         match self.next_field() {
             Some((f, length)) => {
                 if f != field {
+                    // Skip the value of the mismatched field so the decoder
+                    // stays aligned for subsequent reads. Without this, the
+                    // decoder position would be left after the header but
+                    // before the value, corrupting all subsequent field reads.
+                    // This makes `unwrap_or_default()` safe for optional fields.
+                    let _ = self.skip(length);
                     return Err(NetError::Serialize(format!(
                         "expected field {:?}, got {:?}",
                         field, f
@@ -511,6 +523,12 @@ impl<'a> TlvDecoder<'a> {
         match self.next_field() {
             Some((f, length)) => {
                 if f != field {
+                    // Skip the value of the mismatched field so the decoder
+                    // stays aligned for subsequent reads. Without this, the
+                    // decoder position would be left after the header but
+                    // before the value, corrupting all subsequent field reads.
+                    // This makes `unwrap_or_default()` safe for optional fields.
+                    let _ = self.skip(length);
                     return Err(NetError::Serialize(format!(
                         "expected field {:?}, got {:?}",
                         field, f
@@ -530,6 +548,12 @@ impl<'a> TlvDecoder<'a> {
         match self.next_field() {
             Some((f, length)) => {
                 if f != field {
+                    // Skip the value of the mismatched field so the decoder
+                    // stays aligned for subsequent reads. Without this, the
+                    // decoder position would be left after the header but
+                    // before the value, corrupting all subsequent field reads.
+                    // This makes `unwrap_or_default()` safe for optional fields.
+                    let _ = self.skip(length);
                     return Err(NetError::Serialize(format!(
                         "expected field {:?}, got {:?}",
                         field, f
@@ -549,6 +573,12 @@ impl<'a> TlvDecoder<'a> {
         match self.next_field() {
             Some((f, length)) => {
                 if f != field {
+                    // Skip the value of the mismatched field so the decoder
+                    // stays aligned for subsequent reads. Without this, the
+                    // decoder position would be left after the header but
+                    // before the value, corrupting all subsequent field reads.
+                    // This makes `unwrap_or_default()` safe for optional fields.
+                    let _ = self.skip(length);
                     return Err(NetError::Serialize(format!(
                         "expected field {:?}, got {:?}",
                         field, f
@@ -569,6 +599,12 @@ impl<'a> TlvDecoder<'a> {
         match self.next_field() {
             Some((f, length)) => {
                 if f != field {
+                    // Skip the value of the mismatched field so the decoder
+                    // stays aligned for subsequent reads. Without this, the
+                    // decoder position would be left after the header but
+                    // before the value, corrupting all subsequent field reads.
+                    // This makes `unwrap_or_default()` safe for optional fields.
+                    let _ = self.skip(length);
                     return Err(NetError::Serialize(format!(
                         "expected field {:?}, got {:?}",
                         field, f

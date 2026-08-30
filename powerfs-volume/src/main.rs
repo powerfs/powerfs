@@ -213,7 +213,11 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
     // Shared between net server and MasterClient heartbeats.
     let net_transport: Option<Arc<dyn powerfs_net::Transport>> = if net_port > 0 {
         let transport_cfg = powerfs_net::TransportConfig {
-            transport: cfg.volume.transport.clone().unwrap_or_else(|| "tcp".to_string()),
+            transport: cfg
+                .volume
+                .transport
+                .clone()
+                .unwrap_or_else(|| "tcp".to_string()),
             rdma_device: cfg.volume.rdma_device.clone(),
             ..Default::default()
         };
@@ -223,7 +227,10 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
                 Some(t)
             }
             Err(e) => {
-                error!("Failed to create transport '{}': {:?}", transport_cfg.transport, e);
+                error!(
+                    "Failed to create transport '{}': {:?}",
+                    transport_cfg.transport, e
+                );
                 return Err(PowerFsError::InvalidRequest(format!(
                     "transport '{}' init failed: {:?}",
                     transport_cfg.transport, e
@@ -232,6 +239,30 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         }
     } else {
         None
+    };
+
+    // Master management transport: always TCP (management network).
+    // Only the data path (net server for kernel client) uses the configured transport (RDMA).
+    // Heartbeat and registration go over TCP to avoid RDMA connect-attempt overhead
+    // and MR pool churn on every master reconnect.
+    let master_transport: Arc<dyn powerfs_net::Transport> = {
+        let mcfg = powerfs_net::TransportConfig {
+            transport: "tcp".to_string(),
+            ..Default::default()
+        };
+        match powerfs_net::create_transport(&mcfg) {
+            Ok(t) => {
+                info!("Master transport: {} (management network)", t.name());
+                t
+            }
+            Err(e) => {
+                error!("Failed to create master transport: {:?}", e);
+                return Err(PowerFsError::InvalidRequest(format!(
+                    "master transport init failed: {:?}",
+                    e
+                )));
+            }
+        }
     };
 
     // Start powerfs-net binary protocol server for Volume
@@ -245,13 +276,13 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
 
         info!("Starting powerfs-net Volume server on {}", net_bind_addr);
 
-        let transport = net_transport.clone().expect("net_transport Some when net_port>0");
+        let transport = net_transport
+            .clone()
+            .expect("net_transport Some when net_port>0");
 
-        PowerFsNetServer::bind_with_manager_and_transport(
-            &ip, net_port, net_handler, transport,
-        )
-        .await
-        .ok()
+        PowerFsNetServer::bind_with_manager_and_transport(&ip, net_port, net_handler, transport)
+            .await
+            .ok()
     } else {
         None
     };
@@ -342,7 +373,7 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         } else {
             Some(client_cert_pem.clone())
         };
-        let push_transport = net_transport.clone();
+        let push_transport = Some(master_transport.clone());
 
         tokio::spawn(async move {
             struct DebugConfigPushHandler {
@@ -429,7 +460,7 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         ip: &ip,
         registration_token: volume_cfg.registration_token.as_deref(),
         client_cert_pem: &client_cert_pem,
-        transport: net_transport.clone(),
+        transport: Some(master_transport.clone()),
     });
 
     let register = args.register_with_master.unwrap_or(true);

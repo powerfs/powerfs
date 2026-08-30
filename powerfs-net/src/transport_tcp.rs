@@ -24,7 +24,10 @@ pub struct TcpTransportStream {
 impl TransportStream for TcpTransportStream {
     fn split(
         self: Box<Self>,
-    ) -> (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) {
+    ) -> (
+        Box<dyn AsyncRead + Send + Unpin>,
+        Box<dyn AsyncWrite + Send + Unpin>,
+    ) {
         let (read_half, write_half) = self.stream.into_split();
         (Box::new(read_half), Box::new(write_half))
     }
@@ -64,11 +67,9 @@ impl TransportListener for TcpListenerAdapter {
 #[async_trait::async_trait]
 impl Transport for TcpTransport {
     async fn connect(&self, addr: SocketAddr) -> NetResult<Box<dyn TransportStream>> {
-        let stream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| {
-                NetError::Connection(format!("TcpStream connect to {} failed: {}", addr, e))
-            })?;
+        let stream = TcpStream::connect(addr).await.map_err(|e| {
+            NetError::Connection(format!("TcpStream connect to {} failed: {}", addr, e))
+        })?;
         stream.set_nodelay(true).ok();
         // 启用 TCP keepalive (idle=60s, interval=10s, retries=3), 防止对端
         // silent death 时连接长时间卡住. RDMA 传输不需要此设置.
@@ -79,11 +80,9 @@ impl Transport for TcpTransport {
     }
 
     async fn bind(&self, addr: SocketAddr) -> NetResult<Box<dyn TransportListener>> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| {
-                NetError::Connection(format!("TcpListener bind on {} failed: {}", addr, e))
-            })?;
+        let listener = TcpListener::bind(addr).await.map_err(|e| {
+            NetError::Connection(format!("TcpListener bind on {} failed: {}", addr, e))
+        })?;
         Ok(Box::new(TcpListenerAdapter { listener }))
     }
 
@@ -121,7 +120,10 @@ fn apply_tcp_keepalive(stream: &TcpStream) {
 impl TransportStream for tokio::net::TcpStream {
     fn split(
         self: Box<Self>,
-    ) -> (Box<dyn AsyncRead + Send + Unpin>, Box<dyn AsyncWrite + Send + Unpin>) {
+    ) -> (
+        Box<dyn AsyncRead + Send + Unpin>,
+        Box<dyn AsyncWrite + Send + Unpin>,
+    ) {
         let (read_half, write_half) = (*self).into_split();
         (Box::new(read_half), Box::new(write_half))
     }

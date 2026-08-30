@@ -444,7 +444,8 @@ mod tests {
         drop(client_stream);
 
         let (mut read_half, _write_half) = server_stream.into_split();
-        let result = IoLoop::read_frame(&mut read_half as &mut (dyn AsyncRead + Unpin + Send)).await;
+        let result =
+            IoLoop::read_frame(&mut read_half as &mut (dyn AsyncRead + Unpin + Send)).await;
         assert!(result.is_err(), "read_frame should fail on EOF");
         assert!(result.unwrap_err().is_eof(), "error should be EOF");
     }

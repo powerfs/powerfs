@@ -84,7 +84,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn server_loop(stream: Box<dyn TransportStream>, iters: usize, n: usize) -> anyhow::Result<()> {
+async fn server_loop(
+    stream: Box<dyn TransportStream>,
+    iters: usize,
+    n: usize,
+) -> anyhow::Result<()> {
     let (mut r, mut w) = stream.split();
     let mut buf = vec![0u8; n];
     let t0 = Instant::now();
@@ -110,7 +114,11 @@ async fn server_loop(stream: Box<dyn TransportStream>, iters: usize, n: usize) -
     Ok(())
 }
 
-async fn client_loop(stream: Box<dyn TransportStream>, iters: usize, n: usize) -> anyhow::Result<()> {
+async fn client_loop(
+    stream: Box<dyn TransportStream>,
+    iters: usize,
+    n: usize,
+) -> anyhow::Result<()> {
     let (mut r, mut w) = stream.split();
     let mut send = vec![0xABu8; n];
     let mut recv = vec![0u8; n];

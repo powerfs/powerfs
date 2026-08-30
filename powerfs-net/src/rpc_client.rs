@@ -139,9 +139,15 @@ pub async fn call_once_with_transport(
     opts: RpcOpts,
     transport: Arc<dyn Transport>,
 ) -> NetResult<RpcReply> {
-    let mut conn =
-        RpcConnection::connect_with_transport(addr, client_type, client_id, channel, &opts, transport)
-            .await?;
+    let mut conn = RpcConnection::connect_with_transport(
+        addr,
+        client_type,
+        client_id,
+        channel,
+        &opts,
+        transport,
+    )
+    .await?;
     conn.call(msg_type, body, &opts).await
 }
 
