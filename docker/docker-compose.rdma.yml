@@ -1,27 +1,27 @@
 # =============================================================================
-# PowerFS RDMA 传输测试 — 独立 compose 文件 (非覆盖)
+# PowerFS 硬件 RDMA 传输测试 — 独立 compose 文件 (非覆盖)
 # =============================================================================
 # 用法:
 #   # 1. 先停止 TCP 服务 (避免端口冲突)
 #   docker compose -f docker-compose.yml down
-#   # 2. 启动 RDMA 服务 (host 网络模式)
+#   # 2. 启动硬件 RDMA 服务 (host 网络模式)
 #   docker compose -f docker-compose.rdma.yml up -d
 #
 # 架构:
 #   - 所有服务使用 network_mode: host (共享宿主机 netns)
 #   - Redis 复用 bridge 网络 (172.30.0.50), host 网络可直接访问
-#   - rxe0 在 powerfs-br0 上, host 网络的 RDMA_CM 可直接路由
+#   - 硬件 RDMA: mlx5_1 (ConnectX-5, IB 端口 ACTIVE, LID=1)
+#   - IPoIB: ibp160s0f1, IP 192.168.100.1/24
 #   - 单节点 master/volume/filer (功能验证, 非 HA)
-#   - 服务地址: 172.30.0.1 (宿主机 powerfs-br0 IP)
+#   - 服务地址: 192.168.100.1 (IPoIB)
 #
 # 前置条件:
-#   1. sudo modprobe rdma_rxe
-#   2. echo powerfs-br0 > /sys/module/rdma_rxe/parameters/add
-#   3. 验证: rdma link show (应显示 rxe0)
-#   4. 验证: ls /dev/infiniband/uverbs2 (rxe0 的 uverbs 设备)
-#
-# 注: kernel 5.15 的 rxe 不支持容器 netns 隔离,
-#     必须用 network_mode: host 才能让 RDMA_CM 正确路由
+#   1. GRUB: intel_iommu=on iommu=pt (已配置, 需重启生效)
+#   2. sudo modprobe ib_umad ib_uverbs
+#   3. sudo systemctl restart opensm
+#   4. 验证: cat /sys/class/infiniband/mlx5_1/ports/1/state → ACTIVE
+#   5. IPoIB: sudo ip addr add 192.168.100.1/24 dev ibp160s0f1
+#   6. SR-IOV VF 已直通给 QEMU VM (vfio-pci)
 # =============================================================================
 
 # Redis 复用 bridge 网络 (单独定义, 不受 host 网络影响)
@@ -41,12 +41,10 @@ x-logging: &default-logging
     max-size: "100m"
     max-file: "3"
 
-# RDMA 设备映射 (uverbs + rdma_cm, rdma_cm 是 librdmacm 必需的)
+# 硬件 RDMA 设备映射 (mlx5_1 = uverbs1 + rdma_cm)
 x-rdma-common: &rdma-common
   devices:
-    - /dev/infiniband/uverbs0:/dev/infiniband/uverbs0
     - /dev/infiniband/uverbs1:/dev/infiniband/uverbs1
-    - /dev/infiniband/uverbs2:/dev/infiniband/uverbs2
     - /dev/infiniband/rdma_cm:/dev/infiniband/rdma_cm
   cap_add:
     - IPC_LOCK

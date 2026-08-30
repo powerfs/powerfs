@@ -73,6 +73,30 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         }
     };
 
+    // Master management transport: always TCP (management network).
+    // Only the data path (net server + filer→volume) uses the configured transport (RDMA).
+    // Heartbeat, registration, and shard notifications go over TCP to avoid
+    // RDMA connect-attempt overhead and MR pool churn on every master reconnect.
+    let master_transport: Arc<dyn powerfs_net::Transport> = {
+        let mcfg = powerfs_net::TransportConfig {
+            transport: "tcp".to_string(),
+            ..Default::default()
+        };
+        match powerfs_net::create_transport(&mcfg) {
+            Ok(t) => {
+                info!("Master transport: {} (management network)", t.name());
+                t
+            }
+            Err(e) => {
+                error!("Failed to create master transport: {:?}", e);
+                return Err(PowerFsError::InvalidRequest(format!(
+                    "master transport init failed: {:?}",
+                    e
+                )));
+            }
+        }
+    };
+
     info!("Starting PowerFS Filer with sharding");
 
     // 所有端口从配置文件获取 - 无硬编码默认值
@@ -163,7 +187,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     {
         let push_node_id = node_id.clone();
         let push_master_net_port = filer_cfg.master_net_port;
-        let push_transport = net_transport.clone();
+        let push_transport = master_transport.clone();
         let push_master_net_addrs: Vec<(String, u16)> = filer_cfg
             .master_addresses
             .iter()
@@ -431,7 +455,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         if !first_master_net.is_empty() {
             let filer_id = format!("filer-{}", filer_cfg.raft_id);
             let advertise_addr_for_notifier = format!("{}:{}", advertise_ip, net_port);
-            let notifier_transport = Some(net_transport.clone());
+            let notifier_transport = Some(master_transport.clone());
             let rgm = raft_group_manager.clone();
             for i in 0..filer_cfg.shard_count {
                 let shard_id = ShardId(i as u64);
@@ -740,7 +764,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let shard_count = filer_cfg.shard_count as u64;
             let force_register = filer_cfg.force_register;
             let registration_token_for_reg = filer_cfg.registration_token.clone();
-            let transport_for_zone = Some(net_transport.clone());
+            let transport_for_zone = Some(master_transport.clone());
             // Load client certificate PEM for production node authentication.
             // When the master has a CA configured, the filer MUST present this
             // cert during RegisterFiler; empty in dev mode (no cert configured).
