@@ -34,6 +34,7 @@ use std::pin::Pin;
 use std::ptr;
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
 
 use log::{debug, error, info, warn};
 use tokio::io::unix::AsyncFd;
@@ -1477,6 +1478,29 @@ impl MrPool {
         Some(self.mrs[idx].clone())
     }
 
+    /// Synchronous version of `try_acquire` — uses `try_lock()` on the free
+    /// queue.  Safe when the caller knows no other task can be contending for
+    /// the pool (e.g. during initial pre-post on a freshly-created pool).
+    fn try_acquire_sync(&self) -> Option<Arc<IbvMr>> {
+        let mut guard = self.free.try_lock().ok()?;
+        let idx = guard.pop_front()?;
+        Some(self.mrs[idx].clone())
+    }
+
+    /// Synchronous version of `release` — returns an MR to the free queue
+    /// using `try_lock()`.  Intended for error paths inside synchronous code.
+    fn release_sync(&self, mr: Arc<IbvMr>) {
+        if let Some(idx) = self
+            .mrs
+            .iter()
+            .position(|m| Arc::ptr_eq(m, &mr))
+        {
+            if let Ok(mut guard) = self.free.try_lock() {
+                guard.push_back(idx);
+            }
+        }
+    }
+
     /// Return a buffer to the pool.
     async fn release(&self, mr: Arc<IbvMr>) {
         let idx = self
@@ -1597,27 +1621,39 @@ impl RdmaChannel {
         _async_fd: Option<&Arc<CqAsyncFd>>,
     ) -> NetResult<ibv_wc> {
         // ====================================================================
-        // ROOT27 FIX 2: ABANDON AsyncFd CQ-event notification ENTIRELY for
-        // completion polling.  The previous req_notify-in-loop fix still
-        // left rare-but-real hang cases where hardware CQE was in the ring
-        // buffer but AsyncFd never woke (lost edge, or get_cq_event blocked
-        // spuriously).  Symptom confirmed: qp409 first-accept write_all()
-        // for HandshakeResponse never returned despite kernel having
-        // received the bytes AND a subsequent msg_type=24 req POST_SEND_OK
-        // firing on the same QP.  This is classic CQ-notify deadlock.
+        // ROOT27 FIX 2 + ROOT36 FIX: ABANDON AsyncFd CQ-event notification
+        // ENTIRELY for completion polling.  ibv_poll_cq is a pure user-space
+        // CQ-ring pointer read (no syscall), which adds ~20-50us polling
+        // overhead while guaranteeing NO lost wakeups ever.
         //
-        // Replacement: simple yield_now driven busy-poll loop.  `ibv_poll_cq`
-        // is a pure user-space CQ-ring pointer read (no syscall), so this
-        // adds ~20-50us latency per completion while guaranteeing NO lost
-        // wakeups ever.  Tokio yield avoids starving other tasks.  This
-        // matches the lesson learned from soft-RoCE: "CQ event fd based
-        // notification through AsyncFd is unreliable; use poll loops with
-        // yield_now or spawn_blocking."
+        // ROOT36 CRITICAL: we MUST be async-friendly to the tokio runtime.
+        // The previous `spins & 0x3F == 0` only yielded *every 64th*
+        // iteration; on a 200Gbps/InfiniBand host a single CQ busy-poll
+        // task on one worker thread could hog it for ~2077+ ms while other
+        // tasks (e.g. response tx for a different connection sharing the
+        // worker) never got scheduled.  That caused 2-second LOOKUP
+        // deadlines to fire even though the server-side processing was
+        // trivially fast.  Proof-by-log: `net=2079923us` is *exactly*
+        // LOOKUP_TIMEOUT_MS (2000ms) + tiny overhead.
         //
-        // The `_async_fd` parameter and `req_notify`/`get_cq_event` are now
-        // unused in this path; the Arc<CqAsyncFd> is kept in RdmaChannel
-        // only for potential future low-power mode (not latency path).
+        // New contract:
+        //   - First SPINS_BEFORE_YIELD iterations: pure user-space
+        //     spin_loop (no await) → keeps best latency for microsecond
+        //     range RTTs (typical for single-hop IB).
+        //   - After SPINS_BEFORE_YIELD iterations with no CQE: switch to
+        //     async SLEEP strategy.  Every YIELD_PERIOD iterations we call
+        //     `tokio::time::sleep(..).await`, which actually parks the
+        //     current worker thread and lets *all other runnable tasks*
+        //     on every worker run.  This is a much stronger release than
+        //     yield_now(), which only moves this task to the back of the
+        //     *same* worker's run queue and still leaves the worker
+        //     blocked on compute-heavy tasks if there are fewer workers
+        //     than busy-poll tasks.
         // ====================================================================
+        const SPINS_BEFORE_YIELD: u64 = 2048;
+        const YIELD_PERIOD:      u64 =   64;
+        const SLEEP_US:          u64 =    1;
+
         let mut spins: u64 = 0;
         loop {
             let mut wcs = Self::zeroed_wc();
@@ -1626,15 +1662,16 @@ impl RdmaChannel {
                 return Ok(wcs[0]);
             }
             spins += 1;
-            // After 10k pure spins (~microseconds), back off to yield to
-            // the tokio runtime so accept loop / other conns don't starve.
-            if spins & 0x3F == 0 {
-                // Yield every 64 iterations to be friendly to other tasks
-                // on this worker (single digit microsecond overhead).
-                tokio::task::yield_now().await;
+            if spins < SPINS_BEFORE_YIELD {
+                // Pure user-space pause hint (nop-pause, ~dozen cycles).
+                std::hint::spin_loop();
+            } else if spins & (YIELD_PERIOD - 1) == 0 {
+                // Cooperative async sleep: parks the tokio worker,
+                // allowing every other runnable task in the runtime a
+                // chance to execute — including the response sender on a
+                // different conn that's sharing the worker.
+                tokio::time::sleep(Duration::from_micros(SLEEP_US)).await;
             } else {
-                // Short in-user-space pause hint (nop-pause, ~dozen cycles).
-                // (std::hint::spin_loop on aarch64 yields; on x86 it's PAUSE.)
                 std::hint::spin_loop();
             }
         }
@@ -2105,10 +2142,26 @@ unsafe impl Sync for RdmaCmIdPtr {}
 /// Async wrapper for `poll(event_channel_fd) + rdma_get_cm_event`.
 ///
 /// Uses `spawn_blocking` to avoid blocking the tokio worker thread.
-/// The event channel fd is polled with a 30s timeout. When an event is
+/// The event channel fd is polled with a 1000ms timeout. When an event is
 /// available, `rdma_get_cm_event` is called (which returns immediately
 /// because poll confirmed readability). The returned event is NOT acked;
 /// the caller is responsible for `rdma_ack_cm_event`.
+///
+/// ROOT36 FIX: previously poll used `timeout_ms = 30000` and returned
+/// `NetError::Connection("rdma_cm: timeout (30s) waiting for event")` on
+/// every poll expiration.  The server acceptor loop logged this as
+/// `ERROR`, which spammed logs AND incorrectly signalled a fault when the
+/// real condition was simply "no new connection for 30s".  Worse, a
+/// 30-second poll window left the acceptor non-yielding for very long
+/// periods, preventing any concurrent shutdown signalling from running.
+///
+/// The new contract: poll timeouts are a *normal, idle-state* return with
+/// `WouldBlock`.  Callers of `accept()` use `?` on `NetResult`; to avoid
+/// breaking their loops, we propagate through the dedicated
+/// `NetError::WouldBlock` variant that the acceptor explicitly
+/// understands and silently continues on.  The poll timeout is also
+/// reduced to 1000ms so the event channel remains responsive to shutdown
+/// / new-concurrency events (we pay ~0 syscalls / sec cost — trivial).
 ///
 /// Takes the channel pointer as `usize` (not `*mut`) because raw pointers
 /// are `!Send`, which would make the returned future `!Send` and break
@@ -2121,6 +2174,8 @@ async fn async_get_cm_event(channel_raw: usize) -> NetResult<usize> {
         return Err(NetError::Connection("null event channel".to_string()));
     }
 
+    const POLL_TIMEOUT_MS: i32 = 1000;
+
     tokio::task::spawn_blocking(move || -> NetResult<usize> {
         let channel = channel_raw as *mut rdma_event_channel;
         let fd = unsafe { (*channel).fd };
@@ -2130,14 +2185,19 @@ async fn async_get_cm_event(channel_raw: usize) -> NetResult<usize> {
             events: libc::POLLIN,
             revents: 0,
         };
-        let prc = unsafe { libc::poll(&mut pfd, 1, 30000) };
+        let prc = unsafe { libc::poll(&mut pfd, 1, POLL_TIMEOUT_MS) };
         if prc == 0 {
-            return Err(NetError::Connection(
-                "rdma_cm: timeout (30s) waiting for event".to_string(),
-            ));
+            // ROOT36: idle timeout → not an error.  Notify caller via
+            // WouldBlock so acceptor loop can `continue` cleanly.
+            return Err(NetError::WouldBlock);
         }
         if prc < 0 {
             let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                // EINTR is also a normal "no event yet" condition, not an
+                // error worth logging.  Treat identically to timeout.
+                return Err(NetError::WouldBlock);
+            }
             return Err(NetError::Connection(format!(
                 "rdma_cm: poll on channel fd {} failed: {}",
                 fd, e
@@ -2180,38 +2240,45 @@ async fn wait_cm_event_with_id(
     expected: ffi::rdma_cm_event_type,
 ) -> NetResult<()> {
     loop {
-        let event_raw = async_get_cm_event(channel_raw).await?;
-        let event = event_raw as *mut rdma_cm_event;
+        match async_get_cm_event(channel_raw).await {
+            // ROOT36: idle poll timeout is transient; keep waiting for
+            // the expected event.
+            Err(NetError::WouldBlock) => continue,
+            Err(e) => return Err(e),
+            Ok(event_raw) => {
+                let event = event_raw as *mut rdma_cm_event;
 
-        let actual = unsafe { (*event).event };
-        let status = unsafe { (*event).status };
-        debug!(
-            "[rdma_cm] got event {} (status={}), expected {}",
-            actual, status, expected
-        );
+                let actual = unsafe { (*event).event };
+                let status = unsafe { (*event).status };
+                debug!(
+                    "[rdma_cm] got event {} (status={}), expected {}",
+                    actual, status, expected
+                );
 
-        if actual == expected {
-            unsafe { ffi::rdma_ack_cm_event(event) };
-            return Ok(());
-        }
+                if actual == expected {
+                    unsafe { ffi::rdma_ack_cm_event(event) };
+                    return Ok(());
+                }
 
-        debug!(
-            "[rdma_cm] unexpected event {} (expected {}), acking and retrying",
-            actual, expected
-        );
-        unsafe { ffi::rdma_ack_cm_event(event) };
+                debug!(
+                    "[rdma_cm] unexpected event {} (expected {}), acking and retrying",
+                    actual, expected
+                );
+                unsafe { ffi::rdma_ack_cm_event(event) };
 
-        // If it's an error event, return error instead of looping forever.
-        if actual == ffi::RDMA_CM_EVENT_ADDR_ERROR
-            || actual == ffi::RDMA_CM_EVENT_ROUTE_ERROR
-            || actual == ffi::RDMA_CM_EVENT_CONNECT_ERROR
-            || actual == ffi::RDMA_CM_EVENT_UNREACHABLE
-            || actual == ffi::RDMA_CM_EVENT_REJECTED
-        {
-            return Err(NetError::Connection(format!(
-                "rdma_cm: received error event {} (status={}, expected {})",
-                actual, status, expected
-            )));
+                // If it's an error event, return error instead of looping forever.
+                if actual == ffi::RDMA_CM_EVENT_ADDR_ERROR
+                    || actual == ffi::RDMA_CM_EVENT_ROUTE_ERROR
+                    || actual == ffi::RDMA_CM_EVENT_CONNECT_ERROR
+                    || actual == ffi::RDMA_CM_EVENT_UNREACHABLE
+                    || actual == ffi::RDMA_CM_EVENT_REJECTED
+                {
+                    return Err(NetError::Connection(format!(
+                        "rdma_cm: received error event {} (status={}, expected {})",
+                        actual, status, expected
+                    )));
+                }
+            }
         }
     }
 }
@@ -2226,48 +2293,56 @@ async fn wait_cm_event_with_id(
 async fn wait_for_any_cm_event(
     channel_raw: usize,
 ) -> NetResult<(ffi::rdma_cm_event_type, u32, usize)> {
-    let event_raw = async_get_cm_event(channel_raw).await?;
-    let event = event_raw as *mut rdma_cm_event;
+    // ROOT36: loop on WouldBlock so idle poll timeouts do not propagate
+    // to callers that expect to block exactly until a real event or a
+    // real error arrives.
+    loop {
+        let event_raw = match async_get_cm_event(channel_raw).await {
+            Err(NetError::WouldBlock) => continue,
+            other => other?,
+        };
+        let event = event_raw as *mut rdma_cm_event;
 
-    let event_type = unsafe { (*event).event };
-    let status = unsafe { (*event).status };
-    let cm_id = unsafe { (*event).id };
+        let event_type = unsafe { (*event).event };
+        let status = unsafe { (*event).status };
+        let cm_id = unsafe { (*event).id };
 
-    // Extract peer QPN: first try param.qp_num, then private_data.
-    let param_qp_num = unsafe { (*event).param.qp_num };
-    let pd_ptr = unsafe { (*event).param.private_data };
-    let pd_len = unsafe { (*event).param.private_data_len };
-    let peer_qpn = if param_qp_num != 0 {
-        param_qp_num
-    } else if !pd_ptr.is_null() && pd_len >= 4 {
-        // Extract QPN from private_data (first 4 bytes, native endian).
-        let bytes = unsafe { std::slice::from_raw_parts(pd_ptr as *const u8, 4) };
-        u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-    } else {
-        0
-    };
+        // Extract peer QPN: first try param.qp_num, then private_data.
+        let param_qp_num = unsafe { (*event).param.qp_num };
+        let pd_ptr = unsafe { (*event).param.private_data };
+        let pd_len = unsafe { (*event).param.private_data_len };
+        let peer_qpn = if param_qp_num != 0 {
+            param_qp_num
+        } else if !pd_ptr.is_null() && pd_len >= 4 {
+            // Extract QPN from private_data (first 4 bytes, native endian).
+            let bytes = unsafe { std::slice::from_raw_parts(pd_ptr as *const u8, 4) };
+            u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        } else {
+            0
+        };
 
-    debug!(
-        "[rdma_cm] got event {} (status={}, param_qp={}, pd_len={}, peer_qpn={})",
-        event_type, status, param_qp_num, pd_len, peer_qpn
-    );
+        debug!(
+            "[rdma_cm] got event {} (status={}, param_qp={}, pd_len={}, peer_qpn={})",
+            event_type, status, param_qp_num, pd_len, peer_qpn
+        );
 
-    unsafe { ffi::rdma_ack_cm_event(event) };
+        unsafe { ffi::rdma_ack_cm_event(event) };
 
-    // Check for error events
-    if event_type == ffi::RDMA_CM_EVENT_ADDR_ERROR
-        || event_type == ffi::RDMA_CM_EVENT_ROUTE_ERROR
-        || event_type == ffi::RDMA_CM_EVENT_CONNECT_ERROR
-        || event_type == ffi::RDMA_CM_EVENT_UNREACHABLE
-        || event_type == ffi::RDMA_CM_EVENT_REJECTED
-    {
-        return Err(NetError::Connection(format!(
-            "rdma_cm: received error event {} (status={})",
-            event_type, status
-        )));
+        // Check for error events
+        if event_type == ffi::RDMA_CM_EVENT_ADDR_ERROR
+            || event_type == ffi::RDMA_CM_EVENT_ROUTE_ERROR
+            || event_type == ffi::RDMA_CM_EVENT_CONNECT_ERROR
+            || event_type == ffi::RDMA_CM_EVENT_UNREACHABLE
+            || event_type == ffi::RDMA_CM_EVENT_REJECTED
+        {
+            return Err(NetError::Connection(format!(
+                "rdma_cm: received error event {} (status={})",
+                event_type, status
+            )));
+        }
+
+        return Ok((event_type, peer_qpn, cm_id as usize));
     }
-
-    Ok((event_type, peer_qpn, cm_id as usize))
 }
 
 /// Convert a SocketAddr to a libc sockaddr (IPv4 or IPv6).
@@ -2547,6 +2622,15 @@ struct PendingAccepted {
     mr_pool: Arc<MrPool>,
     qp: IbvQp,
     cm_id: RdmaCmIdPtr,
+    /// [ROOT36-C FIX] Receive buffers pre-posted *before* `rdma_accept()` is
+    /// called, so that when the client's first handshake SEND arrives, the
+    /// RQ is already armed.  Without this, the fast-hardware race
+    /// `rdma_accept → client REP → client qp.RTS → ib_post_send(HS) → HCA`
+    /// completes while the server RQ is still empty → `IBV_WC_RNR_RETRY_EXC`
+    /// / infinite RNR retry window → handshake recv hangs forever →
+    /// `READDIR_DEBUG connected=1` but filer never receives any frame →
+    /// kernel-side `deadline exceeded` even though verbs pingpong works.
+    recv_pre_posted: std::collections::VecDeque<Arc<IbvMr>>,
 }
 
 /// RDMA listener adapter. Wraps rdma_cm listen id + event channel.
@@ -2568,7 +2652,14 @@ pub struct RdmaListenerAdapter {
 impl TransportListener for RdmaListenerAdapter {
     async fn accept(&self) -> NetResult<Box<dyn TransportStream>> {
         loop {
-            let event_raw = async_get_cm_event(self.channel.0 as usize).await?;
+            // ROOT36: idle poll timeouts are a normal "idle listener"
+            // condition.  Propagate as NetError::WouldBlock so the
+            // acceptor loop can `continue` without logging ERROR-level
+            // noise and re-check shutdown state.
+            let event_raw = match async_get_cm_event(self.channel.0 as usize).await {
+                Err(NetError::WouldBlock) => return Err(NetError::WouldBlock),
+                other => other?,
+            };
             let event = event_raw as *mut rdma_cm_event;
 
             let event_type = unsafe { (*event).event };
@@ -2701,6 +2792,85 @@ impl TransportListener for RdmaListenerAdapter {
                             }
                         };
 
+                    // ========================================================================
+                    // ROOT36-C FIX: Pre-post N RECV buffers *before* rdma_accept().
+                    // ========================================================================
+                    // Race that existed:
+                    //   1. Server rdma_accept() → sends RC REP to kernel with local QPN
+                    //   2. Kernel receives REP → internal cm transition QP→RTR→RTS
+                    //   3. Kernel ib_post_send(20B handshake request)
+                    //   4. With SR-IOV mlx5 hardware (sub-μs wire latency, 13.5 Gb/s
+                    //      observed pingpong bw), steps 2+3 complete in <1 ms, so the
+                    //      HS SEND lands at server HCA *before* the server code returns
+                    //      from rdma_accept and gets to ESTABLISHED which used to call
+                    //      pre_post_recv(4).
+                    // Result: server RQ is empty while HCA is receiving a SEND packet
+                    //   → RNR NAKs, rnr_retry_count=7 infinite retry loops forever →
+                    //   CONN_SETUP step=0 logged but step=1 handshake_ok NEVER fires
+                    //   → connected=1 on kernel (local QP state only) but server never
+                    //   processes any frame → all RPCs deadline exceeded.
+                    //
+                    // Fix: ibv_post_recv works on QP in INIT state (before RTR/RTS).
+                    // Do 8 pre-posts NOW, then call rdma_accept().  By the time the
+                    // remote's first SEND arrives at our HCA, the RQ already has
+                    // buffers available → handshake bytes complete on recv_cq, HS bytes
+                    // delivered promptly, IoLoop.read_frame 20B header→20B OK,
+                    // handshake processed → CLIENT data/meta handlers fire → OK.
+                    // NOTE: Must NOT use .await inside this loop here because `new_id`
+                    // (raw *mut rdma_cm_id) is not Send and would create a Send-error
+                    // in async_trait. Use try_acquire_sync + release_sync (try_lock).
+                    const PRE_POST_N: usize = 8;
+                    let mut recv_pre_posted = std::collections::VecDeque::with_capacity(PRE_POST_N);
+                    let mut prepost_ok = true;
+                    for i in 0..PRE_POST_N {
+                        let mr = match mr_pool.try_acquire_sync() {
+                            Some(m) => m,
+                            None => {
+                                warn!(
+                                    "accept: MR pool empty during pre-post recv ({}/PRE_POST_N={})",
+                                    i, PRE_POST_N
+                                );
+                                break;
+                            }
+                        };
+                        let sge = ibv_sge {
+                            addr: mr.addr() as u64,
+                            length: mr_pool.buf_size() as u32,
+                            lkey: mr.lkey(),
+                        };
+                        let wr_id = mr.addr() as u64;
+                        if let Err(e) = qp.post_recv(&sge, wr_id) {
+                            warn!(
+                                "accept: pre_post_recv[{}/{}] ibv_post_recv failed: {}, aborting accept",
+                                i, PRE_POST_N, e
+                            );
+                            // Return the failed MR synchronously.
+                            mr_pool.release_sync(mr);
+                            prepost_ok = false;
+                            break;
+                        }
+                        recv_pre_posted.push_back(mr);
+                    }
+                    if !prepost_ok || recv_pre_posted.is_empty() {
+                        // Return all posted MRs back to pool. They've been posted to
+                        // HCA RQ while in INIT state; posting back to pool is safe
+                        // because rdma_destroy_id(new_id) below will destroy QP and
+                        // cancel all WRs, so HCA won't write into those pages after.
+                        for mr in recv_pre_posted.drain(..) {
+                            mr_pool.release_sync(mr);
+                        }
+                        warn!(
+                            "accept: pre_post_recv posted 0 usable buffers; aborting this connection"
+                        );
+                        unsafe { ffi::rdma_destroy_id(new_id) };
+                        continue;
+                    }
+                    debug!(
+                        "[server] CONNECT_REQUEST: pre-posted {} RECV buffers (qpn={}) BEFORE rdma_accept",
+                        recv_pre_posted.len(),
+                        qp.qp_num()
+                    );
+
                     // Call rdma_accept; QP state is managed by rdma_cm.
                     // The matching ESTABLISHED event will arrive asynchronously
                     // on the shared listener event channel.
@@ -2749,6 +2919,7 @@ impl TransportListener for RdmaListenerAdapter {
                         mr_pool,
                         qp,
                         cm_id,
+                        recv_pre_posted,
                     };
                     self.pending.lock().insert(new_id as usize, pending);
 
@@ -2778,6 +2949,11 @@ impl TransportListener for RdmaListenerAdapter {
                     );
 
                     let peer = self.bind_addr;
+                    // ROOT36-C FIX: recv buffers were pre-posted BEFORE rdma_accept
+                    // (in CONNECT_REQUEST handler). Move them to RdmaChannel so the
+                    // read path can pop and repost them on each completion. This
+                    // prevents double-posting.
+                    let recv_pre_posted = tokio::sync::Mutex::new(pending.recv_pre_posted);
                     let channel = RdmaChannel {
                         qp: Arc::new(pending.qp),
                         send_cq: pending.send_cq,
@@ -2786,15 +2962,19 @@ impl TransportListener for RdmaListenerAdapter {
                         peer,
                         send_async_fd: pending.send_async_fd,
                         recv_async_fd: pending.recv_async_fd,
-                        recv_pre_posted: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                        recv_pre_posted,
                         cm_id: Some(pending.cm_id),
                         pd: Some(pending.pd),
                         event_channel: None,
                     };
-                    // Pre-post recv buffers so the client can send data
-                    // without hitting RNR (Receiver Not Ready) retries.
-                    channel.pre_post_recv(4).await?;
-                    info!("RdmaListenerAdapter: accepted connection from {}", peer);
+                    // DO NOT call channel.pre_post_recv again here — recv WEs are
+                    // already posted. Skip the redundant post to avoid spurious
+                    // full/empty recv_pre_posted skew.
+                    info!(
+                        "RdmaListenerAdapter: accepted connection from {} (pre_posted_recv={})",
+                        peer,
+                        channel.recv_pre_posted.lock().await.len()
+                    );
                     return Ok(Box::new(RdmaStream {
                         channel: Arc::new(channel),
                         peer,
