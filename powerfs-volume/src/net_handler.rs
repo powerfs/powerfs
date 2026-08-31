@@ -205,6 +205,131 @@ impl VolumeNetHandler {
         }
     }
 
+    async fn handle_write_needle_blob(
+        &self,
+        msg: &NetMessage,
+        session_client_id: u64,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
+        let inode = dec.next_u64(FieldId::Inode).unwrap_or(file_key);
+        let offset = dec.next_u64(FieldId::Offset).unwrap_or(0);
+        let data = if !msg.data.is_empty() {
+            msg.data.clone()
+        } else {
+            dec.next_bytes(FieldId::DataLen).unwrap_or_default()
+        };
+        let size = data.len() as u64;
+        let lease_token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let holder_client_id = dec
+            .next_string(FieldId::ClientId)
+            .unwrap_or_else(|_| session_client_id.to_string());
+
+        self.register_holder(session_client_id, &holder_client_id)
+            .await;
+
+        info!(
+            "NET_WRITE_NEEDLE_BLOB: volume_id={}, file_key={}, inode={}, offset={}, size={}, has_lease={}, holder={}",
+            volume_id, file_key, inode, offset, size,
+            !lease_token.is_empty(), holder_client_id
+        );
+
+        if !lease_token.is_empty() {
+            if !self.volume_server.lease_enabled {
+                debug!(
+                    "NET_WRITE_NEEDLE_BLOB: lease_enabled=false, skip validation for file_key={} inode={}",
+                    file_key, inode
+                );
+            } else {
+                let lease_mgr = self.volume_server.range_lease_mgr.clone();
+                let result = lease_mgr.validate_token_with_grace_period(
+                    &lease_token,
+                    &holder_client_id,
+                    inode,
+                    3000,
+                );
+                match result {
+                    Ok(()) => {}
+                    Err(e) => {
+                        warn!("NET_WRITE_NEEDLE_BLOB: lease validation failed: {}", e);
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_SERVER_ERROR,
+                            Vec::new(),
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        let storage_manager = self.volume_server.storage_manager.clone();
+        let vid = VolumeId(volume_id);
+        enum BlobOutcome {
+            Ok,
+            NoSpace,
+            ServerError(String),
+        }
+
+        match tokio::task::spawn_blocking(move || -> Result<BlobOutcome, String> {
+            let volume = storage_manager
+                .get_volume(&vid)
+                .ok_or_else(|| format!("volume not found: {}", volume_id))?;
+            match volume.write_needle_blob(file_key, offset as i64, size as i32, bytes::Bytes::from(data), 0) {
+                Ok(_) => Ok(BlobOutcome::Ok),
+                Err(powerfs_common::error::PowerFsError::OutOfSpace) => Ok(BlobOutcome::NoSpace),
+                Err(e) => {
+                    warn!("write_needle_blob failed: {}", e);
+                    Ok(BlobOutcome::ServerError(e.to_string()))
+                }
+            }
+        })
+        .await
+        {
+            Ok(Ok(BlobOutcome::Ok)) => Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new())),
+            Ok(Ok(BlobOutcome::NoSpace)) => {
+                warn!(
+                    "NET_WRITE_NEEDLE_BLOB: volume {} full (OutOfSpace)",
+                    volume_id
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_NO_SPACE,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+            Ok(Ok(BlobOutcome::ServerError(msg_str))) => {
+                warn!("NET_WRITE_NEEDLE_BLOB server error: {}", msg_str);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+            Ok(Err(e)) => {
+                warn!("NET_WRITE_NEEDLE_BLOB inner error: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+            Err(e) => {
+                error!("NET_WRITE_NEEDLE_BLOB task failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     async fn handle_read_needle(
         &self,
         msg: &NetMessage,
@@ -829,6 +954,10 @@ impl NetHandler for VolumeNetHandler {
 
         match msg_type {
             MsgType::WriteNeedle => self.handle_write_needle(msg, ctx.client.client_id).await,
+            MsgType::WriteNeedleBlob => {
+                self.handle_write_needle_blob(msg, ctx.client.client_id)
+                    .await
+            }
             MsgType::ReadNeedle => self.handle_read_needle(msg).await,
             MsgType::DeleteNeedle => self.handle_delete_needle(msg).await,
             MsgType::BatchWriteNeedle => {

@@ -685,6 +685,16 @@ pub enum MsgType {
     /// Filer → Master: requests Zone allocation.
     /// Response: zone_id + [(volume_id, addr, size, used), ...].
     RegisterFiler = 0x006A,
+    /// Partial write within a needle (offset + length).
+    /// Kernel → Volume Server: used by writeback when dirty pages
+    /// cover only a sub-range of the 1MB needle (no full-needle coverage),
+    /// eliminating the RMW (read-modify-write) round-trip that would
+    /// otherwise be required to preserve untouched bytes within the needle.
+    /// Request TLV: VolumeId (Ino) + FileKey + InodeV2 + Offset +
+    ///              optional LeaseToken + optional ClientId.
+    /// Data segment: the blob bytes to write at offset.
+    /// Response TLV: empty body on STATUS_OK (success is implied).
+    WriteNeedleBlob = 0x006B,
 
     // Master topology & discovery operations
     GetTopology = 0x0070,
@@ -876,6 +886,7 @@ impl MsgType {
             0x0068 => Some(Self::VolumeStatus),
             0x0069 => Some(Self::AssignNeedle),
             0x006A => Some(Self::RegisterFiler),
+            0x006B => Some(Self::WriteNeedleBlob),
             0x0070 => Some(Self::GetTopology),
             0x0071 => Some(Self::WatchTopology),
             0x0072 => Some(Self::TopologyChanged),
@@ -1707,6 +1718,9 @@ pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
 
         // BatchWriteNeedle (0x0065) - data ≤ 2MB
         0x0065 => Some((4 * 1024, 2 * 1024 * 1024)),
+
+        // WriteNeedleBlob (0x006B) - partial write within a needle, data ≤ 2MB
+        0x006B => Some((4 * 1024, 2 * 1024 * 1024)),
 
         // 其他消息类型无大小约束
         _ => None,

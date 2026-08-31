@@ -694,6 +694,7 @@ impl PowerFsNetServer {
             let mut s = shutdown.write().await;
             s.active_connections = s.active_connections.saturating_add(1);
         }
+        info!("[CONN_SETUP peer={}] step=0 task_spawned: entering handle_new_connection_spawned", peer);
 
         // handshake 需要读写 stream, 完成后返回 (read_half, write_half, client_id, ...)
         let (read_half, write_half, client_id, client_type, channel, features) =
@@ -706,26 +707,33 @@ impl PowerFsNetServer {
                     return;
                 }
             };
+        info!("[CONN_SETUP peer={}] step=1 handshake_ok: client_id={} client_type={:?} channel={} features={}",
+              peer, client_id, client_type, channel, features);
 
         // 创建 outbound channel: Worker/notify → write_task
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         // 创建 ClientConn
         let conn = ClientConn::new(client_id, peer, client_type, channel, features, outbound_tx);
+        info!("[CONN_SETUP peer={} client_id={}] step=2 client_conn_built", peer, client_id);
 
         // 注册到 ConnRegistry
         registry.register(conn.clone()).await;
+        info!("[CONN_SETUP peer={} client_id={}] step=3 registry_registered", peer, client_id);
 
         // 流控
         flow_ctrl.register_conn(client_id, peer.to_string(), Channel::from_u8(channel));
+        info!("[CONN_SETUP peer={} client_id={}] step=4 flow_ctrl_registered", peer, client_id);
 
         // 注册到 ServerConnectionManager
         if let Some(ref mgr) = manager {
             mgr.register_session(client_id, client_type, peer).await;
         }
+        info!("[CONN_SETUP peer={} client_id={}] step=5 mgr_register_session_done", peer, client_id);
 
         // 通知 handler
         handler.on_connect(client_id, client_type).await;
+        info!("[CONN_SETUP peer={} client_id={}] step=6 handler_on_connect_done", peer, client_id);
 
         // 分配到 IoLoop (hash % N)
         let io_loop_idx = (client_id as usize) % io_loops.len();
@@ -735,6 +743,8 @@ impl PowerFsNetServer {
 
         // IoLoop.manage 会 spawn task 管理该连接
         io_loop.manage(read_half, write_half, conn, outbound_rx);
+        info!("[CONN_SETUP peer={} client_id={}] step=7 io_loop_manage_spawned(io_loop_idx={})",
+              peer, client_id, io_loop_idx);
 
         // 监控 task: 连接断开后 active_connections 计数
         let registry_for_monitor = registry.clone();
@@ -751,6 +761,8 @@ impl PowerFsNetServer {
             }
         });
 
+        info!("[CONN_SETUP peer={} client_id={}] step=8 FULLY_REGISTERED. All setup tasks done.",
+              peer, client_id);
         info!("New connection from {} (client_id={})", peer, client_id);
     }
 
