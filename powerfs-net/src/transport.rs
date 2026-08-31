@@ -107,7 +107,13 @@ impl Default for TransportConfig {
             tcp_fallback: true,
             tcp_interface: None,
             rdma_device: None,
-            rdma_buf_num: 32,
+            // [RC18b ROOT CAUSE 24 FIX] SEND 与 RECV 共享同一个 MrPool (ctrl).
+            // pre-post N RECV + SEND 侧并发 acquire N*2 响应帧时, 若 buf_num 仅
+            // 等于 RECV posted 数 (默认 32) 则 pool.free = 0, SEND acquire
+            // 永远 None, 响应根本无法发出 → 内核客户端 RPC 超时 → EAGAIN.
+            // 对称内核 side CTRL_BUF_NUM=128 = 32 RECV posted + 64 SEND
+            // inflight + 32 slack.
+            rdma_buf_num: 128,
             rdma_buf_size: 65536,
             conn_per_node: 1,
         }
@@ -324,7 +330,7 @@ mod tests {
         let cfg = TransportConfig::default();
         assert_eq!(cfg.transport, "auto");
         assert!(cfg.tcp_fallback);
-        assert_eq!(cfg.rdma_buf_num, 32);
+        assert_eq!(cfg.rdma_buf_num, 128);
         assert_eq!(cfg.rdma_buf_size, 65536);
         assert_eq!(cfg.conn_per_node, 1);
     }

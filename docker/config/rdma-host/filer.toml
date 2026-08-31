@@ -7,7 +7,7 @@ log_level = "info"
 redis_url = "redis://172.30.0.50:6379"
 
 [filer]
-transport = "tcp"
+transport = "auto"
 port = 8888
 grpc_port = 8889
 metrics_port = 8900

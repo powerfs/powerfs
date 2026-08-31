@@ -2654,7 +2654,13 @@ impl MetaShardManager {
                 info.size = sz;
             }
             if let Some(m) = mode {
-                info.mode = (m as u32) & 0o7777;
+                // ROOT34: Preserve S_IFMT (file type) bits, only update
+                // permission bits (0o7777).  The old code `(m as u32) & 0o7777`
+                // stripped S_IFDIR/S_IFREG etc., causing getattr to return
+                // mode without type bits → VFS no longer recognizes the
+                // inode as a directory → stat shows "weird file", find/ls
+                // return 0 entries, tar extraction loses parent dirs.
+                info.mode = (info.mode & !0o7777) | (m as u32 & 0o7777);
             }
             if let Some(u) = uid {
                 info.uid = u as u32;

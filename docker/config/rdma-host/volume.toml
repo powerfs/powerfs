@@ -6,7 +6,7 @@ log_level = "info"
 redis_url = "redis://172.30.0.50:6379"
 
 [volume]
-transport = "tcp"
+transport = "tcp"  # 内核 vol_route 仅支持TCP, volume需TCP listener; filer继续 auto(rdma+tcp)
 grpc_port = 8080
 http_port = 8091
 net_port = 8901

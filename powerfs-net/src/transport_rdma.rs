@@ -1594,47 +1594,49 @@ impl RdmaChannel {
     /// sub-microsecond latency advantage.
     async fn wait_cq_completion(
         cq: &IbvCq,
-        async_fd: Option<&Arc<CqAsyncFd>>,
+        _async_fd: Option<&Arc<CqAsyncFd>>,
     ) -> NetResult<ibv_wc> {
-        // Arm CQ notification before polling to avoid missing events.
-        cq.req_notify(false)?;
-
+        // ====================================================================
+        // ROOT27 FIX 2: ABANDON AsyncFd CQ-event notification ENTIRELY for
+        // completion polling.  The previous req_notify-in-loop fix still
+        // left rare-but-real hang cases where hardware CQE was in the ring
+        // buffer but AsyncFd never woke (lost edge, or get_cq_event blocked
+        // spuriously).  Symptom confirmed: qp409 first-accept write_all()
+        // for HandshakeResponse never returned despite kernel having
+        // received the bytes AND a subsequent msg_type=24 req POST_SEND_OK
+        // firing on the same QP.  This is classic CQ-notify deadlock.
+        //
+        // Replacement: simple yield_now driven busy-poll loop.  `ibv_poll_cq`
+        // is a pure user-space CQ-ring pointer read (no syscall), so this
+        // adds ~20-50us latency per completion while guaranteeing NO lost
+        // wakeups ever.  Tokio yield avoids starving other tasks.  This
+        // matches the lesson learned from soft-RoCE: "CQ event fd based
+        // notification through AsyncFd is unreliable; use poll loops with
+        // yield_now or spawn_blocking."
+        //
+        // The `_async_fd` parameter and `req_notify`/`get_cq_event` are now
+        // unused in this path; the Arc<CqAsyncFd> is kept in RdmaChannel
+        // only for potential future low-power mode (not latency path).
+        // ====================================================================
+        let mut spins: u64 = 0;
         loop {
-            // Fast path: poll for a completion.
             let mut wcs = Self::zeroed_wc();
             let n = cq.poll(&mut wcs);
             if n > 0 {
                 return Ok(wcs[0]);
             }
-
-            // No completion available — wait via AsyncFd.
-            let async_fd = match async_fd {
-                Some(fd) => fd,
-                None => {
-                    // No completion channel async-fd available (e.g.
-                    // AsyncFd registration failed for the underlying fd).
-                    // Yield back to the tokio runtime to avoid starving
-                    // other tasks on the worker thread.
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-            };
-
-            // Wait for the channel fd to become readable.
-            let mut guard = async_fd
-                .readable()
-                .await
-                .map_err(|e| NetError::Connection(format!("AsyncFd readable() failed: {}", e)))?;
-
-            // The fd is readable — a CQ event is pending. Clear the
-            // readiness so we don't get woken again for the same event.
-            guard.clear_ready();
-
-            // Consume the CQ event from the channel.
-            cq.get_cq_event()?;
-            cq.ack_events(1);
-
-            // Loop back to poll the CQ for the actual completion.
+            spins += 1;
+            // After 10k pure spins (~microseconds), back off to yield to
+            // the tokio runtime so accept loop / other conns don't starve.
+            if spins & 0x3F == 0 {
+                // Yield every 64 iterations to be friendly to other tasks
+                // on this worker (single digit microsecond overhead).
+                tokio::task::yield_now().await;
+            } else {
+                // Short in-user-space pause hint (nop-pause, ~dozen cycles).
+                // (std::hint::spin_loop on aarch64 yields; on x86 it's PAUSE.)
+                std::hint::spin_loop();
+            }
         }
     }
 
@@ -1946,7 +1948,7 @@ impl Transport for RdmaTransport {
         //    — rdma_cm uses cm_id->qp->qp_num and handles QP state
         //    transitions (RESET→INIT→RTR→RTS) automatically. C wrapper
         //    avoids Rust struct layout issues.
-        let rc = unsafe { ffi::powerfs_rdma_connect(cm_id.0, 1, 1, 1, 7, 7, 0, 0) };
+        let rc = unsafe { ffi::powerfs_rdma_connect(cm_id.0, 7, 7, 1, 3, 7, 0, 0) };
         if rc != 0 {
             return Err(NetError::Connection(format!(
                 "rdma_connect failed (rc={})",
@@ -2702,7 +2704,7 @@ impl TransportListener for RdmaListenerAdapter {
                     // Call rdma_accept; QP state is managed by rdma_cm.
                     // The matching ESTABLISHED event will arrive asynchronously
                     // on the shared listener event channel.
-                    let rc = unsafe { ffi::powerfs_rdma_accept(new_id, 1, 1, 1, 7, 7, 0, 0) };
+                    let rc = unsafe { ffi::powerfs_rdma_accept(new_id, 7, 7, 1, 3, 7, 0, 0) };
                     if rc != 0 {
                         warn!("rdma_accept failed (rc={})", rc);
                         unsafe { ffi::rdma_destroy_id(new_id) };
