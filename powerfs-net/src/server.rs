@@ -667,8 +667,26 @@ impl PowerFsNetServer {
                         .await;
                     });
                 }
+                Err(NetError::WouldBlock) => {
+                    // ROOT36: idle poll timeout (RDMA cm event channel,
+                    // TCP listener poll, etc.) — normal, no log.  Allows
+                    // the outer loop to re-check the shutdown flag every
+                    // POLL_TIMEOUT_MS (≈ 1 s for RDMA) instead of blocking
+                    // for 30 s.
+                    continue;
+                }
                 Err(e) => {
-                    error!("Accept error: {:?}", e);
+                    // Downgrade pure "timeout"-style connection errors to
+                    // WARN.  They are transient and shouldn't pollute logs
+                    // as ERROR.  Real transport failures still log ERROR.
+                    let msg = e.to_string();
+                    let looks_transient =
+                        msg.contains("timeout") || msg.contains("Timed out");
+                    if looks_transient {
+                        warn!("Accept transient: {:?}", e);
+                    } else {
+                        error!("Accept error: {:?}", e);
+                    }
                 }
             }
         }

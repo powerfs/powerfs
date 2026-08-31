@@ -19,6 +19,14 @@ pub enum NetError {
     #[error("Timeout")]
     Timeout,
 
+    /// Idle "try again later" condition returned by async I/O primitives
+    /// that the caller would otherwise have to string-match against.
+    /// Specifically used by `async_get_cm_event` for `rdma_cm` poll
+    /// timeouts / EINTR, so the acceptor loop can `continue` cleanly
+    /// without logging ERROR-level noise (ROOT36).
+    #[error("Would block")]
+    WouldBlock,
+
     #[error("Not connected")]
     NotConnected,
 
