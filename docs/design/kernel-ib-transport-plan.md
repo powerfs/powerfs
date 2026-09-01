@@ -875,15 +875,26 @@ Master: docker master-1, TLS listener 0.0.0.0:9334 (两 VM 共用).
 **测试步骤：**
 1. **ib_send_lat（VM 间）**：vm2 server + vm1 client，1000 iterations
 2. **ib_send_bw（VM 间）**：vm2 server + vm1 client，2MB 消息大小
-3. **PowerFS I/O 延迟**：vm1 + vm2 各执行 `dd if=/dev/zero of=/mnt/powerfs/perf_test bs=4K count=1000` 测吞吐
-4. **PowerFS I/O 吞吐**：vm1 `dd if=/dev/zero of=/mnt/powerfs/perf_1m bs=1M count=100` 测 MB/s
+3. **PowerFS I/O 延迟**：vm1 + vm2 各执行 `dd if=/dev/zero of=/mnt/powerfs/perf_test bs=4K count=1000 oflag=direct` 测延迟
+4. **PowerFS I/O 吞吐**：vm1 + vm2 各执行 `dd if=/dev/zero of=/mnt/powerfs/perf_1m bs=1M count=100 oflag=direct` 测 MB/s
 5. **Filer RDMA 连接数**：filer 日志 grep `accepted connection` 确认两个独立 RDMA 连接
 
 **验收标准：**
-- [ ] ib_send_lat avg < 2.0µs（当前 1.46µs）
-- [ ] ib_send_bw > 5 Gb/s
-- [ ] dd 4K 写入无 timeout
-- [ ] dd 1M 吞吐 > 50 MB/s
+- [x] ib_send_lat avg < 2.0µs → 实测 **1.478 µs**（200G IB 硬件 RDMA，CPU pin 到 NUMA node 1）
+- [x] ib_send_bw > 5 Gb/s → 实测 **200.08 Gb/s**（peak 200.65，接近 200G 线速）
+- [x] dd 4K 写入无 timeout → 两 VM 均在 1.46s 完成 1000 次直接 I/O（~700 IOPS，无 deadline）
+- [x] dd 1M 吞吐 > 50 MB/s → vm1 **186 MB/s**、vm2 **160 MB/s**（oflag=direct，单 stream 1MB needle）
+
+**测试结果（2026-09-01）：**
+
+| 指标 | vm1 | vm2 | 阈值 | 结果 |
+|------|-----|-----|------|------|
+| ib_send_lat avg (µs) | client 1.478 | server 1.478 | < 2.0 | PASS |
+| ib_send_bw avg (Gb/s) | client 200.08 | server 200.08 | > 5 | PASS |
+| dd 4K direct 耗时 (s) | 1.463 (2.8 MB/s) | 1.464 (2.8 MB/s) | 无 timeout | PASS |
+| dd 1M direct 吞吐 (MB/s) | 186 | 160 | > 50 | PASS |
+
+dmesg 检查：两 VM 仅显示正常 writeback 日志（WP_START/WB_WRITE_CB err=0/RELEASE FLAT synced），无 deadline/panic/hung task。
 
 #### A.7.7 Phase 6 — 故障注入与恢复
 
@@ -895,10 +906,23 @@ Master: docker master-1, TLS listener 0.0.0.0:9334 (两 VM 共用).
 3. **VF 临时拔插**：两 VM 挂载 → vm1 `ibv_devinfo` 确认 VF 在线 → 模拟 VF 路径异常（可选：QEMU device_del+readd，较激进）→ 恢复后 I/O 正常
 
 **验收标准：**
-- [ ] Filer restart 后两 VM 自动重连（dmesg 显示 reconnect → connected）
-- [ ] VM1 crash 期间 VM2 I/O 不中断
-- [ ] VM1 恢复后可重新挂载
-- [ ] 无 panic / 数据丢失
+- [x] Filer restart 后两 VM 自动重连（dmesg 显示 reconnect → connected）→ filer-1 重启耗时 10s，vm1 在 T+4s 重连成功（qp_num 422），vm2 在 T+5s 重连成功（qp_num 293）
+- [x] VM1 crash 期间 VM2 I/O 不中断 → vm1 在 20:38:23 被 SIGKILL，vm2 立即写入 post_kill_vm2 文件成功，dmesg 无新错误
+- [x] VM1 恢复后可重新挂载 → systemctl restart powerfs-vm1 + 手动配置 ib0 + mount → I/O 恢复，可见 vm2 在 crash 期间写入的文件
+- [x] 无 panic / 数据丢失 → 两 VM 跨向文件互见（recovered_vm1 / post_kill_vm2），filer 数据持久
+
+**测试结果（2026-09-01）：**
+
+| 场景 | 触发 | 恢复时间 | 验证 |
+|------|------|---------|------|
+| Filer restart | docker restart filer-1 (10s 停机) | vm1 ~4s / vm2 ~5s 自动重连 | dmesg 显示 peer disconnect → RECV ERROR -107 → connect rejected -111 (filer 启动中) → handshake OK → connected |
+| VM1 crash | kill -9 PID 697397 | vm2 I/O 完全不受影响；vm1 重启 8s + 挂载 | vm2 写入 post_kill_vm2 OK；vm1 重挂载后写入 recovered_vm1 OK，互见文件 |
+| VF 热插拔 | 可选激进测试，本次跳过 | — | 已通过 filer restart + VM crash 覆盖主要故障路径；VF device_del/readd 风险高，留作后续单独验证 |
+
+**关键观察：**
+1. RDMA 客户端重连逻辑健壮：filer 重启期间多次被 reject (status=-111 ECONNREFUSED)，客户端持续重试直到握手成功
+2. VM 隔离性良好：vm1 内核 crash 对 vm2 完全无影响，证明两 VM 通过独立 RDMA QP 与 filer 通信
+3. 跨 VM 一致性：vm1 重挂载后立即可见 vm2 在 crash 期间写入的文件（post_kill_vm2_1788266305），filer 数据持久
 
 #### A.7.8 Phase 7 — 内核模块生命周期交叉验证
 
@@ -914,10 +938,35 @@ Master: docker master-1, TLS listener 0.0.0.0:9334 (两 VM 共用).
 7. filer 日志: 两个 client_id 均经历 disconnect → 重新 connect（如重挂载）
 
 **验收标准：**
-- [ ] vm1 rmmod 不影响 vm2 I/O
-- [ ] 两 VM 同时 rmmod 均干净卸载（module exit → comm layer exited → module unloaded）
-- [ ] 无 UAF panic / hung task
-- [ ] 重挂载后 I/O 恢复
+- [x] vm1 rmmod 不影响 vm2 I/O → vm2 在 vm1 rmmod 后写入 vm2_alive.txt 成功，可见 vm1 文件
+- [x] 两 VM 同时 rmmod 均干净卸载（module exit → comm layer exited → module unloaded）
+- [x] 无 UAF panic / hung task
+- [x] 重挂载后 I/O 恢复 → vm1 重挂载后写入 recovered 文件成功
+
+**测试结果（2026-09-01）：**
+
+| 步骤 | vm1 | vm2 | 结果 |
+|------|-----|-----|------|
+| 初始挂载 + 写文件 | phase7_marker_vm1.txt | phase7_marker_vm2.txt | PASS |
+| vm1 umount+rmmod | module exit → unloaded | I/O 不受影响（vm2_alive.txt 写入成功） | PASS |
+| vm1 重挂载 | insmod + mount 成功 | — | PASS |
+| 双 VM 同时 umount+rmmod | module exit → unloaded | module exit → unloaded | PASS |
+| filer restart 后重连 | disconnect → handshake OK qp=416 | disconnect → handshake OK qp=298 | PASS |
+
+**ROOT37 修复（测试中发现）：**
+
+测试中发现 `ib_free_cq` WARNING（`cq.c:273 cqe_used!=0`）在每次 RDMA disconnect 时触发（模块卸载、filer 重启），导致 CQ 资源泄漏。
+
+根因：`ib_free_cq` 在 `cancel_work_sync`（line 288）**之前**检查 `cqe_used`（line 273），若 CQ 有未 reap 的 CQE 则直接 return 不释放 CQ 内存。powerfs 的 `IB_POLL_WORKQUEUE` 模式下 workqueue 异步处理 CQE，手动 200+400 次 `ib_process_cq_direct` drain 不可靠。
+
+修复：用内核标准 API `ib_drain_qp(qp)` 替换手动 drain。`ib_drain_qp` 内部：
+1. `ib_modify_qp(qp, IB_QPS_ERR)` → 在飞 WR 以错误完成
+2. post drain WR（SQ+RQ）
+3. `wait_for_completion` → 等 drain WR 完成（workqueue 必已处理所有前序 CQE）
+
+修复后序列：`rdma_disconnect` → `ib_drain_qp` → `rdma_destroy_id` → `ib_free_cq`（cqe_used==0，无 WARNING）。
+
+验证：模块卸载、filer 重启重连、双 VM 同时卸载三个场景均无 WARNING。
 
 #### A.7.9 测试执行顺序
 
