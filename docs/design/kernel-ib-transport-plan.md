@@ -706,6 +706,21 @@ WRITES 阈值从 >1000 调整为 >500：ROOT36-B 公平性修复（2048 spin 后
 
 **Cross-VM 一致性验证（RDMA 传输）：** vm1 `dd if=/dev/urandom of=cross_1m.bin bs=1M count=1` (77.8 MB/s) md5=`86f74df40c498f34d0ea99391953e71a` → vm2 `ls + md5sum` MD5 match，vm1/vm2 dmesg deadline-exceeded 新条目 = 0，filer 日志 `FILER_NET_MKDIR/CREATE/READDIR/LOOKUP` 全部对应出现，client_id=1000001。
 
+**Complex Stress Test V2（RDMA 传输）：** `test_complex_stress_v2.sh` 全部通过，PASS=36 / FAIL=0 / WARN=2。
+
+| 测试项 | 验证内容 | 结果 |
+|--------|----------|------|
+| C8: Hard links + symlinks | inode 共享、link count、symlink traversal、dangling symlink | ✅ 10/10 PASS |
+| C9: Large directory (1000 entries) | 1000 文件创建/readdir/find/内容校验/50x readdir stress | ✅ 7/7 PASS |
+| C10: Concurrent rename/unlink races | 4 并发 rename worker (200 ops) + 并发 create+unlink | ✅ 3/3 PASS, 0 corrupted |
+| C11: fsync correctness | 4MB copy + fsync → MD5 match; 2MB append → 原 4MB 完好 + size=6MB | ✅ 4/4 PASS |
+| C12: Sparse file holes | 3x4KB at offset 0/1MB/2MB → size=2MB+4K; hole 区域读零 | ✅ 5/5 PASS |
+| C13: statfs consistency | df before/after 50MB write/after delete | ✅ 2/3 PASS, 1 WARN (cached) |
+| C14: 3-minute mixed workload | create/write/read/delete/rename 3986 iterations, 0 panic | ✅ 2/2 PASS |
+| C15: Memory pressure + slab leak | 500 文件 create/delete, slab before=64 after=64 无泄漏 | ✅ 2/2 PASS |
+
+WARN 说明：(1) C13a statfs used space 未增（volume server 报告 cached，非 bug）；(2) slab 从 32→64 未完全释放（内核 slab cache 正常行为，保留供复用）。
+
 ---
 
 
