@@ -767,3 +767,164 @@ WARN 说明：(1) C13a statfs used space 未增（volume server 报告 cached，
 5. IPoIB + RDMA CM 路径解析正确（IPoIB IP → GID → LID）
 
 **已知坑**：`ibv_rc_pingpong <host>` 的 `<host>` 参数是 hostname/IP（不是 LID）。初次尝试用 `ibv_rc_pingpong -d mlx5_0 1`（1 被当作 hostname）导致连接失败。正确用法是 `ibv_rc_pingpong -d mlx5_0 -g 0 192.168.100.3`。
+
+### A.7 双 VM 内核客户端测试验证计划
+
+本节规划对两个 VM（vm1=192.168.100.100, vm2=192.168.100.101）各自独立挂载 PowerFS 内核客户端（transport=rdma）的全面测试验证。测试分 7 个阶段，由浅入深，从基础连通性到并发压力到故障注入。
+
+#### A.7.1 测试环境基线
+
+| 组件 | vm1 | vm2 |
+|------|-----|-----|
+| SSH | localhost:2223 | localhost:2224 |
+| eth0 (TAP) | 172.30.0.100 | 172.30.0.101 |
+| ib0 (IPoIB) | 192.168.100.100 | 192.168.100.101 |
+| mlx5_0 LID | 0x04 | 0x05 |
+| VF PCI BDF | 0000:a0:02.3 | 0000:a0:02.4 |
+| CPU pinning | cores 1,3,5,7 (NUMA 1) | cores 9,11,13,15 (NUMA 1) |
+| powerfs.ko | /mnt/host/powerfs.ko (9p 热部署) | 同上 |
+| mount point | /mnt/powerfs | /mnt/powerfs |
+| transport | rdma | rdma |
+
+Filer: docker filer-1, network_mode=host, RDMA listener 0.0.0.0:9336, TCP fallback 9335.
+Master: docker master-1, TLS listener 0.0.0.0:9334 (两 VM 共用).
+
+#### A.7.2 Phase 1 — 双 VM 独立挂载 + 基础 I/O 验证
+
+**目标：** 确认两个 VM 各自独立挂载 transport=rdma 且基础 I/O 正常，filer 为每个 VM 分配独立 client_id。
+
+**测试步骤：**
+1. `bash ./qemuctl2.sh mount vm1` → `PROC_MOUNTS_CHECK=PASS transport=rdma` + `ls /mnt/powerfs` 5s 内出列表
+2. `bash ./qemuctl2.sh mount vm2` → 同上
+3. vm1: `echo "hello_from_vm1" > /mnt/powerfs/phase1_vm1.txt && cat /mnt/powerfs/phase1_vm1.txt`
+4. vm2: `echo "hello_from_vm2" > /mnt/powerfs/phase1_vm2.txt && cat /mnt/powerfs/phase1_vm2.txt`
+5. vm1: `cat /mnt/powerfs/phase1_vm2.txt` → 内容一致
+6. vm2: `cat /mnt/powerfs/phase1_vm1.txt` → 内容一致
+7. filer 日志: grep `CONN_SETUP.*FULLY_REGISTERED` 出现两个不同 client_id（vm1 + vm2）
+8. vm1/vm2 dmesg: `grep deadline` 0 新增行
+
+**验收标准：**
+- [ ] 两 VM 均 PROC_MOUNTS_CHECK=PASS（一次，无 FAIL 二行）
+- [ ] 跨 VM 读文件内容一致
+- [ ] filer 日志含两个不同 client_id 的 FULLY_REGISTERED
+- [ ] 两 VM dmesg deadline-exceeded = 0
+
+#### A.7.3 Phase 2 — 双 VM 并发 I/O + 一致性验证
+
+**目标：** 两 VM 同时对同一目录进行创建/写入/读取，验证文件系统一致性、lease 传播、dentry cache 刷新。
+
+**测试步骤：**
+1. vm1: `mkdir /mnt/powerfs/phase2_shared && cd /mnt/powerfs/phase2_shared`
+2. vm2: `cd /mnt/powerfs/phase2_shared`
+3. **并发写入**：vm1 和 vm2 各写 10 个不重名文件（file_vm1_0..9 / file_vm2_0..9），每文件 4KB 随机数据 + md5sum
+4. **交叉读取**：vm1 读 vm2 的 10 个文件并校验 MD5；vm2 读 vm1 的 10 个文件并校验 MD5
+5. **并发追加**：vm1 和 vm2 同时 `echo` 追加到同一文件 `shared_log.txt`，各 20 次
+6. vm1: `wc -l /mnt/powerfs/phase2_shared/shared_log.txt` → 行数 = 40 ± 2
+7. **并发删除**：vm1 删 file_vm1_*，vm2 删 file_vm2_*，然后 `ls` 确认目录空
+8. **目录可见性**：vm1 `mkdir sub1`，vm2 `ls -d sub1` → 存在；vm2 `mkdir sub2`，vm1 `ls -d sub2` → 存在
+9. vm1/vm2 dmesg: deadline-exceeded = 0
+
+**验收标准：**
+- [ ] 20 个文件 MD5 全部校验通过
+- [ ] shared_log.txt 行数 ≈ 40（并发追加无丢失行）
+- [ ] 删除后目录空
+- [ ] 子目录即时可见（lease 刷新正常）
+- [ ] dmesg deadline-exceeded = 0
+
+#### A.7.4 Phase 3 — 单 VM 卸载/重挂载不影响对端
+
+**目标：** vm1 umount + rmmod 后，vm2 的 mount 和 I/O 不受影响；vm1 重新 mount 后恢复。
+
+**测试步骤：**
+1. 确认两 VM 均已挂载，vm2 写入 `persistent.txt` 内容 "vm2_data"
+2. vm1: `umount /mnt/powerfs && rmmod powerfs`
+3. vm2: `cat /mnt/powerfs/persistent.txt` → "vm2_data"（不受影响）
+4. vm2: `echo "more_data" >> /mnt/powerfs/persistent.txt` → 写入成功
+5. vm1: `bash ./qemuctl2.sh mount vm1` → 重新挂载 transport=rdma
+6. vm1: `cat /mnt/powerfs/persistent.txt` → 内容含 "vm2_data" + "more_data"
+7. filer 日志: vm1 断开后 vm2 的连接保持 active，vm1 重新挂载分配新 client_id
+8. vm2 dmesg: 无新 ERROR/WARN
+
+**验收标准：**
+- [ ] vm1 卸载期间 vm2 I/O 正常
+- [ ] vm1 重新挂载后可见 vm2 的写入
+- [ ] filer 日志显示 vm2 连接未断开
+
+#### A.7.5 Phase 4 — 双 VM 并发压力测试
+
+**目标：** 两 VM 同时跑 60s I/O stress，验证 filer RDMA 连接池在双连接并发负载下的稳定性。
+
+**测试步骤：**
+1. vm1 和 vm2 同时执行 `rc18f_stress.sh` PART1（60s create/write/read/delete 循环）
+2. 两 VM 写入各自独立子目录 `stress_vm1/` / `stress_vm2/`
+3. 结束后交叉验证：vm1 `find /mnt/powerfs/stress_vm2 -type f | wc -l` 与 vm2 的 CREATES 数一致
+4. filer 日志: grep `FILER_NET_READDIR\|FILER_NET_LOOKUP\|FILER_NET_CREATE` 均有来自两个 client_id 的条目
+5. vm1/vm2 dmesg: 无 panic / hung task / deadline exceeded
+6. filer docker: 无 OOM / 无 restart
+
+**验收标准：**
+- [ ] 两 VM PART1 均 ERRORS=0
+- [ ] 跨 VM 文件数一致
+- [ ] filer 日志含两个 client_id 的 handler 调用
+- [ ] 无 panic / hung task / deadline exceeded
+
+#### A.7.6 Phase 5 — RDMA 性能基准测试
+
+**目标：** 测量两个 VM 内核客户端到 filer 的 RDMA 传输性能，以及 VM 间 RDMA 通信性能。
+
+**测试步骤：**
+1. **ib_send_lat（VM 间）**：vm2 server + vm1 client，1000 iterations
+2. **ib_send_bw（VM 间）**：vm2 server + vm1 client，2MB 消息大小
+3. **PowerFS I/O 延迟**：vm1 + vm2 各执行 `dd if=/dev/zero of=/mnt/powerfs/perf_test bs=4K count=1000` 测吞吐
+4. **PowerFS I/O 吞吐**：vm1 `dd if=/dev/zero of=/mnt/powerfs/perf_1m bs=1M count=100` 测 MB/s
+5. **Filer RDMA 连接数**：filer 日志 grep `accepted connection` 确认两个独立 RDMA 连接
+
+**验收标准：**
+- [ ] ib_send_lat avg < 2.0µs（当前 1.46µs）
+- [ ] ib_send_bw > 5 Gb/s
+- [ ] dd 4K 写入无 timeout
+- [ ] dd 1M 吞吐 > 50 MB/s
+
+#### A.7.7 Phase 6 — 故障注入与恢复
+
+**目标：** 验证单侧故障（VM crash / filer restart / RDMA 连接断开）后系统恢复能力。
+
+**测试步骤：**
+1. **Filer restart 场景**：两 VM 挂载 + 写入文件 → `docker restart filer-1` → 两 VM 重试连接 → 恢复后 I/O 正常
+2. **VM1 kill 场景**：两 VM 挂载 → `kill -9` vm1 QEMU → vm2 I/O 不受影响 → vm1 重启重新挂载 → I/O 恢复
+3. **VF 临时拔插**：两 VM 挂载 → vm1 `ibv_devinfo` 确认 VF 在线 → 模拟 VF 路径异常（可选：QEMU device_del+readd，较激进）→ 恢复后 I/O 正常
+
+**验收标准：**
+- [ ] Filer restart 后两 VM 自动重连（dmesg 显示 reconnect → connected）
+- [ ] VM1 crash 期间 VM2 I/O 不中断
+- [ ] VM1 恢复后可重新挂载
+- [ ] 无 panic / 数据丢失
+
+#### A.7.8 Phase 7 — 内核模块生命周期交叉验证
+
+**目标：** 验证一个 VM 的 powerfs.ko 卸载不影响另一个 VM 的内核模块运行。
+
+**测试步骤：**
+1. 两 VM 均挂载 transport=rdma，各写入文件
+2. vm1: `umount /mnt/powerfs && rmmod powerfs` → dmesg 显示干净卸载
+3. vm2: `ls /mnt/powerfs` 正常、`echo "still_working" > /mnt/powerfs/vm2_alive.txt` 成功
+4. vm2: `cat /mnt/powerfs/vm2_alive.txt` → "still_working"
+5. vm1: `bash ./qemuctl2.sh mount vm1` → 重新 insmod + mount → I/O 恢复
+6. 两 VM 同时 `umount + rmmod` → 均干净卸载
+7. filer 日志: 两个 client_id 均经历 disconnect → 重新 connect（如重挂载）
+
+**验收标准：**
+- [ ] vm1 rmmod 不影响 vm2 I/O
+- [ ] 两 VM 同时 rmmod 均干净卸载（module exit → comm layer exited → module unloaded）
+- [ ] 无 UAF panic / hung task
+- [ ] 重挂载后 I/O 恢复
+
+#### A.7.9 测试执行顺序
+
+```
+Phase 1 (基础挂载) → Phase 2 (并发 I/O) → Phase 3 (单侧卸载)
+→ Phase 4 (并发压力) → Phase 5 (性能基准) → Phase 6 (故障注入)
+→ Phase 7 (模块生命周期)
+```
+
+每个 Phase 通过后进入下一个。Phase 6 故障注入可以独立运行，不依赖前序结果。
