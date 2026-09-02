@@ -4297,6 +4297,121 @@ impl FilerNetHandler {
             }
         }
     }
+
+    /// P1-1: Session-level batch CapRelease — 多个 inode 的 CapRelease
+    /// 合并为一次 RPC, 典型场景是 `cp -r` 等批量 close 操作。
+    ///
+    /// **协议约定 (与内核侧 powerfs_net_batch_cap_release 对称):**
+    ///   Request: ClientId(string, 全局共享) + Limit(u64=batch_count)
+    ///            + per-entry (Ino + LeaseToken + CapSet) × batch_count
+    ///   Response: Limit(u64=echo)
+    ///            + per-entry (Ino + CapSet(entry_status, 0=OK)) × batch_count
+    ///
+    /// **路由简化:** 取第一个 inode 做 shard hint — 多数场景同目录 close
+    /// 的 inode 落在同一 shard, 只做一次 check_leader_strict。跨 shard
+    /// 的 entry release_cap 会返回 Err, per-entry 标错, 客户端后续可
+    /// 对错误条目单独发 CapRelease。
+    async fn handle_batch_cap_release(
+        &self,
+        ctx: &RequestContext,
+        msg: &NetMessage,
+    ) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let batch_limit = dec.next_u64(FieldId::Limit).unwrap_or(0);
+
+        if client_id.is_empty() || batch_limit == 0 {
+            warn!(
+                "BATCH_CAP_RELEASE: missing client_id={} or limit=0",
+                !client_id.is_empty()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        // ---- 全部顺序解码 (不解码时不需要路由判断) ----
+        let batch_limit_usize = batch_limit as usize;
+        let mut entries: Vec<(u64, String, u8)> = Vec::with_capacity(batch_limit_usize);
+        for _ in 0..batch_limit_usize {
+            let ino = dec.next_u64(FieldId::Ino).unwrap_or(0);
+            let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+            let held_caps = dec.next_u8(FieldId::CapSet).unwrap_or(0);
+            entries.push((ino, token, held_caps));
+        }
+
+        // ---- 双向 client_id 映射 (同 handle_cap_acquire) ----
+        {
+            let net_cid = ctx.client.client_id;
+            if net_cid != 0 {
+                self.cap_client_id_map
+                    .lock()
+                    .unwrap()
+                    .insert(client_id.clone(), net_cid);
+                self.cap_net_to_string
+                    .lock()
+                    .unwrap()
+                    .insert(net_cid, client_id.clone());
+            }
+        }
+
+        // ---- 路由: 第一个 ino 做 shard hint ----
+        let first_ino = entries[0].0;
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(first_ino);
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        // ---- 逐个 release_cap, per-entry 独立 status ----
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_u64(FieldId::Limit, batch_limit);
+
+        let mut ok_count: u64 = 0;
+        let mut err_count: u64 = 0;
+
+        for (ino, token, _held_caps) in &entries {
+            let status: u8 = match self.cap_mgr.release_cap(*ino, &client_id, token) {
+                Ok(Some(upgrade)) => {
+                    self.push_cap_upgrade_notify(
+                        *ino,
+                        &upgrade.holder,
+                        upgrade.sn,
+                        upgrade.granted_caps,
+                    );
+                    0 // OK, survivor upgraded
+                }
+                Ok(None) => 0, // OK, no upgrade needed
+                Err(e) => {
+                    warn!(
+                        "BATCH_CAP_RELEASE: inode={} client={} failed: {}",
+                        ino, client_id, e
+                    );
+                    1 // per-entry error
+                }
+            };
+            if status == 0 {
+                ok_count += 1;
+            } else {
+                err_count += 1;
+            }
+
+            // Response per-entry: Ino + CapSet(entry_status, 0=OK)
+            let _ = enc.add_u64(FieldId::Ino, *ino);
+            let _ = enc.add_u8(FieldId::CapSet, status);
+        }
+
+        info!(
+            "BATCH_CAP_RELEASE: client={} total={} ok={} err={}",
+            client_id, batch_limit, ok_count, err_count
+        );
+
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -4539,6 +4654,8 @@ impl NetHandler for FilerNetHandler {
             MsgType::CapRelease => self.handle_cap_release(msg).await,
             // P0-1: Incremental cap acquire (wanted > issued → upgrade)
             MsgType::CapAcquire => self.handle_cap_acquire(ctx, msg).await,
+            // P1-1: Session-level batch CapRelease (N× release merged into 1 RTT)
+            MsgType::BatchCapRelease => self.handle_batch_cap_release(ctx, msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {
