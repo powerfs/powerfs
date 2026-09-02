@@ -5,6 +5,7 @@
 //! storage, Raft consensus, and strong consistency metadata operations.
 
 use crate::cap_manager::{CapManager, CapRevoker, CapSet, RecallTimeoutPenalty};
+use crate::lock_arbiter::LockType;
 use crate::inode_lease_manager::InodeLeaseManager;
 use crate::inode_notifier::InodeNotifier;
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
@@ -4412,6 +4413,170 @@ impl FilerNetHandler {
 
         Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
     }
+
+    /// P1-3: POSIX advisory file lock request (flock / fcntl F_SETLK).
+    ///
+    /// Client sends Ino + ClientId + LockMode(0=RD, 1=WR, 2=UNLOCK) + Wait(0/1).
+    /// Filer's lock_arbiter Posix lock type (SimpleLock class) arbitrates.
+    /// For Wait=1 (blocking), if conflict, returns Granted=0 with a pending
+    /// notification — when the conflicting holder releases, FileLockGrant(0x99)
+    /// is pushed asynchronously. For Wait=0, returns Granted=0 immediately.
+    async fn handle_file_lock_request(
+        &self,
+        ctx: &RequestContext,
+        msg: &NetMessage,
+    ) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let lock_mode = dec.next_u8(FieldId::IsWriteOpen).unwrap_or(0); // 0=RD, 1=WR, 2=UNLOCK
+        let wait = dec.next_u8(FieldId::HasUpgrade).unwrap_or(0); // 0=non-block, 1=block
+
+        if inode == 0 || client_id.is_empty() {
+            warn!(
+                "FILE_LOCK: missing inode={} client_id={}",
+                inode,
+                !client_id.is_empty()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        // Bidirectional client_id mapping (same as handle_cap_acquire)
+        {
+            let net_cid = ctx.client.client_id;
+            if net_cid != 0 {
+                self.cap_client_id_map
+                    .lock()
+                    .unwrap()
+                    .insert(client_id.clone(), net_cid);
+                self.cap_net_to_string
+                    .lock()
+                    .unwrap()
+                    .insert(net_cid, client_id.clone());
+            }
+        }
+
+        // Route to shard leader (strict)
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        let arbiter = self.cap_mgr.arbiter();
+        let mut enc = TlvEncoder::new();
+        let granted: u8;
+
+        match lock_mode {
+            0 => {
+                // RD (shared/read lock)
+                let result = arbiter.rdlock(inode, LockType::Posix, &client_id);
+                if result.sn != 0 {
+                    granted = 1;
+                    info!(
+                        "FILE_LOCK: RD granted inode={} client={} sn={}",
+                        inode, client_id, result.sn
+                    );
+                } else {
+                    granted = 0;
+                    debug!(
+                        "FILE_LOCK: RD blocked inode={} client={} wait={}",
+                        inode, client_id, wait
+                    );
+                }
+            }
+            1 => {
+                // WR (exclusive/write lock)
+                let result = arbiter.wrlock(inode, LockType::Posix, &client_id);
+                if result.sn != 0 {
+                    granted = 1;
+                    info!(
+                        "FILE_LOCK: WR granted inode={} client={} sn={}",
+                        inode, client_id, result.sn
+                    );
+                } else {
+                    granted = 0;
+                    debug!(
+                        "FILE_LOCK: WR blocked inode={} client={} wait={}",
+                        inode, client_id, wait
+                    );
+                }
+            }
+            2 => {
+                // UNLOCK by client_id (not sn)
+                let _ = arbiter.posix_unlock(inode, &client_id);
+                granted = 1;
+                info!(
+                    "FILE_LOCK: UNLOCK inode={} client={}",
+                    inode, client_id
+                );
+                // After unlock, check if there are waiters to promote
+                // wake_waiters is called inside unlock; if a waiter is granted,
+                // we need to push FileLockGrant notification to it
+                let _ = self.push_file_lock_grant_to_waiters(inode);
+            }
+            _ => {
+                warn!("FILE_LOCK: invalid lock_mode={}", lock_mode);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_BAD_REQUEST,
+                    Vec::new(),
+                ));
+            }
+        }
+
+        let _ = enc.add_u8(FieldId::IsWriteOpen, lock_mode);
+        let _ = enc.add_u8(FieldId::HasUpgrade, granted);
+
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+    }
+
+    /// P1-3: After UNLOCK, check if any waiting client can now be granted.
+    /// Pushes FileLockGrant(0x99) notification to the newly-granted client.
+    fn push_file_lock_grant_to_waiters(&self, inode: u64) -> bool {
+        let Some(conn_mgr) = &self.server_conn_mgr else {
+            return false;
+        };
+
+        // Check if there's a waiter that was promoted by wake_waiters
+        let arbiter = self.cap_mgr.arbiter();
+        let waiters = arbiter.get_pending_waiters(inode, LockType::Posix);
+        for (client_id, lock_mode) in waiters {
+            let net_cid = {
+                let map = self.cap_client_id_map.lock().unwrap();
+                map.get(&client_id).copied()
+            };
+            if let Some(net_cid) = net_cid {
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_u64(FieldId::Ino, inode);
+                let _ = enc.add_u8(FieldId::IsWriteOpen, lock_mode);
+                let _ = enc.add_u8(FieldId::HasUpgrade, 1); // granted=1
+                let notify_msg =
+                    NetMessage::notification(MsgType::FileLockGrant, enc.into_bytes(), Vec::new());
+                match conn_mgr.send_notification(net_cid, notify_msg) {
+                    Ok(true) => {
+                        info!(
+                            "FileLockGrant: pushed to client={} inode={} mode={}",
+                            client_id, inode, lock_mode
+                        );
+                    }
+                    _ => {
+                        warn!(
+                            "FileLockGrant: push failed for client={} inode={}",
+                            client_id, inode
+                        );
+                    }
+                }
+            }
+        }
+        true
+    }
 }
 
 #[async_trait::async_trait]
@@ -4656,6 +4821,12 @@ impl NetHandler for FilerNetHandler {
             MsgType::CapAcquire => self.handle_cap_acquire(ctx, msg).await,
             // P1-1: Session-level batch CapRelease (N× release merged into 1 RTT)
             MsgType::BatchCapRelease => self.handle_batch_cap_release(ctx, msg).await,
+            MsgType::FileLockRequest => self.handle_file_lock_request(ctx, msg).await,
+            MsgType::FileLockGrant => {
+                // Filer should not receive FileLockGrant (it's Filer→Client notification)
+                // If we get here, it's a protocol error
+                Ok(Self::build_response(msg, STATUS_ERR_BAD_REQUEST, Vec::new()))
+            }
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {
