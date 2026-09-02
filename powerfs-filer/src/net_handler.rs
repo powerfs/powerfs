@@ -4197,7 +4197,20 @@ impl FilerNetHandler {
         match self.cap_mgr.recall_ack(inode, &client_id, &token) {
             Ok(_) => {
                 info!("CAP_RECALL_ACK: inode={} client={} acked", inode, client_id);
-                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+
+                // P2-1: Piggyback the client's new issued CapSet in the
+                // response. After recall_ack, the client's caps may have
+                // changed (e.g., downgraded from EXCL to WR). Including
+                // the new CapSet here saves a separate CapUpgradeNotify
+                // RPC (1 RTT saved per recall cycle).
+                let new_caps = self.cap_mgr.arbiter().eval_client_caps(inode, &client_id);
+                if !new_caps.is_empty() {
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_u8(FieldId::CapSet, new_caps.0);
+                    Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+                } else {
+                    Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+                }
             }
             Err(e) => {
                 warn!(
