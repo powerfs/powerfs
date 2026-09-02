@@ -833,6 +833,22 @@ pub enum MsgType {
     // Response TLV: LeaseToken + CapSet(granted) + CapEpoch + CapSn + LeaseDuration
     CapAcquire = 0x0096,
 
+    // P1-1: Client → Filer: batch-release caps for multiple inodes in one RTT.
+    // Session-level merging: when N inodes close() nearly simultaneously,
+    // the client queues them and flushes via one BatchCapRelease instead of Nx CapRelease.
+    // Filer iterates entries and calls cap_manager.release_cap() per inode,
+    // running upgrade detection independently for each.
+    //
+    // Request TLV:
+    //   ClientId(string)  — at top level (shared by all entries)
+    //   BatchCount(u64)   — number of entries following
+    //   Per-entry (repeated BatchCount times, fields embedded directly —
+    //   NOT nested sub-TLV to keep wire simple):
+    //     Ino(u64) + LeaseToken(string) + CapSet(held_caps u8)
+    //
+    // Response TLV: BatchCount(u64) + per-entry Status(u16)
+    BatchCapRelease = 0x0097,
+
     // Raft inter-node operations
     /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
     /// to the peer that leads the target shard group.
@@ -918,6 +934,7 @@ impl MsgType {
             0x0094 => Some(Self::CapRecallNotify),
             0x0095 => Some(Self::CapUpgradeNotify),
             0x0096 => Some(Self::CapAcquire),
+            0x0097 => Some(Self::BatchCapRelease),
             0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
@@ -960,6 +977,7 @@ impl MsgType {
                 | MsgType::CapRecallNotify
                 | MsgType::CapUpgradeNotify
                 | MsgType::CapAcquire
+                | MsgType::BatchCapRelease
         )
     }
 }
