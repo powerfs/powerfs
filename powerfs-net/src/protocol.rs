@@ -849,6 +849,27 @@ pub enum MsgType {
     // Response TLV: BatchCount(u64) + per-entry Status(u16)
     BatchCapRelease = 0x0097,
 
+    // P1-3: Client → Filer: request a POSIX advisory file lock (flock/fcntl).
+    // The Filer's lock_arbiter arbitrates cross-node conflicts using a
+    // dedicated Posix lock type (SimpleLock class: shared read / exclusive write).
+    //
+    // Request TLV:
+    //   Ino(u64) + ClientId(string) + LockMode(u8: 0=RD/SHARED, 1=WR/EXCLUSIVE, 2=UNLOCK)
+    //   + Wait(u8: 0=non-blocking(EAGAIN on conflict), 1=blocking(sleep until granted))
+    //
+    // Response TLV:
+    //   LockMode(u8, echo) + Granted(u8: 1=granted, 0=denied/conflict)
+    FileLockRequest = 0x0098,
+
+    // P1-3: Filer → Client: async grant notification for a previously blocked
+    // FileLockRequest (Wait=1). When a conflicting holder releases, the Filer
+    // pushes this notification to the waiting client so it can complete the
+    // blocking flock/setlkw call.
+    //
+    // Notification TLV:
+    //   Ino(u64) + LockMode(u8) + Granted(u8=1)
+    FileLockGrant = 0x0099,
+
     // Raft inter-node operations
     /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
     /// to the peer that leads the target shard group.
@@ -935,6 +956,8 @@ impl MsgType {
             0x0095 => Some(Self::CapUpgradeNotify),
             0x0096 => Some(Self::CapAcquire),
             0x0097 => Some(Self::BatchCapRelease),
+            0x0098 => Some(Self::FileLockRequest),
+            0x0099 => Some(Self::FileLockGrant),
             0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
@@ -978,6 +1001,8 @@ impl MsgType {
                 | MsgType::CapUpgradeNotify
                 | MsgType::CapAcquire
                 | MsgType::BatchCapRelease
+                | MsgType::FileLockRequest
+                | MsgType::FileLockGrant
         )
     }
 }
