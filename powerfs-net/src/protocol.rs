@@ -825,6 +825,13 @@ pub enum MsgType {
     // caching). Carries new caps + epoch + SN.
     // Notification TLV: Ino + LeaseToken + CapSet(granted) + LeaseEpoch + SN
     CapUpgradeNotify = 0x0095,
+    // P0-1: Client → Filer: incrementally acquire/upgrade caps after open().
+    // When wanted > issued (e.g. write-opened file needs FILE_WR/EXCL but only
+    // has FILE_SHARED), client sends this with wanted CapSet. Filer runs
+    // lock_arbiter wrlock/xlock → GATHER recall if needed → returns upgraded grant.
+    // Request TLV: Ino + ClientId + LeaseToken + CapSet(wanted u8)
+    // Response TLV: LeaseToken + CapSet(granted) + CapEpoch + CapSn + LeaseDuration
+    CapAcquire = 0x0096,
 
     // Raft inter-node operations
     /// Filer → Filer: forward a Raft protocol message (eraftpb::Message)
@@ -910,6 +917,7 @@ impl MsgType {
             0x0093 => Some(Self::CapRelease),
             0x0094 => Some(Self::CapRecallNotify),
             0x0095 => Some(Self::CapUpgradeNotify),
+            0x0096 => Some(Self::CapAcquire),
             0x0090 => Some(Self::RaftMessage),
             _ => None,
         }
@@ -951,6 +959,7 @@ impl MsgType {
                 | MsgType::CapRelease
                 | MsgType::CapRecallNotify
                 | MsgType::CapUpgradeNotify
+                | MsgType::CapAcquire
         )
     }
 }

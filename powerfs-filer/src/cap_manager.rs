@@ -382,6 +382,85 @@ impl CapManager {
         }
     }
 
+    /// P0-1: Incrementally acquire/upgrade caps for an existing cap holder.
+    ///
+    /// Called when client's `wanted > issued` (e.g. file was opened read-only
+    /// but now needs write access, or SHARED_WRITE holder needs EXCL).
+    /// The Filer's lock_arbiter runs the appropriate lock operation:
+    ///   - wanted has X → `xlock` (exclusive, triggers GATHER on others)
+    ///   - wanted has W → `wrlock` (write, may trigger recall)
+    ///   - wanted has R only → `rdlock` (read, usually instant)
+    ///
+    /// If other holders exist, the arbiter generates `recall_tasks` which
+    /// the caller (net_handler) dispatches asynchronously, exactly as in
+    /// `open_grant`. The acquire RPC itself returns immediately with the
+    /// upgraded grant (or `NONE` if GATHER is in progress and client must wait).
+    pub fn acquire(
+        &self,
+        inode: u64,
+        client_id: &str,
+        _token: &str,
+        wanted: CapSet,
+    ) -> OpenGrantResult {
+        self.active_inodes.lock().unwrap().insert(inode);
+
+        let lock_type = LockType::File;
+        let grant = if wanted.has_x() {
+            self.arbiter.xlock(inode, lock_type, client_id)
+        } else if wanted.has_w() {
+            self.arbiter.wrlock(inode, lock_type, client_id)
+        } else {
+            self.arbiter.rdlock(inode, lock_type, client_id)
+        };
+
+        if grant.granted_caps != CapSet::NONE {
+            if let Some(mc) = &self.meta_cache {
+                mc.incr_refcount(inode);
+                mc.cap_attach(
+                    inode,
+                    client_id,
+                    grant.sn,
+                    grant.granted_caps,
+                    grant.epoch,
+                    true,
+                );
+            }
+        }
+
+        let recall_tasks: Vec<RecallTask> = grant
+            .recall_tasks
+            .iter()
+            .map(|t| RecallTask {
+                holder: t.client_id.clone(),
+                token: generate_token(inode, &t.client_id, t.sn),
+                caps_to_recall: t.caps_to_recall,
+                retained_caps: t.retained_caps,
+                new_epoch: t.new_epoch,
+            })
+            .collect();
+
+        let token = generate_token(inode, client_id, grant.sn);
+
+        log::debug!(
+            "CapManager::acquire inode={} client={} wanted={:?} granted={:?} sn={} recalls={}",
+            inode,
+            client_id,
+            wanted,
+            grant.granted_caps,
+            grant.sn,
+            recall_tasks.len()
+        );
+
+        OpenGrantResult {
+            granted_caps: grant.granted_caps,
+            token,
+            epoch: grant.epoch,
+            duration_ms: self.duration_ms,
+            sn: grant.sn,
+            recall_tasks,
+        }
+    }
+
     /// 客户端 ACK recall. 遍历所有 `LockType` 调 `arbiter.recall_ack`,
     /// 命中匹配 (client_id, sn) 的 lock_type 即完成 GATHER 计数减一.
     ///

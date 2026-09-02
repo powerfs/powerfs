@@ -4052,6 +4052,94 @@ impl FilerNetHandler {
         Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
     }
 
+    /// P0-1: Handle CapAcquire (incremental cap upgrade request).
+    ///
+    /// Request TLV: Ino + ClientId + LeaseToken + CapSet(wanted u8)
+    /// Response TLV: LeaseToken + CapSet(granted) + CapEpoch + CapSn + LeaseDuration
+    ///
+    /// Similar to handle_cap_open_grant but for existing cap holders wanting
+    /// to upgrade (e.g. SHARED → EXCL after write open, or R-only → W+X).
+    async fn handle_cap_acquire(
+        &self,
+        ctx: &RequestContext,
+        msg: &NetMessage,
+    ) -> NetResult<NetMessage> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let token = dec.next_string(FieldId::LeaseToken).unwrap_or_default();
+        let wanted_u8 = dec.next_u8(FieldId::CapSet).unwrap_or(0);
+        let wanted = CapSet(wanted_u8);
+
+        if inode == 0 || client_id.is_empty() || token.is_empty() {
+            warn!("CAP_ACQUIRE: missing inode={} or client_id/token empty", inode);
+            return Ok(Self::build_response(msg, STATUS_ERR_BAD_REQUEST, Vec::new()));
+        }
+
+        // Route to shard leader (same as cap_open_grant)
+        let shard_id = self
+            .meta_shard_manager
+            .get_shard_strategy()
+            .calculate_shard(inode);
+        if let Err(redirect) = self.check_leader_strict(msg, shard_id).await {
+            return Ok(redirect);
+        }
+
+        // Ensure bidirectional client_id mapping is up-to-date
+        {
+            let net_cid = ctx.client.client_id;
+            if net_cid != 0 {
+                self.cap_client_id_map
+                    .lock()
+                    .unwrap()
+                    .insert(client_id.clone(), net_cid);
+                self.cap_net_to_string
+                    .lock()
+                    .unwrap()
+                    .insert(net_cid, client_id.clone());
+            }
+        }
+
+        let result = self.cap_mgr.acquire(inode, &client_id, &token, wanted);
+
+        // Dispatch recall tasks asynchronously (same as open_grant)
+        for task in &result.recall_tasks {
+            if let Err(e) = self.cap_mgr.recall_holder(
+                inode,
+                &task.holder,
+                &task.token,
+                task.caps_to_recall,
+                task.retained_caps,
+                task.new_epoch,
+            ) {
+                warn!(
+                    "CAP_ACQUIRE: recall push failed for holder={} inode={}: {}",
+                    task.holder, inode, e
+                );
+            }
+        }
+
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_string(FieldId::LeaseToken, &result.token);
+        let _ = enc.add_u8(FieldId::CapSet, result.granted_caps.0);
+        let _ = enc.add_u64(FieldId::CapEpoch, result.epoch);
+        let _ = enc.add_u64(FieldId::CapSn, result.sn);
+        let _ = enc.add_u64(FieldId::LeaseDuration, result.duration_ms);
+
+        info!(
+            "CAP_ACQUIRE: inode={} client={} wanted={:?} granted={:?} epoch={} sn={} recalls={}",
+            inode,
+            client_id,
+            wanted,
+            result.granted_caps,
+            result.epoch,
+            result.sn,
+            result.recall_tasks.len()
+        );
+
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+    }
+
     /// Handle CapRecallAck (§13 — client flushed dirty data, releasing caps).
     ///
     /// Request TLV: Ino + ClientId + LeaseToken
@@ -4449,6 +4537,8 @@ impl NetHandler for FilerNetHandler {
             MsgType::CapOpenGrant => self.handle_cap_open_grant(ctx, msg).await,
             MsgType::CapRecallAck => self.handle_cap_recall_ack(msg).await,
             MsgType::CapRelease => self.handle_cap_release(msg).await,
+            // P0-1: Incremental cap acquire (wanted > issued → upgrade)
+            MsgType::CapAcquire => self.handle_cap_acquire(ctx, msg).await,
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
             _ => {
