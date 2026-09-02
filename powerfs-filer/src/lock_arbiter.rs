@@ -1325,6 +1325,26 @@ impl LockArbiter {
         total
     }
 
+    /// P2-1: 获取指定 client 在指定 inode 上的当前 issued caps.
+    /// 用于 recall_ack piggyback grant — recall_ack 响应中携带 client 的新
+    /// issued caps, 省 1 次 CapUpgradeNotify RPC.
+    pub fn eval_client_caps(&self, inode: u64, client_id: &str) -> CapSet {
+        let locks = self.locks.lock().unwrap();
+        if let Some(lock_arr) = locks.get(&inode) {
+            let mut total = CapSet::NONE;
+            for lock in lock_arr.iter() {
+                for holder in &lock.holders {
+                    if holder.client_id == client_id {
+                        total = total | holder.granted_caps;
+                    }
+                }
+            }
+            total
+        } else {
+            CapSet::NONE
+        }
+    }
+
     /// 获取指定锁的当前 eval_issued
     pub fn get_eval_issued(&self, inode: u64, lock_type: LockType) -> CapSet {
         let mut locks = self.locks.lock().unwrap();
