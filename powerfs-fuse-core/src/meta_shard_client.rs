@@ -1899,6 +1899,61 @@ impl MetaShardClient {
 
         Ok(())
     }
+
+    /// §13 Phase 3: send a `CapAcquire` (0x96) to the Filer to request
+    /// incremental cap bits (e.g. AUTH_EXCL / XATTR_EXCL for setattr /
+    /// unlink / rename). The Filer's `handle_cap_acquire` evals the
+    /// lock_arbiter state and returns the granted bits (may be fewer
+    /// than requested if there are conflicting holders).
+    ///
+    /// Request TLV: Ino + ClientId + LeaseToken + CapSet(wanted u8).
+    /// Response TLV: LeaseToken + CapSet(granted) + CapEpoch + CapSn +
+    ///               LeaseDuration (same shape as CapOpenGrant response).
+    pub async fn cap_acquire(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+        wanted: u8,
+    ) -> Result<(String, u8, u64, u64, u64), String> {
+        let shard_id = self.calculate_shard_id(inode);
+
+        let mut enc = serialize::TlvEncoder::new();
+        enc.add_u64(powerfs_net::FieldId::Ino, inode);
+        enc.add_string(powerfs_net::FieldId::ClientId, client_id)
+            .map_err(|e| format!("encode ClientId: {:?}", e))?;
+        enc.add_string(powerfs_net::FieldId::LeaseToken, token)
+            .map_err(|e| format!("encode LeaseToken: {:?}", e))?;
+        enc.add_u8(powerfs_net::FieldId::CapSet, wanted);
+
+        let resp = self
+            .send_coherence_msg(MsgType::CapAcquire, shard_id, enc.into_bytes())
+            .await?;
+
+        let mut dec = powerfs_net::serialize::TlvDecoder::new(&resp);
+        let granted_token = dec
+            .next_string(powerfs_net::FieldId::LeaseToken)
+            .unwrap_or_default();
+        let granted_bits = dec.next_u8(powerfs_net::FieldId::CapSet).unwrap_or(0);
+        let epoch = dec.next_u64(powerfs_net::FieldId::CapEpoch).unwrap_or(0);
+        let sn = dec.next_u64(powerfs_net::FieldId::CapSn).unwrap_or(0);
+        let duration_ms = dec
+            .next_u64(powerfs_net::FieldId::LeaseDuration)
+            .unwrap_or(0);
+
+        log::debug!(
+            "cap_acquire: inode={} client={} wanted={:#b} → granted={:#b} epoch={} sn={} duration_ms={}",
+            inode,
+            client_id,
+            wanted,
+            granted_bits,
+            epoch,
+            sn,
+            duration_ms
+        );
+
+        Ok((granted_token, granted_bits, epoch, sn, duration_ms))
+    }
 }
 
 // ---------------------------------------------------------------------------

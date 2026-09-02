@@ -108,6 +108,11 @@ pub struct ClientCap {
     /// Flushing cap bits. Set while a flush RPC is in flight; cleared
     /// when release/recall ACK succeeds.
     pub flushing_caps: CapSet,
+    /// Pending flush caps — bits queued for the next batch flush
+    /// (BatchCapRelease 0x97). Set when dirty_caps is moved to flushing
+    /// but the RPC hasn't been sent yet. Distinct from `flushing_caps`
+    /// which tracks in-flight RPC bits.
+    pub pending_flush: CapSet,
     /// True if the client opened with O_WRONLY/O_RDWR (a writer).
     pub is_writer: bool,
     /// Grant timestamp.
@@ -135,6 +140,7 @@ impl ClientCap {
             epoch,
             dirty_caps: CapSet::NONE,
             flushing_caps: CapSet::NONE,
+            pending_flush: CapSet::NONE,
             is_writer,
             granted_at: Instant::now(),
         }
@@ -143,6 +149,34 @@ impl ClientCap {
     /// Mark the given cap bits as dirty (local unsynced state).
     pub fn mark_dirty(&mut self, cap: CapSet) {
         self.dirty_caps = self.dirty_caps.union(cap);
+    }
+
+    /// Mark cap bits as wanted (advisory — tells the server what we need).
+    /// If the wanted bits are not yet issued, the caller should send
+    /// an AcquireCap (0x96) RPC to request the upgrade.
+    pub fn mark_wanted(&mut self, cap: CapSet) {
+        self.wanted = self.wanted.union(cap);
+    }
+
+    /// Returns the cap bits that are wanted but not yet issued —
+    /// i.e. the bits we need to acquire from the server.
+    /// Non-empty result means the caller should send AcquireCap(0x96).
+    pub fn needs_acquire(&self) -> CapSet {
+        self.wanted.remove(self.issued)
+    }
+
+    /// True if there are pending cap bits to acquire from the server.
+    pub fn needs_acquire_rpc(&self) -> bool {
+        !self.needs_acquire().is_empty()
+    }
+
+    /// Mark the given dirty cap bits as pending flush (queued for the
+    /// next BatchCapRelease RPC). Moves bits from dirty_caps to
+    /// pending_flush atomically.
+    pub fn mark_pending_flush(&mut self, cap: CapSet) {
+        let to_move = self.dirty_caps.intersection(cap);
+        self.dirty_caps = self.dirty_caps.remove(to_move);
+        self.pending_flush = self.pending_flush.union(to_move);
     }
 
     /// Issued caps minus dirty and flushing (clean issued bits).
@@ -167,8 +201,9 @@ impl ClientCap {
         self.issued.contains(CapSet::CAP_X)
     }
 
-    /// Apply a server grant/update.
+    /// Apply a server grant/update (from CapOpenGrant or AcquireCap response).
     /// Returns the old issued caps for diffing.
+    /// Clears wanted bits that are now satisfied by the new issued set.
     pub fn apply_grant(&mut self, issued: CapSet, seq: u64, epoch: u64) -> CapSet {
         let old = self.issued;
         self.issued = issued;
@@ -178,6 +213,8 @@ impl ClientCap {
         self.epoch = epoch;
         // Clear dirty bits that are now re-issued.
         self.dirty_caps = self.dirty_caps.remove(issued);
+        // Clear wanted bits that are now issued (need satisfied).
+        self.wanted = self.wanted.remove(issued);
         old
     }
 
@@ -196,9 +233,10 @@ impl ClientCap {
         recalled
     }
 
-    /// Mark flush complete — clear `flushing_caps`.
+    /// Mark flush complete — clear `flushing_caps` and `pending_flush`.
     pub fn mark_flushed(&mut self) {
         self.flushing_caps = CapSet::NONE;
+        self.pending_flush = CapSet::NONE;
     }
 
     /// Apply a server upgrade notification — restore EXCLUSIVE caps.
@@ -348,5 +386,38 @@ mod tests {
         waiters.notify(42, CapSet::EXCLUSIVE);
         let issued = rx.blocking_recv().unwrap();
         assert!(issued.is_exclusive());
+    }
+
+    #[test]
+    fn test_needs_acquire_after_mark_wanted() {
+        // Start with CAP_R only.
+        let mut cap = ClientCap::new(4, "tok-4".into(), CapSet::CAP_R, 1, true, 400);
+        assert!(!cap.needs_acquire_rpc());
+
+        // Want CAP_W for writes — not yet issued.
+        cap.mark_wanted(CapSet::CAP_W);
+        assert!(cap.needs_acquire_rpc());
+        assert!(cap.needs_acquire().contains(CapSet::CAP_W));
+        assert!(!cap.needs_acquire().contains(CapSet::CAP_R));
+
+        // Server grants CAP_W — wanted cleared.
+        cap.apply_grant(CapSet::CAP_R.union(CapSet::CAP_W), 401, 2);
+        assert!(!cap.needs_acquire_rpc());
+    }
+
+    #[test]
+    fn test_pending_flush_lifecycle() {
+        let mut cap = ClientCap::new(5, "tok-5".into(), CapSet::EXCLUSIVE, 1, true, 500);
+        cap.mark_dirty(CapSet::CAP_W);
+        assert!(!cap.dirty_caps.is_empty());
+
+        // Queue for batch flush.
+        cap.mark_pending_flush(CapSet::CAP_W);
+        assert!(cap.dirty_caps.is_empty());
+        assert!(cap.pending_flush.contains(CapSet::CAP_W));
+
+        // mark_flushed clears pending_flush.
+        cap.mark_flushed();
+        assert!(cap.pending_flush.is_empty());
     }
 }

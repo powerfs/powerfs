@@ -1103,6 +1103,62 @@ impl PowerFsFs {
             .calculate_shard_id(inode)
     }
 
+    /// §13 Phase 3.3: Ensure the client has CAP_X (AUTH_EXCL) before
+    /// metadata operations (setattr/unlink/rename). If the current cap
+    /// doesn't include CAP_X, send a CapAcquire(0x96) RPC to the Filer
+    /// so the lock_arbiter can recall conflicting caps from other clients.
+    ///
+    /// Advisory — if the RPC fails (no cap yet, or Filer rejects), the
+    /// caller proceeds with the metadata RPC which goes through Filer Raft
+    /// (strong consistency), so correctness is preserved even without the cap.
+    fn acquire_meta_cap(&self, inode: u64) {
+        // Check if we already have CAP_X.
+        let needs_x = self
+            .cache
+            .with_cap_mut(inode, |cap| {
+                !cap.issued.contains(crate::client_cap::CapSet::CAP_X)
+            })
+            .unwrap_or(true); // No cap at all → needs acquire.
+
+        if !needs_x {
+            return; // Already have CAP_X.
+        }
+
+        // Get the current token (if any) for the acquire RPC.
+        let token = self
+            .cache
+            .with_cap_mut(inode, |cap| cap.token.clone())
+            .unwrap_or_default();
+
+        if token.is_empty() {
+            return; // No cap — metadata RPC goes through Filer directly.
+        }
+
+        let facade = self.client.facade().clone();
+        let cid = self.client.client_id();
+        match self.client.block_on(async move {
+            facade.cap_acquire(inode, &cid, &token, 0b100).await
+        }) {
+            Ok((_granted_token, granted_bits, epoch, sn, _duration_ms)) => {
+                let granted = crate::client_cap::CapSet(granted_bits);
+                self.cache.with_cap_mut(inode, |cap| {
+                    cap.apply_grant(granted, sn, epoch);
+                });
+                debug!(
+                    "acquire_meta_cap: inode={} granted CAP_X={:#b} epoch={} sn={}",
+                    inode, granted_bits, epoch, sn
+                );
+            }
+            Err(e) => {
+                // Advisory — proceed with metadata RPC (Filer Raft handles consistency).
+                debug!(
+                    "acquire_meta_cap: inode={} advisory skip: {}",
+                    inode, e
+                );
+            }
+        }
+    }
+
     /// Phase-4 §5.1 Lockify fast path: speculatively populate the
     /// local lock cache with a local token after a fresh inode is
     /// minted by the Filer (creat/mkdir/mknod/symlink). The async
@@ -3382,6 +3438,11 @@ impl FileSystem for PowerFsFs {
     ) -> std::io::Result<(libc::stat64, Duration)> {
         debug!("setattr: inode={}, valid={:?}", inode, valid);
 
+        // §13 Phase 3.3: Acquire CAP_X (AUTH_EXCL) before metadata mutation.
+        // Advisory — if it fails, the Filer Raft setattr RPC still ensures
+        // consistency.
+        self.acquire_meta_cap(inode);
+
         // NOTE: Do NOT check the cache at the start of setattr. The kernel
         // passes all needed fields via `attr` and `valid`, so reading from
         // the cache is unnecessary. More importantly, checking the cache here
@@ -3686,6 +3747,9 @@ impl FileSystem for PowerFsFs {
             parent, name_str, mode
         );
 
+        // §13 Phase 3.3: Acquire CAP_X on parent before directory mutation.
+        self.acquire_meta_cap(parent);
+
         if self.entry_exists(parent, name_str) {
             return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
         }
@@ -3798,6 +3862,9 @@ impl FileSystem for PowerFsFs {
         let name_str = name.to_str().unwrap_or("");
         debug!("rmdir: parent={}, name={}", parent, name_str);
 
+        // §13 Phase 3.3: Acquire CAP_X on parent before directory mutation.
+        self.acquire_meta_cap(parent);
+
         // Step 2: 通过 MetadataClient.rmdir RPC 走 Filer Raft leader（强一致）
         // Filer 的 handle_rmdir 会做空目录检查（ENOTEMPTY），客户端不需要重复检查。
         let meta_client = self.client.facade().meta_shard_client().clone();
@@ -3827,6 +3894,10 @@ impl FileSystem for PowerFsFs {
     fn unlink(&self, _ctx: &Context, parent: Self::Inode, name: &CStr) -> std::io::Result<()> {
         let name_str = name.to_str().unwrap_or("");
         debug!("unlink: parent={}, name={}", parent, name_str);
+
+        // §13 Phase 3.3: Acquire CAP_X (AUTH_EXCL) on parent before
+        // directory mutation. Advisory — Filer Raft ensures consistency.
+        self.acquire_meta_cap(parent);
 
         // Try cache first; if miss, use dentry lease check.
         // Only fall back to lookup RPC when dentry lease is expired/miss.
@@ -8629,6 +8700,14 @@ impl FileSystem for PowerFsFs {
             "rename: olddir={}, oldname={}, newdir={}, newname={}, flags={}",
             olddir, old_str, newdir, new_str, flags
         );
+
+        // §13 Phase 3.3: Acquire CAP_X (AUTH_EXCL) on both source and
+        // target parent directories before cross-directory mutation.
+        // Advisory — Filer Raft ensures consistency.
+        self.acquire_meta_cap(olddir);
+        if newdir != olddir {
+            self.acquire_meta_cap(newdir);
+        }
 
         let no_replace = (flags & 1) != 0;
         if no_replace && self.entry_exists(newdir, new_str) {

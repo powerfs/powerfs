@@ -883,6 +883,22 @@ impl FuseClientFacade {
             .await
     }
 
+    /// §13 Phase 3: send a `CapAcquire` (0x96) to request incremental cap
+    /// bits (e.g. AUTH_EXCL for setattr, XATTR_EXCL for setxattr). Returns
+    /// `(granted_token, granted_bits, epoch, sn, duration_ms)`. Delegates
+    /// to MetaShardClient.
+    pub async fn cap_acquire(
+        &self,
+        inode: u64,
+        client_id: &str,
+        token: &str,
+        wanted: u8,
+    ) -> Result<(String, u8, u64, u64, u64), String> {
+        self.meta_shard_client
+            .cap_acquire(inode, client_id, token, wanted)
+            .await
+    }
+
     /// 获取指定 inode 的所有有效 stripe lease token（委托给 VolumeClient）
     pub fn get_all_valid_lease_tokens_for_inode(
         &self,
