@@ -1122,6 +1122,47 @@ impl LockArbiter {
                 LockState::Dscatter if lock.holders.is_empty() => {
                     lock.state = LockState::Inactive;
                 }
+                LockState::Gather => {
+                    // ROOT48: GATHER 状态下被 recall 的 holder unlock
+                    // (close/release/断连), 必须 ACK 该 holder 的
+                    // gather entry. 否则 GATHER 残留, gather_remaining
+                    // 不减, 新的 wrlock 调用看到 holders 为空,
+                    // need_gather=false, 直接授予 EXCL — 导致两台 VM
+                    // 同时持有 EXCL, O_APPEND 并发写入互相覆盖数据
+                    // (实测 concurrent_test.txt 两台 VM 大小不同,
+                    //  丢失 VM2-23 行).
+                    //
+                    // 处理:
+                    //   a) sn 在 gather_list 中 → ACK 该 entry
+                    //   b) 所有 entry 都 ACK → gather_complete + wake
+                    //   c) holders 空 (被 recall 方都离开) → 清除
+                    //      GATHER + wake (等待者重新发起 xlock/wrlock)
+                    let mut all_done = true;
+                    let mut matched_in_gather = false;
+                    for g in &mut lock.gather_list {
+                        if g.sn == sn {
+                            g.acked = true;
+                            matched_in_gather = true;
+                        }
+                        if !g.acked {
+                            all_done = false;
+                        }
+                    }
+                    if matched_in_gather {
+                        if all_done && lock.gather_remaining > 0 {
+                            lock.gather_remaining = 0;
+                            lock.gather_complete();
+                            wake_needed = true;
+                        } else if lock.holders.is_empty() {
+                            // 被 recall 方都离开了, GATHER 无意义,
+                            // 清除 + 唤醒等待者重新发起请求
+                            lock.gather_list.clear();
+                            lock.gather_remaining = 0;
+                            lock.state = LockState::Available;
+                            wake_needed = true;
+                        }
+                    }
+                }
                 _ => {}
             }
 
