@@ -238,7 +238,7 @@ pub struct FilerConfig {
 }
 
 /// 文件布局预测配置
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayoutConfig {
     /// 启用布局预测 (默认 true).
     /// 关闭时新文件使用 Empty → auto_promote 回退.
@@ -301,6 +301,22 @@ fn default_rule_confidence() -> f32 {
 
 fn default_rule_priority() -> u32 {
     50
+}
+
+/// Manual Default impl — when [filer.layout] section is entirely missing
+/// from TOML, serde uses this to provide sensible defaults
+/// (enable_prediction=true, min_confidence=0.6).
+/// Without this, #[derive(Default)] would give enable_prediction=false
+/// and min_confidence=0.0.
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            enable_prediction: true,
+            fallback: default_fallback_strategy(),
+            min_confidence: default_min_confidence(),
+            rules: Vec::new(),
+        }
+    }
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置
