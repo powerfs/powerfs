@@ -219,6 +219,7 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
                 .clone()
                 .unwrap_or_else(|| "tcp".to_string()),
             rdma_device: cfg.volume.rdma_device.clone(),
+            require_rdma: cfg.volume.require_rdma,
             ..Default::default()
         };
         match powerfs_net::create_transport(&transport_cfg) {
