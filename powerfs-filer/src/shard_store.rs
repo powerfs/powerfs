@@ -2980,7 +2980,29 @@ impl ShardStore {
             // Filer's current data, causing other clients' appends to
             // be lost). This is the ONLY place inline_data is overwritten
             // (not appended), so any size regression traces back to here.
-            if inline_data.is_some() {
+            //
+            // MC-108 fix: If the inode has already been migrated to FLAT
+            // (chunks non-empty or storage_mode is Flat), reject the
+            // inline overwrite from a stale client that doesn't know about
+            // the migration. Otherwise the stale inline sync would clear
+            // the migrated chunks and regress the inode back to Inline,
+            // losing the other client's data.
+            if inline_data.is_some() && (!info.chunks.is_empty() || info.storage_mode.is_volume_backed()) {
+                log::warn!(
+                    "Shard {} STALE_INLINE_REJECT: inode {} has chunks (len={}) / storage_mode={:?}, \
+                     rejecting inline overwrite (size={}, inline_len={}) — client must re-fetch layout",
+                    self.shard_id.0,
+                    inode,
+                    info.chunks.len(),
+                    info.storage_mode,
+                    size,
+                    inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                );
+                // Keep existing FLAT state intact. Do NOT overwrite chunks
+                // or inline_data. The stale client will re-fetch via
+                // refresh_work / dentry lease expiry and see FLAT.
+                // Skip the rest of the inline overwrite branch.
+            } else if inline_data.is_some() {
                 log::info!(
                     "Shard {} Overwrite: inode {} size={} inline_len={} (existing_inline_len={}) — \
                      is_append=false, client buffer sent in overwrite mode",

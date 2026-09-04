@@ -630,10 +630,29 @@ impl MetaCache {
             // already committed a larger size. Protect by using max(size)
             // semantics (mirrors ShardStore L2945-2969).
             if let Some(data) = inline_data {
-                // Inline overwrite (explicit): caller wants full replacement.
-                existing.info.size = size;
-                existing.info.chunks = chunks;
-                existing.info.inline_data = Some(data);
+                // MC-108 fix: If the inode has already been migrated to FLAT
+                // (chunks non-empty or storage_mode is Flat), reject the
+                // inline overwrite from a stale client. Otherwise the stale
+                // projection would clear chunks and regress to Inline.
+                if !existing.info.chunks.is_empty()
+                    || existing.info.storage_mode.is_volume_backed()
+                {
+                    log::warn!(
+                        "MetaCache STALE_INLINE_REJECT: inode {} has chunks (len={}) / storage_mode={:?}, \
+                         rejecting inline projection (size={}, inline_len={}) — stale client must re-fetch",
+                        inode,
+                        existing.info.chunks.len(),
+                        existing.info.storage_mode,
+                        size,
+                        data.len(),
+                    );
+                    // Keep existing FLAT state intact.
+                } else {
+                    // Inline overwrite (explicit): caller wants full replacement.
+                    existing.info.size = size;
+                    existing.info.chunks = chunks;
+                    existing.info.inline_data = Some(data);
+                }
             } else {
                 // Flat sync (A7 fix): never allow size regression. If this
                 // projection is from a stale client cache, max() preserves
