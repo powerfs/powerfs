@@ -98,6 +98,11 @@ pub struct TransportConfig {
     pub rdma_buf_size: usize,
     /// 每个节点并行连接数 (多 QP)
     pub conn_per_node: usize,
+    /// 要求二进制必须以 --features rdma 编译 (#47 硬化).
+    /// 为 true 时, 若当前二进制未编译 rdma feature, `create_transport`
+    /// 返回 fatal error 而非静默降级为 TCP. 防止 RDMA 部署中
+    /// 误用 TCP-only 二进制导致 RDMA listener 缺失 → 客户端 stale cache.
+    pub require_rdma: bool,
 }
 
 impl Default for TransportConfig {
@@ -116,6 +121,7 @@ impl Default for TransportConfig {
             rdma_buf_num: 128,
             rdma_buf_size: 65536,
             conn_per_node: 1,
+            require_rdma: false,
         }
     }
 }
@@ -125,9 +131,44 @@ impl Default for TransportConfig {
 /// - "auto": 检测 RDMA 硬件, 有则用 RDMA + TCP fallback, 无则用 TCP
 /// - "tcp": 强制 TCP
 /// - "rdma": 强制 RDMA, 无硬件则报错
+///
+/// # #47 硬化: `require_rdma = true` 时, 若二进制未编译 `rdma` feature,
+/// 所有 transport 类型均返回 fatal error, 防止 RDMA 部署中误用 TCP-only
+/// 二进制导致 RDMA listener 缺失 → 客户端静默服务 stale cache.
 pub fn create_transport(config: &TransportConfig) -> NetResult<std::sync::Arc<dyn Transport>> {
+    // #47 硬化: require_rdma + transport=tcp 是矛盾配置, 优先拒绝
+    // (在 feature 守卫之前检查, 因为矛盾配置无论 rdma feature 是否
+    // 编译都应报错).
+    if config.require_rdma && config.transport == "tcp" {
+        return Err(NetError::Config(
+            "require_rdma=true is incompatible with transport='tcp' \
+             (use transport='auto' or 'rdma' in RDMA deployments)"
+                .to_string(),
+        ));
+    }
+
+    // #47 硬化: require_rdma 守卫 — require_rdma=true 但二进制未编译
+    // rdma feature 时, 拒绝启动 (此时 transport 已不是 tcp).
+    if config.require_rdma {
+        #[cfg(not(feature = "rdma"))]
+        {
+            return Err(NetError::Config(format!(
+                "require_rdma=true but this binary was NOT compiled with --features rdma; \
+                 rebuild with: cargo build --release --features rdma \
+                 (transport='{}')",
+                config.transport
+            )));
+        }
+        #[cfg(feature = "rdma")]
+        {
+            log::debug!("require_rdma=true: binary has rdma feature, proceeding");
+        }
+    }
+
     match config.transport.as_str() {
-        "tcp" => Ok(std::sync::Arc::new(crate::transport_tcp::TcpTransport)),
+        "tcp" => {
+            Ok(std::sync::Arc::new(crate::transport_tcp::TcpTransport))
+        }
         "rdma" => {
             #[cfg(feature = "rdma")]
             {
@@ -164,6 +205,7 @@ pub fn create_transport(config: &TransportConfig) -> NetResult<std::sync::Arc<dy
             }
             #[cfg(not(feature = "rdma"))]
             {
+                // require_rdma 守卫已在函数入口拦截, 到这里说明 require_rdma=false.
                 log::info!("AutoTransport: RDMA feature not compiled, using TCP");
                 Ok(std::sync::Arc::new(crate::transport_tcp::TcpTransport))
             }
@@ -333,5 +375,57 @@ mod tests {
         assert_eq!(cfg.rdma_buf_num, 128);
         assert_eq!(cfg.rdma_buf_size, 65536);
         assert_eq!(cfg.conn_per_node, 1);
+        assert!(!cfg.require_rdma);
+    }
+
+    /// #47 硬化: require_rdma=true 且未编译 rdma feature 时,
+    /// create_transport 必须返回 fatal error 而非静默降级 TCP.
+    #[test]
+    fn test_require_rdma_without_feature_returns_error() {
+        #[cfg(not(feature = "rdma"))]
+        {
+            let cfg = TransportConfig {
+                transport: "auto".to_string(),
+                require_rdma: true,
+                ..Default::default()
+            };
+            match create_transport(&cfg) {
+                Err(NetError::Config(msg)) => {
+                    assert!(
+                        msg.contains("require_rdma"),
+                        "error should mention require_rdma, got: {}",
+                        msg
+                    );
+                }
+                Err(e) => panic!("expected Config error, got {:?}", e),
+                Ok(_) => panic!("require_rdma=true must fail without rdma feature"),
+            }
+        }
+        #[cfg(feature = "rdma")]
+        {
+            // With rdma feature, require_rdma=true is satisfied.
+            // Don't actually call create_transport to avoid hardware init.
+        }
+    }
+
+    /// #47 硬化: require_rdma=true + transport=tcp 是矛盾配置, 必须拒绝.
+    #[test]
+    fn test_require_rdma_with_tcp_returns_error() {
+        let cfg = TransportConfig {
+            transport: "tcp".to_string(),
+            require_rdma: true,
+            ..Default::default()
+        };
+        match create_transport(&cfg) {
+            Err(NetError::Config(msg)) => {
+                assert!(
+                    msg.contains("incompatible"),
+                    "error should mention incompatible, got: {}",
+                    msg
+                );
+            }
+            Err(e) => panic!("expected Config error, got {:?}", e),
+            Ok(_) => panic!("require_rdma=true + tcp must fail"),
+        }
     }
 }

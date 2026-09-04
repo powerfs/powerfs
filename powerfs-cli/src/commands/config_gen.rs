@@ -766,6 +766,7 @@ fn build_config(
             registration_token: None,
             transport: None,
             rdma_device: None,
+            require_rdma: false,
         },
         volume: VolumeConfig {
             grpc_port: cfg.volume_grpc_port,
@@ -786,6 +787,7 @@ fn build_config(
             client_key: None,
             transport: None,
             rdma_device: None,
+            require_rdma: false,
         },
         filer: FilerConfig {
             port: cfg.filer_port,
@@ -811,6 +813,7 @@ fn build_config(
             client_key: None,
             transport: None,
             rdma_device: None,
+            require_rdma: false,
         },
         s3: S3Config {
             port: cfg.s3_port,

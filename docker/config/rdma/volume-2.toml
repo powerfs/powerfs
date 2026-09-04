@@ -7,6 +7,7 @@ redis_url = "redis://172.30.0.50:6379"
 
 [volume]
 transport = "rdma"              # RDMA transport for powerfs-net listener + clients
+require_rdma = true             # #47 硬化: 拒绝未编译 --features rdma 的二进制启动
 grpc_port = 8080
 http_port = 8092
 net_port = 8901

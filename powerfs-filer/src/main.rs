@@ -57,6 +57,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     let transport_cfg = powerfs_net::TransportConfig {
         transport: filer_cfg.transport.clone().unwrap_or_else(|| "tcp".to_string()),
         rdma_device: filer_cfg.rdma_device.clone(),
+        require_rdma: filer_cfg.require_rdma,
         ..Default::default()
     };
     let net_transport: Arc<dyn powerfs_net::Transport> = match powerfs_net::create_transport(&transport_cfg) {

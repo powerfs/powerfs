@@ -87,6 +87,11 @@ pub struct MasterConfig {
     /// choosing a hardware device whose subnet doesn't match the bind IP).
     #[serde(default)]
     pub rdma_device: Option<String>,
+    /// #47 硬化: 为 true 时, 启动时检查二进制是否以 --features rdma 编译.
+    /// 未编译 rdma feature 则 fatal error 拒绝启动, 防止 RDMA 部署中
+    /// 误用 TCP-only 二进制导致 RDMA listener 缺失.
+    #[serde(default)]
+    pub require_rdma: bool,
 }
 
 /// Volume 节点配置 - 所有端口和地址必须显式配置
@@ -141,6 +146,9 @@ pub struct VolumeConfig {
     /// RDMA device name override. See MasterConfig.rdma_device for details.
     #[serde(default)]
     pub rdma_device: Option<String>,
+    /// #47 硬化: 为 true 时, 启动时检查二进制是否以 --features rdma 编译.
+    #[serde(default)]
+    pub require_rdma: bool,
 }
 
 /// Filer 节点配置 - 所有端口和地址必须显式配置
@@ -218,6 +226,9 @@ pub struct FilerConfig {
     /// RDMA device name override. See MasterConfig.rdma_device for details.
     #[serde(default)]
     pub rdma_device: Option<String>,
+    /// #47 硬化: 为 true 时, 启动时检查二进制是否以 --features rdma 编译.
+    #[serde(default)]
+    pub require_rdma: bool,
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置
