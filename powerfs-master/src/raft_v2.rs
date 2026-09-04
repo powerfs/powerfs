@@ -654,6 +654,7 @@ impl RaftNodeV2 {
                                     elapsed
                                 );
                                 raft_unavailable.store(true, Ordering::Relaxed);
+                                crate::metrics::set_raft_unavailable(true);
                                 was_unavailable = true;
                             } else {
                                 // 已停止服务, 每 60s 打一次日志
@@ -677,6 +678,7 @@ impl RaftNodeV2 {
                                 node_id
                             );
                             raft_unavailable.store(false, Ordering::Relaxed);
+                            crate::metrics::set_raft_unavailable(false);
                             was_unavailable = false;
                         }
                         fake_leader_since = None;
@@ -694,6 +696,7 @@ impl RaftNodeV2 {
                     // Follower 的 raft 请求由 Leader 处理, 不需要停止服务
                     if was_unavailable {
                         raft_unavailable.store(false, Ordering::Relaxed);
+                        crate::metrics::set_raft_unavailable(false);
                         was_unavailable = false;
                     }
                 }

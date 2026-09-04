@@ -1,9 +1,22 @@
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::{routing::get, routing::post, Router, Server};
 use log::{error, info};
 use prometheus::{register_counter, register_gauge, Counter, Encoder, Gauge, TextEncoder};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::ca_manager::{get_ca_cert, sign_client, sign_server, CaManager};
+
+/// Global flag set by the raft health monitor when the node is a
+/// fake-Leader (lease expired but still Leader). The /healthz endpoint
+/// reads this to return 503 so Docker auto-restarts the container (#58).
+static RAFT_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Set the global raft-unavailable flag (called from health monitor).
+pub fn set_raft_unavailable(v: bool) {
+    RAFT_UNAVAILABLE.store(v, Ordering::Relaxed);
+}
 
 lazy_static::lazy_static! {
     pub static ref RAFT_TERM: Gauge = register_gauge!(
@@ -47,9 +60,16 @@ lazy_static::lazy_static! {
     ).unwrap();
 }
 
-pub async fn start_metrics_server(addr: &str, ca_manager: Arc<CaManager>) -> Result<(), String> {
+pub async fn start_metrics_server(
+    addr: &str,
+    ca_manager: Arc<CaManager>,
+) -> Result<(), String> {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
+        // Health endpoint for Docker healthcheck. Returns 503 when the
+        // master is a fake-Leader (raft_unavailable=true) so Docker
+        // restarts the container automatically (#58).
+        .route("/healthz", get(healthz_handler))
         // Certificate Authority HTTP API (master acts as cluster CA).
         .route("/api/cert/ca", get(get_ca_cert))
         .route("/api/cert/sign-client", post(sign_client))
@@ -77,4 +97,18 @@ async fn metrics_handler() -> String {
     let metrics = prometheus::gather();
     encoder.encode(&metrics, &mut buffer).unwrap();
     String::from_utf8(buffer).unwrap()
+}
+
+/// Docker healthcheck endpoint. Returns 200 OK when raft is available,
+/// 503 when the master is a fake-Leader (raft_unavailable=true).
+/// This lets Docker auto-restart wedged masters (#58).
+async fn healthz_handler() -> axum::response::Response {
+    if RAFT_UNAVAILABLE.load(Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "raft unavailable (fake-Leader)\n",
+        )
+            .into_response();
+    }
+    (StatusCode::OK, "ok\n").into_response()
 }

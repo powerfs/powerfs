@@ -76,10 +76,11 @@ services:
       /app/powerfs-master
       --config /app/config/master.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.30.0.11 9333 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "curl -sf http://172.30.0.11:9300/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
       retries: 3
+      start_period: 15s
     depends_on:
       redis:
         condition: service_healthy
@@ -109,10 +110,11 @@ services:
       /app/powerfs-master
       --config /app/config/master.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.30.0.12 9333 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "curl -sf http://172.30.0.12:9300/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
       retries: 3
+      start_period: 15s
     depends_on:
       redis:
         condition: service_healthy
@@ -142,10 +144,11 @@ services:
       /app/powerfs-master
       --config /app/config/master.toml
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 172.30.0.13 9333 || exit 1"]
-      interval: 5s
-      timeout: 3s
+      test: ["CMD-SHELL", "curl -sf http://172.30.0.13:9300/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
       retries: 3
+      start_period: 15s
     depends_on:
       redis:
         condition: service_healthy

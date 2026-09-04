@@ -6,6 +6,7 @@ log_level = "info"
 redis_url = "redis://172.30.0.50:6379"
 
 [volume]
+transport = "auto"
 grpc_port = 8080
 http_port = 8096
 net_port = 8901
