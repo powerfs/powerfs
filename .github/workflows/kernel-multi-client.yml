@@ -142,9 +142,13 @@ jobs:
       - name: Start VM1
         run: |
           cd kernel/vm
-          # Kill any existing VMs
-          sudo pkill -f "qemu.*2223" 2>/dev/null || true
-          sleep 1
+          # Kill any existing VM1. The [q]emu bracket trick prevents pkill
+          # from matching this step's own shell (its cmdline contains the
+          # literal pattern), which previously SIGTERM-killed the step itself
+          # and left orphan QEMUs from cancelled runs holding the port/tap.
+          sudo pkill -f "[q]emu-system.*2223" 2>/dev/null || true
+          # Wait for the SSH forward port to be released before relaunching
+          for i in $(seq 1 15); do ss -ltn | grep -q ':2223 ' || break; sleep 1; done
           # Start VM1 in background
           sudo nohup bash run_qemu_kernel_ssh.sh > /tmp/vm1_boot.log 2>&1 &
           echo "VM1 starting (PID: $!)"
@@ -162,8 +166,9 @@ jobs:
       - name: Start VM2
         run: |
           cd kernel/vm
-          sudo pkill -f "qemu.*2224" 2>/dev/null || true
-          sleep 1
+          # See Start VM1: bracket pattern avoids self-match; wait for port release.
+          sudo pkill -f "[q]emu-system.*2224" 2>/dev/null || true
+          for i in $(seq 1 15); do ss -ltn | grep -q ':2224 ' || break; sleep 1; done
           sudo nohup bash run_qemu_vm2.sh > /tmp/vm2_boot.log 2>&1 &
           echo "VM2 starting (PID: $!)"
           echo "Waiting for VM2 SSH..."
@@ -402,8 +407,9 @@ jobs:
         if: always()
         run: |
           echo "=== Cleaning up VMs ==="
-          sudo pkill -f "qemu.*2223" 2>/dev/null || true
-          sudo pkill -f "qemu.*2224" 2>/dev/null || true
+          # Bracket pattern prevents pkill from matching this step's own shell.
+          sudo pkill -f "[q]emu-system.*2223" 2>/dev/null || true
+          sudo pkill -f "[q]emu-system.*2224" 2>/dev/null || true
           sleep 2
           # Verify cleanup
-          pgrep -af qemu | head -5 || echo "All VMs stopped"
+          pgrep -af "[q]emu-system" | head -5 || echo "All VMs stopped"
