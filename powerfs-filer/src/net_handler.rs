@@ -3069,6 +3069,10 @@ impl FilerNetHandler {
                 .collect(),
             _ => Vec::new(),
         };
+        // MC-108: capture whether chunks is non-empty before it's moved
+        // into update_inode_size_chunks_atomic, so we can use it for the
+        // notification decision below.
+        let has_chunks = !chunks.is_empty();
 
         // P2.5: Inline 小文件 close 路径. 客户端在 CLOSE 时把 inline_data
         // (≤ 8KB) 直接发 Filer, 由 Filer 单次 Raft 提交 (数据 + 元数据),
@@ -3157,7 +3161,19 @@ impl FilerNetHandler {
                 // 这与  MDS 的 cap recall 模型对齐：写入者 close 后
                 // 不主动驱逐自己的 page cache，其他客户端通过 cap recall
                 // 机制延迟刷新。
+                //
+                // MC-108 fix: When a file transitions from INLINE to FLAT
+                // (inline_data=None, chunks non-empty), also broadcast
+                // Invalidate. Otherwise, a client that still has the old
+                // INLINE layout cached will write to inline_data on close,
+                // racing with the migration. The notification forces the
+                // stale client to invalidate its inline_buffer and re-fetch
+                // the new FLAT layout before writing.
                 if inline_data.is_some() {
+                    self.notify_inode_change(inode, self.next_version());
+                } else if has_chunks {
+                    // FLAT sync with chunks — notify so other clients that
+                    // may still have INLINE layout can re-fetch as FLAT.
                     self.notify_inode_change(inode, self.next_version());
                 }
                 // 成功: STATUS_OK + 空 body
