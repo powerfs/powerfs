@@ -21,8 +21,8 @@ services:
         ipv4_address: 172.20.0.50
     volumes:
       - redis-data:/data
-    ports:
-      - "6379:6379"
+    # 不映射端口到宿主机 (宿主机已有 redis 运行在 6379)
+    # 容器内通过 redis:6379 访问
     command: redis-server --bind 0.0.0.0 --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -69,7 +69,7 @@ services:
     networks:
       powerfs-network:
         ipv4_address: 172.20.0.21
-    command: ["/app/powerfs-volume", "--config", "/etc/powerfs/volume.toml", "--grpc-address", "172.20.0.21:8080"]
+    command: ["/app/powerfs-volume", "--config", "/etc/powerfs/volume.toml"]
     volumes:
       - volume-1-data:/data
       - ../config/volume-1.toml:/etc/powerfs/volume.toml:ro
@@ -82,9 +82,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "8080:8080"
-      - "8091:8091"
+    # 不映射端口到宿主机 (避免与宿主机服务冲突)
     restart: unless-stopped
 
   # ===== Filer (单节点模式) =====
@@ -100,17 +98,11 @@ services:
         ipv4_address: 172.20.0.35
     command: >
       /app/powerfs-filer
-      --port 8888
-      --grpc-port 8889
-      --net-port 9334
-      --raft-id 1
-      -D /data/filer
-      --shard-count 1
-      --master 172.20.0.11:9333
-      --raft-peer 172.20.0.35:8889
+      --config /etc/powerfs/filer.toml
     volumes:
       - filer-1-data:/data/filer
       - ../logs:/logs
+      - ./config/single/filer-1.toml:/etc/powerfs/filer.toml:ro
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       RUST_LOG: ${RUST_LOG:-info,powerfs_filer=info,powerfs_net=debug}
@@ -121,10 +113,7 @@ services:
         condition: service_healthy
       volume-server-1:
         condition: service_started
-    ports:
-      - "8888:8888"
-      - "8889:8889"
-      - "9334:9334"
+    # 不映射端口到宿主机 (避免与宿主机服务冲突)
     restart: unless-stopped
 
   # ===== FUSE Client =====

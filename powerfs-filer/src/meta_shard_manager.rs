@@ -2620,19 +2620,22 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
-            storage_mode: powerfs_layout::StorageMode::Inline,
+            // Layout-prediction: decide initial layout based on file name.
+            // See docs/file-layout-prediction-design.md §3.2.
+            storage_mode: self.predict_storage_mode(name, parent_inode),
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
             .await?;
 
         log::info!(
-            "create_file_with_shard latency: total={}ms, inode={}, mode={:o}, uid={}, gid={}",
+            "create_file_with_shard latency: total={}ms, inode={}, mode={:o}, uid={}, gid={}, storage_mode={:?}",
             t0.elapsed().as_millis(),
             inode,
             mode,
             uid,
-            gid
+            gid,
+            info.storage_mode
         );
         Ok(inode)
     }
