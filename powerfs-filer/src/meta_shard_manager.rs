@@ -198,6 +198,14 @@ pub struct MetaShardManager {
     /// `sweep_leaked_refcounts` in the GC loop.
     lease_mgr:
         std::sync::RwLock<Option<std::sync::Arc<crate::inode_lease_manager::InodeLeaseManager>>>,
+    /// Layout predictor for file layout prediction (Phase 1).
+    /// None when prediction is disabled; Some when enabled.
+    /// Used by create_file to decide initial layout based on file
+    /// name/path (see docs/file-layout-prediction-design.md).
+    layout_predictor:
+        std::sync::RwLock<Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>>,
+    /// Minimum confidence threshold for layout prediction.
+    layout_min_confidence: std::sync::atomic::AtomicU32,
 }
 
 /// Per-shard inode allocator.
@@ -258,7 +266,40 @@ impl MetaShardManager {
             meta_cache: std::sync::Arc::new(crate::meta_cache::MetaCache::new()),
             inode_notifier: std::sync::RwLock::new(None),
             lease_mgr: std::sync::RwLock::new(None),
+            layout_predictor: std::sync::RwLock::new(None),
+            layout_min_confidence: std::sync::atomic::AtomicU32::new(
+                f32::to_bits(0.6),
+            ),
         }
+    }
+
+    /// Configure layout prediction from the FilerConfig.layout section.
+    /// Called from main.rs at startup. When prediction is disabled
+    /// (enable_prediction=false), the predictor is None and new files
+    /// use the Empty → auto_promote fallback path.
+    pub fn set_layout_predictor(
+        &self,
+        predictor: Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>,
+        min_confidence: f32,
+    ) {
+        log::info!(
+            "LAYOUT_PREDICTOR: configured min_confidence={:.2} enabled={}",
+            min_confidence,
+            predictor.is_some()
+        );
+        *self.layout_predictor.write().unwrap() = predictor;
+        self.layout_min_confidence
+            .store(f32::to_bits(min_confidence), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read the layout predictor (if enabled) and min_confidence threshold.
+    /// Returns (predictor_clone, min_confidence).
+    fn get_layout_predictor(&self) -> (Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>, f32) {
+        let predictor = self.layout_predictor.read().unwrap().clone();
+        let bits = self
+            .layout_min_confidence
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (predictor, f32::from_bits(bits))
     }
 
     /// Set async_meta_persist mode at runtime.
@@ -687,6 +728,13 @@ impl MetaShardManager {
         let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
         let inode = self.alloc_inode_in_shard(parent_shard);
         let now = chrono::Utc::now().timestamp() as u64;
+
+        // Layout-prediction (Phase 1): decide initial storage_mode based on
+        // file name/path via LayoutPredictor. If prediction is disabled or
+        // low confidence, use Empty (fallback to auto_promote on first write).
+        // See docs/file-layout-prediction-design.md §3.2.
+        let storage_mode = self.predict_storage_mode(name, parent_inode);
+
         let info = InodeInfo {
             inode,
             name: name.to_string(),
@@ -714,20 +762,75 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
-            // Layout-prediction: new files start as Empty, layout decided
-            // on first write. See docs/file-layout-prediction-design.md §3.1.
-            storage_mode: powerfs_layout::StorageMode::Empty,
+            storage_mode,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
             .await?;
 
         log::info!(
-            "create_file latency: total={}ms, inode={}",
+            "create_file latency: total={}ms, inode={}, storage_mode={:?}",
             t0.elapsed().as_millis(),
-            inode
+            inode,
+            info.storage_mode
         );
         Ok(info)
+    }
+
+    /// Predict the storage mode for a new file based on its name and parent
+    /// directory. Returns Empty when prediction is disabled or low confidence.
+    fn predict_storage_mode(
+        &self,
+        filename: &str,
+        parent_inode: u64,
+    ) -> powerfs_layout::StorageMode {
+        let (predictor, min_confidence) = self.get_layout_predictor();
+
+        let Some(predictor) = predictor else {
+            // Prediction disabled → Empty (auto_promote on first write)
+            return powerfs_layout::StorageMode::Empty;
+        };
+
+        // Build prediction context. parent_path is best-effort (we don't
+        // resolve the full path here; the predictor uses filename as the
+        // primary signal).
+        let ctx = powerfs_layout::PredictContext {
+            filename: filename.to_string(),
+            parent_path: format!("/inode:{}", parent_inode),
+            ..Default::default()
+        };
+
+        let result = predictor.predict(&ctx);
+        if !result.is_confident(min_confidence) {
+            log::debug!(
+                "LAYOUT_PREDICT: low confidence {:.2} < {:.2} for {}, rule={}, using Empty",
+                result.confidence,
+                min_confidence,
+                filename,
+                result.rule_name
+            );
+            return powerfs_layout::StorageMode::Empty;
+        }
+
+        let mode = match result.placement {
+            powerfs_layout::Placement::Inline { .. } => powerfs_layout::StorageMode::Inline,
+            powerfs_layout::Placement::Flat => powerfs_layout::StorageMode::Flat,
+            powerfs_layout::Placement::Stripe { .. } => powerfs_layout::StorageMode::Stripe,
+            powerfs_layout::Placement::WideStripe { .. } => {
+                powerfs_layout::StorageMode::WideStripe
+            }
+        };
+
+        log::info!(
+            "LAYOUT_PREDICT: file={} rule={} placement={:?} confidence={:.2} → mode={:?}",
+            filename,
+            result.rule_name,
+            result.placement,
+            result.confidence,
+            mode
+        );
+
+        mode
     }
 
     /// Two-phase create used by `create_file`, `create_directory`,
