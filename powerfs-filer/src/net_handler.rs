@@ -1304,9 +1304,9 @@ impl FilerNetHandler {
         // ---- Authoritative storage mode ----
         //
         // `info.storage_mode` is the persisted state bit, set explicitly
-        // during CREATE (Inline) and MIGRATE/sync (Flat via Raft). It is
-        // the authoritative source for deciding the wire-protocol
-        // Placement — NOT inferred from data fields.
+        // during CREATE (Empty — new layout-prediction feature) and
+        // MIGRATE/sync (Flat via Raft). It is the authoritative source
+        // for deciding the wire-protocol Placement — NOT inferred from data fields.
         //
         // This eliminates the rsync data loss race: previously the Filer
         // inferred Inline from `chunks.is_empty()` during Raft apply lag
@@ -1315,10 +1315,19 @@ impl FilerNetHandler {
         // reads returned 0 bytes for a file whose data was on Volume Server.
         //
         // Transitional safety: old inodes (created before this field) have
-        // `storage_mode = Inline` (serde default). If such an inode has
-        // non-empty chunks, it's actually Flat — treat it as Flat until
-        // the next sync updates the field.
-        let effective_mode = if info.storage_mode.is_inline() && !info.chunks.is_empty() {
+        // `storage_mode = Inline` (serde default, pre-Empty era). If such
+        // an inode has non-empty chunks, it's actually Flat — treat it as
+        // Flat until the next sync updates the field.
+        //
+        // StorageMode::Empty (new files, layout-prediction feature):
+        //   - content_size = 0, no data yet
+        //   - Encode as Inline with empty data so the kernel client enters
+        //     the Inline write path; the Filer will resolve the real layout
+        //     on the first write via LayoutPredictor.
+        let effective_mode = if info.storage_mode.is_empty() {
+            // Empty: new file, no data — encode as Inline empty
+            powerfs_layout::StorageMode::Inline
+        } else if info.storage_mode.is_inline() && !info.chunks.is_empty() {
             powerfs_layout::StorageMode::Flat
         } else {
             info.storage_mode
@@ -1336,7 +1345,10 @@ impl FilerNetHandler {
         );
 
         match effective_mode {
-            powerfs_layout::StorageMode::Inline => {
+            // Empty is mapped to Inline by effective_mode above, but the
+            // compiler's exhaustiveness checker requires an explicit arm.
+            powerfs_layout::StorageMode::Empty
+            | powerfs_layout::StorageMode::Inline => {
                 // Inline mode: data in Filer metadata (inline_data).
                 // Empty file (no data yet) also uses Inline so the kernel
                 // client's write_end enters the Inline path.

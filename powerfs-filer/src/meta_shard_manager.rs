@@ -714,7 +714,9 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
-            storage_mode: powerfs_layout::StorageMode::Inline,
+            // Layout-prediction: new files start as Empty, layout decided
+            // on first write. See docs/file-layout-prediction-design.md §3.1.
+            storage_mode: powerfs_layout::StorageMode::Empty,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
