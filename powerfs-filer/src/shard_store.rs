@@ -1327,7 +1327,10 @@ impl ShardStore {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
-            storage_mode: powerfs_layout::StorageMode::Inline,
+            // Layout-prediction: new files start as Empty, layout decided
+            // on first write by LayoutPredictor or auto_promote fallback.
+            // See docs/file-layout-prediction-design.md §3.1.
+            storage_mode: powerfs_layout::StorageMode::Empty,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();

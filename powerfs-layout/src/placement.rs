@@ -71,9 +71,14 @@ pub enum Placement {
 /// `storage_mode`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StorageMode {
+    /// Empty file, layout not yet assigned.
+    /// New files start in this state; the first write triggers
+    /// `LayoutPredictor::predict()` to decide the real layout,
+    /// avoiding premature Inline→Flat migration.
+    #[default]
+    Empty,
     /// Data stored in Filer metadata (`inline_data` field).
     /// No Volume Server involvement.
-    #[default]
     Inline,
     /// Data on a single Volume Server (`chunks` + `fid`).
     Flat,
@@ -81,7 +86,7 @@ pub enum StorageMode {
     Stripe,
     /// Data striped across the entire cluster (max parallelism).
     WideStripe,
-    /// Erasure-coded data (future use).
+    /// Erasure coded data (future use).
     Ec,
 }
 
@@ -94,7 +99,12 @@ impl StorageMode {
 
     /// Returns true if this mode stores data on Volume Server(s).
     pub fn is_volume_backed(self) -> bool {
-        !self.is_inline()
+        matches!(self, Self::Flat | Self::Stripe | Self::WideStripe | Self::Ec)
+    }
+
+    /// Returns true if the layout has not yet been assigned (empty file).
+    pub fn is_empty(self) -> bool {
+        matches!(self, Self::Empty)
     }
 }
 

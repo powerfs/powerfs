@@ -12,6 +12,7 @@
 use crate::encoding::ChunkEncoding;
 use crate::placement::{Placement, PlacementSpec};
 use crate::policy::PlacementPolicy;
+use crate::predictor::{LayoutPredictor, PredictContext};
 use crate::reliability::{CompressionState, Reliability, ReliabilityState};
 
 /// 文件布局 (三维正交)
@@ -41,7 +42,10 @@ impl FileLayout {
     /// 2. 若父目录有 powerfs.placement xattr: 超 inline 阈值后按此 placement
     /// 3. 否则: 按全局默认 auto_promote
     ///
-    /// TODO: P2.5 (Inline) / P3 (Stripe) 实现时完善
+    /// 注意: 此方法用于已知文件大小的场景.
+    /// 对于创建时空文件 (大小未知), 应使用 [`FileLayout::for_empty_file`]
+    /// 获得 Empty 布局, 然后通过 [`FileLayout::resolve_on_first_write`]
+    /// 或 [`FileLayout::resolve_with_predictor`] 在第一次写入时决定实际布局.
     pub fn for_new_file(
         file_size: u64,
         dir_placement: Option<&PlacementSpec>,
@@ -98,6 +102,88 @@ impl FileLayout {
             compression: CompressionState::default(),
             encoding,
         }
+    }
+
+    /// 创建空文件布局 (StorageMode::Empty).
+    ///
+    /// 设计文档 §3.1: 新文件创建时返回 Empty 布局, 不预分配任何实际布局.
+    /// 第一次 write 时由 `resolve_on_first_write()` 或 `resolve_with_predictor()`
+    /// 决定实际布局 (Inline/Flat/Stripe), 避免初始布局误判导致的 Inline→Flat 迁移.
+    ///
+    /// Empty 状态语义:
+    /// - `content_size = 0`, `inline_data = []`, `chunks = []`, `fid = None`
+    /// - 读操作返回空数据 (0 bytes)
+    /// - placement 为 Flat (占位, 不影响 IO, 因为 content_size=0)
+    pub fn for_empty_file() -> Self {
+        Self {
+            placement: Placement::Flat,
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::default(),
+            compression: CompressionState::default(),
+            encoding: ChunkEncoding::PerChunk { chunks: Vec::new() },
+        }
+    }
+
+    /// 第一次写入时通过预测器解析布局 (设计文档 §3.2)
+    ///
+    /// 调用时机: Empty 状态文件的第一次 write
+    /// 返回: 解析后的实际布局 (Inline/Flat/Stripe) 或 None (预测低置信度, 调用方应回退 auto_promote)
+    pub fn resolve_with_predictor(
+        predictor: &dyn LayoutPredictor,
+        ctx: &PredictContext,
+        _policy: &PlacementPolicy,
+        min_confidence: f32,
+    ) -> Option<Self> {
+        let result = predictor.predict(ctx);
+        if !result.is_confident(min_confidence) {
+            log::debug!(
+                "LAYOUT_PREDICT: low confidence {} < {}, rule={}, deferring",
+                result.confidence,
+                min_confidence,
+                result.rule_name
+            );
+            return None;
+        }
+
+        log::info!(
+            "LAYOUT_PREDICT: file={} rule={} placement={:?} confidence={}",
+            ctx.filename,
+            result.rule_name,
+            result.placement,
+            result.confidence
+        );
+
+        let (reliability, encoding) = if result.placement.is_inline() {
+            (
+                Reliability::Replicated { count: 1 },
+                ChunkEncoding::InlineData { data: Vec::new() },
+            )
+        } else {
+            (
+                Reliability::SingleReplica,
+                ChunkEncoding::PerChunk { chunks: Vec::new() },
+            )
+        };
+
+        Some(Self {
+            placement: result.placement,
+            reliability,
+            reliability_state: ReliabilityState::default(),
+            compression: CompressionState::default(),
+            encoding,
+        })
+    }
+
+    /// 第一次写入时通过大小回退解析布局 (auto_promote 策略)
+    ///
+    /// 当预测器未命中或置信度不足时, 回退到基于写入大小的 auto_promote.
+    pub fn resolve_on_first_write(
+        write_size: u64,
+        dir_placement: Option<&PlacementSpec>,
+        dir_inline_threshold: Option<u32>,
+        policy: &PlacementPolicy,
+    ) -> Self {
+        Self::for_new_file(write_size, dir_placement, dir_inline_threshold, policy)
     }
 
     /// 统一定位入口: file_offset -> (volume_id, volume_offset)

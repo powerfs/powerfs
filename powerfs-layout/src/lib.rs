@@ -30,6 +30,7 @@ pub mod error;
 pub mod layout;
 pub mod placement;
 pub mod policy;
+pub mod predictor;
 pub mod reliability;
 pub mod xattr;
 
@@ -41,4 +42,8 @@ pub use error::LayoutError;
 pub use layout::FileLayout;
 pub use placement::{Placement, PlacementSpec, StorageMode};
 pub use policy::PlacementPolicy;
+pub use predictor::{
+    ClientType, LayoutPredictor, LayoutRule, PredictContext, PredictResult, RuleBasedPredictor,
+    RuleMatcher, RulePlacement,
+};
 pub use reliability::{CompressionState, Reliability, ReliabilityState};
