@@ -51,13 +51,20 @@ jobs:
           # Self-hosted runner hits codeload.github.com 429 (IP-based rate limit)
           # when downloading actions/checkout. Use direct git clone instead.
           cd "$GITHUB_WORKSPACE"
-          # Clean workspace (runner ensures it's empty, but be defensive)
+          # Clean workspace. sudo pass first is REQUIRED: earlier job steps run
+          # QEMU via sudo (run_qemu_*.sh writes root-owned disk images under
+          # kernel/vm/output inside the workspace). A plain user-level rm cannot
+          # remove root-owned entries, leaves a non-empty kernel/ dir behind,
+          # and `git submodule update --init` then fails with
+          # "fatal: destination path 'kernel' already exists and is not an
+          # empty directory" — which every nightly full run since Aug 23 hit.
+          sudo find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           git init
           git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git fetch --depth 1 origin "$GITHUB_SHA"
           git checkout FETCH_HEAD
-          git submodule update --init --recursive --depth 1
+          git submodule update --init --recursive --depth 1 --force
           echo "Checked out: $(git log --oneline -1)"
 
       - name: Check KVM availability
