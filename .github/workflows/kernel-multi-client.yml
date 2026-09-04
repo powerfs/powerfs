@@ -124,9 +124,10 @@ jobs:
       - name: Setup network for dual VM
         run: |
           cd kernel/vm
-          # Setup tap0 (VM1) and tap1 (VM2)
-          sudo bash setup_network.sh || true
-          sudo bash setup_network_dual.sh || true
+          # Setup tap0 (VM1) and tap1 (VM2) — both must exist before starting
+          # QEMU (netdev script=no). Do NOT mask errors with || true: a missing
+          # tap must fail the step loudly instead of breaking VM boot later.
+          sudo bash setup_network_dual.sh
           # Verify tap devices
           ip link show tap0 && ip link show tap1
 
