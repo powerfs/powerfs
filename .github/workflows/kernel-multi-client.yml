@@ -44,12 +44,17 @@ jobs:
       issues: write
       checks: write
     steps:
-      - name: Checkout code (local git clone — bypasses codeload IP rate limit)
+      - name: Checkout code (local-first fetch; https with retries as fallback)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Self-hosted runner hits codeload.github.com 429 (IP-based rate limit)
-          # when downloading actions/checkout. Use direct git clone instead.
+          # Self-hosted runner networking to github.com is unreliable:
+          # codeload.github.com 429s (IP rate limit) and mid-fetch TLS resets
+          # (GnuTLS recv error -110) both killed past runs at checkout.
+          # The runner shares this host with the canonical working repos, so
+          # fetch from the local repos first (local transport hardlinks
+          # objects — zero network, instant). Only fall back to https (with
+          # retries) when the target SHA is absent locally (e.g. pull requests).
           cd "$GITHUB_WORKSPACE"
           # Clean workspace. sudo pass first is REQUIRED: earlier job steps run
           # QEMU via sudo (run_qemu_*.sh writes root-owned disk images under
@@ -60,12 +65,53 @@ jobs:
           # empty directory" — which every nightly full run since Aug 23 hit.
           sudo find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-          git init
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git fetch --depth 1 origin "$GITHUB_SHA"
-          git checkout FETCH_HEAD
-          git submodule update --init --recursive --depth 1 --force
-          echo "Checked out: $(git log --oneline -1)"
+          git init -q
+
+          LOCAL_MAIN="/home/portion/powerfs"
+          LOCAL_KERNEL_GITDIR="/home/portion/powerfs/.git/modules/kernel"
+          FETCH_OK=0
+
+          if [ -d "$LOCAL_MAIN/.git" ] \
+             && git fetch -q "$LOCAL_MAIN" master \
+             && git cat-file -e "${GITHUB_SHA}^{commit}" 2>/dev/null; then
+            echo "Local main repo has target commit ${GITHUB_SHA:0:7} (no network needed)"
+            FETCH_OK=1
+          else
+            echo "=== Local main repo missing ${GITHUB_SHA:0:7} — fetching from GitHub with retries ==="
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            for attempt in 1 2 3 4 5; do
+              if git fetch --depth 1 origin "$GITHUB_SHA"; then FETCH_OK=1; break; fi
+              wait_s=$((attempt * 15))
+              echo "git fetch attempt ${attempt}/5 failed; retrying in ${wait_s}s..."
+              sleep $wait_s
+            done
+          fi
+          [ "$FETCH_OK" = "1" ] || { echo "::error::Failed to fetch ${GITHUB_SHA} from both local and remote"; exit 1; }
+          git checkout -q "$GITHUB_SHA"
+
+          # This workflow only needs the 'kernel' submodule (rfs_tester and
+          # s3-tests belong to other test suites). Local submodule gitdir first
+          # (hardlinks), https with retries as fallback.
+          KERNEL_SHA=$(git ls-tree HEAD kernel | awk '{print $3}')
+          if [ -d "$LOCAL_KERNEL_GITDIR" ] \
+             && git -C "$LOCAL_KERNEL_GITDIR" cat-file -e "${KERNEL_SHA}^{commit}" 2>/dev/null; then
+            echo "=== Using local kernel submodule at ${KERNEL_SHA:0:7} ==="
+            git config submodule.kernel.url "$LOCAL_KERNEL_GITDIR"
+            # protocol.file.allow=always: git blocks file:// transport for
+            # submodule clones by default (CVE-2022-39253); the local gitdir is
+            # a trusted, host-controlled path on this self-hosted runner.
+            git -c protocol.file.allow=always submodule update --init --force kernel
+          else
+            echo "=== Local kernel submodule missing ${KERNEL_SHA:0:7} — network with retries ==="
+            for attempt in 1 2 3 4 5; do
+              if git submodule update --init --depth 1 --force kernel; then SUB_OK=1; break; fi
+              wait_s=$((attempt * 15))
+              echo "submodule update attempt ${attempt}/5 failed; retrying in ${wait_s}s..."
+              sleep $wait_s
+            done
+            [ "${SUB_OK:-0}" = "1" ] || { echo "::error::kernel submodule update failed after 5 attempts"; exit 1; }
+          fi
+          echo "Checked out: $(git log --oneline -1) | kernel: $(git -C kernel log --oneline -1)"
 
       - name: Check KVM availability
         run: |
@@ -286,6 +332,12 @@ jobs:
       - name: Check dmesg for anomalies (SLUB, oops, etc.)
         if: always()
         run: |
+          # If checkout failed there is no kernel/vm and no VMs to inspect;
+          # skip instead of failing with "cd: kernel/vm: No such file or directory".
+          if [ ! -d kernel/vm ]; then
+            echo "Skipping dmesg check: kernel/vm absent (checkout or earlier setup step failed)"
+            exit 0
+          fi
           cd kernel/vm
           BASE_A="${{ steps.dmesg_baseline.outputs.BASE_A }}"
           BASE_B="${{ steps.dmesg_baseline.outputs.BASE_B }}"
