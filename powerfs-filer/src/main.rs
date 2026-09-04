@@ -485,6 +485,22 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     // Prevents inode number reuse after restart (was causing -ENOSPC in kernel).
     meta_shard_manager.recover_inode_generator();
 
+    // Layout-prediction (Phase 1): initialize the RuleBasedPredictor from
+    // the [filer.layout] config section. When enabled, create_file uses the
+    // predictor to decide initial layout (Inline/Flat/Stripe) based on file
+    // name/extension, avoiding Inline→Flat runtime migration.
+    // See docs/file-layout-prediction-design.md.
+    {
+        let layout_config = &filer_cfg.layout;
+        let predictor = powerfs_layout::RuleBasedPredictor::from_config(
+            layout_config,
+            powerfs_layout::PlacementPolicy::default(),
+        );
+        let predictor: Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>> =
+            predictor.map(|p| std::sync::Arc::new(p) as std::sync::Arc<dyn powerfs_layout::LayoutPredictor>);
+        meta_shard_manager.set_layout_predictor(predictor, layout_config.min_confidence);
+    }
+
     // 初始化 POSIX root inode (inode=1, 目录 "/").
     // 首次启动或全新部署时必须创建, 否则 FUSE getattr(1) 返回 ENOENT,
     // 导致挂载点显示为 d????????? (无法访问).

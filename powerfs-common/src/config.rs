@@ -229,6 +229,78 @@ pub struct FilerConfig {
     /// #47 硬化: 为 true 时, 启动时检查二进制是否以 --features rdma 编译.
     #[serde(default)]
     pub require_rdma: bool,
+    /// 文件布局预测配置 (Phase 1: 规则驱动).
+    /// 启用后, 新文件创建时为 Empty 状态, 第一次写入时由
+    /// LayoutPredictor 根据文件名/扩展名/路径决定实际布局,
+    /// 避免 Inline→Flat 运行时迁移. 详见 docs/file-layout-prediction-design.md.
+    #[serde(default)]
+    pub layout: LayoutConfig,
+}
+
+/// 文件布局预测配置
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LayoutConfig {
+    /// 启用布局预测 (默认 true).
+    /// 关闭时新文件使用 Empty → auto_promote 回退.
+    #[serde(default = "default_layout_enabled")]
+    pub enable_prediction: bool,
+    /// 预测失败回退策略: "auto_promote" | "flat" | "inline" (默认 "auto_promote").
+    #[serde(default = "default_fallback_strategy")]
+    pub fallback: String,
+    /// 最小置信度 [0.0, 1.0], 低于此值不预测, 回退 auto_promote (默认 0.6).
+    #[serde(default = "default_min_confidence")]
+    pub min_confidence: f32,
+    /// 自定义规则 (按优先级降序匹配). 为空时使用内置默认规则集.
+    #[serde(default)]
+    pub rules: Vec<LayoutRuleConfig>,
+}
+
+/// 布局规则配置 (TOML 格式)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LayoutRuleConfig {
+    /// 规则名
+    pub name: String,
+    /// 匹配类型: "extension" | "glob" | "path_prefix" | "parent_dir" | "size_range"
+    pub matcher: String,
+    /// 匹配参数 (matcher=extension: [".pt", ".pth"]; matcher=glob: "ior*"; ...)
+    pub values: serde_json::Value,
+    /// 布局类型: "inline" | "flat" | "stripe"
+    pub placement: String,
+    /// Stripe 数量 (placement=stripe 时有效)
+    #[serde(default)]
+    pub stripe_count: Option<u32>,
+    /// Stripe 大小 (bytes, placement=stripe 时有效)
+    #[serde(default)]
+    pub stripe_size: Option<u64>,
+    /// Inline 最大字节数 (placement=inline 时有效)
+    #[serde(default)]
+    pub max_size: Option<u32>,
+    /// 置信度 [0.0, 1.0]
+    #[serde(default = "default_rule_confidence")]
+    pub confidence: f32,
+    /// 优先级 (高优先级先匹配)
+    #[serde(default = "default_rule_priority")]
+    pub priority: u32,
+}
+
+fn default_layout_enabled() -> bool {
+    true
+}
+
+fn default_fallback_strategy() -> String {
+    "auto_promote".to_string()
+}
+
+fn default_min_confidence() -> f32 {
+    0.6
+}
+
+fn default_rule_confidence() -> f32 {
+    0.7
+}
+
+fn default_rule_priority() -> u32 {
+    50
 }
 
 /// S3 服务配置 - 所有端口和地址必须显式配置

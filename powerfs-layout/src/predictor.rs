@@ -272,6 +272,45 @@ impl RuleBasedPredictor {
         self.rules.push(rule);
         self.rules.sort_by_key(|a| std::cmp::Reverse(a.priority));
     }
+
+    /// 从 powerfs-common::config::LayoutConfig 构建预测器.
+    ///
+    /// 若 `config.rules` 为空, 使用内置默认规则集.
+    /// 若 `config.enable_prediction` 为 false, 返回 None (调用方应跳过预测).
+    pub fn from_config(
+        config: &powerfs_common::config::LayoutConfig,
+        policy: PlacementPolicy,
+    ) -> Option<Self> {
+        if !config.enable_prediction {
+            return None;
+        }
+
+        if config.rules.is_empty() {
+            return Some(Self::with_defaults(policy));
+        }
+
+        let mut rules = Vec::with_capacity(config.rules.len());
+        for rc in &config.rules {
+            if let Ok(rule) = rc.try_into() {
+                rules.push(rule);
+            } else {
+                log::warn!(
+                    "LAYOUT_CONFIG: skipping invalid rule '{}' (matcher={}, placement={})",
+                    rc.name,
+                    rc.matcher,
+                    rc.placement
+                );
+            }
+        }
+
+        if rules.is_empty() {
+            // 所有自定义规则都无效, 回退到默认规则集
+            log::warn!("LAYOUT_CONFIG: all custom rules invalid, using defaults");
+            return Some(Self::with_defaults(policy));
+        }
+
+        Some(Self::new(policy, rules))
+    }
 }
 
 impl LayoutPredictor for RuleBasedPredictor {
@@ -335,6 +374,95 @@ impl LayoutPredictor for RuleBasedPredictor {
 
         // Step 4: 无规则命中, 返回低置信度 DeferToPolicy
         PredictResult::defer()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config → Rule 转换
+// ---------------------------------------------------------------------------
+
+/// 将 powerfs_common::config::LayoutRuleConfig 转换为 LayoutRule
+impl TryFrom<&powerfs_common::config::LayoutRuleConfig> for LayoutRule {
+    type Error = String;
+
+    fn try_from(rc: &powerfs_common::config::LayoutRuleConfig) -> Result<Self, Self::Error> {
+        let matcher = match rc.matcher.as_str() {
+            "extension" => {
+                let exts: Vec<String> = rc
+                    .values
+                    .as_array()
+                    .ok_or("extension matcher requires array values")?
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if exts.is_empty() {
+                    return Err("extension matcher: empty array".to_string());
+                }
+                RuleMatcher::Extension { exts }
+            }
+            "glob" => {
+                let pattern = rc
+                    .values
+                    .as_str()
+                    .ok_or("glob matcher requires string value")?
+                    .to_string();
+                RuleMatcher::FilenameGlob { pattern }
+            }
+            "path_prefix" => {
+                let prefix = rc
+                    .values
+                    .as_str()
+                    .ok_or("path_prefix matcher requires string value")?
+                    .to_string();
+                RuleMatcher::PathPrefix { prefix }
+            }
+            "parent_dir" => {
+                let names: Vec<String> = rc
+                    .values
+                    .as_array()
+                    .ok_or("parent_dir matcher requires array values")?
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if names.is_empty() {
+                    return Err("parent_dir matcher: empty array".to_string());
+                }
+                RuleMatcher::ParentDir { names }
+            }
+            "size_range" => {
+                let arr = rc
+                    .values
+                    .as_array()
+                    .ok_or("size_range matcher requires [min, max] array")?;
+                if arr.len() != 2 {
+                    return Err("size_range matcher requires exactly [min, max]".to_string());
+                }
+                let min = arr[0].as_u64().ok_or("size_range min must be u64")?;
+                let max = arr[1].as_u64().ok_or("size_range max must be u64")?;
+                RuleMatcher::SizeRange { min, max }
+            }
+            other => return Err(format!("unknown matcher type: '{}'", other)),
+        };
+
+        let placement = match rc.placement.as_str() {
+            "inline" => RulePlacement::Inline {
+                max_size: rc.max_size.unwrap_or(4096),
+            },
+            "flat" => RulePlacement::Flat,
+            "stripe" => RulePlacement::Stripe {
+                stripe_count: rc.stripe_count.unwrap_or(4),
+                stripe_size: rc.stripe_size.unwrap_or(64 * 1024 * 1024),
+            },
+            other => return Err(format!("unknown placement type: '{}'", other)),
+        };
+
+        Ok(Self {
+            name: rc.name.clone(),
+            matcher,
+            placement,
+            confidence: rc.confidence,
+            priority: rc.priority,
+        })
     }
 }
 
