@@ -3057,15 +3057,21 @@ impl ShardStore {
         // (read path) can use the authoritative state instead of inferring
         // from data fields, which was fragile during Raft apply lag.
         //
-        // Stripe detection: Flat files have exactly one chunk (single
-        // volume/needle); Stripe/WideStripe files have multiple chunks
-        // (one per stripe unit, each on its own volume). We classify
-        // multi-chunk files as Stripe (WideStripe is rarely auto-used and
-        // the wire encoding is identical for both — PerChunk chunks).
+        // Stripe detection: Stripe 文件的 chunks 分布在多个 volume
+        // (anti-affinity, 每个 stripe unit 一个 volume); Flat 文件即使
+        // 有多个 chunk (如 100MB = 100 chunks) 也全在同一个 volume.
+        // 必须按 volume_id 分布判断, 不能用 chunks.len() > 1 — 那会把
+        // 单卷 Flat 大文件误判成 Stripe. 对齐 detect_placement_from_chunks.
         let new_mode = if info.inline_data.is_some() {
             powerfs_layout::StorageMode::Inline
         } else if info.chunks.len() > 1 {
-            powerfs_layout::StorageMode::Stripe
+            let first_vid = info.chunks[0].volume_id;
+            let multi_volume = info.chunks.iter().any(|c| c.volume_id != first_vid);
+            if multi_volume {
+                powerfs_layout::StorageMode::Stripe
+            } else {
+                powerfs_layout::StorageMode::Flat
+            }
         } else if !info.chunks.is_empty() {
             powerfs_layout::StorageMode::Flat
         } else {

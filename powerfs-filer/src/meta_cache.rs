@@ -712,10 +712,26 @@ impl MetaCache {
         // shard_store.rs update_inode_size_chunks_atomic. This ensures
         // cross-client getattr (MetaCache fast path) returns the correct
         // mode immediately, before Raft apply.
+        //
+        // Stripe 检测必须看 chunks 是否跨多个 volume_id (对齐
+        // detect_placement_from_chunks): Stripe 文件的 chunks 分布在多个
+        // volume (anti-affinity), Flat 文件即使有几十个 chunk 也全在单 volume.
+        // 旧逻辑 "chunks 非空 → Flat" 会把 Stripe 投影成 Flat, 导致 GETATTR
+        // 返回 Flat placement, 客户端 reopen 后丢失多卷路由.
         let new_mode = if existing.info.inline_data.is_some() {
             powerfs_layout::StorageMode::Inline
         } else if !existing.info.chunks.is_empty() {
-            powerfs_layout::StorageMode::Flat
+            let first_vid = existing.info.chunks[0].volume_id;
+            let multi_volume = existing
+                .info
+                .chunks
+                .iter()
+                .any(|c| c.volume_id != first_vid);
+            if multi_volume {
+                powerfs_layout::StorageMode::Stripe
+            } else {
+                powerfs_layout::StorageMode::Flat
+            }
         } else {
             existing.info.storage_mode
         };
