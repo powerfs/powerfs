@@ -5,7 +5,13 @@ edition = "2021"
 description = "PowerFS lightweight binary network protocol for metadata and data operations"
 
 [features]
-default = ["tcp"]
+# RDMA is a default feature: PowerFS is a distributed filesystem whose core
+# value proposition includes hardware RDMA transport. Defaulting RDMA on means
+# every build (CI, dev, release) exercises the RDMA code path so immature
+# modes are used and bugs surface, rather than being hidden behind --features.
+# Requires libibverbs-dev + librdmacm-dev on the host. If missing, install:
+#   sudo apt-get install -y libibverbs-dev librdmacm-dev
+default = ["tcp", "rdma"]
 tcp = []
 # RDMA feature: enables transport_rdma module. The RDMA implementation uses
 # direct FFI bindings to libibverbs + librdmacm (via the `libc` crate), so no

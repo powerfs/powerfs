@@ -20,5 +20,8 @@ advertise_addr = "192.168.100.3:9333"
 raft_id = 1
 raft_peers = ["192.168.100.3:9335"]
 admin_token = "powerfs-admin-test"
-# ca_dir = (DISABLED dev mode: no cert enforcement)
+# ca_dir 启用: master 作为集群 CA, 首次启动自动生成自签名 CA 到此目录.
+# 容器内路径 /data/master/ca 在 docker-compose 中挂载自 ./docker/certs-default
+# (dev/test 缺省证书入库, 生产部署替换为 docker/certs/).
+ca_dir = "/data/master/ca"
 registration_token = "powerfs-cluster-test"
