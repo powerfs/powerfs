@@ -258,12 +258,11 @@ impl RuleBasedPredictor {
 
     /// 创建预测器并使用自定义规则
     pub fn new(policy: PlacementPolicy, rules: Vec<LayoutRule>) -> Self {
-        let mut predictor = Self {
-            rules,
-            policy,
-        };
+        let mut predictor = Self { rules, policy };
         // 按 priority 降序排列
-        predictor.rules.sort_by_key(|a| std::cmp::Reverse(a.priority));
+        predictor
+            .rules
+            .sort_by_key(|a| std::cmp::Reverse(a.priority));
         predictor
     }
 
@@ -325,10 +324,7 @@ impl LayoutPredictor for RuleBasedPredictor {
                     start_volume_idx: 0,
                     volume_ids: Vec::new(),
                 },
-                PlacementSpec::WideStripe {
-                    count,
-                    stripe_size,
-                } => Placement::WideStripe {
+                PlacementSpec::WideStripe { count, stripe_size } => Placement::WideStripe {
                     stripe_size: *stripe_size,
                     stripe_count: *count,
                     start_volume_idx: 0,
@@ -571,12 +567,10 @@ fn default_rules() -> Vec<LayoutRule> {
         LayoutRule {
             name: "archives".to_string(),
             matcher: RuleMatcher::Extension {
-                exts: [
-                    ".tar", ".gz", ".zip", ".bz2", ".xz", ".7z", ".tgz", ".tbz",
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+                exts: [".tar", ".gz", ".zip", ".bz2", ".xz", ".7z", ".tgz", ".tbz"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
             },
             placement: stripe4.clone(),
             confidence: 0.75,
@@ -621,7 +615,10 @@ fn default_rules() -> Vec<LayoutRule> {
         LayoutRule {
             name: "logs".to_string(),
             matcher: RuleMatcher::Extension {
-                exts: [".log", ".out", ".err"].iter().map(|s| s.to_string()).collect(),
+                exts: [".log", ".out", ".err"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
             },
             placement: RulePlacement::Flat,
             confidence: 0.6,
@@ -632,7 +629,14 @@ fn default_rules() -> Vec<LayoutRule> {
             name: "config_files".to_string(),
             matcher: RuleMatcher::Extension {
                 exts: [
-                    ".conf", ".ini", ".cfg", ".toml", ".yaml", ".yml", ".json", ".xml",
+                    ".conf",
+                    ".ini",
+                    ".cfg",
+                    ".toml",
+                    ".yaml",
+                    ".yml",
+                    ".json",
+                    ".xml",
                     ".properties",
                 ]
                 .iter()
@@ -658,7 +662,10 @@ fn default_rules() -> Vec<LayoutRule> {
         LayoutRule {
             name: "text_files".to_string(),
             matcher: RuleMatcher::Extension {
-                exts: [".txt", ".md", ".rst", ".tex"].iter().map(|s| s.to_string()).collect(),
+                exts: [".txt", ".md", ".rst", ".tex"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
             },
             placement: RulePlacement::Inline { max_size: 4096 },
             confidence: 0.65,

@@ -634,8 +634,7 @@ impl MetaCache {
                 // (chunks non-empty or storage_mode is Flat), reject the
                 // inline overwrite from a stale client. Otherwise the stale
                 // projection would clear chunks and regress to Inline.
-                if !existing.info.chunks.is_empty()
-                    || existing.info.storage_mode.is_volume_backed()
+                if !existing.info.chunks.is_empty() || existing.info.storage_mode.is_volume_backed()
                 {
                     log::warn!(
                         "MetaCache STALE_INLINE_REJECT: inode {} has chunks (len={}) / storage_mode={:?}, \

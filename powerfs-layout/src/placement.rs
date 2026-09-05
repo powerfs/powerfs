@@ -99,7 +99,10 @@ impl StorageMode {
 
     /// Returns true if this mode stores data on Volume Server(s).
     pub fn is_volume_backed(self) -> bool {
-        matches!(self, Self::Flat | Self::Stripe | Self::WideStripe | Self::Ec)
+        matches!(
+            self,
+            Self::Flat | Self::Stripe | Self::WideStripe | Self::Ec
+        )
     }
 
     /// Returns true if the layout has not yet been assigned (empty file).

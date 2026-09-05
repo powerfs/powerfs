@@ -245,6 +245,20 @@ pub enum MetaShardClientState {
     Closed,
 }
 
+/// Result of `migrate_inline_alloc`: either a single Flat volume allocation
+/// or a multi-volume Stripe allocation.
+#[derive(Clone, Debug)]
+pub enum MigrateAllocResult {
+    /// Flat mode: single (volume_id, needle_id) pair.
+    Flat { volume_id: u64, needle_id: u64 },
+    /// Stripe mode: N (volume_id, needle_id) pairs + stripe_size.
+    Stripe {
+        stripe_size: u64,
+        stripe_count: u32,
+        allocations: Vec<(u64, u64)>,
+    },
+}
+
 /// MetaShardClient - 元数据分片客户端
 #[allow(dead_code)]
 pub struct MetaShardClient {
@@ -1573,24 +1587,31 @@ impl MetaShardClient {
         })
     }
 
-    /// P2.5c: Inline → Flat 迁移分配. 客户端 write 超 max_size×1.5 时调用.
+    /// P2.5c: Inline → Flat/Stripe 迁移分配. 客户端 write 超 max_size×1.5 时调用.
     /// Filer 仅分配 (volume_id, needle_id), 不修改 inode (crash safety).
-    /// 返回 (volume_id, needle_id), 客户端把数据放入 chunk_cache, close 时
-    /// flush + sync 原子完成切换.
     ///
-    /// TLV 编码: Request = ShardId + Ino
-    ///           Response = VolumeId + FileKey(needle_id)
+    /// `desired_stripe`: 当客户端检测到首次写入内容为二进制 (非文本) 时传 true,
+    /// 请求 Filer 分配 Stripe 多卷布局; 否则传 false 走 Flat 单卷.
+    /// Empty 状态文件 (无文件名预测命中) 的首次写入迁移由内容特征决定模式.
+    ///
+    /// TLV 编码: Request  = ShardId + Ino + [DesiredMode(u8: 0=Flat, 1=Stripe)]
+    ///           Response = Flat:  VolumeId + FileKey
+    ///                      Stripe: StripeCount(u32) + StripeSize(u64) + N×(VolumeId + FileKey)
     pub async fn migrate_inline_alloc(
         &self,
         shard_id: u64,
         inode: u64,
-    ) -> Result<(u64, u64), String> {
+        desired_stripe: bool,
+    ) -> Result<MigrateAllocResult, String> {
         use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
         use powerfs_net::FieldId;
 
         let mut enc = TlvEncoder::new();
         enc.add_u64(FieldId::ShardId, shard_id);
         enc.add_u64(FieldId::Ino, inode);
+        if desired_stripe {
+            enc.add_u8(FieldId::DesiredMode, 1);
+        }
 
         let body = enc.into_bytes();
         let resp_body = self
@@ -1598,13 +1619,53 @@ impl MetaShardClient {
             .await?;
 
         let mut dec = TlvDecoder::new(&resp_body);
+
+        // Check for Stripe response: presence of StripeCount field.
+        if let Ok(stripe_count) = dec.next_u32(FieldId::StripeCount) {
+            let stripe_size = dec
+                .next_u64(FieldId::StripeSize)
+                .unwrap_or(powerfs_layout::policy::PlacementPolicy::default().default_stripe_size);
+            // Collect N (volume_id, needle_id) pairs from repeated VolumeId/FileKey fields.
+            let mut allocations = Vec::with_capacity(stripe_count as usize);
+            // Re-decode from the start to iterate fields in order.
+            let mut pair_dec = TlvDecoder::new(&resp_body);
+            // Skip StripeCount and StripeSize fields already consumed conceptually;
+            // iterate all fields collecting VolumeId/FileKey pairs.
+            while let Some((fid, length)) = pair_dec.next_field() {
+                if fid == FieldId::VolumeId {
+                    if let Ok(vid) = pair_dec.read_u64(length) {
+                        // Peek the next FileKey
+                        if let Some((fid2, len2)) = pair_dec.next_field() {
+                            if fid2 == FieldId::FileKey {
+                                if let Ok(nid) = pair_dec.read_u64(len2) {
+                                    allocations.push((vid, nid));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if allocations.is_empty() {
+                return Err("migrate_inline_alloc: Stripe response has no allocations".to_string());
+            }
+            return Ok(MigrateAllocResult::Stripe {
+                stripe_size,
+                stripe_count: allocations.len() as u32,
+                allocations,
+            });
+        }
+
+        // Flat response: single (volume_id, needle_id)
         let volume_id = dec
             .next_u64(FieldId::VolumeId)
             .map_err(|_| "migrate_inline_alloc: response missing VolumeId".to_string())?;
         let needle_id = dec
             .next_u64(FieldId::FileKey)
             .map_err(|_| "migrate_inline_alloc: response missing FileKey".to_string())?;
-        Ok((volume_id, needle_id))
+        Ok(MigrateAllocResult::Flat {
+            volume_id,
+            needle_id,
+        })
     }
 
     /// P3: Set an extended attribute on an inode (persisted via Raft on Filer).

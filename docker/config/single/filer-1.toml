@@ -19,3 +19,7 @@ raft_id = 1
 raft_peers = ["172.20.0.35:8889"]
 inline_max_size = 8192
 registration_token = "powerfs-cluster-test"
+
+[filer.layout]
+# 优化测试: 开启布局预测
+enable_prediction = true

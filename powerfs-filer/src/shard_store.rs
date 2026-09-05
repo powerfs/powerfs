@@ -2990,7 +2990,9 @@ impl ShardStore {
             // the migration. Otherwise the stale inline sync would clear
             // the migrated chunks and regress the inode back to Inline,
             // losing the other client's data.
-            if inline_data.is_some() && (!info.chunks.is_empty() || info.storage_mode.is_volume_backed()) {
+            if inline_data.is_some()
+                && (!info.chunks.is_empty() || info.storage_mode.is_volume_backed())
+            {
                 log::warn!(
                     "Shard {} STALE_INLINE_REJECT: inode {} has chunks (len={}) / storage_mode={:?}, \
                      rejecting inline overwrite (size={}, inline_len={}) — client must re-fetch layout",
@@ -3054,8 +3056,16 @@ impl ShardStore {
         // Flat files. Setting the mode here ensures encode_chunks_fields
         // (read path) can use the authoritative state instead of inferring
         // from data fields, which was fragile during Raft apply lag.
+        //
+        // Stripe detection: Flat files have exactly one chunk (single
+        // volume/needle); Stripe/WideStripe files have multiple chunks
+        // (one per stripe unit, each on its own volume). We classify
+        // multi-chunk files as Stripe (WideStripe is rarely auto-used and
+        // the wire encoding is identical for both — PerChunk chunks).
         let new_mode = if info.inline_data.is_some() {
             powerfs_layout::StorageMode::Inline
+        } else if info.chunks.len() > 1 {
+            powerfs_layout::StorageMode::Stripe
         } else if !info.chunks.is_empty() {
             powerfs_layout::StorageMode::Flat
         } else {

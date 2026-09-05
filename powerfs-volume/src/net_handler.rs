@@ -276,7 +276,13 @@ impl VolumeNetHandler {
             let volume = storage_manager
                 .get_volume(&vid)
                 .ok_or_else(|| format!("volume not found: {}", volume_id))?;
-            match volume.write_needle_blob(file_key, offset as i64, size as i32, bytes::Bytes::from(data), 0) {
+            match volume.write_needle_blob(
+                file_key,
+                offset as i64,
+                size as i32,
+                bytes::Bytes::from(data),
+                0,
+            ) {
                 Ok(_) => Ok(BlobOutcome::Ok),
                 Err(powerfs_common::error::PowerFsError::OutOfSpace) => Ok(BlobOutcome::NoSpace),
                 Err(e) => {
@@ -287,7 +293,9 @@ impl VolumeNetHandler {
         })
         .await
         {
-            Ok(Ok(BlobOutcome::Ok)) => Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new())),
+            Ok(Ok(BlobOutcome::Ok)) => {
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()))
+            }
             Ok(Ok(BlobOutcome::NoSpace)) => {
                 warn!(
                     "NET_WRITE_NEEDLE_BLOB: volume {} full (OutOfSpace)",
