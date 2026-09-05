@@ -1490,11 +1490,7 @@ impl MrPool {
     /// Synchronous version of `release` — returns an MR to the free queue
     /// using `try_lock()`.  Intended for error paths inside synchronous code.
     fn release_sync(&self, mr: Arc<IbvMr>) {
-        if let Some(idx) = self
-            .mrs
-            .iter()
-            .position(|m| Arc::ptr_eq(m, &mr))
-        {
+        if let Some(idx) = self.mrs.iter().position(|m| Arc::ptr_eq(m, &mr)) {
             if let Ok(mut guard) = self.free.try_lock() {
                 guard.push_back(idx);
             }
@@ -1651,8 +1647,8 @@ impl RdmaChannel {
         //     than busy-poll tasks.
         // ====================================================================
         const SPINS_BEFORE_YIELD: u64 = 2048;
-        const YIELD_PERIOD:      u64 =   64;
-        const SLEEP_US:          u64 =    1;
+        const YIELD_PERIOD: u64 = 64;
+        const SLEEP_US: u64 = 1;
 
         let mut spins: u64 = 0;
         loop {

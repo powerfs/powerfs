@@ -96,6 +96,8 @@ fn print_stats_debug(s: &FilerNodeStats) {
     println!("{}", s.lease_stats_json);
     println!("  shards_json:");
     println!("{}", s.shards_json);
+    println!("  layout_migration_stats_json:");
+    println!("{}", s.layout_migration_stats_json);
     println!("}}");
 }
 
@@ -126,6 +128,14 @@ fn display_formatted(stats: &[FilerNodeStats]) {
             println!("{}", s.shards_json);
         } else {
             println!("--- shards --- (not reported: http_port=0 or endpoint down)");
+        }
+        if !s.layout_migration_stats_json.is_empty() {
+            println!("--- layout-migration-stats ---");
+            println!("{}", s.layout_migration_stats_json);
+        } else {
+            println!(
+                "--- layout-migration-stats --- (not reported: metrics_port=0 or endpoint down)"
+            );
         }
         println!();
     }

@@ -96,7 +96,9 @@ impl LockType {
     /// 锁类型 → 状态机类别
     pub fn class(self) -> LockClass {
         match self {
-            LockType::Auth | LockType::Link | LockType::Xattr | LockType::Dn | LockType::Posix => LockClass::Simple,
+            LockType::Auth | LockType::Link | LockType::Xattr | LockType::Dn | LockType::Posix => {
+                LockClass::Simple
+            }
             LockType::Snap => LockClass::Local,
             LockType::File => LockClass::File,
             LockType::Dft | LockType::Nest => LockClass::Scatter,
@@ -114,7 +116,7 @@ impl LockType {
             LockType::Snap => CapSet::NONE,                  // LocalLock: 不输出 cap
             LockType::File => CapSet::CAP_R | CapSet::CAP_W | CapSet::CAP_X, // 文件: 全套
             LockType::Dft | LockType::Nest => CapSet::NONE,  // ScatterLock: 不输出 cap
-            LockType::Posix => CapSet::NONE,  // P1-3: POSIX advisory lock, 不输出 cap
+            LockType::Posix => CapSet::NONE, // P1-3: POSIX advisory lock, 不输出 cap
         }
     }
 }
@@ -1194,11 +1196,7 @@ impl LockArbiter {
     /// P1-3: POSIX file lock unlock by client_id (not sn).
     /// Removes all Posix lock holders matching client_id on the given inode.
     /// Returns true if any holder was removed.
-    pub fn posix_unlock(
-        &self,
-        inode: u64,
-        client_id: &str,
-    ) -> bool {
+    pub fn posix_unlock(&self, inode: u64, client_id: &str) -> bool {
         let mut wake_needed = false;
         let mut promote_task: Option<(String, u64, CapSet)> = None;
 
@@ -1243,7 +1241,10 @@ impl LockArbiter {
 
         debug!(
             "posix_unlock inode={} client={} wake={} promote={}",
-            inode, client_id, wake_needed, promote_task.is_some()
+            inode,
+            client_id,
+            wake_needed,
+            promote_task.is_some()
         );
 
         if wake_needed {
@@ -1257,11 +1258,7 @@ impl LockArbiter {
     /// P1-3: Get pending waiters for a specific inode+lock_type.
     /// Returns Vec<(client_id, lock_mode)> where lock_mode: 0=RD, 1=WR.
     /// Used by net_handler to push FileLockGrant notifications after unlock.
-    pub fn get_pending_waiters(
-        &self,
-        inode: u64,
-        lock_type: LockType,
-    ) -> Vec<(String, u8)> {
+    pub fn get_pending_waiters(&self, inode: u64, lock_type: LockType) -> Vec<(String, u8)> {
         let locks = self.locks.lock().unwrap();
         if let Some(lock_arr) = locks.get(&inode) {
             let lock = &lock_arr[lock_type as usize];

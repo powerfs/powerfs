@@ -25,6 +25,7 @@
 
 pub mod anti_affinity;
 pub mod codec;
+pub mod content_detector;
 pub mod encoding;
 pub mod error;
 pub mod layout;
@@ -37,6 +38,7 @@ pub mod xattr;
 // ---- 便捷 re-export (常用类型可直接 `use powerfs_layout::*`) ----
 
 pub use anti_affinity::{NodeId, VolumeInfo};
+pub use content_detector::{detect_content_type, ContentType};
 pub use encoding::{ChunkEncoding, ChunkRef};
 pub use error::LayoutError;
 pub use layout::FileLayout;

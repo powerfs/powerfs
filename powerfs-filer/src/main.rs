@@ -55,24 +55,31 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     // Create transport (tcp/rdma/auto) based on filer config.
     // Shared across net server + inter-service clients (TlvMasterClient, ClientConnPool).
     let transport_cfg = powerfs_net::TransportConfig {
-        transport: filer_cfg.transport.clone().unwrap_or_else(|| "tcp".to_string()),
+        transport: filer_cfg
+            .transport
+            .clone()
+            .unwrap_or_else(|| "tcp".to_string()),
         rdma_device: filer_cfg.rdma_device.clone(),
         require_rdma: filer_cfg.require_rdma,
         ..Default::default()
     };
-    let net_transport: Arc<dyn powerfs_net::Transport> = match powerfs_net::create_transport(&transport_cfg) {
-        Ok(t) => {
-            info!("Net transport: {}", t.name());
-            t
-        }
-        Err(e) => {
-            error!("Failed to create transport '{}': {:?}", transport_cfg.transport, e);
-            return Err(PowerFsError::InvalidRequest(format!(
-                "transport '{}' init failed: {:?}",
-                transport_cfg.transport, e
-            )));
-        }
-    };
+    let net_transport: Arc<dyn powerfs_net::Transport> =
+        match powerfs_net::create_transport(&transport_cfg) {
+            Ok(t) => {
+                info!("Net transport: {}", t.name());
+                t
+            }
+            Err(e) => {
+                error!(
+                    "Failed to create transport '{}': {:?}",
+                    transport_cfg.transport, e
+                );
+                return Err(PowerFsError::InvalidRequest(format!(
+                    "transport '{}' init failed: {:?}",
+                    transport_cfg.transport, e
+                )));
+            }
+        };
 
     // Master management transport: always TCP (management network).
     // Only the data path (net server + filer→volume) uses the configured transport (RDMA).
@@ -496,8 +503,8 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             layout_config,
             powerfs_layout::PlacementPolicy::default(),
         );
-        let predictor: Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>> =
-            predictor.map(|p| std::sync::Arc::new(p) as std::sync::Arc<dyn powerfs_layout::LayoutPredictor>);
+        let predictor: Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>> = predictor
+            .map(|p| std::sync::Arc::new(p) as std::sync::Arc<dyn powerfs_layout::LayoutPredictor>);
         meta_shard_manager.set_layout_predictor(predictor, layout_config.min_confidence);
     }
 
@@ -697,9 +704,13 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 format!("{}:{}", bind_ip, metrics_port).parse()?;
             let lease_mgr = net_handler.inode_lease_mgr.clone();
             let meta_cache = meta_shard_manager.meta_cache();
-            if let Err(e) =
-                powerfs_filer::metrics::start_metrics_server(metrics_addr, lease_mgr, meta_cache)
-                    .await
+            if let Err(e) = powerfs_filer::metrics::start_metrics_server(
+                metrics_addr,
+                lease_mgr,
+                meta_cache,
+                meta_shard_manager.clone(),
+            )
+            .await
             {
                 warn!("filer metrics server failed to start (non-fatal): {}", e);
             }
@@ -1016,8 +1027,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         // net_transport was created early in run_filer() and is shared with
         // inter-service clients (TlvMasterClient, ClientConnPool).
         if let Ok(net_server) = PowerFsNetServer::bind_with_registry_and_transport(
-            &bind_ip, net_port, net_handler, net_registry,
-            powerfs_net::ServerConfig::default(), net_transport.clone(),
+            &bind_ip,
+            net_port,
+            net_handler,
+            net_registry,
+            powerfs_net::ServerConfig::default(),
+            net_transport.clone(),
         )
         .await
         {

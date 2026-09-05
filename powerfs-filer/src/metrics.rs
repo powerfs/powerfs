@@ -21,6 +21,7 @@
 
 use crate::inode_lease_manager::InodeLeaseManager;
 use crate::meta_cache::{MetaCache, MetaCacheStats};
+use crate::meta_shard_manager::MetaShardManager;
 use axum::{routing::get, Json, Router, Server};
 use log::{error, info};
 use prometheus::{register_int_gauge, Encoder, IntGauge};
@@ -213,12 +214,39 @@ lazy_static::lazy_static! {
         "powerfs_filer_mc_refcount_leak_fixes",
         "MetaCache Phase 3: leaked refcounts (refcount > 0 but no active lease) reset to 0 by sweep"
     ).unwrap();
+
+    // ===== Layout migration stats (layout-prediction observability) =====
+    static ref LM_REAL_MIGRATION_TOTAL: IntGauge = register_int_gauge!(
+        "powerfs_filer_lm_real_migration_total",
+        "Layout: real layout migrations (Inline/Empty -> Flat/Stripe) since startup"
+    ).unwrap();
+    static ref LM_FIRST_ALLOC_TOTAL: IntGauge = register_int_gauge!(
+        "powerfs_filer_lm_first_alloc_total",
+        "Layout: first-time Volume allocations for Flat/Stripe files (not migrations) since startup"
+    ).unwrap();
+    static ref LM_MIGRATE_TO_FLAT: IntGauge = register_int_gauge!(
+        "powerfs_filer_lm_migrate_to_flat",
+        "Layout: real migrations to Flat mode"
+    ).unwrap();
+    static ref LM_MIGRATE_TO_STRIPE: IntGauge = register_int_gauge!(
+        "powerfs_filer_lm_migrate_to_stripe",
+        "Layout: real migrations to Stripe mode"
+    ).unwrap();
+    static ref LM_FIRST_ALLOC_FLAT: IntGauge = register_int_gauge!(
+        "powerfs_filer_lm_first_alloc_flat",
+        "Layout: first allocations for Flat files"
+    ).unwrap();
+    static ref LM_FIRST_ALLOC_STRIPE: IntGauge = register_int_gauge!(
+        "powerfs_filer_lm_first_alloc_stripe",
+        "Layout: first allocations for Stripe files"
+    ).unwrap();
 }
 
 /// Shared state passed into the axum Router: lease manager + meta cache.
 pub struct MetricsAppState {
     pub lease_mgr: Arc<InodeLeaseManager>,
     pub meta_cache: Arc<MetaCache>,
+    pub meta_shard_manager: Arc<MetaShardManager>,
 }
 
 /// Refresh prometheus gauges from a lease-manager snapshot + MetaCache
@@ -278,6 +306,15 @@ pub fn refresh_prometheus(state: &MetricsAppState) {
     MC_RECALL_TOTAL.set(m.recall_total as i64);
     MC_RECALL_COOLDOWN_SKIPS.set(m.recall_cooldown_skips as i64);
     MC_REFCOUNT_LEAK_FIXES.set(m.refcount_leak_fixes as i64);
+
+    // --- Layout migration stats ---
+    let lm = state.meta_shard_manager.layout_migration_stats().snapshot();
+    LM_REAL_MIGRATION_TOTAL.set(lm.real_migration_total as i64);
+    LM_FIRST_ALLOC_TOTAL.set(lm.first_alloc_total as i64);
+    LM_MIGRATE_TO_FLAT.set(lm.migrate_to_flat as i64);
+    LM_MIGRATE_TO_STRIPE.set(lm.migrate_to_stripe as i64);
+    LM_FIRST_ALLOC_FLAT.set(lm.first_alloc_flat as i64);
+    LM_FIRST_ALLOC_STRIPE.set(lm.first_alloc_stripe as i64);
 }
 
 /// Start the HTTP metrics server on the given address.
@@ -286,23 +323,30 @@ pub fn refresh_prometheus(state: &MetricsAppState) {
 /// - `/metrics` (Prometheus text format)
 /// - `/admin/lease-stats` (JSON)
 /// - `/admin/meta-cache-stats` (JSON)
+/// - `/admin/layout-migration-stats` (JSON)
 pub async fn start_metrics_server(
     addr: SocketAddr,
     lease_mgr: Arc<InodeLeaseManager>,
     meta_cache: Arc<MetaCache>,
+    meta_shard_manager: Arc<MetaShardManager>,
 ) -> Result<(), String> {
     let state = Arc::new(MetricsAppState {
         lease_mgr,
         meta_cache,
+        meta_shard_manager,
     });
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/admin/lease-stats", get(lease_stats_handler))
         .route("/admin/meta-cache-stats", get(meta_cache_stats_handler))
+        .route(
+            "/admin/layout-migration-stats",
+            get(layout_migration_stats_handler),
+        )
         .with_state(state);
 
     info!(
-        "Filer metrics server (lease + MetaCache) listening on http://{}",
+        "Filer metrics server (lease + MetaCache + layout) listening on http://{}",
         addr
     );
 
@@ -388,6 +432,21 @@ async fn meta_cache_stats_handler(
     }))
 }
 
+async fn layout_migration_stats_handler(
+    axum::extract::State(state): axum::extract::State<Arc<MetricsAppState>>,
+) -> Json<serde_json::Value> {
+    let lm = state.meta_shard_manager.layout_migration_stats().snapshot();
+    Json(json!({
+        "real_migration_total": lm.real_migration_total,
+        "first_alloc_total": lm.first_alloc_total,
+        "migrate_to_flat": lm.migrate_to_flat,
+        "migrate_to_stripe": lm.migrate_to_stripe,
+        "first_alloc_flat": lm.first_alloc_flat,
+        "first_alloc_stripe": lm.first_alloc_stripe,
+        "migration_rate": lm.migration_rate,
+    }))
+}
+
 /// Helper for tests / callers that want a `IntoResponse`-style status
 /// string without spinning up the HTTP server.
 #[allow(dead_code)]
@@ -422,9 +481,28 @@ pub fn render_status(state: &MetricsAppState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta_shard_manager::MetaShardManager;
+    use crate::raft_group_manager_v2::RaftGroupManagerV2;
+    use crate::shard_strategy::ShardStrategy;
 
-    #[test]
-    fn test_refresh_prometheus_reflects_lease_stats() {
+    /// Create a minimal MetaShardManager for metrics tests.
+    /// Uses a temp dir and a single-shard strategy.
+    async fn make_test_meta_shard_manager() -> Arc<MetaShardManager> {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("powerfs-metrics-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let data_path = tmp_dir.to_string_lossy().to_string();
+        let port = 19000 + (std::process::id() % 1000) as u16;
+        let raft_addr = format!("127.0.0.1:{}", port);
+        let raft_mgr = RaftGroupManagerV2::new(1, raft_addr, format!("{}/raft", data_path))
+            .await
+            .unwrap();
+        let strategy = Arc::new(ShardStrategy::new(1));
+        Arc::new(MetaShardManager::new(raft_mgr, strategy, data_path, 1))
+    }
+
+    #[tokio::test]
+    async fn test_refresh_prometheus_reflects_lease_stats() {
         // Use the real InodeLeaseManager so stats() reflects acquire side
         // effects. acquire_total / active_count should show up in gauges.
         let lease_mgr = Arc::new(InodeLeaseManager::new());
@@ -432,9 +510,11 @@ mod tests {
         // One conflict (different holder, same inode) bumps conflict_total.
         let _ = lease_mgr.acquire(1, "client-B", 1_000).unwrap_err();
         let meta_cache = Arc::new(MetaCache::new());
+        let meta_shard_manager = make_test_meta_shard_manager().await;
         let state = Arc::new(MetricsAppState {
             lease_mgr,
             meta_cache,
+            meta_shard_manager,
         });
 
         // IntGauges live in the SHARED default prometheus registry. Other
@@ -463,8 +543,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_metacache_counters_flow_to_gauges() {
+    #[tokio::test]
+    async fn test_metacache_counters_flow_to_gauges() {
         let lease_mgr = Arc::new(InodeLeaseManager::new());
         let mc = Arc::new(MetaCache::new());
 
@@ -502,9 +582,11 @@ mod tests {
         // at least once the test passes. This keeps the test meaningful
         // (it still validates the propagation path) while tolerating
         // parallel-test interference on the global registry.
+        let meta_shard_manager = make_test_meta_shard_manager().await;
         let state = Arc::new(MetricsAppState {
             lease_mgr,
             meta_cache: mc,
+            meta_shard_manager,
         });
 
         let mut ok = false;

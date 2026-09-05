@@ -882,6 +882,7 @@ message FilerNodeStats {
     bool is_healthy = 9;
     uint32 leader_count = 10;
     uint32 total_shards = 11;
+    string layout_migration_stats_json = 12; // Layout migration stats JSON from /admin/layout-migration-stats
 }
 
 message FilerStatsResponse {

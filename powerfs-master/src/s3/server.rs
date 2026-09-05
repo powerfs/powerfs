@@ -1474,6 +1474,8 @@ mod tests {
                 None,
                 Some(dir.path().join("ca").to_str().unwrap().to_string()),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap(),

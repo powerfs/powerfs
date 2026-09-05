@@ -60,10 +60,7 @@ lazy_static::lazy_static! {
     ).unwrap();
 }
 
-pub async fn start_metrics_server(
-    addr: &str,
-    ca_manager: Arc<CaManager>,
-) -> Result<(), String> {
+pub async fn start_metrics_server(addr: &str, ca_manager: Arc<CaManager>) -> Result<(), String> {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         // Health endpoint for Docker healthcheck. Returns 503 when the

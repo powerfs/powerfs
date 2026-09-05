@@ -166,9 +166,7 @@ pub fn create_transport(config: &TransportConfig) -> NetResult<std::sync::Arc<dy
     }
 
     match config.transport.as_str() {
-        "tcp" => {
-            Ok(std::sync::Arc::new(crate::transport_tcp::TcpTransport))
-        }
+        "tcp" => Ok(std::sync::Arc::new(crate::transport_tcp::TcpTransport)),
         "rdma" => {
             #[cfg(feature = "rdma")]
             {

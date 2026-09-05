@@ -1379,6 +1379,12 @@ pub enum FieldId {
     /// Optional client-certificate signature over the request body (bytes).
     /// Reserved for future HMAC-based replay protection; currently unused.
     ClientCertSignature = 0xD5,
+    /// Desired allocation mode (u8, 0=Flat, 1=Stripe). Sent by the client in
+    /// MigrateInlineAlloc requests when the file was created with
+    /// StorageMode::Empty (no filename-based layout prediction). The client
+    /// inspects the first-write content (magic number / printable ratio) and
+    /// requests Stripe for binary data, Flat for text. Absent → Flat (legacy).
+    DesiredMode = 0xD6,
 }
 
 impl FieldId {
@@ -1509,6 +1515,7 @@ impl FieldId {
             0xD3 => Some(Self::RegistrationToken),
             0xD4 => Some(Self::ClientCert),
             0xD5 => Some(Self::ClientCertSignature),
+            0xD6 => Some(Self::DesiredMode),
             _ => None,
         }
     }

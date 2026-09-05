@@ -206,6 +206,107 @@ pub struct MetaShardManager {
         std::sync::RwLock<Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>>,
     /// Minimum confidence threshold for layout prediction.
     layout_min_confidence: std::sync::atomic::AtomicU32,
+    /// Layout migration statistics (layout-prediction observability).
+    /// Tracks real migrations (Inline→Flat/Stripe) vs first allocations
+    /// (Flat/Stripe predicted at create, Volume allocated on first write).
+    layout_migration_stats: LayoutMigrationStats,
+}
+
+/// Layout migration statistics for observability.
+///
+/// Distinguishes two cases in `handle_migrate_inline_alloc`:
+/// - **Real migration**: storage_mode was Inline/Empty → layout changed to
+///   Flat/Stripe. These are the events layout prediction aims to eliminate.
+/// - **First allocation**: storage_mode was already Flat/Stripe (predicted
+///   at create), Volume is allocated on first write. Not a real migration.
+#[derive(Default)]
+pub struct LayoutMigrationStats {
+    /// Real layout migrations (Inline/Empty → Flat/Stripe).
+    pub real_migration_total: std::sync::atomic::AtomicU64,
+    /// First-time Volume allocation for Flat/Stripe files (not a migration).
+    pub first_alloc_total: std::sync::atomic::AtomicU64,
+    /// Real migrations where target was Flat.
+    pub migrate_to_flat: std::sync::atomic::AtomicU64,
+    /// Real migrations where target was Stripe.
+    pub migrate_to_stripe: std::sync::atomic::AtomicU64,
+    /// First allocations for Flat files.
+    pub first_alloc_flat: std::sync::atomic::AtomicU64,
+    /// First allocations for Stripe files.
+    pub first_alloc_stripe: std::sync::atomic::AtomicU64,
+}
+
+/// Snapshot of [`LayoutMigrationStats`] for JSON/Prometheus export.
+#[derive(Debug, serde::Serialize)]
+pub struct LayoutMigrationStatsSnapshot {
+    pub real_migration_total: u64,
+    pub first_alloc_total: u64,
+    pub migrate_to_flat: u64,
+    pub migrate_to_stripe: u64,
+    pub first_alloc_flat: u64,
+    pub first_alloc_stripe: u64,
+    /// real_migration / (real_migration + first_alloc). 0.0 when no events.
+    pub migration_rate: f64,
+}
+
+impl LayoutMigrationStats {
+    /// Record a real migration (storage_mode was Inline/Empty).
+    pub fn record_real_migration(&self, target_is_stripe: bool) {
+        self.real_migration_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if target_is_stripe {
+            self.migrate_to_stripe
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.migrate_to_flat
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record a first allocation (storage_mode was already Flat/Stripe).
+    pub fn record_first_alloc(&self, is_stripe: bool) {
+        self.first_alloc_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if is_stripe {
+            self.first_alloc_stripe
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.first_alloc_flat
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot all counters for export.
+    pub fn snapshot(&self) -> LayoutMigrationStatsSnapshot {
+        let real = self
+            .real_migration_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let first = self
+            .first_alloc_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total = real + first;
+        let migration_rate = if total > 0 {
+            real as f64 / total as f64
+        } else {
+            0.0
+        };
+        LayoutMigrationStatsSnapshot {
+            real_migration_total: real,
+            first_alloc_total: first,
+            migrate_to_flat: self
+                .migrate_to_flat
+                .load(std::sync::atomic::Ordering::Relaxed),
+            migrate_to_stripe: self
+                .migrate_to_stripe
+                .load(std::sync::atomic::Ordering::Relaxed),
+            first_alloc_flat: self
+                .first_alloc_flat
+                .load(std::sync::atomic::Ordering::Relaxed),
+            first_alloc_stripe: self
+                .first_alloc_stripe
+                .load(std::sync::atomic::Ordering::Relaxed),
+            migration_rate,
+        }
+    }
 }
 
 /// Per-shard inode allocator.
@@ -267,10 +368,14 @@ impl MetaShardManager {
             inode_notifier: std::sync::RwLock::new(None),
             lease_mgr: std::sync::RwLock::new(None),
             layout_predictor: std::sync::RwLock::new(None),
-            layout_min_confidence: std::sync::atomic::AtomicU32::new(
-                f32::to_bits(0.6),
-            ),
+            layout_min_confidence: std::sync::atomic::AtomicU32::new(f32::to_bits(0.6)),
+            layout_migration_stats: LayoutMigrationStats::default(),
         }
+    }
+
+    /// Access layout migration statistics (for metrics/observability).
+    pub fn layout_migration_stats(&self) -> &LayoutMigrationStats {
+        &self.layout_migration_stats
     }
 
     /// Configure layout prediction from the FilerConfig.layout section.
@@ -288,13 +393,20 @@ impl MetaShardManager {
             predictor.is_some()
         );
         *self.layout_predictor.write().unwrap() = predictor;
-        self.layout_min_confidence
-            .store(f32::to_bits(min_confidence), std::sync::atomic::Ordering::Relaxed);
+        self.layout_min_confidence.store(
+            f32::to_bits(min_confidence),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Read the layout predictor (if enabled) and min_confidence threshold.
     /// Returns (predictor_clone, min_confidence).
-    fn get_layout_predictor(&self) -> (Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>, f32) {
+    fn get_layout_predictor(
+        &self,
+    ) -> (
+        Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>,
+        f32,
+    ) {
         let predictor = self.layout_predictor.read().unwrap().clone();
         let bits = self
             .layout_min_confidence
@@ -816,9 +928,7 @@ impl MetaShardManager {
             powerfs_layout::Placement::Inline { .. } => powerfs_layout::StorageMode::Inline,
             powerfs_layout::Placement::Flat => powerfs_layout::StorageMode::Flat,
             powerfs_layout::Placement::Stripe { .. } => powerfs_layout::StorageMode::Stripe,
-            powerfs_layout::Placement::WideStripe { .. } => {
-                powerfs_layout::StorageMode::WideStripe
-            }
+            powerfs_layout::Placement::WideStripe { .. } => powerfs_layout::StorageMode::WideStripe,
         };
 
         log::info!(
