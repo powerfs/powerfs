@@ -1,6 +1,6 @@
 //! [`TlvMasterClient`] — reusable TLV client for the Master service.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -556,10 +556,27 @@ impl TlvMasterClient {
     // ── internals ────────────────────────────────────────────────
 
     fn build_net_client(host: &str, port: u16, config: &TlvMasterClientConfig) -> PowerFsNetClient {
+        // Generate a unique pre-registration client_id so the master's
+        // ConnRegistry does not collapse multiple unregistered clients
+        // (which all default to 0) onto a single ClientConn — that reuse
+        // made cert san_ips validation compare against the wrong peer IP.
+        // Each container has a unique HOSTNAME (docker container_name),
+        // hashed + combined with a per-process sequence so two clients in
+        // the same container also diverge. Mirrors the kernel-side
+        // seq_counter + 1000000 fallback. After successful RegisterClient
+        // the master issues an authoritative client_id.
+        static PRE_REG_SEQ: AtomicU64 = AtomicU64::new(0);
+        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "anon".into());
+        let mut hash: u64 = 0;
+        for b in hostname.bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(b as u64);
+        }
+        let pre_reg_id = (hash & 0x0FFF_FFFF) * 1000
+            + PRE_REG_SEQ.fetch_add(1, Ordering::Relaxed);
         let net_cfg = ClientConfig {
             addr: host.to_string(),
             port,
-            client_id: 0,
+            client_id: pre_reg_id,
             client_type: config.client_type,
             channel: powerfs_net::protocol::CHANNEL_DATA,
             connect_timeout: config.connect_timeout,
