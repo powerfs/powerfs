@@ -67,9 +67,9 @@ build
 node_modules
 
 # Production TLS/X.509 certificates and private keys.
-# Certs must be generated at deploy time (see powerfs-cli cert commands),
-# never committed to the repository — pushing to public remote would leak
-# production secrets.
+# Production certs (docker/certs/) MUST be generated at deploy time via
+# scripts/generate-certs.sh, never committed — pushing to a public remote
+# would leak production secrets.
 docker/certs/
 *.crt
 *.key
@@ -77,6 +77,19 @@ docker/certs/
 !**/test-fixtures/**/*.crt
 !**/test-fixtures/**/*.key
 !**/test-fixtures/**/*.pem
+
+# Default dev/test certificate bundle (docker/certs-default/).
+# These are PRE-SHARED development certificates checked in so a fresh
+# `docker compose up` works out of the box for local testing. They are
+# ONLY for dev/test — production deployments MUST regenerate via
+# scripts/generate-certs.sh --output-dir docker/certs and mount that
+# directory instead. See docs/cert-deployment.md.
+!docker/certs-default/
+!docker/certs-default/**
+!docker/certs-default/**/*.crt
+!docker/certs-default/**/*.key
+!docker/certs-default/**/*.pem
+!docker/certs-default/**/*.json
 
 # Temporary kernel-debug notes / scratch markdown
 debug-kernel-*.md
