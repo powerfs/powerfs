@@ -245,16 +245,30 @@ fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
         return Placement::Flat;
     }
 
-    // Stripe: 推断 stripe_size 从前两个 chunk 的 offset 差值
-    let stripe_size = if chunks.len() >= 2 && chunks[0].offset < chunks[1].offset {
-        chunks[1].offset - chunks[0].offset
-    } else {
-        // 兜底: 1MB (对齐 POWERFS_CHUNK_SIZE)
-        1024 * 1024
-    };
+    // Stripe 参数推断 (dense chunks: 每个 chunk 1MB, offset 连续):
+    //
+    // stripe_size = 首个 volume 切换点的 offset. 同一 stripe unit 内的所有
+    // chunk 落在同一 volume, 连续排布; 当 chunk 的 volume_id 与前一个不同时,
+    // 说明进入下一个 stripe unit, 该 chunk 的 offset 就是 stripe_size.
+    //   例: chunks[0..63] 全在 vol0 (offset 0..64MB), chunks[64] 在 vol1
+    //       (offset 64MB) → stripe_size = 64MB.
+    // 旧逻辑用 chunks[1].offset - chunks[0].offset = 1MB (chunk 间距),
+    // 把 stripe_size 误判成 1MB.
+    let stripe_size = chunks
+        .windows(2)
+        .find(|w| w[0].volume_id != w[1].volume_id)
+        .map(|w| w[1].offset)
+        .unwrap_or(1024 * 1024);
 
-    // 收集 volume_ids (按 chunk 顺序, 每个 chunk 代表一个 stripe unit)
-    let volume_ids: Vec<u64> = chunks.iter().map(|c| c.volume_id).collect();
+    // volume_ids = 去重后的卷序列 (按首次出现顺序). 这是 stripe unit → volume
+    // 的映射表, 长度 = stripe_count. 旧逻辑为每个 chunk 放一个 vid (长度=
+    // chunk 数=100), 把 stripe_count 误判成 100 而非实际卷数 (如 3).
+    let mut volume_ids: Vec<u64> = Vec::new();
+    for c in chunks {
+        if !volume_ids.contains(&c.volume_id) {
+            volume_ids.push(c.volume_id);
+        }
+    }
 
     Placement::Stripe {
         stripe_size,
@@ -746,12 +760,20 @@ impl FilerNetHandler {
             return Some(Vec::new());
         }
 
-        // Execute: allocate needle_id from each pick's zone counter.
+        // Execute: allocate a file_key (STRIDE 步长) from each pick's zone
+        // counter. 必须用 alloc_file_key 而非 alloc_needle_id: 客户端按
+        // base_needle + vol_chunk_idx 寻址 (一个 stripe unit 跨多个 chunk, 回绕
+        // 后同一卷还会推进 round*chunks_per_unit), 需要每个 stripe unit 预留
+        // FILE_KEY_STRIDE (65536) 个 needle 的独立区间. 旧逻辑用 alloc_needle_id
+        // (counter+1), 三个 stripe unit 的 base needle 低位连续 (如 ...09/0A/0B),
+        // base+idx 区间互相重叠 → 不同卷的 chunk 写到同一 needle, 跨卷数据互相
+        // 覆盖 (reopen 后 verify 错位/读 0). 与 Flat 的 alloc_for_new_file 一致
+        // (见 net_handler L888 alloc_file_key 说明).
         let mut result = Vec::with_capacity(picks.len());
         for pick in &picks {
             let zone = zones.iter().find(|z| z.zone_id == pick.zone_id);
             if let Some(zone) = zone {
-                let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+                let needle_id = crate::zone_client::alloc_file_key(zone.zone_id, &zone.counter);
                 result.push((pick.volume_id, needle_id));
             }
         }
@@ -1426,13 +1448,33 @@ impl FilerNetHandler {
 
                 let placement = detect_placement_from_chunks(&chunks);
 
+                // 只发 sparse anchors (每个卷的 base needle), 而非全部 dense
+                // chunks. Stripe 客户端用 Placement::Stripe 的 stripe_size /
+                // stripe_count / volume_ids 做 RAID0 数学寻址 (卷回绕 + 卷内
+                // 偏移推进, 见 powerfs-layout placement.rs locate 与内核
+                // locate_chunk), 不需要 per-chunk ChunkRef.
+                //
+                // 这样 GETATTR/LOOKUP 响应大小与文件大小无关 (≈ stripe_count
+                // × 44B), 避免大文件 dense chunks 撑爆客户端接收缓冲
+                // (RX_TRUNCATE → E2BIG, 200MB=200 chunks×44B > 8.7KB cap).
+                // anchor 取每个 volume_id 第一次出现的 chunk (即该卷 round 0
+                // 的起始 chunk): offset = vol_rank * stripe_size, needle = base.
+                let mut anchors: Vec<ChunkRef> = Vec::new();
+                let mut seen_vids: std::collections::HashSet<u64> =
+                    std::collections::HashSet::new();
+                for c in &chunks {
+                    if seen_vids.insert(c.volume_id) {
+                        anchors.push(c.clone());
+                    }
+                }
+
                 let layout = FileLayout {
                     placement: placement.clone(),
                     reliability: info.reliability.clone(),
                     reliability_state: info.reliability_state.clone(),
                     compression: info.compression_state.clone(),
                     encoding: ChunkEncoding::PerChunk {
-                        chunks: chunks.clone(),
+                        chunks: anchors.clone(),
                     },
                 };
                 encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
