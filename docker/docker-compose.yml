@@ -535,26 +535,9 @@ services:
       s3:
         condition: service_healthy
 
-  frontend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile-frontend
-    image: powerfs-frontend:latest
-    container_name: frontend
-    logging: *default-logging
-    networks:
-      powerfs-network:
-        ipv4_address: 172.30.0.43
-    ports:
-      - "8084:80"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://127.0.0.1/ >/dev/null || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-    depends_on:
-      monitor:
-        condition: service_healthy
+  # NOTE: frontend service temporarily removed — the latest frontend code
+  # lives on the `aiagent` branch. Re-add (with updated Dockerfile-frontend
+  # using a reachable node/nginx base) after merging aiagent.
 
   fuse-1:
     build:
