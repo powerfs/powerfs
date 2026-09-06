@@ -1039,7 +1039,6 @@ impl MetaShardManager {
             //
             // dirty (setattr) and deleted (unlink) also use `propose`
             // (synchronous commit) — see their respective methods.
-
             self.meta_cache
                 .stage_create(info.clone(), parent_inode, name);
 
@@ -1381,6 +1380,150 @@ impl MetaShardManager {
         }
 
         Ok(())
+    }
+
+    /// Batch create multiple files in one RPC, using `propose_many` to merge
+    /// all Raft commits into a single replication cycle.
+    ///
+    /// All entries must share the same parent shard (caller groups by shard).
+    /// The inodes are pre-allocated by the client via AllocInodeBatch, so the
+    /// Filer does NOT allocate — it uses the client-provided inode numbers.
+    ///
+    /// For N entries on the same shard, Raft commits = 1 (not 2N).
+    ///
+    /// Each entry: (ino, parent_ino, name, mode, uid, gid)
+    pub async fn batch_create_file(
+        &self,
+        entries: &[(u64, u64, String, u32, u32, u32)],
+    ) -> Vec<Result<(), String>> {
+        let n = entries.len();
+        let mut results = vec![Ok(()); n];
+
+        if entries.is_empty() {
+            return results;
+        }
+
+        // All entries share the same parent → same shard_dir.
+        let shard_dir = self.shard_strategy.calculate_shard(entries[0].1);
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        // Verify shard exists.
+        {
+            let stores = self.shard_stores.read().unwrap();
+            if stores.get(&shard_dir).is_none() {
+                let err = format!("shard {} not found", shard_dir.0);
+                return vec![Err(err); n];
+            }
+        }
+
+        // Build InodeInfo + stage each create in MetaCache (immediate
+        // visibility for reads before Raft apply).
+        let mut infos: Vec<InodeInfo> = Vec::with_capacity(n);
+        for (idx, (ino, parent_ino, name, mode, uid, gid)) in entries.iter().enumerate() {
+            // Validate: inode must not already exist.
+            let shard_ino = self.shard_strategy.calculate_shard(*ino);
+            {
+                let stores = self.shard_stores.read().unwrap();
+                if let Some(s) = stores.get(&shard_ino) {
+                    if s.get_inode(*ino).is_some() {
+                        results[idx] = Err(format!(
+                            "inode {} already exists (duplicate batch_create)",
+                            ino
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            let info = InodeInfo {
+                inode: *ino,
+                name: name.clone(),
+                parent_inode: *parent_ino,
+                file_type: FileType::File,
+                size: 0,
+                mtime: now,
+                atime: now,
+                ctime: now,
+                mode: if *mode & 0o170000 != 0 {
+                    *mode
+                } else {
+                    *mode | 0o100000
+                },
+                uid: *uid,
+                gid: *gid,
+                blocks: 0,
+                fid: None,
+                volume_id: None,
+                etag: None,
+                chunks: vec![],
+                inline_data: None,
+                extended: HashMap::new(),
+                symlink_target: None,
+                nlink: 1,
+                version: 0,
+                delete_time: 0,
+                reliability: powerfs_layout::reliability::Reliability::default(),
+                reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+                compression_state: powerfs_layout::reliability::CompressionState::default(),
+                replica_chunks: Vec::new(),
+                storage_mode: self.predict_storage_mode(name, *parent_ino),
+            };
+
+            self.meta_cache
+                .stage_create(info.clone(), *parent_ino, name);
+            infos.push(info);
+        }
+
+        if infos.is_empty() {
+            return results;
+        }
+
+        // Build [CreateInode, AddDirEntry] * N commands and propose_many
+        // in a single Raft replication cycle.
+        let mut cmds: Vec<Vec<u8>> = Vec::with_capacity(infos.len() * 2);
+        for info in &infos {
+            cmds.push(
+                ShardCommand::CreateInode {
+                    info: Box::new(info.clone()),
+                }
+                .serialize(),
+            );
+            cmds.push(
+                ShardCommand::AddDirEntry {
+                    parent_inode: info.parent_inode,
+                    name: info.name.clone(),
+                    inode: info.inode,
+                }
+                .serialize(),
+            );
+        }
+
+        match self.raft_group_manager.propose_many(shard_dir, cmds).await {
+            Ok(_) => {
+                for info in &infos {
+                    info!(
+                        "batch_create: committed inode={} parent={} name={} to shard {}",
+                        info.inode, info.parent_inode, info.name, shard_dir.0
+                    );
+                }
+            }
+            Err(e) => {
+                // Propose failed (lost leadership, network error, etc.)
+                // Invalidate staging and mark all entries as failed.
+                for info in &infos {
+                    self.meta_cache
+                        .invalidate_staging(info.inode, info.parent_inode, &info.name);
+                }
+                // Find the entries that were staged (infos) and mark them.
+                for (idx, (_, parent_ino, name, _, _, _)) in entries.iter().enumerate() {
+                    if infos.iter().any(|i| i.parent_inode == *parent_ino && i.name == *name) {
+                        results[idx] = Err(e.clone());
+                    }
+                }
+            }
+        }
+
+        results
     }
 
     /// Batch delete multiple files in one RPC, using `propose_many` to merge

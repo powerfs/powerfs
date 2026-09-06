@@ -2711,6 +2711,83 @@ impl FilerNetHandler {
         Ok(Self::build_response(msg, overall_status, resp_body))
     }
 
+    /// Handle BatchCreate: flush N locally-created files to Filer in one RPC.
+    /// All entries must belong to the same shard (caller ensures this).
+    /// Uses `batch_create_file` → `propose_many` to submit all CreateInode +
+    /// AddDirEntry commands in a single Raft replication cycle.
+    ///
+    /// For N entries on the same shard, Raft commits = 1 (not 2N).
+    async fn handle_batch_create(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let (shard_id_raw, entries) = match powerfs_net::serialize::decode_batch_create_req(&msg.body) {
+            Ok(e) => e,
+            Err(err) => {
+                warn!("FILER_NET_BATCH_CREATE: decode failed: {}", err);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_BAD_REQUEST,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        if entries.is_empty() {
+            return Ok(Self::build_response(msg, STATUS_OK, Vec::new()));
+        }
+
+        let shard_id = ShardId(shard_id_raw);
+
+        info!(
+            "FILER_NET_BATCH_CREATE: {} entries, shard={}",
+            entries.len(),
+            shard_id.0
+        );
+
+        // Check leader once for the whole batch.
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_BATCH_CREATE: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
+        let results = self.meta_shard_manager.batch_create_file(&entries).await;
+
+        let mut flushed: u32 = 0;
+        let mut any_ok = false;
+        for (i, result) in results.iter().enumerate() {
+            let (ino, parent_ino, name, _, _, _) = &entries[i];
+            match result {
+                Ok(_) => {
+                    flushed += 1;
+                    any_ok = true;
+                    debug!(
+                        "FILER_NET_BATCH_CREATE: created ino={} parent={} name={}",
+                        ino, parent_ino, name
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "FILER_NET_BATCH_CREATE: failed ino={} parent={} name={}: {}",
+                        ino, parent_ino, name, e
+                    );
+                }
+            }
+        }
+
+        // Notify parent dir change so clients refresh their dir cache.
+        if any_ok {
+            let parent_ino = entries[0].1;
+            let v = self.next_version();
+            self.notify_inode_change(parent_ino, v);
+        }
+
+        let resp_body =
+            powerfs_net::serialize::encode_batch_create_resp(flushed).unwrap_or_default();
+        let overall_status = if any_ok { STATUS_OK } else { STATUS_ERR_SERVER_ERROR };
+        Ok(Self::build_response(msg, overall_status, resp_body))
+    }
+
     /// Handle Rmdir request
     async fn handle_rmdir(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -4995,6 +5072,7 @@ impl NetHandler for FilerNetHandler {
             MsgType::MkdirPhaseA => self.handle_mkdir_phase_a(msg).await,
             MsgType::MkdirPhaseB => self.handle_mkdir_phase_b(msg).await,
             MsgType::BatchUnlink => self.handle_batch_unlink(msg).await,
+            MsgType::BatchCreate => self.handle_batch_create(msg).await,
             // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)
             MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
             MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,
