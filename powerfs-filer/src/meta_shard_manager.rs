@@ -1350,13 +1350,24 @@ impl MetaShardManager {
             entries.iter().enumerate()
         {
             // Validate: inode must not already exist.
+            // Idempotent: if inode exists with same parent+name, treat as
+            // success (retry from kernel after transient network error).
+            // Only fail if parent/name differ (genuine collision).
             let shard_ino = self.shard_strategy.calculate_shard(*ino);
             {
                 let stores = self.shard_stores.read().unwrap();
                 if let Some(s) = stores.get(&shard_ino) {
-                    if s.get_inode(*ino).is_some() {
+                    if let Some(existing) = s.get_inode(*ino) {
+                        if existing.parent_inode == *parent_ino
+                            && existing.name == *name
+                            && existing.file_type == FileType::File
+                        {
+                            // Idempotent retry — same file, skip silently.
+                            results[idx] = Ok(());
+                            continue;
+                        }
                         results[idx] = Err(format!(
-                            "inode {} already exists (duplicate batch_create)",
+                            "inode {} already exists with different parent/name (collision)",
                             ino
                         ));
                         continue;
