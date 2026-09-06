@@ -2717,7 +2717,7 @@ impl FilerNetHandler {
     /// AddDirEntry commands in a single Raft replication cycle.
     ///
     /// For N entries on the same shard, Raft commits = 1 (not 2N).
-    async fn handle_batch_create(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+    async fn handle_batch_create(&self, msg: &NetMessage, origin_client_id: u64) -> NetResult<NetMessage> {
         let (shard_id_raw, entries) = match powerfs_net::serialize::decode_batch_create_req(&msg.body) {
             Ok(e) => e,
             Err(err) => {
@@ -2775,11 +2775,23 @@ impl FilerNetHandler {
             }
         }
 
-        // Notify parent dir change so clients refresh their dir cache.
+        // Notify parent dir change so OTHER clients refresh their dir cache.
+        // Exclude the originating client: it already has the new inodes
+        // in its local cache, and receiving its own broadcast would trigger
+        // a redundant dir lease invalidation + SUBSCRIBE + GETATTR cycle.
         if any_ok {
             let parent_ino = entries[0].1;
             let v = self.next_version();
-            self.notify_inode_change(parent_ino, v);
+            if let Some(ref notifier) = self.inode_notifier {
+                let notifier = notifier.clone();
+                tokio::spawn(async move {
+                    let count = notifier.broadcast_exclude(parent_ino, v, Some(origin_client_id));
+                    log::info!(
+                        "FILER_NET_NOTIFY: inode={}, version={}, excluded client={}, notified {} others",
+                        parent_ino, v, origin_client_id, count
+                    );
+                });
+            }
         }
 
         let resp_body =
@@ -5072,7 +5084,7 @@ impl NetHandler for FilerNetHandler {
             MsgType::MkdirPhaseA => self.handle_mkdir_phase_a(msg).await,
             MsgType::MkdirPhaseB => self.handle_mkdir_phase_b(msg).await,
             MsgType::BatchUnlink => self.handle_batch_unlink(msg).await,
-            MsgType::BatchCreate => self.handle_batch_create(msg).await,
+            MsgType::BatchCreate => self.handle_batch_create(msg, ctx.client.client_id).await,
             // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)
             MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
             MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,
