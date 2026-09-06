@@ -706,6 +706,15 @@ pub enum MsgType {
     /// Response TLV: empty body on STATUS_OK (success is implied).
     WriteNeedleBlob = 0x006B,
 
+    /// fsync durability barrier.  Asks the volume to force-materialise the
+    /// given needles (a file's chunks) out of the in-memory write coalescer
+    /// into the data file + RocksDB index and to fsync the WAL, so that data
+    /// written before fsync is on stable storage.
+    /// Request TLV: VolumeId (Ino) + Count (Limit, u64 number of keys) +
+    ///              Count × FileKey.
+    /// Response TLV: empty body on STATUS_OK.
+    FlushNeedles = 0x006C,
+
     // Master topology & discovery operations
     GetTopology = 0x0070,
     WatchTopology = 0x0071,
@@ -942,6 +951,7 @@ impl MsgType {
             0x0069 => Some(Self::AssignNeedle),
             0x006A => Some(Self::RegisterFiler),
             0x006B => Some(Self::WriteNeedleBlob),
+            0x006C => Some(Self::FlushNeedles),
             0x0070 => Some(Self::GetTopology),
             0x0071 => Some(Self::WatchTopology),
             0x0072 => Some(Self::TopologyChanged),
@@ -1793,6 +1803,9 @@ pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
 
         // WriteNeedleBlob (0x006B) - partial write within a needle, data ≤ 2MB
         0x006B => Some((4 * 1024, 2 * 1024 * 1024)),
+
+        // FlushNeedles (0x006C) - fsync barrier, response is status only
+        0x006C => Some((256, 0)),
 
         // 其他消息类型无大小约束
         _ => None,
