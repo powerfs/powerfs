@@ -623,6 +623,16 @@ pub enum MsgType {
     /// See docs/shard-routing-no-forward-principle.md §8
     BatchUnlink = 0x003e,
 
+    /// Batch create: flush N locally-created files to Filer in one RPC.
+    /// Client batches optimistic creates into one RPC → one Raft
+    /// propose_many (CreateInode + AddDirEntry × N). Amortizes ~10ms Raft
+    /// commit over N creates.
+    ///
+    /// Request: ShardId + Count(u32) + [Entry(Ino+ParentIno+Name+Mode+Uid+Gid)] * Count
+    /// Response: Status + Count(u32) of successfully flushed entries
+    /// See docs/optimistic-local-create-design.md §4.3
+    BatchCreate = 0x003f,
+
     // Status
     StatFs = 0x0040,
 
@@ -911,6 +921,7 @@ impl MsgType {
             0x003c => Some(Self::MkdirPhaseA),
             0x003d => Some(Self::MkdirPhaseB),
             0x003e => Some(Self::BatchUnlink),
+            0x003f => Some(Self::BatchCreate),
             0x0040 => Some(Self::StatFs),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
@@ -1765,6 +1776,8 @@ pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
         0x003d => Some((256, 0)),
         // BatchUnlink (0x003e) - body < 64KB (up to ~256 entries × 256B each)
         0x003e => Some((64 * 1024, 0)),
+        // BatchCreate (0x003f) - body < 64KB (up to ~64 entries × 320B each)
+        0x003f => Some((64 * 1024, 0)),
 
         // ReadNeedle (0x0063) - data ≤ 2MB, body < 256KB
         0x0063 => Some((256 * 1024, 2 * 1024 * 1024)),
