@@ -414,6 +414,41 @@ impl WriteCoalescer {
         }
         n
     }
+
+    /// Flush only the entries whose id is in `needle_ids` (fsync barrier).
+    ///
+    /// Used by the Volume's per-file fsync: the caller asks to force-materialise
+    /// exactly the needles belonging to the file being fsynced, without touching
+    /// unrelated dirty entries (no cross-client latency amplification). Entries
+    /// are removed from the map under the lock; the (possibly heavy) `op` runs
+    /// *after* the lock is released, mirroring [`flush_expired`].
+    ///
+    /// Returns the number of entries that were dirty and handed to `op`.
+    /// Needles not currently dirty (already flushed / never written) are
+    /// skipped silently — their data is already on stable storage.
+    pub fn flush_specific<F: FnMut(NeedleId, Vec<u8>, bool) -> Result<(), ()>>(
+        &self,
+        needle_ids: &[NeedleId],
+        mut op: F,
+    ) -> usize {
+        let taken: Vec<(NeedleId, DirtyEntry)> = {
+            let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
+            let mut out = Vec::new();
+            for k in needle_ids {
+                if let Some(v) = inner.entries.remove(k) {
+                    inner.dirty_bytes_total =
+                        inner.dirty_bytes_total.saturating_sub(v.merged.len());
+                    out.push((k.clone(), v));
+                }
+            }
+            out
+        };
+        let n = taken.len();
+        for (id, e) in taken {
+            let _ = op(id, e.merged, e.is_new_needle);
+        }
+        n
+    }
 }
 
 impl Default for WriteCoalescer {
@@ -470,6 +505,32 @@ mod tests {
         seen.sort_by_key(|(k, _, _)| *k);
         assert_eq!(seen[0], (1, b"aa".to_vec(), true));
         assert_eq!(seen[1], (2, b"bb".to_vec(), true));
+    }
+
+    #[test]
+    fn flush_specific_only_drains_requested_needles() {
+        let coal = WriteCoalescer::new(CoalescerConfig::default());
+        coal.record_write(&NeedleId(1), 0, b"aa", 2, None);
+        coal.record_write(&NeedleId(2), 0, b"bb", 2, None);
+        coal.record_write(&NeedleId(3), 0, b"cc", 2, None);
+        // fsync only flushes needles 1 and 3 (plus an id that was never dirty).
+        let mut seen = Vec::new();
+        let n = coal.flush_specific(
+            &[NeedleId(1), NeedleId(99), NeedleId(3)],
+            |id, v, _is_new| {
+                seen.push((id.0, v));
+                Ok(())
+            },
+        );
+        // Only the two dirty, requested needles are materialised; id 99 (never
+        // dirty) is skipped and id 2 (dirty but not requested) stays buffered.
+        assert_eq!(n, 2);
+        seen.sort_by_key(|(k, _)| *k);
+        assert_eq!(seen[0], (1, b"aa".to_vec()));
+        assert_eq!(seen[1], (3, b"cc".to_vec()));
+        assert!(coal.is_dirty(&NeedleId(2)), "unrequested dirty needle must stay");
+        assert!(!coal.is_dirty(&NeedleId(1)));
+        assert_eq!(coal.dirty_entry_count(), 1);
     }
 
     #[test]

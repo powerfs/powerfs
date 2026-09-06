@@ -423,7 +423,22 @@ impl Volume {
 
             // Normal path: parse + checksum-verify via from_bytes.
             match Needle::from_bytes(&raw, self.id(), info.offset, info.checksum_algorithm) {
-                Ok(needle) => Ok(needle.data),
+                Ok(needle) => {
+                    // #75 debug: log data_size and bytes at offset 1044480 (last 4K block)
+                    if needle.data.len() >= 1044484 {
+                        let probe = &needle.data[1044480..1044484];
+                        log::info!(
+                            "READ_NEEDLE_DEBUG needle={} data_size={} offset={} first4_at_1044480={:02x?}",
+                            needle_id.0, needle.data.len(), info.offset, probe
+                        );
+                    } else {
+                        log::info!(
+                            "READ_NEEDLE_DEBUG needle={} data_size={} offset={} (too small for 1044480)",
+                            needle_id.0, needle.data.len(), info.offset
+                        );
+                    }
+                    Ok(needle.data)
+                }
                 Err(PowerFsError::InvalidRequest(ref msg))
                     if msg.contains("size mismatch") =>
                 {
@@ -1030,6 +1045,53 @@ impl Volume {
         self.coalescer.flush_expired(|id, vec, is_new| {
             self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
         })
+    }
+
+    /// Durability barrier used by fsync: force-materialise the given needles
+    /// (the file's chunks) out of the in-memory coalescer into the data file
+    /// and RocksDB index, then fsync the RocksDB WAL.
+    ///
+    /// Each materialised needle is written through [`flush_coalescer_entry`],
+    /// which persists the data via the storage backend (`fdatasync` on the data
+    /// file for the local backend) and updates the index.  Unlike the periodic
+    /// flush paths, errors are propagated (an fsync must NOT silently succeed
+    /// if the data could not be made durable).  Needles that are not currently
+    /// dirty are skipped — their latest data is already on stable storage.
+    ///
+    /// Returns the number of dirty needles that were materialised.
+    pub fn flush_needles_durable(&self, needle_ids: &[NeedleId]) -> Result<usize> {
+        let mut flush_err: Option<PowerFsError> = None;
+        let n = self.coalescer.flush_specific(needle_ids, |id, vec, is_new| {
+            if flush_err.is_some() {
+                // Keep draining remaining entries even after a failure so the
+                // coalescer does not leak them, but remember the first error.
+                let _ = self.flush_coalescer_entry(id, vec, is_new);
+                return Err(());
+            }
+            let log_id = id.clone();
+            if let Err(e) = self.flush_coalescer_entry(id, vec, is_new) {
+                log::error!("flush_needles_durable: materialise needle {:?} failed: {}", log_id, e);
+                flush_err = Some(e);
+                return Err(());
+            }
+            Ok(())
+        });
+        if let Some(e) = flush_err {
+            return Err(e);
+        }
+        // Always sync the RocksDB WAL, even when n==0 (nothing materialised
+        // in this call).  The regular coalescer flush paths
+        // (flush_expired_dirty / flush_all_dirty) write the index row via
+        // write_needle_atomic but do NOT sync the WAL — only this fsync-driven
+        // barrier does.  If we skip sync_wal when n==0, a needle that was
+        // already flushed by the regular path has its data file sync'd but
+        // its index row still sitting in the RocksDB WAL buffer in memory.
+        // A volume restart then loses the index row → read returns zeros
+        // even though the data file has the bytes.  fsync semantics require
+        // that ALL prior writes (including those flushed by the background
+        // coalescer) are durable, so we must barrier the WAL unconditionally.
+        self.index.sync_wal()?;
+        Ok(n)
     }
 
     /// Opportunistic deadline flush helper: cheap on the hot path (a single

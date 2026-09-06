@@ -650,6 +650,82 @@ impl VolumeNetHandler {
         }
     }
 
+    /// fsync durability barrier: force-materialise the given needles (the
+    /// file's chunks) from the in-memory coalescer to stable storage and
+    /// fsync the RocksDB WAL.  Empty/already-flushed needles are no-ops.
+    async fn handle_flush_needles(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        let count = dec.next_u64(FieldId::Limit).unwrap_or(0);
+        info!(
+            "NET_FLUSH_NEEDLES DECODE: body_len={}, decoded_count_from_limit={}",
+            msg.body.len(),
+            count
+        );
+        let mut file_keys: Vec<u64> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            match dec.next_u64(FieldId::FileKey) {
+                Ok(k) => {
+                    info!("NET_FLUSH_NEEDLES DECODE: file_key[{}]={}", i, k);
+                    file_keys.push(k);
+                }
+                Err(e) => {
+                    info!("NET_FLUSH_NEEDLES DECODE: file_key[{}] failed: {}", i, e);
+                    break;
+                }
+            }
+        }
+
+        info!(
+            "NET_FLUSH_NEEDLES: volume_id={}, count={} keys",
+            volume_id,
+            file_keys.len()
+        );
+
+        let storage_manager = self.volume_server.storage_manager.clone();
+        let vid = VolumeId(volume_id);
+        let requested = file_keys.len();
+
+        match tokio::task::spawn_blocking(move || -> Result<usize, String> {
+            let volume = storage_manager
+                .get_volume(&vid)
+                .ok_or_else(|| format!("volume not found: {}", volume_id))?;
+            let ids: Vec<NeedleId> = file_keys.into_iter().map(NeedleId).collect();
+            volume.flush_needles_durable(&ids).map_err(|e| {
+                warn!("flush_needles_durable failed: {}", e);
+                format!("{}", e)
+            })
+        })
+        .await
+        {
+            Ok(Ok(n)) => {
+                info!("NET_FLUSH_NEEDLES: volume_id={} materialised {} needles (requested {})", volume_id, n, requested);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()))
+            }
+            Ok(Err(e)) => {
+                warn!("NET_FLUSH_NEEDLES server error: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+            Err(e) => {
+                error!("flush_needles task failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     fn handle_range_lease(&self, msg: &NetMessage) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
@@ -973,6 +1049,7 @@ impl NetHandler for VolumeNetHandler {
                     .await
             }
             MsgType::ReadNeedleBlob => self.handle_read_needle_blob(msg).await,
+            MsgType::FlushNeedles => self.handle_flush_needles(msg).await,
             MsgType::RangeLease => self.handle_range_lease(msg),
             MsgType::AcquireLease => self.handle_acquire_lease(msg),
             MsgType::AcquireLeaseBatch => self.handle_acquire_lease_batch(msg),
