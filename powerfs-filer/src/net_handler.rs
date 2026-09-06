@@ -2756,7 +2756,7 @@ impl FilerNetHandler {
         let mut flushed: u32 = 0;
         let mut any_ok = false;
         for (i, result) in results.iter().enumerate() {
-            let (ino, parent_ino, name, _, _, _) = &entries[i];
+            let (ino, parent_ino, name, _, _, _, _, _) = &entries[i];
             match result {
                 Ok(_) => {
                     flushed += 1;

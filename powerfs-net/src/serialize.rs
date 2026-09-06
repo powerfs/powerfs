@@ -1370,11 +1370,13 @@ pub fn encode_batch_unlink_req(entries: &[(u64, String)]) -> Result<Vec<u8>, Net
     Ok(enc.into_bytes())
 }
 
-/// Batch create entry: (ino, parent_ino, name, mode, uid, gid)
-pub type BatchCreateEntry = (u64, u64, String, u32, u32, u32);
+/// Batch create entry: (ino, parent_ino, name, mode, uid, gid, mtime, atime)
+/// mtime/atime are unix seconds; 0 means the server assigns the current time.
+pub type BatchCreateEntry = (u64, u64, String, u32, u32, u32, u64, u64);
 
 /// Encode a batch create request (client side)
-/// Format: ShardId(u64) + Count(u32) + [Entry(Ino+ParentIno+Name+Mode+Uid+Gid)] * count
+/// Format: ShardId(u64) + Count(u32) +
+///         [Entry(Ino+ParentIno+Name+Mode+Uid+Gid+[Mtime]+[Atime])] * count
 pub fn encode_batch_create_req(
     shard_id: u64,
     entries: &[BatchCreateEntry],
@@ -1382,7 +1384,7 @@ pub fn encode_batch_create_req(
     let mut enc = TlvEncoder::new();
     enc.add_u64(FieldId::ShardId, shard_id);
     enc.add_u32(FieldId::Count, entries.len() as u32);
-    for (ino, parent_ino, name, mode, uid, gid) in entries {
+    for (ino, parent_ino, name, mode, uid, gid, mtime, atime) in entries {
         let mut entry_enc = TlvEncoder::new();
         entry_enc.add_u64(FieldId::Ino, *ino);
         entry_enc.add_u64(FieldId::ParentIno, *parent_ino);
@@ -1390,13 +1392,22 @@ pub fn encode_batch_create_req(
         entry_enc.add_u32(FieldId::Mode, *mode);
         entry_enc.add_u32(FieldId::Uid, *uid);
         entry_enc.add_u32(FieldId::Gid, *gid);
+        // Optional timestamps: carry utimensat/touch times applied while the
+        // create was still a local (optimistic) entry, so they publish
+        // atomically with the create instead of a separate setattr RPC.
+        if *mtime != 0 {
+            entry_enc.add_u64(FieldId::Mtime, *mtime);
+        }
+        if *atime != 0 {
+            entry_enc.add_u64(FieldId::Atime, *atime);
+        }
         enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
     }
     Ok(enc.into_bytes())
 }
 
 /// Decode a batch create request (server side)
-/// Returns (shard_id, Vec of (ino, parent_ino, name, mode, uid, gid))
+/// Returns (shard_id, Vec of (ino, parent_ino, name, mode, uid, gid, mtime, atime))
 pub fn decode_batch_create_req(body: &[u8]) -> Result<(u64, Vec<BatchCreateEntry>), NetError> {
     let mut dec = TlvDecoder::new(body);
     let shard_id = dec.next_u64(FieldId::ShardId)?;
@@ -1411,7 +1422,10 @@ pub fn decode_batch_create_req(body: &[u8]) -> Result<(u64, Vec<BatchCreateEntry
         let mode = entry_dec.next_u32(FieldId::Mode)?;
         let uid = entry_dec.next_u32(FieldId::Uid)?;
         let gid = entry_dec.next_u32(FieldId::Gid)?;
-        entries.push((ino, parent_ino, name, mode, uid, gid));
+        // Optional (older clients don't send them): default 0 = server time.
+        let mtime = entry_dec.next_u64(FieldId::Mtime).unwrap_or(0);
+        let atime = entry_dec.next_u64(FieldId::Atime).unwrap_or(0);
+        entries.push((ino, parent_ino, name, mode, uid, gid, mtime, atime));
     }
     Ok((shard_id, entries))
 }
