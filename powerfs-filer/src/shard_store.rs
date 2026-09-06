@@ -2779,9 +2779,15 @@ impl ShardStore {
     }
 
     /// 初始化 next_inode：从 CF_METADATA 读，若无用 inode_range.start（§4 1.4）
-    /// 保留 inode 0（无效）和 inode 1（POSIX root），shard 0 起始至少为 2
+    /// 保留 inode 0（无效）和 inode 1（POSIX root），shard 0 起始至少为 2。
+    ///
+    /// 安全兜底：再扫描 CF_INODES 取本 shard 范围内最大已存在 inode+1，
+    /// next_inode 不得低于该值。历史上 meta 层 ShardAllocator（慢路径
+    /// create/mkdir）与本计数器在同一范围发号，已存在 inode 可能远超
+    /// CF_METADATA 持久值；若池计数器从低值重启，会把活 inode 重发给
+    /// BatchCreate，造成 "already exists" 永久失败 + create 幽灵文件。
     fn init_next_inode(&self) {
-        let start = match self.db.cf_handle(CF_METADATA) {
+        let persisted = match self.db.cf_handle(CF_METADATA) {
             Some(cf) => match self.db.get_cf(cf, b"next_inode") {
                 Ok(Some(v)) if v.len() == 8 => {
                     let mut arr = [0u8; 8];
@@ -2792,12 +2798,14 @@ impl ShardStore {
             },
             None => self.inode_range.0,
         };
+        // get_max_inode_in_range returns max_ino+1 (or range_start).
+        let scanned = self.get_max_inode_in_range(self.inode_range.0, self.inode_range.1);
         // 跳过保留 inode：0（无效）和 1（POSIX root）
-        let start = start.max(2);
+        let start = persisted.max(scanned).max(2);
         *self.next_inode.lock().unwrap() = start;
         info!(
-            "Shard {}: init_next_inode = {} (range={:?})",
-            self.shard_id.0, start, self.inode_range
+            "Shard {}: init_next_inode = {} (persisted={}, scanned={}, range={:?})",
+            self.shard_id.0, start, persisted, scanned, self.inode_range
         );
     }
 
