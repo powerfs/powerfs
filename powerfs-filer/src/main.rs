@@ -975,8 +975,6 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         // EC/scrubber 参数可通过环境变量覆盖 (便于测试调整 EC 配置):
         //   POWERFS_SCRUBBER_SCAN_INTERVAL  扫描间隔秒 (默认 30)
         //   POWERFS_SCRUBBER_MAX_INODES     每轮最大 inode 数 (默认 50)
-        //   POWERFS_EC_DATA_SHARDS          EC 数据分片数 (默认 4)
-        //   POWERFS_EC_PARITY_SHARDS        EC 校验分片数 (默认 2)
         //   POWERFS_EC_MIN_FILE_SIZE        EC 转换最小文件字节数 (默认 0=不限制)
         {
             let scrubber_config = powerfs_filer::scrubber::ScrubberConfig {
@@ -989,25 +987,17 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(50),
                 replica_count: 2,
-                ec_data_shards: std::env::var("POWERFS_EC_DATA_SHARDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(4),
-                ec_parity_shards: std::env::var("POWERFS_EC_PARITY_SHARDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(2),
                 ec_min_file_size: std::env::var("POWERFS_EC_MIN_FILE_SIZE")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0),
+                ec_tiers: powerfs_filer::scrubber::ScrubberConfig::default().ec_tiers,
             };
             info!(
-                "P4_SCRUBBER: config scan_interval={}s max_inodes={} ec={:?}+{:?} min_file_size={}",
+                "P4_SCRUBBER: config scan_interval={}s max_inodes={} ec_tiers={:?} min_file_size={}",
                 scrubber_config.scan_interval_secs,
                 scrubber_config.max_inodes_per_scan,
-                scrubber_config.ec_data_shards,
-                scrubber_config.ec_parity_shards,
+                scrubber_config.ec_tiers,
                 scrubber_config.ec_min_file_size,
             );
             let scrubber = powerfs_filer::scrubber::ScrubberWorker::new(
