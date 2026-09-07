@@ -2541,9 +2541,18 @@ impl AsyncWrite for RdmaWriteHalf {
             return Poll::Ready(Ok(0));
         }
 
-        // Truncate to MR buffer size (partial write — write_all will retry).
+        // [#79] Do NOT truncate for RDMA — each SEND is a message boundary.
+        // Truncating splits a frame across multiple messages, corrupting the
+        // protocol (receiver sees partial frames, decode fails with "invalid
+        // magic"). If buf exceeds buffer size, return an error.
         let max_len = self.channel.mr_pool.buf_size();
-        let write_len = std::cmp::min(buf.len(), max_len);
+        if buf.len() > max_len {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("RDMA write: frame {} exceeds buffer size {}", buf.len(), max_len),
+            )));
+        }
+        let write_len = buf.len();
 
         let channel = self.channel.clone();
         let data = buf[..write_len].to_vec();
