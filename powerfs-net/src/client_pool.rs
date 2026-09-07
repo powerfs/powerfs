@@ -26,14 +26,14 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
 use tokio::time::interval;
 
 use crate::client::{ClientConfig, NotificationHandler, PowerFsNetClient};
-use crate::errors::NetResult;
+use crate::errors::{NetError, NetResult};
 use crate::protocol::{ClientType, NetMessage, CHANNEL_DATA, CHANNEL_META};
 use crate::transport::Transport;
 
@@ -124,10 +124,28 @@ pub struct ClientPoolConfig {
     pub max_retries: u32,
     /// Retry delay between connect attempts.
     pub retry_delay: Duration,
+    /// Connection-failure backoff base. After a failed `get_or_connect`, the
+    /// pool refuses to re-attempt that addr for `backoff_base * 2^(attempts-1)`
+    /// (capped at `backoff_max`). This prevents tight reconnect storms (and
+    /// RDMA MR-pool churn / memory growth) when topology points at a dead or
+    /// unreachable address. Env: `POWERFS_CONN_BACKOFF_BASE_MS`.
+    pub backoff_base: Duration,
+    /// Connection-failure backoff cap. Env: `POWERFS_CONN_BACKOFF_MAX_MS`.
+    pub backoff_max: Duration,
 }
 
 impl Default for ClientPoolConfig {
     fn default() -> Self {
+        let backoff_base = std::env::var("POWERFS_CONN_BACKOFF_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_millis(500));
+        let backoff_max = std::env::var("POWERFS_CONN_BACKOFF_MAX_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30));
         Self {
             health_check_interval: Duration::from_secs(15),
             connect_timeout: Duration::from_secs(5),
@@ -135,8 +153,24 @@ impl Default for ClientPoolConfig {
             max_inflight_per_conn: 256,
             max_retries: 3,
             retry_delay: Duration::from_millis(100),
+            backoff_base,
+            backoff_max,
         }
     }
+}
+
+/// Negative-cache entry for an address whose connection establishment failed.
+///
+/// While `Instant::now() < next_allowed_at`, `get_or_connect` fast-fails
+/// without calling `Transport::connect` (which, for RDMA, allocates an MR
+/// pool + QP per attempt). Prevents a reconnect storm / memory growth when a
+/// topology entry points at a dead node.
+#[derive(Debug, Clone)]
+struct FailedConn {
+    /// Earliest time at which a new connect attempt is allowed.
+    next_allowed_at: Instant,
+    /// Consecutive failure count (drives exponential backoff).
+    attempts: u32,
 }
 
 /// Wrapper to convert `Arc<dyn NotificationHandler>` into
@@ -172,6 +206,10 @@ pub struct ClientConnPool {
     /// mgmt processors all start at once) create duplicate TCP connections
     /// with the same `client_id`, causing server-side ConnRegistry collisions.
     per_key_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Negative cache for addresses whose connection establishment recently
+    /// failed. While in the backoff window, `get_or_connect` fast-fails
+    /// without allocating transport resources (see [`FailedConn`]).
+    failures: DashMap<String, FailedConn>,
     /// FUSE client ID (shared across all connections).
     client_id: u64,
     /// Pool configuration.
@@ -211,6 +249,7 @@ impl ClientConnPool {
         Self {
             connections: DashMap::new(),
             per_key_locks: DashMap::new(),
+            failures: DashMap::new(),
             client_id,
             config,
             notification_handler: parking_lot::RwLock::new(notification_handler),
@@ -260,6 +299,15 @@ impl ClientConnPool {
             drop(entry);
         }
 
+        // Negative cache: if a recent connect to this addr failed and we are
+        // still inside the backoff window, fast-fail WITHOUT touching the
+        // transport (no new TCP socket / RDMA MR-pool + QP). This is the
+        // primary guard against reconnect storms when topology points at a
+        // dead/unreachable node (see #77).
+        if let Err(e) = self.check_backoff(&key) {
+            return Err(e);
+        }
+
         // Slow path: acquire per-key lock to prevent concurrent connection
         // creation. Without this, multiple threads (e.g. FUSE startup with
         // data/lease/mgmt processors) create duplicate TCP connections with
@@ -285,13 +333,79 @@ impl ClientConnPool {
             drop(entry);
         }
 
+        // Re-check backoff while holding the lock: another task may have just
+        // recorded a failure for this key.
+        if let Err(e) = self.check_backoff(&key) {
+            return Err(e);
+        }
+
         debug!(
             "ClientConnPool: slow path creating connection {} (channel={}, client_id={})",
             key,
             channel_label(channel),
             self.client_id
         );
-        self.create_connection(addr, port, channel, &key).await
+        match self.create_connection(addr, port, channel, &key).await {
+            Ok(client) => {
+                // Success: clear any negative-cache entry for this addr.
+                self.failures.remove(&key);
+                Ok(client)
+            }
+            Err(e) => {
+                self.record_connect_failure(&key, addr, port, channel);
+                Err(e)
+            }
+        }
+    }
+
+    /// Return `Err` if `key` is currently in its connect-backoff window.
+    fn check_backoff(&self, key: &str) -> NetResult<()> {
+        if let Some(f) = self.failures.get(key) {
+            let now = Instant::now();
+            if now < f.next_allowed_at {
+                let wait = f.next_allowed_at.saturating_duration_since(now);
+                return Err(NetError::Connection(format!(
+                    "addr {} in connect backoff (attempts={}, retry in {:.2}s)",
+                    key,
+                    f.attempts,
+                    wait.as_secs_f64()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a failed connection attempt and compute the next backoff delay
+    /// with exponential growth: `base * 2^(attempts-1)`, capped at `backoff_max`.
+    fn record_connect_failure(&self, key: &str, addr: &str, port: u16, channel: u8) {
+        let (attempts, delay) = {
+            let mut entry = self
+                .failures
+                .entry(key.to_string())
+                .or_insert_with(|| FailedConn {
+                    next_allowed_at: Instant::now(),
+                    attempts: 0,
+                });
+            entry.attempts = entry.attempts.saturating_add(1);
+            // attempts=1 -> base, 2 -> 2*base, 3 -> 4*base, ...
+            let shift = entry.attempts.saturating_sub(1).min(20) as u32;
+            let delay = self
+                .config
+                .backoff_base
+                .checked_mul(1u32 << shift)
+                .unwrap_or(self.config.backoff_max)
+                .min(self.config.backoff_max);
+            entry.next_allowed_at = Instant::now() + delay;
+            (entry.attempts, delay)
+        }; // guard dropped before logging
+        warn!(
+            "ClientConnPool: connect to {}:{} (channel={}) failed; backoff {:.2}s (attempts={})",
+            addr,
+            port,
+            channel_label(channel),
+            delay.as_secs_f64(),
+            attempts
+        );
     }
 
     /// Get an existing connection or create a new one via `ServerEndpoint`.
@@ -431,6 +545,9 @@ impl ClientConnPool {
                 );
                 let _ = client.disconnect().await;
             }
+            // Also drop any backoff state so a later explicit reconnect is
+            // not blocked by a stale failure entry.
+            self.failures.remove(&key);
         }
     }
 
@@ -646,6 +763,48 @@ mod tests {
         // Should not panic on removing a nonexistent connection.
         pool.remove("1.2.3.4", 9999).await;
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn test_connect_backoff_blocks_then_allows_after_window() {
+        // Tiny backoff so we can observe window expiry without a long sleep.
+        let cfg = ClientPoolConfig {
+            backoff_base: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let pool = ClientConnPool::new(1, cfg, None);
+        let key = make_pool_key("10.0.0.99", 8901, CHANNEL_DATA);
+
+        // No failure recorded yet -> backoff check passes.
+        assert!(pool.check_backoff(&key).is_ok());
+
+        // Record a failure -> now inside backoff window, check fails.
+        pool.record_connect_failure(&key, "10.0.0.99", 8901, CHANNEL_DATA);
+        assert!(
+            pool.check_backoff(&key).is_err(),
+            "expected backoff to block immediately after a failure"
+        );
+
+        // Subsequent failures grow the backoff exponentially (attempts counter).
+        pool.record_connect_failure(&key, "10.0.0.99", 8901, CHANNEL_DATA);
+        let attempts = pool
+            .failures
+            .get(&key)
+            .map(|f| f.attempts)
+            .unwrap_or(0);
+        assert_eq!(attempts, 2);
+
+        // After the (short) window elapses, the check passes again.
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            pool.check_backoff(&key).is_ok(),
+            "expected backoff window to expire"
+        );
+
+        // Clearing (e.g. on remove) drops the negative cache entirely.
+        pool.failures.remove(&key);
+        assert!(pool.check_backoff(&key).is_ok());
     }
 
     #[tokio::test]

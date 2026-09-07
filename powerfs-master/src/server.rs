@@ -2017,6 +2017,27 @@ impl MasterService for MasterGrpcServer {
         }
     }
 
+    async fn remove_data_node(
+        &self,
+        request: Request<RemoveDataNodeRequest>,
+    ) -> Result<Response<MigrationControlResponse>, Status> {
+        let req = request.into_inner();
+        match self
+            .master
+            .remove_data_node_checked(&req.node_id, req.force)
+            .await
+        {
+            Ok(()) => Ok(Response::new(MigrationControlResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(MigrationControlResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
     async fn pin_volume(
         &self,
         request: Request<PinVolumeRequest>,

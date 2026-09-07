@@ -134,6 +134,13 @@ pub enum RaftCommand {
         node_id: String,
         enabled: bool,
     },
+    /// Set a data node's lifecycle state (e.g. `Unavailable` on heartbeat
+    /// timeout by the liveness watcher). `state` is a `NodeState` tag name
+    /// (`"Unavailable"`, `"Healthy"`, ...) to keep the Raft log stable.
+    SetNodeState {
+        node_id: String,
+        state: String,
+    },
     /// Pin a volume to a specific node (ops override).
     PinVolume {
         volume_id: u64,

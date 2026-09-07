@@ -1341,6 +1341,9 @@ impl MasterNode {
             RaftCommand::SetNodeMaintenance { node_id, enabled } => {
                 self.apply_set_node_maintenance(&node_id, enabled)?;
             }
+            RaftCommand::SetNodeState { node_id, state } => {
+                self.apply_set_node_state(&node_id, &state)?;
+            }
             RaftCommand::PinVolume { volume_id, node_id } => {
                 self.apply_pin_volume(volume_id, node_id)?;
             }
@@ -1427,11 +1430,77 @@ impl MasterNode {
 
     fn apply_remove_node(&self, node_id: &str) -> Result<()> {
         let nid = NodeId(node_id.to_string());
-        let mut topology = self.topology.write().unwrap();
-        if topology.remove_node(&nid).is_none() {
-            return Err(PowerFsError::InvalidRequest("node not found".to_string()));
+        {
+            let mut topology = self.topology.write().unwrap();
+            if topology.remove_node(&nid).is_none() {
+                return Err(PowerFsError::InvalidRequest("node not found".to_string()));
+            }
         }
-        info!("Applied RemoveNode: {}", node_id);
+
+        // Purge all volume routes owned by this node so they stop being handed
+        // out to filers (a route without a live node would trigger reconnect
+        // storms). Returns the removed volume_ids for zone cleanup.
+        let removed_volume_ids: Vec<u64> = {
+            let mut routes = self.volume_routes.write().unwrap();
+            let mut removed = Vec::new();
+            routes.retain(|vid, r| {
+                if r.node_id == node_id {
+                    removed.push(*vid);
+                    false
+                } else {
+                    true
+                }
+            });
+            removed
+        };
+
+        // Drop references to the removed volumes from any filer zone so
+        // re-registration does not resurface stale addresses.
+        if !removed_volume_ids.is_empty() {
+            let mut zones = self.zone_registry.write().unwrap();
+            for zone in zones.values_mut() {
+                let before = zone.physical_volumes.len();
+                zone.physical_volumes
+                    .retain(|zv| !removed_volume_ids.contains(&zv.volume_id));
+                if zone.physical_volumes.len() != before {
+                    debug!(
+                        "Applied RemoveNode: zone {} dropped {} volume(s) of node {}",
+                        zone.zone_id,
+                        before - zone.physical_volumes.len(),
+                        node_id
+                    );
+                }
+            }
+        }
+
+        info!(
+            "Applied RemoveNode: {} (removed {} volume route(s))",
+            node_id,
+            removed_volume_ids.len()
+        );
+        Ok(())
+    }
+
+    /// Apply `SetNodeState` Raft command: set the lifecycle state of a data
+    /// node in the in-memory topology (used by the liveness watcher to mark
+    /// heartbeat-timed-out nodes `Unavailable`).
+    fn apply_set_node_state(&self, node_id: &str, state: &str) -> Result<()> {
+        let new_state = parse_node_state(state);
+        let nid = NodeId(node_id.to_string());
+        let mut topology = self.topology.write().unwrap();
+        if let Some(node) = topology.get_node_mut(&nid) {
+            if node.state != new_state {
+                info!(
+                    "Applied SetNodeState via Raft: node={} {:?} -> {:?}",
+                    node_id, node.state, new_state
+                );
+                node.state = new_state;
+                node.state_since = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+            }
+        }
         Ok(())
     }
 
@@ -2092,6 +2161,133 @@ impl MasterNode {
 
         self.propose_command(cmd).await?;
         Ok(())
+    }
+
+    /// Propose a data-node lifecycle state change (e.g. mark a
+    /// heartbeat-timed-out node `Unavailable`). Idempotent: the apply step is a
+    /// no-op when the node is already in the requested state.
+    ///
+    /// Only the Raft leader can propose this command.
+    pub async fn set_node_state(
+        &self,
+        node_id: &str,
+        state: powerfs_common::types::NodeState,
+    ) -> Result<()> {
+        if !self.is_leader().await {
+            return Err(PowerFsError::NotLeader);
+        }
+
+        let cmd = RaftCommand::SetNodeState {
+            node_id: node_id.to_string(),
+            state: node_state_name(state).to_string(),
+        };
+
+        self.propose_command(cmd).await?;
+        Ok(())
+    }
+
+    /// Remove a data node (and all of its volume routes / zone references) via
+    /// Raft. Used by the admin `node remove` API. Idempotent-ish: applying to a
+    /// missing node returns an error that callers may treat as success.
+    ///
+    /// Only the Raft leader can propose this command.
+    pub async fn remove_data_node(&self, node_id: &str) -> Result<()> {
+        self.remove_node(&NodeId(node_id.to_string())).await
+    }
+
+    /// Safety-checked removal used by the admin API. When `force` is false, a
+    /// node that still appears servable (readable state, not in maintenance)
+    /// and owns volume routes is rejected — operators should drain / take it
+    /// down (the liveness watcher then marks it `Unavailable`) before removal.
+    /// A missing node is treated as already-removed (idempotent success).
+    pub async fn remove_data_node_checked(&self, node_id: &str, force: bool) -> Result<()> {
+        // Snapshot under the topology lock, then release it before touching
+        // volume_routes (avoid holding two locks at once).
+        let serving: Option<bool> = {
+            let topology = self.topology.read().unwrap();
+            topology
+                .get_node(&NodeId(node_id.to_string()))
+                .map(|n| n.state.is_readable() && !n.maintenance_mode)
+        };
+
+        match serving {
+            None => {
+                // Node already absent from topology — nothing to remove.
+                info!("remove_data_node: node={} not present in topology (already removed)", node_id);
+                Ok(())
+            }
+            Some(true) if !force => {
+                let route_count = self
+                    .volume_routes
+                    .read()
+                    .unwrap()
+                    .values()
+                    .filter(|r| r.node_id == node_id)
+                    .count();
+                if route_count > 0 {
+                    return Err(PowerFsError::InvalidRequest(format!(
+                        "node {} is still healthy and owns {} volume route(s); \
+                         drain it or take it offline first, or pass force=true",
+                        node_id, route_count
+                    )));
+                }
+                self.remove_data_node(node_id).await
+            }
+            Some(_) => self.remove_data_node(node_id).await,
+        }
+    }
+
+    /// Scan data-node heartbeats and mark stale ones `Unavailable` (leader
+    /// only; followers no-op). Nodes that are in maintenance or already
+    /// `Unavailable`/`Maintenance` are skipped. Recovery is automatic because
+    /// `apply_heartbeat` resets state to Healthy on the next heartbeat.
+    pub async fn check_node_liveness(&self, offline_timeout: chrono::Duration) {
+        if !self.is_leader().await {
+            return;
+        }
+
+        let now = chrono::Utc::now();
+        // Snapshot candidates under the topology lock, then release it before
+        // proposing Raft commands (propose is async and must not hold the lock).
+        let stale: Vec<String> = {
+            let topology = self.topology.read().unwrap();
+            topology
+                .list_all_nodes()
+                .iter()
+                .filter(|n| {
+                    if n.maintenance_mode {
+                        return false; // intentionally offline
+                    }
+                    // Only flag nodes that are expected to be serving.
+                    if !matches!(
+                        n.state,
+                        powerfs_common::types::NodeState::Ready
+                            | powerfs_common::types::NodeState::Healthy
+                            | powerfs_common::types::NodeState::SoftError
+                            | powerfs_common::types::NodeState::FailSlow
+                            | powerfs_common::types::NodeState::Degraded
+                    ) {
+                        return false;
+                    }
+                    now.signed_duration_since(n.last_heartbeat) > offline_timeout
+                })
+                .map(|n| n.id.0.clone())
+                .collect()
+        };
+
+        for node_id in stale {
+            warn!(
+                "Node liveness: node={} missed heartbeats (timeout {}s); marking Unavailable",
+                node_id,
+                offline_timeout.num_seconds()
+            );
+            if let Err(e) = self
+                .set_node_state(&node_id, powerfs_common::types::NodeState::Unavailable)
+                .await
+            {
+                warn!("Node liveness: failed to mark node={} Unavailable: {}", node_id, e);
+            }
+        }
     }
 
     /// Pin a volume to a specific node via Raft replication.
@@ -2917,6 +3113,32 @@ impl MasterNode {
             .collect()
     }
 
+    /// Volume routes whose owning node is currently servable, i.e. the node is
+    /// in a readable state (`NodeState::is_readable`) and not in maintenance.
+    ///
+    /// Routes belonging to heartbeat-timed-out (`Unavailable`), `Fault`, or
+    /// maintenance nodes are excluded, so filer zones never advertise addresses
+    /// that cannot serve traffic (prevents client reconnect storms to dead
+    /// nodes; see #78).
+    pub fn list_servable_volume_routes(&self) -> Vec<VolumeRoute> {
+        let servable_nodes: std::collections::HashSet<String> = {
+            let topology = self.topology.read().unwrap();
+            topology
+                .list_all_nodes()
+                .iter()
+                .filter(|n| n.state.is_readable() && !n.maintenance_mode)
+                .map(|n| n.id.0.clone())
+                .collect()
+        };
+        self.volume_routes
+            .read()
+            .unwrap()
+            .values()
+            .filter(|r| servable_nodes.contains(&r.node_id))
+            .cloned()
+            .collect()
+    }
+
     /// Return a snapshot of the rebalance engine's migration tasks (empty if
     /// the engine hasn't started yet). For StatusQuery / monitoring.
     pub fn migration_tasks(&self) -> Vec<powerfs_allocator::MigrationTaskStatus> {
@@ -3174,7 +3396,9 @@ impl MasterNode {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| (ec_data + ec_parity).max(3));
-        let routes = self.list_volume_routes();
+        // Only advertise routes on servable (healthy / not-in-maintenance /
+        // not-heartbeat-timed-out) nodes to filers (see #78).
+        let routes = self.list_servable_volume_routes();
         let mut sorted_routes: Vec<VolumeRoute> = routes.into_iter().collect();
         sorted_routes.sort_by(|a, b| {
             let free_a = if a.size > 0 {
@@ -3828,6 +4052,32 @@ impl MasterNode {
             info!("Allocator management API initialized");
         }
 
+        // Node liveness watcher: leader-only background task that marks data
+        // nodes which stopped heartbeating as `Unavailable` so their volume
+        // routes stop being advertised to filers (see #78). Recovery is
+        // automatic: a fresh heartbeat resets state to Healthy.
+        {
+            let liveness_master = Arc::clone(&self);
+            tokio::spawn(async move {
+                let interval_secs: u64 = std::env::var("POWERFS_NODE_LIVENESS_INTERVAL")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10);
+                let offline_secs: i64 = std::env::var("POWERFS_NODE_OFFLINE_TIMEOUT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(30);
+                let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+                loop {
+                    ticker.tick().await;
+                    liveness_master
+                        .check_node_liveness(chrono::Duration::seconds(offline_secs))
+                        .await;
+                }
+            });
+            info!("Node liveness watcher started");
+        }
+
         let master_clone = self.clone();
         let kv_cache_clone = self.kv_cache.clone();
         let server_address = self.address;
@@ -4239,6 +4489,41 @@ fn map_node_state(
         NodeState::Degraded => NodeRuntimeState::Degraded,
         NodeState::Maintenance => NodeRuntimeState::Maintenance,
         NodeState::Fault | NodeState::Unavailable => NodeRuntimeState::Down,
+    }
+}
+
+/// Parse a `NodeState` tag name (as stored in a `RaftCommand::SetNodeState`)
+/// back into the enum. Unknown values default to `Unavailable` (safe: an
+/// unrecognized state is treated as not-servable rather than healthy).
+fn parse_node_state(s: &str) -> powerfs_common::types::NodeState {
+    use powerfs_common::types::NodeState;
+    match s {
+        "Init" => NodeState::Init,
+        "Ready" => NodeState::Ready,
+        "Healthy" => NodeState::Healthy,
+        "SoftError" => NodeState::SoftError,
+        "FailSlow" => NodeState::FailSlow,
+        "Degraded" => NodeState::Degraded,
+        "Fault" => NodeState::Fault,
+        "Maintenance" => NodeState::Maintenance,
+        "Unavailable" => NodeState::Unavailable,
+        _ => NodeState::Unavailable,
+    }
+}
+
+/// Serialize a `NodeState` to its tag name (inverse of [`parse_node_state`]).
+fn node_state_name(state: powerfs_common::types::NodeState) -> &'static str {
+    use powerfs_common::types::NodeState;
+    match state {
+        NodeState::Init => "Init",
+        NodeState::Ready => "Ready",
+        NodeState::Healthy => "Healthy",
+        NodeState::SoftError => "SoftError",
+        NodeState::FailSlow => "FailSlow",
+        NodeState::Degraded => "Degraded",
+        NodeState::Fault => "Fault",
+        NodeState::Maintenance => "Maintenance",
+        NodeState::Unavailable => "Unavailable",
     }
 }
 
