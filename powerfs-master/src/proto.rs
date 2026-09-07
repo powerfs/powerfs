@@ -109,6 +109,7 @@ pub use powerfs::{
     PutBlockResponse,
     RackStats,
     RebalanceActionInfo,
+    RemoveDataNodeRequest,
     RemoveNodeRequest,
     RemoveNodeResponse,
     RenameOp,
