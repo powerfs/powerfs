@@ -480,22 +480,25 @@ pub enum ReliabilityState {
 - `EC → Degraded`：读路径检测到分片丢失但仍在容错范围内
 - `Degraded → EC`：scrubber 后台重建丢失分片
 
-### 5.2 默认策略表
+### 5.2 默认策略表（分层 EC）
 
-| 文件大小 | 写入时 | 后台目标 | 理由 |
-|---------|--------|---------|------|
-| < 4KB (Inline) | **Raft 复制（隐式 N=3）** | **保持 Raft 复制** | Inline 数据不参与 scrubber，Filer Raft 已保证 3 副本 |
-| 4KB - 10MB | SingleReplica | EC(4+2) | 小文件直接 EC，省去副本中间态 |
-| 10MB - 1GB | SingleReplica | EC(4+2) | 中等文件 EC 节省空间 50% |
-| 1GB - 100GB | SingleReplica | EC(8+4) | 大文件 EC 节省空间 67% |
-| > 100GB | SingleReplica | EC(16+4) | 极致空间效率 |
-| HPC 标志 | SingleReplica | 保持 SingleReplica 或 EC(16+4) | 由目录属性决定 |
+| 文件大小 | 写入时 | 后台 EC 配置 | Volume 数 | 容错 | 存储开销 | 理由 |
+|---------|--------|-------------|----------|------|---------|------|
+| < 8KB (Inline) | **Raft 复制（隐式 N=3）** | **保持 Raft 复制** | — | 1 node | 3x | Inline 数据不参与 scrubber，Filer Raft 已保证 3 副本 |
+| 8KB - 1MB | SingleReplica | **EC(2+1)** | 3 | 1 failure | 1.5x | 小文件 shard 数少，3 volume 即可 |
+| 1MB - 1GB | SingleReplica | **EC(4+2)** | 6 | 2 failures | 1.5x | 中等文件，6 volume anti-affinity |
+| 1GB - 100GB | SingleReplica | **EC(8+4)** | 12 | 4 failures | 1.5x | 大文件，12 volume 分布广 |
+| > 100GB | SingleReplica | **EC(16+4)** | 20 | 4 failures | 1.25x | 极致空间效率 |
+| HPC 标志 | SingleReplica | **EC(16+4)** 或保持 SingleReplica | 20 | 4 failures | 1.25x | 由目录属性决定 |
 
-**Inline 特例**：Placement=Inline 时，Reliability 隐式为 Raft 复制（Filer Raft 组的副本数，通常 N=3），不参与 scrubber 异步转换。Inline 文件迁移到 Flat 后，Reliability 按上表转为 SingleReplica → 后台 EC。
+**设计要点**：
+- **统一 1.5x 存储开销**（除超大文件 1.25x），避免小文件用 EC(4+2) 浪费 6 个 volume
+- **按需 shard 数**：小文件 3 volume 即可容错，不必拉满 6+ volume
+- **Inline 特例**：Placement=Inline 时，Reliability 隐式为 Raft 复制（Filer Raft 组的副本数，通常 N=3），不参与 scrubber 异步转换。Inline 文件迁移到 Flat 后，Reliability 按上表转为 SingleReplica → 后台分层 EC。
 
 > **可靠性分层（2026-09-06 对齐）**：
 > - **Inline 模式**：数据在 Filer Raft 中（元数据+数据 3 副本），无需 Volume 层保护。
-> - **Flat/Stripe 模式**：数据在 Volume Server，由 EC 容错（data+parity shards 跨节点分布）。
+> - **Flat/Stripe 模式**：数据在 Volume Server，由**分层 EC** 容错（按文件大小选择 shard 数，data+parity shards 跨节点分布）。
 > - **FlushNeedles 定位**：是**数据持久性屏障**（保证 Volume coalescer 内存数据物化到
 >   数据文件 + RocksDB WAL sync），与 EC（**容错机制**，防 disk/node 故障）正交。
 >   FlushNeedles 保证 volume 重启不丢数据；EC 保证多 volume 故障可恢复。两者不可互替。
