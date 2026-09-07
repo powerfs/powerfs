@@ -131,22 +131,21 @@ AUTO fallback 逻辑（conn.c:1954-2008）：先试 RDMA，`init_conn`/`connect`
 
 #### 修复
 
-两处 volume TCP-forced 改为：**当 mount transport 为 RDMA 或 AUTO 时，volume
-连接用 `POWERFS_TRANSPORT_AUTO`（RDMA 优先 + TCP fallback）；mount 为 TCP 时
-保持 TCP**。
+两处 volume TCP-forced 改为：**直接继承 mount 的 `g_pool.transport_type`**。
 
 ```c
-/* Volume connections: RDMA-priority when mount transport includes RDMA,
- * TCP-only when mount explicitly chose TCP. The AUTO fallback in
- * powerfs_conn_connect_one handles RDMA-fail → TCP. */
-enum powerfs_transport_type vol_transport;
-if (g_pool.transport_type == POWERFS_TRANSPORT_TCP)
-    vol_transport = POWERFS_TRANSPORT_TCP;
-else
-    vol_transport = POWERFS_TRANSPORT_AUTO;
-conn->transport = powerfs_transport_pick_ops(vol_transport);
-conn->transport_type = vol_transport;
+/* Volume connections inherit mount transport type:
+ *   tcp  → TCP only
+ *   rdma → RDMA only (fails hard, no TCP fallback)
+ *   auto → RDMA first, TCP fallback on failure */
+conn->transport = powerfs_transport_pick_ops(g_pool.transport_type);
+conn->transport_type = g_pool.transport_type;
 ```
+
+`powerfs_conn_connect_one` 已有各模式的正确处理：
+- `transport=rdma`：RDMA 失败直接返回错误（**不 fallback**）
+- `transport=auto`：RDMA 失败后回退 TCP
+- `transport=tcp`：走 TCP socket 路径
 
 - `powerfs_net_data.c:533-542`（`pfs_ensure_volume_conn`）
 - `powerfs_net_conn.c:2750-2757`（静态 pool init volume 分支）
@@ -156,15 +155,16 @@ conn->transport_type = vol_transport;
 | volume 配置 | mount transport | 内核 volume 实际路径 |
 |-------------|----------------|---------------------|
 | tcp | tcp | TCP（不变） |
-| tcp | rdma/auto | AUTO: RDMA 快速失败 → TCP fallback（~ms 级，rdma_cm REJECTED） |
+| tcp | rdma | RDMA 失败 → **报错**（无 fallback，符合预期） |
+| tcp | auto | RDMA 快速失败 → TCP fallback（~ms 级，rdma_cm REJECTED） |
 | rdma | tcp | TCP（mount 显式选 TCP） |
-| rdma | rdma/auto | RDMA（内核→Rust volume RDMA server，同 filer 路径） |
+| rdma | rdma | RDMA 连接成功；**数据帧失败**（#79：Rust server recv buf 64KB < kernel 2MB） |
+| rdma | auto | 同上（RDMA 连接成功，数据帧失败） |
 
-- RDMA 失败是快速失败（rdma_cm event 8 REJECTED，非超时），fallback 不影响
-  首次建连延迟。
-- 内核 RDMA client → Rust RDMA server（filer）已验证正常（FULLY_REGISTERED），
-  volume 用同一服务端 RDMA 代码，因此内核→volume RDMA 路径也应正常（#76 的
-  Rust→Rust RDMA 帧问题是另一条路径）。
+- `transport=rdma` 不通就报错（不 fallback），只有 `transport=auto` 才 fallback。
+- RDMA 失败是快速失败（rdma_cm REJECTED / ECONNREFUSED，非超时）。
+- 内核→filer RDMA 正常（小帧 ≤64KB）；内核→volume RDMA 连接成功但数据帧
+  传输因 buffer 不匹配失败（#79），待修复。
 
 #### 非目标（记录为后续特性）
 
