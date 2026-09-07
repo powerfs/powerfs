@@ -1136,9 +1136,10 @@ impl PowerFsFs {
 
         let facade = self.client.facade().clone();
         let cid = self.client.client_id();
-        match self.client.block_on(async move {
-            facade.cap_acquire(inode, &cid, &token, 0b100).await
-        }) {
+        match self
+            .client
+            .block_on(async move { facade.cap_acquire(inode, &cid, &token, 0b100).await })
+        {
             Ok((_granted_token, granted_bits, epoch, sn, _duration_ms)) => {
                 let granted = crate::client_cap::CapSet(granted_bits);
                 self.cache.with_cap_mut(inode, |cap| {
@@ -1151,10 +1152,7 @@ impl PowerFsFs {
             }
             Err(e) => {
                 // Advisory — proceed with metadata RPC (Filer Raft handles consistency).
-                debug!(
-                    "acquire_meta_cap: inode={} advisory skip: {}",
-                    inode, e
-                );
+                debug!("acquire_meta_cap: inode={} advisory skip: {}", inode, e);
             }
         }
     }
@@ -7148,9 +7146,20 @@ impl FileSystem for PowerFsFs {
             }
         }; // RefMut guaranteed dropped here
 
-        // Phase 2: Inline→Flat migration (no DashMap lock held)
+        // Phase 2: Inline→Flat/Stripe migration (no DashMap lock held)
         if let Some((merged_data, new_end, migrate_threshold)) = migrate_data {
             let meta_client = self.client.facade().meta_shard_client().clone();
+            // Content-based layout decision for Empty-state files:
+            // binary content (ELF, images, archives, …) → Stripe;
+            // text content (config, scripts, source) → Flat.
+            // This only affects the *desired* mode sent to the Filer; the
+            // Filer may still fall back to Flat if Stripe allocation fails.
+            let content_type = powerfs_layout::detect_content_type(&merged_data);
+            let desired_stripe = matches!(content_type, powerfs_layout::ContentType::Binary);
+            info!(
+                "write inline migrate: inode={} new_end={} > threshold={}, content={:?}, desired_stripe={}",
+                inode, new_end, migrate_threshold, content_type, desired_stripe
+            );
             // Route migrate_inline_alloc via the inode's own shard
             // (calculate_shard(inode) on the client == calculate_shard(inode)
             // on the filer, since both use (inode / 1_000_000) % shard_count).
@@ -7159,9 +7168,14 @@ impl FileSystem for PowerFsFs {
             // → EFBIG → buffer discarded → 0-byte file on release.
             let routing_shard = self.routing_shard(inode);
             match self.client.block_on(async move {
-                meta_client.migrate_inline_alloc(routing_shard, inode).await
+                meta_client
+                    .migrate_inline_alloc(routing_shard, inode, desired_stripe)
+                    .await
             }) {
-                Ok((volume_id, needle_id)) => {
+                Ok(powerfs_fuse_core::meta_shard_client::MigrateAllocResult::Flat {
+                    volume_id,
+                    needle_id,
+                }) => {
                     info!(
                         "write inline migrate: inode={} new_end={} > threshold={} → \
                          Flat volume_id={} needle_id={:#x}",
@@ -7192,7 +7206,7 @@ impl FileSystem for PowerFsFs {
                         volume_id,
                         crc32: 0,
                     }];
-                    self.cache.update_fid(inode, fid);
+                    self.cache.update_fid(inode, Some(fid));
                     self.cache.update_chunks(inode, chunks);
                     self.cache.update_size(inode, new_size);
 
@@ -7208,6 +7222,64 @@ impl FileSystem for PowerFsFs {
                     );
                     // EntryState: 标记 Dirty 以反映 chunk_cache 已写入迁移数据
                     // §13 Cap model: mark CAP_W dirty for recall flush.
+                    self.cache.mark_dirty_cap_w(inode);
+                    return Ok(read_len);
+                }
+                Ok(powerfs_fuse_core::meta_shard_client::MigrateAllocResult::Stripe {
+                    stripe_size,
+                    stripe_count,
+                    allocations,
+                }) => {
+                    info!(
+                        "write inline migrate: inode={} new_end={} → Stripe count={} size={} (binary content detected)",
+                        inode, new_end, stripe_count, stripe_size
+                    );
+                    let mtime = chrono::Utc::now().timestamp() as u64;
+                    let new_size = new_end;
+
+                    // Put the full migrated data into chunk_cache at offset 0.
+                    // The Stripe write/flush path uses placement.locate() to
+                    // route each byte range to the correct volume, so we do
+                    // not need to split the data here.
+                    self.chunk_cache
+                        .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
+                    self.mark_dirty(inode, 0);
+
+                    // Build Stripe placement + per-stripe chunks.
+                    let volume_ids: Vec<u64> = allocations.iter().map(|(v, _)| *v).collect();
+                    let placement = powerfs_layout::Placement::Stripe {
+                        stripe_size,
+                        stripe_count,
+                        start_volume_idx: 0,
+                        volume_ids: volume_ids.clone(),
+                    };
+                    let chunks: Vec<CachedFileChunk> = allocations
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (vid, nid))| CachedFileChunk {
+                            offset: (i as u64) * stripe_size,
+                            size: 0,
+                            mtime,
+                            needle_id: *nid,
+                            volume_id: *vid,
+                            crc32: 0,
+                        })
+                        .collect();
+
+                    // Stripe files use per-chunk needle IDs, not a single fid.
+                    self.cache.update_fid(inode, None);
+                    self.cache.update_placement(inode, Some(placement));
+                    self.cache.update_chunks(inode, chunks);
+                    self.cache.update_size(inode, new_size);
+
+                    self.inline_buffers.remove(&inode);
+                    self.inline_max_sizes.remove(&inode);
+
+                    info!(
+                        "write inline migrate done: inode={} size={} → Stripe({}), \
+                         subsequent writes → striped Volume Servers",
+                        inode, new_size, stripe_count
+                    );
                     self.cache.mark_dirty_cap_w(inode);
                     return Ok(read_len);
                 }
@@ -7700,17 +7772,25 @@ impl FileSystem for PowerFsFs {
                     data
                 };
                 let migrate_threshold = INLINE_HARD_LIMIT as u64;
+                // Content-based layout decision (same as the primary migrate path).
+                let content_type = powerfs_layout::detect_content_type(&merged_data);
+                let desired_stripe = matches!(content_type, powerfs_layout::ContentType::Binary);
                 info!(
-                    "write: inode {} new_end={} > INLINE_HARD_LIMIT={}, invoking migrate \
+                    "write: inode {} new_end={} > INLINE_HARD_LIMIT={}, content={:?}, desired_stripe={}, invoking migrate \
                      (inline_buffer was evicted, data reconstructed from write buffer)",
-                    inode, new_end, INLINE_HARD_LIMIT
+                    inode, new_end, INLINE_HARD_LIMIT, content_type, desired_stripe
                 );
                 let meta_client = self.client.facade().meta_shard_client().clone();
                 let routing_shard = self.routing_shard(inode);
                 match self.client.block_on(async move {
-                    meta_client.migrate_inline_alloc(routing_shard, inode).await
+                    meta_client
+                        .migrate_inline_alloc(routing_shard, inode, desired_stripe)
+                        .await
                 }) {
-                    Ok((volume_id, needle_id)) => {
+                    Ok(powerfs_fuse_core::meta_shard_client::MigrateAllocResult::Flat {
+                        volume_id,
+                        needle_id,
+                    }) => {
                         info!(
                             "write inline migrate (evicted): inode={} new_end={} > threshold={} → \
                              Flat volume_id={} needle_id={:#x}",
@@ -7734,7 +7814,7 @@ impl FileSystem for PowerFsFs {
                             volume_id,
                             crc32: 0,
                         }];
-                        self.cache.update_fid(inode, fid);
+                        self.cache.update_fid(inode, Some(fid));
                         self.cache.update_chunks(inode, chunks);
                         self.cache.update_size(inode, new_size);
                         self.inline_buffers.remove(&inode);
@@ -7745,6 +7825,52 @@ impl FileSystem for PowerFsFs {
                             inode, new_size
                         );
                         // §13 Cap model: mark CAP_W dirty for recall flush.
+                        self.cache.mark_dirty_cap_w(inode);
+                        return Ok(read_len);
+                    }
+                    Ok(powerfs_fuse_core::meta_shard_client::MigrateAllocResult::Stripe {
+                        stripe_size,
+                        stripe_count,
+                        allocations,
+                    }) => {
+                        info!(
+                            "write inline migrate (evicted): inode={} new_end={} → Stripe count={} size={} (binary content detected)",
+                            inode, new_end, stripe_count, stripe_size
+                        );
+                        let mtime = chrono::Utc::now().timestamp() as u64;
+                        let new_size = new_end;
+                        self.chunk_cache
+                            .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
+                        self.mark_dirty(inode, 0);
+                        let volume_ids: Vec<u64> = allocations.iter().map(|(v, _)| *v).collect();
+                        let placement = powerfs_layout::Placement::Stripe {
+                            stripe_size,
+                            stripe_count,
+                            start_volume_idx: 0,
+                            volume_ids: volume_ids.clone(),
+                        };
+                        let chunks: Vec<CachedFileChunk> = allocations
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (vid, nid))| CachedFileChunk {
+                                offset: (i as u64) * stripe_size,
+                                size: 0,
+                                mtime,
+                                needle_id: *nid,
+                                volume_id: *vid,
+                                crc32: 0,
+                            })
+                            .collect();
+                        self.cache.update_fid(inode, None);
+                        self.cache.update_placement(inode, Some(placement));
+                        self.cache.update_chunks(inode, chunks);
+                        self.cache.update_size(inode, new_size);
+                        self.inline_buffers.remove(&inode);
+                        self.inline_max_sizes.remove(&inode);
+                        info!(
+                            "write inline migrate (evicted) done: inode={} size={} → Stripe({})",
+                            inode, new_size, stripe_count
+                        );
                         self.cache.mark_dirty_cap_w(inode);
                         return Ok(read_len);
                     }

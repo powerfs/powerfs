@@ -27,8 +27,8 @@ pub use fuse_client_facade::{
 };
 pub use lease::{LeaseGuard, LeaseManager, LeaseMode, LeaseState, LeaseToken, VolumeLeaseManager};
 pub use meta_shard_client::{
-    ChannelConfig, MetaShardClient, MetaShardClientConfig, MetaShardClientState, PendingRequest,
-    RequestQueue, RequestResult, TransportChannel,
+    ChannelConfig, MetaShardClient, MetaShardClientConfig, MetaShardClientState,
+    MigrateAllocResult, PendingRequest, RequestQueue, RequestResult, TransportChannel,
 };
 pub use provider_adapter::{FacadeMetadataProvider, FacadeStorageProvider, FacadeVolumeProvider};
 pub use request_id::RequestId;

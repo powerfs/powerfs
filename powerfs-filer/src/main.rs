@@ -55,24 +55,31 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     // Create transport (tcp/rdma/auto) based on filer config.
     // Shared across net server + inter-service clients (TlvMasterClient, ClientConnPool).
     let transport_cfg = powerfs_net::TransportConfig {
-        transport: filer_cfg.transport.clone().unwrap_or_else(|| "tcp".to_string()),
+        transport: filer_cfg
+            .transport
+            .clone()
+            .unwrap_or_else(|| "tcp".to_string()),
         rdma_device: filer_cfg.rdma_device.clone(),
         require_rdma: filer_cfg.require_rdma,
         ..Default::default()
     };
-    let net_transport: Arc<dyn powerfs_net::Transport> = match powerfs_net::create_transport(&transport_cfg) {
-        Ok(t) => {
-            info!("Net transport: {}", t.name());
-            t
-        }
-        Err(e) => {
-            error!("Failed to create transport '{}': {:?}", transport_cfg.transport, e);
-            return Err(PowerFsError::InvalidRequest(format!(
-                "transport '{}' init failed: {:?}",
-                transport_cfg.transport, e
-            )));
-        }
-    };
+    let net_transport: Arc<dyn powerfs_net::Transport> =
+        match powerfs_net::create_transport(&transport_cfg) {
+            Ok(t) => {
+                info!("Net transport: {}", t.name());
+                t
+            }
+            Err(e) => {
+                error!(
+                    "Failed to create transport '{}': {:?}",
+                    transport_cfg.transport, e
+                );
+                return Err(PowerFsError::InvalidRequest(format!(
+                    "transport '{}' init failed: {:?}",
+                    transport_cfg.transport, e
+                )));
+            }
+        };
 
     // Master management transport: always TCP (management network).
     // Only the data path (net server + filer→volume) uses the configured transport (RDMA).
@@ -485,6 +492,22 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     // Prevents inode number reuse after restart (was causing -ENOSPC in kernel).
     meta_shard_manager.recover_inode_generator();
 
+    // Layout-prediction (Phase 1): initialize the RuleBasedPredictor from
+    // the [filer.layout] config section. When enabled, create_file uses the
+    // predictor to decide initial layout (Inline/Flat/Stripe) based on file
+    // name/extension, avoiding Inline→Flat runtime migration.
+    // See docs/file-layout-prediction-design.md.
+    {
+        let layout_config = &filer_cfg.layout;
+        let predictor = powerfs_layout::RuleBasedPredictor::from_config(
+            layout_config,
+            powerfs_layout::PlacementPolicy::default(),
+        );
+        let predictor: Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>> = predictor
+            .map(|p| std::sync::Arc::new(p) as std::sync::Arc<dyn powerfs_layout::LayoutPredictor>);
+        meta_shard_manager.set_layout_predictor(predictor, layout_config.min_confidence);
+    }
+
     // 初始化 POSIX root inode (inode=1, 目录 "/").
     // 首次启动或全新部署时必须创建, 否则 FUSE getattr(1) 返回 ENOENT,
     // 导致挂载点显示为 d????????? (无法访问).
@@ -681,9 +704,13 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 format!("{}:{}", bind_ip, metrics_port).parse()?;
             let lease_mgr = net_handler.inode_lease_mgr.clone();
             let meta_cache = meta_shard_manager.meta_cache();
-            if let Err(e) =
-                powerfs_filer::metrics::start_metrics_server(metrics_addr, lease_mgr, meta_cache)
-                    .await
+            if let Err(e) = powerfs_filer::metrics::start_metrics_server(
+                metrics_addr,
+                lease_mgr,
+                meta_cache,
+                meta_shard_manager.clone(),
+            )
+            .await
             {
                 warn!("filer metrics server failed to start (non-fatal): {}", e);
             }
@@ -948,8 +975,6 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         // EC/scrubber 参数可通过环境变量覆盖 (便于测试调整 EC 配置):
         //   POWERFS_SCRUBBER_SCAN_INTERVAL  扫描间隔秒 (默认 30)
         //   POWERFS_SCRUBBER_MAX_INODES     每轮最大 inode 数 (默认 50)
-        //   POWERFS_EC_DATA_SHARDS          EC 数据分片数 (默认 4)
-        //   POWERFS_EC_PARITY_SHARDS        EC 校验分片数 (默认 2)
         //   POWERFS_EC_MIN_FILE_SIZE        EC 转换最小文件字节数 (默认 0=不限制)
         {
             let scrubber_config = powerfs_filer::scrubber::ScrubberConfig {
@@ -962,25 +987,17 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(50),
                 replica_count: 2,
-                ec_data_shards: std::env::var("POWERFS_EC_DATA_SHARDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(4),
-                ec_parity_shards: std::env::var("POWERFS_EC_PARITY_SHARDS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(2),
                 ec_min_file_size: std::env::var("POWERFS_EC_MIN_FILE_SIZE")
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0),
+                ec_tiers: powerfs_filer::scrubber::ScrubberConfig::default().ec_tiers,
             };
             info!(
-                "P4_SCRUBBER: config scan_interval={}s max_inodes={} ec={:?}+{:?} min_file_size={}",
+                "P4_SCRUBBER: config scan_interval={}s max_inodes={} ec_tiers={:?} min_file_size={}",
                 scrubber_config.scan_interval_secs,
                 scrubber_config.max_inodes_per_scan,
-                scrubber_config.ec_data_shards,
-                scrubber_config.ec_parity_shards,
+                scrubber_config.ec_tiers,
                 scrubber_config.ec_min_file_size,
             );
             let scrubber = powerfs_filer::scrubber::ScrubberWorker::new(
@@ -1000,8 +1017,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         // net_transport was created early in run_filer() and is shared with
         // inter-service clients (TlvMasterClient, ClientConnPool).
         if let Ok(net_server) = PowerFsNetServer::bind_with_registry_and_transport(
-            &bind_ip, net_port, net_handler, net_registry,
-            powerfs_net::ServerConfig::default(), net_transport.clone(),
+            &bind_ip,
+            net_port,
+            net_handler,
+            net_registry,
+            powerfs_net::ServerConfig::default(),
+            net_transport.clone(),
         )
         .await
         {

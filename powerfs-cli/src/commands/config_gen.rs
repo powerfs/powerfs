@@ -814,6 +814,12 @@ fn build_config(
             transport: None,
             rdma_device: None,
             require_rdma: false,
+            layout: powerfs_common::config::LayoutConfig {
+                enable_prediction: true,
+                fallback: "auto_promote".to_string(),
+                min_confidence: 0.6,
+                rules: vec![],
+            },
         },
         s3: S3Config {
             port: cfg.s3_port,

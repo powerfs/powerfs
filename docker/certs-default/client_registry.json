@@ -1,0 +1,621 @@
+{
+  "by_fingerprint": {
+    "9fd09dd1b38257fe9c294fda9e0ea455418c2d99248c39e27379f3d3ec61f147": {
+      "client_name": "filer-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.32"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "9fd09dd1b38257fe9c294fda9e0ea455418c2d99248c39e27379f3d3ec61f147",
+      "revoked": false
+    },
+    "b06567ff91c713f17de8121d3e7d8c5ca4b4335fa55392bd08436b8a275c182a": {
+      "client_name": "kernel-client-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.101"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "b06567ff91c713f17de8121d3e7d8c5ca4b4335fa55392bd08436b8a275c182a",
+      "revoked": false
+    },
+    "d3f2d0a7bca78702d351cf68eb5c07f709dc055f3a45ee7cdb0116a6b2c6f587": {
+      "client_name": "fuse-client-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.41"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "d3f2d0a7bca78702d351cf68eb5c07f709dc055f3a45ee7cdb0116a6b2c6f587",
+      "revoked": false
+    },
+    "7e34180d7eba4a1177742138db460f19c92ed487ce7775634429c59b0524c6e7": {
+      "client_name": "filer-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.32"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "7e34180d7eba4a1177742138db460f19c92ed487ce7775634429c59b0524c6e7",
+      "revoked": false
+    },
+    "6aca30dfe87b5e73323343ba54394a20bd6593daa4733736dea4a1ba1c8e5ac3": {
+      "client_name": "volume-server-3",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.23"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "6aca30dfe87b5e73323343ba54394a20bd6593daa4733736dea4a1ba1c8e5ac3",
+      "revoked": false
+    },
+    "86538f3779065dad8e18d0ba65af41286e2964a31ddb47337344c92bdf2d4422": {
+      "client_name": "volume-server-3",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.23"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "86538f3779065dad8e18d0ba65af41286e2964a31ddb47337344c92bdf2d4422",
+      "revoked": false
+    },
+    "14c4e74e5006b61d18543d255b6c2c710ca743e7783bc3cad1b18aa998eb0112": {
+      "client_name": "volume-server-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.31"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "14c4e74e5006b61d18543d255b6c2c710ca743e7783bc3cad1b18aa998eb0112",
+      "revoked": false
+    },
+    "2356f744015fd485f83fdc8c2130fdfb0f4af91781f9c50b6e2162cd389a30e2": {
+      "client_name": "volume-server-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.21"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "2356f744015fd485f83fdc8c2130fdfb0f4af91781f9c50b6e2162cd389a30e2",
+      "revoked": false
+    },
+    "2cfd41709270da8bc8a68082df6b7acfcde0522fef14102e1a6551e80d26f680": {
+      "client_name": "fuse-client-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.41"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "2cfd41709270da8bc8a68082df6b7acfcde0522fef14102e1a6551e80d26f680",
+      "revoked": false
+    },
+    "11ae86c2632377520d2a13d15794f040777242da4c4b6a2363d41f0684c8ddea": {
+      "client_name": "volume-server-5",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.25"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "11ae86c2632377520d2a13d15794f040777242da4c4b6a2363d41f0684c8ddea",
+      "revoked": false
+    },
+    "8e1738c8b975a19caf2ee79cdc6328cf101d0dc99e299baa5a5b57830038e09a": {
+      "client_name": "fuse-client-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.42"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "8e1738c8b975a19caf2ee79cdc6328cf101d0dc99e299baa5a5b57830038e09a",
+      "revoked": false
+    },
+    "962fd5e909988edbdaef0346560ce596705c72674da3b936fae423312b2b2e46": {
+      "client_name": "volume-server-4",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.24"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "962fd5e909988edbdaef0346560ce596705c72674da3b936fae423312b2b2e46",
+      "revoked": false
+    },
+    "cc3954e2c759c88470d3554e6829b38670e7374afd271a7168957a036cf6c327": {
+      "client_name": "volume-server-5",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.25"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "cc3954e2c759c88470d3554e6829b38670e7374afd271a7168957a036cf6c327",
+      "revoked": false
+    },
+    "dbcc6214d5478befd380889dd48b512731bc39eb46f04d628dae205a33a092c0": {
+      "client_name": "filer-3",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.23"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "dbcc6214d5478befd380889dd48b512731bc39eb46f04d628dae205a33a092c0",
+      "revoked": false
+    },
+    "eac764ef36db17eb1e5d6a3efbb40d4e1727ee87d073f1e674a685f433287a9e": {
+      "client_name": "volume-server-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.22"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "eac764ef36db17eb1e5d6a3efbb40d4e1727ee87d073f1e674a685f433287a9e",
+      "revoked": false
+    },
+    "0cb5881d456c9a9a72a9461a08ba499f3e47be6a1dd222f1c97040c7de841700": {
+      "client_name": "kernel-client-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.100"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "0cb5881d456c9a9a72a9461a08ba499f3e47be6a1dd222f1c97040c7de841700",
+      "revoked": false
+    },
+    "86f4d8c6a9865be4c23ed583d17c1c33c694cd05f8102937ad95a127ffa54c69": {
+      "client_name": "filer-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.22"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "86f4d8c6a9865be4c23ed583d17c1c33c694cd05f8102937ad95a127ffa54c69",
+      "revoked": false
+    },
+    "6056918c0da6141238e8fa4d83659fb63f511efc91d09f627f622e960af82713": {
+      "client_name": "volume-server-5",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.25"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "6056918c0da6141238e8fa4d83659fb63f511efc91d09f627f622e960af82713",
+      "revoked": false
+    },
+    "e38e2a29104f0525f83369ceef7f4b92b7b479e8934006c756cf8569d5fcc9e6": {
+      "client_name": "volume-server-4",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.24"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "e38e2a29104f0525f83369ceef7f4b92b7b479e8934006c756cf8569d5fcc9e6",
+      "revoked": false
+    },
+    "8c7d6e52ec99dd0a617a459f2a29932e189aff9c789c0b879092e943cba78915": {
+      "client_name": "volume-server-4",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.24"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "8c7d6e52ec99dd0a617a459f2a29932e189aff9c789c0b879092e943cba78915",
+      "revoked": false
+    },
+    "5351086d45216a880930f6eada9640b259b912bac97da2325e42ef26dd6565b8": {
+      "client_name": "filer-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.31"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "5351086d45216a880930f6eada9640b259b912bac97da2325e42ef26dd6565b8",
+      "revoked": false
+    },
+    "7ca6bb4ed722e9f08a7f8bce55cc483d9c1729b9792ef46eb538d2b4c2e7dc61": {
+      "client_name": "kernel-client-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.100"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "7ca6bb4ed722e9f08a7f8bce55cc483d9c1729b9792ef46eb538d2b4c2e7dc61",
+      "revoked": false
+    },
+    "9cd10a950a27ba21414449ba998163c8f53f6a9eca455d29e8011f53d0f0ad95": {
+      "client_name": "filer-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.21"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "9cd10a950a27ba21414449ba998163c8f53f6a9eca455d29e8011f53d0f0ad95",
+      "revoked": false
+    },
+    "73ea96d5f4d7de9bc5db897a917ad3567e38ceb6deac5dd33885025bfbf03259": {
+      "client_name": "filer-3",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.33"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "73ea96d5f4d7de9bc5db897a917ad3567e38ceb6deac5dd33885025bfbf03259",
+      "revoked": false
+    },
+    "b7391ae6286cea967cdc09240f2cc1a485da85bf018e2ade28d944cdf3bc36f0": {
+      "client_name": "volume-server-6",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.26"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "b7391ae6286cea967cdc09240f2cc1a485da85bf018e2ade28d944cdf3bc36f0",
+      "revoked": false
+    },
+    "2a4742755c08fc66b76b567658fee6fc47f447ff3c33202b09c8389cf6f4b0c4": {
+      "client_name": "volume-server-6",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.26"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "2a4742755c08fc66b76b567658fee6fc47f447ff3c33202b09c8389cf6f4b0c4",
+      "revoked": false
+    },
+    "bcd6b48fdf37cf9301c0cafbeeea23a4515cf39d652aec170c4f9ce249d7f534": {
+      "client_name": "filer-1",
+      "client_id": null,
+      "san_ips": [
+        "192.168.100.3"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788602822,
+      "expires_at": 1820138822,
+      "cert_fingerprint_sha256": "bcd6b48fdf37cf9301c0cafbeeea23a4515cf39d652aec170c4f9ce249d7f534",
+      "revoked": false
+    },
+    "a647594297a571138012c40928922523846f9e2570c2cd5e5ddd6ba173bb4c95": {
+      "client_name": "kernel-client-2",
+      "client_id": null,
+      "san_ips": [
+        "192.168.100.101",
+        "172.30.0.101"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788602822,
+      "expires_at": 1820138822,
+      "cert_fingerprint_sha256": "a647594297a571138012c40928922523846f9e2570c2cd5e5ddd6ba173bb4c95",
+      "revoked": false
+    },
+    "0fb58a64d5a1523dc8d1e01956235731e524b1d6fda0eff4b99e3283ad7f343b": {
+      "client_name": "filer-1",
+      "client_id": null,
+      "san_ips": [
+        "192.168.100.3",
+        "172.30.0.31"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788663158,
+      "expires_at": 1820199158,
+      "cert_fingerprint_sha256": "0fb58a64d5a1523dc8d1e01956235731e524b1d6fda0eff4b99e3283ad7f343b",
+      "revoked": false
+    },
+    "5bbecd119b2c5589ca17071c18e4c53a2f9a62e13d3f5fb4b72be057598de249": {
+      "client_name": "volume-server-1",
+      "client_id": null,
+      "san_ips": [
+        "192.168.100.3",
+        "172.30.0.21"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788663158,
+      "expires_at": 1820199158,
+      "cert_fingerprint_sha256": "5bbecd119b2c5589ca17071c18e4c53a2f9a62e13d3f5fb4b72be057598de249",
+      "revoked": false
+    },
+    "f874e9d3b52950289f0d3c11b3e5d981097c58b15e760ec452ff59582eac1a05": {
+      "client_name": "volume-server-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.21"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "f874e9d3b52950289f0d3c11b3e5d981097c58b15e760ec452ff59582eac1a05",
+      "revoked": false
+    },
+    "0dc074b77bdd8d608b0df8aff9279a70fb3b2a5f7ba22d9fe498960e6f8ade21": {
+      "client_name": "kernel-client-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.100"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "0dc074b77bdd8d608b0df8aff9279a70fb3b2a5f7ba22d9fe498960e6f8ade21",
+      "revoked": false
+    },
+    "c68c9da36f01f4ec1aec9dcce89a4db1abb2c189eb36fbdeac201f6ba93b1588": {
+      "client_name": "volume-server-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.22"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "c68c9da36f01f4ec1aec9dcce89a4db1abb2c189eb36fbdeac201f6ba93b1588",
+      "revoked": false
+    },
+    "736fc2b69778bb7e32db19fb4ce890fda6e7ea4e21ae24e4edf901a7463f455b": {
+      "client_name": "kernel-client-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.101"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "736fc2b69778bb7e32db19fb4ce890fda6e7ea4e21ae24e4edf901a7463f455b",
+      "revoked": false
+    },
+    "35105c673cab281eba475c0bd17b2a881e366cae4e977b2c723d7ea628fe93a6": {
+      "client_name": "kernel-client-1",
+      "client_id": null,
+      "san_ips": [
+        "192.168.100.100",
+        "172.30.0.100"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788602822,
+      "expires_at": 1820138822,
+      "cert_fingerprint_sha256": "35105c673cab281eba475c0bd17b2a881e366cae4e977b2c723d7ea628fe93a6",
+      "revoked": false
+    },
+    "da7b324bae401b8c28e1a3563a454e633ee1c252952d857c25cbb2afe8eaec29": {
+      "client_name": "volume-server-3",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.33"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "da7b324bae401b8c28e1a3563a454e633ee1c252952d857c25cbb2afe8eaec29",
+      "revoked": false
+    },
+    "16cf7951009ae5276a221d65aa420ac9cb63bf24ad089bf0f9b755c5dcd934ba": {
+      "client_name": "kernel-client-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.101"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "16cf7951009ae5276a221d65aa420ac9cb63bf24ad089bf0f9b755c5dcd934ba",
+      "revoked": false
+    },
+    "d987d68fd088606f053750afc81669f45bac34f0f8ae40a747fffa4ef09ed2df": {
+      "client_name": "fuse-client-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.42"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "d987d68fd088606f053750afc81669f45bac34f0f8ae40a747fffa4ef09ed2df",
+      "revoked": false
+    },
+    "fb76058c245d24db12f97d7c60fb88b6f74a4232d927ffee890c1099e941357a": {
+      "client_name": "volume-server-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.32"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600412,
+      "expires_at": 1820136412,
+      "cert_fingerprint_sha256": "fb76058c245d24db12f97d7c60fb88b6f74a4232d927ffee890c1099e941357a",
+      "revoked": false
+    },
+    "d6b4ecd1228843b65dace271fb90adfbe9c73b03d807e74aa066d0e9da43b837": {
+      "client_name": "volume-server-6",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.26"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788600823,
+      "expires_at": 1820136823,
+      "cert_fingerprint_sha256": "d6b4ecd1228843b65dace271fb90adfbe9c73b03d807e74aa066d0e9da43b837",
+      "revoked": false
+    },
+    "33d2693b1a2e2183adf554e45bb6512d4a96d8b0acfeee803e202ac5d5dcab90": {
+      "client_name": "kernel-client-1",
+      "client_id": "kernel-client-1",
+      "san_ips": [
+        "192.168.100.100",
+        "172.30.0.100"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788663158,
+      "expires_at": 1820199158,
+      "cert_fingerprint_sha256": "33d2693b1a2e2183adf554e45bb6512d4a96d8b0acfeee803e202ac5d5dcab90",
+      "revoked": false
+    },
+    "e77d129b33f19eb97d4a3453c980c3d99f57fc4a02fc29a382979306f649856c": {
+      "client_name": "kernel-client-2",
+      "client_id": "kernel-client-2",
+      "san_ips": [
+        "192.168.100.101",
+        "172.30.0.101"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788663158,
+      "expires_at": 1820199158,
+      "cert_fingerprint_sha256": "e77d129b33f19eb97d4a3453c980c3d99f57fc4a02fc29a382979306f649856c",
+      "revoked": false
+    },
+    "c54eae5e6181ac7b3efd9352336745ecbd062aeb5eea6587c21bea85c51704dc": {
+      "client_name": "fuse-client-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.41"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "c54eae5e6181ac7b3efd9352336745ecbd062aeb5eea6587c21bea85c51704dc",
+      "revoked": false
+    },
+    "229fc908513130b253679b30ef9f97a0fa7f2db69f92e9b2eb0d5835d7944f24": {
+      "client_name": "fuse-client-2",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.42"
+      ],
+      "mount_dirs": [
+        "/mnt/powerfs"
+      ],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "229fc908513130b253679b30ef9f97a0fa7f2db69f92e9b2eb0d5835d7944f24",
+      "revoked": false
+    },
+    "b760bccfc76a1f2a03b088d15130574de17c740aa894333a1498d691d1264a85": {
+      "client_name": "filer-3",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.33"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "b760bccfc76a1f2a03b088d15130574de17c740aa894333a1498d691d1264a85",
+      "revoked": false
+    },
+    "b6a49e29366a170df926c2da170a874feecc6071454af38ae1c79c836d06fe15": {
+      "client_name": "volume-server-1",
+      "client_id": null,
+      "san_ips": [
+        "192.168.100.3"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788602822,
+      "expires_at": 1820138822,
+      "cert_fingerprint_sha256": "b6a49e29366a170df926c2da170a874feecc6071454af38ae1c79c836d06fe15",
+      "revoked": false
+    },
+    "367b109300a348f27519688d1cb6d4a32f76d23938ece4e254658b54fbed8c1d": {
+      "client_name": "filer-1",
+      "client_id": null,
+      "san_ips": [
+        "172.30.0.31"
+      ],
+      "mount_dirs": [],
+      "issued_at": 1788620681,
+      "expires_at": 1820156681,
+      "cert_fingerprint_sha256": "367b109300a348f27519688d1cb6d4a32f76d23938ece4e254658b54fbed8c1d",
+      "revoked": false
+    }
+  },
+  "by_client_name": {
+    "filer-2": "7e34180d7eba4a1177742138db460f19c92ed487ce7775634429c59b0524c6e7",
+    "fuse-client-1": "c54eae5e6181ac7b3efd9352336745ecbd062aeb5eea6587c21bea85c51704dc",
+    "volume-server-5": "6056918c0da6141238e8fa4d83659fb63f511efc91d09f627f622e960af82713",
+    "kernel-client-2": "e77d129b33f19eb97d4a3453c980c3d99f57fc4a02fc29a382979306f649856c",
+    "filer-1": "0fb58a64d5a1523dc8d1e01956235731e524b1d6fda0eff4b99e3283ad7f343b",
+    "volume-server-1": "5bbecd119b2c5589ca17071c18e4c53a2f9a62e13d3f5fb4b72be057598de249",
+    "volume-server-6": "2a4742755c08fc66b76b567658fee6fc47f447ff3c33202b09c8389cf6f4b0c4",
+    "volume-server-3": "6aca30dfe87b5e73323343ba54394a20bd6593daa4733736dea4a1ba1c8e5ac3",
+    "filer-3": "b760bccfc76a1f2a03b088d15130574de17c740aa894333a1498d691d1264a85",
+    "fuse-client-2": "229fc908513130b253679b30ef9f97a0fa7f2db69f92e9b2eb0d5835d7944f24",
+    "kernel-client-1": "33d2693b1a2e2183adf554e45bb6512d4a96d8b0acfeee803e202ac5d5dcab90",
+    "volume-server-2": "c68c9da36f01f4ec1aec9dcce89a4db1abb2c189eb36fbdeac201f6ba93b1588",
+    "volume-server-4": "962fd5e909988edbdaef0346560ce596705c72674da3b936fae423312b2b2e46"
+  }
+}

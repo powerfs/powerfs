@@ -19,6 +19,21 @@ use powerfs_layout::reliability::{Reliability, ReliabilityState};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
+/// 分层 EC 配置项：按文件大小选择不同的 EC(data+parity) 配置
+#[derive(Clone, Debug)]
+pub struct EcTier {
+    /// 该 tier 适用的文件大小上限 (bytes). 最后一个 tier 忽略此字段.
+    pub max_file_size: u64,
+    pub data_shards: u32,
+    pub parity_shards: u32,
+}
+
+impl EcTier {
+    pub fn total_shards(&self) -> usize {
+        (self.data_shards + self.parity_shards) as usize
+    }
+}
+
 /// Scrubber 配置
 pub struct ScrubberConfig {
     /// 扫描间隔 (秒), 默认 30
@@ -27,12 +42,13 @@ pub struct ScrubberConfig {
     pub max_inodes_per_scan: usize,
     /// 副本数 (含原始副本), 默认 2
     pub replica_count: u32,
-    /// P6: EC 数据块数, 默认 4
-    pub ec_data_shards: u32,
-    /// P6: EC 校验块数, 默认 2
-    pub ec_parity_shards: u32,
     /// P6: EC 转换最小文件大小 (字节), 默认 0 = 不限制
     pub ec_min_file_size: u64,
+    /// 分层 EC 配置表 (按文件大小升序). select_ec_config 按文件大小
+    /// 匹配第一个 max_file_size > size 的 tier; 都不匹配则用最后一个.
+    /// 默认: 8KB-1MB → EC(2+1), 1MB-1GB → EC(4+2),
+    ///       1GB-100GB → EC(8+4), >100GB → EC(16+4)
+    pub ec_tiers: Vec<EcTier>,
 }
 
 impl Default for ScrubberConfig {
@@ -41,10 +57,38 @@ impl Default for ScrubberConfig {
             scan_interval_secs: 30,
             max_inodes_per_scan: 50,
             replica_count: 2,
-            ec_data_shards: 4,
-            ec_parity_shards: 2,
             ec_min_file_size: 0,
+            ec_tiers: vec![
+                EcTier { max_file_size: 1 << 20,       data_shards: 2,  parity_shards: 1 }, // 8KB-1MB → EC(2+1)
+                EcTier { max_file_size: 1 << 30,       data_shards: 4,  parity_shards: 2 }, // 1MB-1GB → EC(4+2)
+                EcTier { max_file_size: 100 * (1 << 30), data_shards: 8,  parity_shards: 4 }, // 1GB-100GB → EC(8+4)
+                EcTier { max_file_size: u64::MAX,      data_shards: 16, parity_shards: 4 }, // >100GB → EC(16+4)
+            ],
         }
+    }
+}
+
+impl ScrubberConfig {
+    /// 按文件大小选择 EC tier 配置 (data_shards, parity_shards)
+    fn select_ec_config(&self, file_size: u64) -> (u32, u32) {
+        for tier in &self.ec_tiers {
+            if file_size < tier.max_file_size {
+                return (tier.data_shards, tier.parity_shards);
+            }
+        }
+        // 都不匹配 (理论上不会, 因为最后一个 tier 是 u64::MAX), 用最后一个
+        let last = self.ec_tiers.last().expect("ec_tiers must not be empty");
+        (last.data_shards, last.parity_shards)
+    }
+
+    /// 所有 tier 中最大的 total_shards, 用于判断 EC 是否可行
+    /// (volume 数至少要满足最小 tier 的要求才能开始扫描)
+    fn min_total_shards(&self) -> usize {
+        self.ec_tiers
+            .iter()
+            .map(|t| t.total_shards())
+            .min()
+            .unwrap_or(6)
     }
 }
 
@@ -86,12 +130,11 @@ impl ScrubberWorker {
         let mut tick = interval(Duration::from_secs(self.config.scan_interval_secs));
 
         info!(
-            "P4_SCRUBBER: started, scan_interval={}s, max_inodes={}, replicas={}, ec={:?}+{:?}",
+            "P4_SCRUBBER: started, scan_interval={}s, max_inodes={}, replicas={}, ec_tiers={:?}",
             self.config.scan_interval_secs,
             self.config.max_inodes_per_scan,
             self.config.replica_count,
-            self.config.ec_data_shards,
-            self.config.ec_parity_shards,
+            self.config.ec_tiers,
         );
 
         // 首次延迟 10 秒, 等待 Filer 完成启动 + Zone 注册
@@ -292,11 +335,14 @@ impl ScrubberWorker {
     // P6: EC 转换 (Replicated → EC)
     // ========================================================================
 
-    /// P6: 扫描 Replicated 文件, 执行 EC 转换
+    /// P6: 扫描 Replicated 文件, 执行分层 EC 转换
+    ///
+    /// 按文件大小选择 EC 配置 (select_ec_config):
+    ///   8KB-1MB → EC(2+1), 1MB-1GB → EC(4+2),
+    ///   1GB-100GB → EC(8+4), >100GB → EC(16+4)
     async fn scan_and_ec_convert(&self) -> Result<(), String> {
-        let data_shards = self.config.ec_data_shards as usize;
-        let parity_shards = self.config.ec_parity_shards as usize;
-        let total_shards = data_shards + parity_shards;
+        // 用最小 tier 的 total_shards 做 EC 可行性判断 (volume 数至少满足最小 tier)
+        let min_shards = self.config.min_total_shards();
 
         // 快速跳过: 如果 EC 之前被判定为不可行, 只在周期性重检时重新检查
         if self
@@ -323,7 +369,7 @@ impl ScrubberWorker {
         }
 
         let volume_addrs = self.net_handler.get_all_volume_addrs();
-        if volume_addrs.len() < total_shards {
+        if volume_addrs.len() < min_shards {
             // EC 不可行: volume 数不足. 标记并跳过, 避免每轮重复日志.
             if !self
                 .ec_infeasible
@@ -331,19 +377,17 @@ impl ScrubberWorker {
             {
                 // 首次检测到不可行, 打印 warn 级别日志
                 warn!(
-                    "P6_SCRUBBER: EC disabled — only {} volumes available, need >= {} for EC({}+{}). \
+                    "P6_SCRUBBER: EC disabled — only {} volumes available, need >= {} for smallest EC tier. \
                      Files will stay in Replicated state. Will re-check every {} scans.",
                     volume_addrs.len(),
-                    total_shards,
-                    data_shards,
-                    parity_shards,
+                    min_shards,
                     EC_RECHECK_CYCLES,
                 );
             } else {
                 debug!(
                     "P6_SCRUBBER: EC still infeasible ({} < {} volumes)",
                     volume_addrs.len(),
-                    total_shards
+                    min_shards
                 );
             }
             return Ok(());
@@ -355,9 +399,9 @@ impl ScrubberWorker {
             .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             info!(
-                "P6_SCRUBBER: EC re-enabled — {} volumes available (need >= {})",
+                "P6_SCRUBBER: EC re-enabled — {} volumes available (need >= {} for smallest tier)",
                 volume_addrs.len(),
-                total_shards
+                min_shards
             );
         }
         self.ec_skip_count
@@ -382,7 +426,21 @@ impl ScrubberWorker {
                 break;
             }
 
-            match self.ec_convert_inode(inode, &chunks, &addr_map).await {
+            // 按文件大小选择 EC tier (data_shards, parity_shards)
+            let file_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
+            let (data_shards, parity_shards) = self.config.select_ec_config(file_size);
+            let total_shards = (data_shards + parity_shards) as usize;
+
+            // 该文件 tier 需要的 volume 数 > 当前可用数, 跳过 (不阻塞其他文件)
+            if volume_addrs.len() < total_shards {
+                debug!(
+                    "P6_SCRUBBER: inode {} file_size={} needs EC({}+{}) = {} volumes, only {} available, skipping",
+                    inode, file_size, data_shards, parity_shards, total_shards, volume_addrs.len()
+                );
+                continue;
+            }
+
+            match self.ec_convert_inode(inode, &chunks, &addr_map, data_shards, parity_shards).await {
                 Ok(ec_chunks) => {
                     // P6 CAS: 提交前重新检查 chunks 是否变化 (防止转换期间被写).
                     // 如果 chunks 变了, 说明文件被追加写/截断, Fix 1 已将状态
@@ -419,7 +477,7 @@ impl ScrubberWorker {
                         .enumerate()
                         .map(|(i, c)| {
                             let addr = addr_map.get(&c.volume_id).cloned().unwrap_or_default();
-                            let kind = if i < data_shards { "D" } else { "P" };
+                            let kind = if i < data_shards as usize { "D" } else { "P" };
                             format!(
                                 "{}[{}]:vol={} needle={:#x}@{}",
                                 kind, i, c.volume_id, c.needle_id, addr
@@ -427,8 +485,8 @@ impl ScrubberWorker {
                         })
                         .collect();
                     let reliability = Reliability::EC {
-                        data: self.config.ec_data_shards,
-                        parity: self.config.ec_parity_shards,
+                        data: data_shards,
+                        parity: parity_shards,
                     };
                     let shard_id = self.meta_shard_manager.calculate_shard_id(inode);
                     match self
@@ -444,8 +502,8 @@ impl ScrubberWorker {
                     {
                         Ok(()) => {
                             info!(
-                                "P6_SCRUBBER: inode {} EC converted, {}+{} per group, {} groups, {}B shard_size, {} needles total, state -> EC | G0=[{}]",
-                                inode, data_shards, parity_shards, num_groups, shard_size, total_needles, g0_details.join(", ")
+                                "P6_SCRUBBER: inode {} EC({}+{}) converted, file_size={}B, {} groups, {}B shard_size, {} needles total, state -> EC | G0=[{}]",
+                                inode, data_shards, parity_shards, file_size, num_groups, shard_size, total_needles, g0_details.join(", ")
                             );
                             processed += 1;
                             // Only convert one file per scan to avoid overload
@@ -471,7 +529,7 @@ impl ScrubberWorker {
 
     /// P6: 将单个 inode 的数据转换为 EC shards
     /// 1. 读取所有 chunks, 拼接成完整文件数据
-    /// 2. EC 编码: data shards + parity shards
+    /// 2. EC 编码: data shards + parity shards (由调用方按文件大小选择)
     /// 3. 分配 volumes + needle_ids (anti-affinity)
     /// 4. 写入每个 shard 到对应 volume
     /// 5. 返回 ec_chunks (data + parity shard 位置信息)
@@ -480,9 +538,11 @@ impl ScrubberWorker {
         inode: u64,
         chunks: &[StoredFileChunk],
         addr_map: &std::collections::HashMap<u64, String>,
+        data_shards: u32,
+        parity_shards: u32,
     ) -> Result<Vec<StoredFileChunk>, String> {
-        let data_shards = self.config.ec_data_shards as usize;
-        let parity_shards = self.config.ec_parity_shards as usize;
+        let data_shards = data_shards as usize;
+        let parity_shards = parity_shards as usize;
         let total_shards = data_shards + parity_shards;
 
         // 1. 读取所有 chunks, 拼接成完整文件数据

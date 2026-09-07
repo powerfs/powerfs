@@ -2017,6 +2017,27 @@ impl MasterService for MasterGrpcServer {
         }
     }
 
+    async fn remove_data_node(
+        &self,
+        request: Request<RemoveDataNodeRequest>,
+    ) -> Result<Response<MigrationControlResponse>, Status> {
+        let req = request.into_inner();
+        match self
+            .master
+            .remove_data_node_checked(&req.node_id, req.force)
+            .await
+        {
+            Ok(()) => Ok(Response::new(MigrationControlResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(MigrationControlResponse {
+                success: false,
+                error: e.to_string(),
+            })),
+        }
+    }
+
     async fn pin_volume(
         &self,
         request: Request<PinVolumeRequest>,
@@ -2264,6 +2285,23 @@ fn fetch_filer_stats_sync(filer: FilerNodeInfo) -> FilerNodeStats {
         String::new()
     };
 
+    let layout_migration_stats_json = if filer.metrics_port != 0 {
+        let addr = format!("{}:{}", ip_only, filer.metrics_port);
+        match http_get_sync(&addr, "/admin/layout-migration-stats") {
+            Ok(s) => s,
+            Err(e) => {
+                fetch_error_parts.push(format!("/admin/layout-migration-stats: {}", e));
+                error!(
+                    "GetFilerStats: /admin/layout-migration-stats failed for {} addr={}: {}",
+                    filer.node_id, addr, e
+                );
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
     FilerNodeStats {
         node_id: filer.node_id,
         address: filer.address,
@@ -2275,6 +2313,7 @@ fn fetch_filer_stats_sync(filer: FilerNodeInfo) -> FilerNodeStats {
         meta_cache_stats_json,
         lease_stats_json,
         shards_json,
+        layout_migration_stats_json,
         fetch_error: fetch_error_parts.join("; "),
     }
 }

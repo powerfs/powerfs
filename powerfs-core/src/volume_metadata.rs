@@ -401,6 +401,18 @@ impl VolumeMetadata {
         Ok(stats)
     }
 
+    /// Force-fsync the RocksDB write-ahead log so all index rows written
+    /// since the last WAL sync survive a power loss.  Called after an
+    /// fsync-driven coalescer flush (the data file itself is already
+    /// `fdatasync`'d by the storage backend) to make the needle→offset
+    /// index durable as well.
+    pub fn sync_wal(&self) -> Result<()> {
+        log::info!("VOLUME_SYNC_WAL: flushing RocksDB WAL (full barrier)");
+        self.db
+            .flush_wal(true)
+            .map_err(|e| PowerFsError::Internal(format!("RocksDB flush_wal failed: {}", e)))
+    }
+
     /// 原子删除 Needle + 更新分配状态，返回被删除的 NeedleInfo
     /// 硬删除策略：从 needles CF 移除，完整 NeedleInfo（含 deleted_at）存入 deleted CF
     pub fn delete_needle_atomic(

@@ -170,6 +170,31 @@ impl InodeNotifier {
         count
     }
 
+    /// Broadcast an invalidation to all connected clients EXCEPT the
+    /// originating client.
+    ///
+    /// Used by BatchCreate: the creator already has the new inodes in
+    /// its local cache, so receiving its own broadcast would trigger
+    /// a redundant dir lease invalidation + SUBSCRIBE + GETATTR cycle.
+    pub fn broadcast_exclude(
+        &self,
+        inode: u64,
+        version: u64,
+        exclude_client_id: Option<u64>,
+    ) -> usize {
+        let count = self
+            .connection_manager
+            .broadcast_invalidate_exclude(inode, version, exclude_client_id);
+        log::debug!(
+            "InodeNotifier: broadcast_exclude Invalidate(inode={}, v={}, exclude={:?}) to {} clients",
+            inode,
+            version,
+            exclude_client_id,
+            count
+        );
+        count
+    }
+
     /// Broadcast a dentry-level Invalidate notification to all clients.
     ///
     /// Unlike `broadcast` (inode-only), this carries (parent, name) so
