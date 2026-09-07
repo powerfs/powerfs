@@ -64,6 +64,7 @@ services:
         ipv4_address: 172.30.0.11
     volumes:
       - master-1-data:/data
+      - ./certs-default:/data/master/ca
       - ./config/master-1.toml:/app/config/master.toml:ro
       - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
@@ -98,6 +99,7 @@ services:
         ipv4_address: 172.30.0.12
     volumes:
       - master-2-data:/data
+      - ./certs-default:/data/master/ca
       - ./config/master-2.toml:/app/config/master.toml:ro
       - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
@@ -132,6 +134,7 @@ services:
         ipv4_address: 172.30.0.13
     volumes:
       - master-3-data:/data
+      - ./certs-default:/data/master/ca
       - ./config/master-3.toml:/app/config/master.toml:ro
       - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
@@ -168,7 +171,7 @@ services:
       - volume-1-data:/data
       - ./config/volume-1.toml:/app/config/volume.toml:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8080:8080"    # gRPC端口
       - "8091:8091"    # HTTP管理端口
@@ -202,7 +205,7 @@ services:
       - volume-2-data:/data
       - ./config/volume-2.toml:/app/config/volume.toml:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8081:8080"    # gRPC端口
       - "8092:8092"    # HTTP管理端口
@@ -236,7 +239,7 @@ services:
       - volume-3-data:/data
       - ./config/volume-3.toml:/app/config/volume.toml:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8082:8080"    # gRPC端口
       - "8093:8093"    # HTTP管理端口
@@ -271,7 +274,7 @@ services:
       - volume-4-data:/data
       - ./config/volume-4.toml:/app/config/volume.toml:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8085:8080"    # gRPC端口
       - "8094:8094"    # HTTP管理端口
@@ -305,7 +308,7 @@ services:
       - volume-5-data:/data
       - ./config/volume-5.toml:/app/config/volume.toml:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8086:8080"    # gRPC端口
       - "8095:8095"    # HTTP管理端口
@@ -339,7 +342,7 @@ services:
       - volume-6-data:/data
       - ./config/volume-6.toml:/app/config/volume.toml:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8087:8080"    # gRPC端口
       - "8096:8096"    # HTTP管理端口
@@ -373,7 +376,7 @@ services:
       - filer-1-data:/data/filer
       - ./config/filer-1.toml:/app/config/filer.toml:ro
       - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8888:8888"    # HTTP端口
       - "8889:8889"    # gRPC端口
@@ -412,7 +415,7 @@ services:
       - filer-2-data:/data/filer
       - ./config/filer-2.toml:/app/config/filer.toml:ro
       - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8898:8888"    # HTTP端口
       - "8899:8889"    # gRPC端口
@@ -451,7 +454,7 @@ services:
       - filer-3-data:/data/filer
       - ./config/filer-3.toml:/app/config/filer.toml:ro
       - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     ports:
       - "8908:8888"    # HTTP端口
       - "8909:8889"    # gRPC端口
@@ -535,26 +538,9 @@ services:
       s3:
         condition: service_healthy
 
-  frontend:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile-frontend
-    image: powerfs-frontend:latest
-    container_name: frontend
-    logging: *default-logging
-    networks:
-      powerfs-network:
-        ipv4_address: 172.30.0.43
-    ports:
-      - "8084:80"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -s http://127.0.0.1/ >/dev/null || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 3
-    depends_on:
-      monitor:
-        condition: service_healthy
+  # NOTE: frontend service temporarily removed — the latest frontend code
+  # lives on the `aiagent` branch. Re-add (with updated Dockerfile-frontend
+  # using a reachable node/nginx base) after merging aiagent.
 
   fuse-1:
     build:
@@ -583,7 +569,7 @@ services:
       - /tmp/powerfs/fuse1:/mnt/powerfs
       - ./config/fuse-1.toml:/app/config/fuse.toml:ro
       - /home/portion/powerfs/target/release/powerfs-fuse:/app/powerfs-fuse:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     command: >
       /app/powerfs-fuse
       --config /app/config/fuse.toml
@@ -624,7 +610,7 @@ services:
       - /tmp/powerfs/fuse2:/mnt/powerfs
       - ./config/fuse-2.toml:/app/config/fuse.toml:ro
       - /home/portion/powerfs/target/release/powerfs-fuse:/app/powerfs-fuse:ro
-      - ./certs:/etc/powerfs/certs:ro
+      - ./certs-default:/etc/powerfs/certs:ro
     command: >
       /app/powerfs-fuse
       --config /app/config/fuse.toml

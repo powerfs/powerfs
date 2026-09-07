@@ -422,6 +422,18 @@ impl ServerConnectionManager {
         self.broadcast_notification(&msg)
     }
 
+    /// Broadcast an Invalidate(inode, version) to all clients EXCEPT
+    /// the originating client.
+    pub fn broadcast_invalidate_exclude(
+        &self,
+        inode: u64,
+        version: u64,
+        exclude_client_id: Option<u64>,
+    ) -> usize {
+        let msg = Self::build_invalidate_message(inode, version);
+        self.broadcast_notification_exclude(&msg, exclude_client_id)
+    }
+
     /// Broadcast a dentry-level Invalidate notification to all clients.
     ///
     /// This extends the inode-level Invalidate with (parent, name) info so

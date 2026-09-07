@@ -96,7 +96,9 @@ impl LockType {
     /// 锁类型 → 状态机类别
     pub fn class(self) -> LockClass {
         match self {
-            LockType::Auth | LockType::Link | LockType::Xattr | LockType::Dn | LockType::Posix => LockClass::Simple,
+            LockType::Auth | LockType::Link | LockType::Xattr | LockType::Dn | LockType::Posix => {
+                LockClass::Simple
+            }
             LockType::Snap => LockClass::Local,
             LockType::File => LockClass::File,
             LockType::Dft | LockType::Nest => LockClass::Scatter,
@@ -114,7 +116,7 @@ impl LockType {
             LockType::Snap => CapSet::NONE,                  // LocalLock: 不输出 cap
             LockType::File => CapSet::CAP_R | CapSet::CAP_W | CapSet::CAP_X, // 文件: 全套
             LockType::Dft | LockType::Nest => CapSet::NONE,  // ScatterLock: 不输出 cap
-            LockType::Posix => CapSet::NONE,  // P1-3: POSIX advisory lock, 不输出 cap
+            LockType::Posix => CapSet::NONE, // P1-3: POSIX advisory lock, 不输出 cap
         }
     }
 }
@@ -692,6 +694,76 @@ impl LockArbiter {
             };
         }
 
+        // LONER 打破: 其他 client 持 CAP_W|CAP_X (LONER File holder 持有
+        // R|W|X) 时, 读者必须等写者先 flush 脏数据并被降级为 CAP_R 后
+        // 才能拿到读锁 — 否则读者会在 Empty/stale 存储上读到旧数据/零.
+        // 对齐 wrlock() 的 GATHER 流程: 触发 recall (fire-and-forget),
+        // GATHER 未完成时返回 NONE, 调用方 (CAP_ACQUIRE 重试) 在
+        // writer ACK → gather_complete(ToShared) 后获得 CAP_R.
+        let conflict_caps = CapSet::CAP_W | CapSet::CAP_X;
+        let need_gather = lock.holders.iter().any(|h| {
+            h.client_id != client_id
+                && !CapSet(h.granted_caps.0 & conflict_caps.0).is_empty()
+        });
+        if need_gather {
+            let mut recall_tasks = Vec::new();
+            if lock.state != LockState::Gather {
+                lock.state = LockState::Gather;
+                // 读者+降级后的写者共存 → SHARED
+                lock.gather_target = GatherTarget::ToShared;
+                let new_epoch = self.alloc_epoch();
+
+                for other in &mut lock.holders {
+                    if other.client_id == client_id {
+                        continue;
+                    }
+                    let need_recall = CapSet(other.granted_caps.0 & conflict_caps.0);
+                    if need_recall.is_empty() {
+                        continue;
+                    }
+                    let retain = other.granted_caps.remove(need_recall);
+                    let g = GatherEntry {
+                        client_id: other.client_id.clone(),
+                        sn: other.sn,
+                        sent_at: now,
+                        acked: false,
+                    };
+                    lock.gather_list.push(g);
+                    lock.gather_remaining += 1;
+                    other.recall_in_flight = true;
+                    other.recall_caps = need_recall;
+                    other.retain_caps = retain;
+                    other.epoch = new_epoch;
+
+                    recall_tasks.push(RecallTask {
+                        client_id: other.client_id.clone(),
+                        lock_type,
+                        sn: other.sn,
+                        caps_to_recall: need_recall,
+                        retained_caps: retain,
+                        new_epoch,
+                    });
+                }
+            }
+
+            // GATHER 超时检查 (unresponsive holder → force-reclaim)
+            lock.gather_timeout(self.recall_timeout);
+
+            if lock.gather_remaining > 0 {
+                // 写者仍未 flush/ACK: 暂不授予读锁, 返回 NONE.
+                return LockGrantResult {
+                    client_id: client_id.to_string(),
+                    lock_type,
+                    sn: 0,
+                    epoch: 0,
+                    granted_caps: CapSet::NONE,
+                    recall_tasks,
+                    duration_ms: 0,
+                };
+            }
+            lock.gather_complete();
+        }
+
         // 分配新 holder
         let granted_caps = match lock.state {
             LockState::Available | LockState::Shared => CapSet::CAP_R,
@@ -1194,11 +1266,7 @@ impl LockArbiter {
     /// P1-3: POSIX file lock unlock by client_id (not sn).
     /// Removes all Posix lock holders matching client_id on the given inode.
     /// Returns true if any holder was removed.
-    pub fn posix_unlock(
-        &self,
-        inode: u64,
-        client_id: &str,
-    ) -> bool {
+    pub fn posix_unlock(&self, inode: u64, client_id: &str) -> bool {
         let mut wake_needed = false;
         let mut promote_task: Option<(String, u64, CapSet)> = None;
 
@@ -1243,7 +1311,10 @@ impl LockArbiter {
 
         debug!(
             "posix_unlock inode={} client={} wake={} promote={}",
-            inode, client_id, wake_needed, promote_task.is_some()
+            inode,
+            client_id,
+            wake_needed,
+            promote_task.is_some()
         );
 
         if wake_needed {
@@ -1257,11 +1328,7 @@ impl LockArbiter {
     /// P1-3: Get pending waiters for a specific inode+lock_type.
     /// Returns Vec<(client_id, lock_mode)> where lock_mode: 0=RD, 1=WR.
     /// Used by net_handler to push FileLockGrant notifications after unlock.
-    pub fn get_pending_waiters(
-        &self,
-        inode: u64,
-        lock_type: LockType,
-    ) -> Vec<(String, u8)> {
+    pub fn get_pending_waiters(&self, inode: u64, lock_type: LockType) -> Vec<(String, u8)> {
         let locks = self.locks.lock().unwrap();
         if let Some(lock_arr) = locks.get(&inode) {
             let lock = &lock_arr[lock_type as usize];
@@ -2347,6 +2414,56 @@ mod tests {
         // 实际上 FileLock::eval_file Loner 只在 holders.len() == 1 时下发全套, 这里 2 个 holders
         // 会走到 Sync(或 Loner 判断失败), 所以验证 C2 自身 granted_caps 即可 (上面已断言).
         let _ = r2;
+    }
+
+    #[test]
+    fn test_rdlock_breaks_loner_recall_writer_first() {
+        // Regression: reader opening a file held by a LONER writer used to
+        // get CAP_R immediately with no recall — the writer was never asked to
+        // flush, so the reader observed Empty/stale data. The reader must
+        // instead hit GATHER (recall W+X, retain R) and only receive
+        // CAP_R after the writer flushed/ACKed.
+        let a = LockArbiter::new();
+
+        // C1 写开 → LONER writer (R|W|X)
+        let r1 = a.wrlock(202, LockType::File, "C1");
+        assert!(r1.granted_caps.is_exclusive());
+
+        // C2 读开 → 应 GATHER: granted=NONE, recall C1 W+X 保留 R
+        let r2 = a.rdlock(202, LockType::File, "C2");
+        assert!(
+            r2.granted_caps.is_empty(),
+            "读者必须在 writer flush/ACK 前被挡住, got {:?}",
+            r2.granted_caps
+        );
+        assert!(!r2.recall_tasks.is_empty(), "应 recall LONER writer");
+        let recall = &r2.recall_tasks[0];
+        assert_eq!(recall.client_id, "C1");
+        assert!(recall.caps_to_recall.has_w() && recall.caps_to_recall.has_x());
+        assert!(recall.retained_caps.has_r());
+        assert!(!recall.retained_caps.has_w());
+
+        // 注意: GATHER 期间连 C1 重发 rdlock 也会被状态闸门挡回 NONE
+        // (writer 内核侧本地 cap 仍满足自身读, 不依赖 open_grant).
+        let r1_re = a.rdlock(202, LockType::File, "C1");
+        assert!(r1_re.granted_caps.is_empty(), "GATHER 期间 rdlock 一律等待");
+
+        // C1 flush 完 ACK → gather 完成, 状态转 Shared
+        let matched = a.recall_ack(202, LockType::File, "C1", r1.sn);
+        assert!(matched, "C1 ACK 应匹配 gather 条目");
+
+        // C2 retry rdlock → 获得 CAP_R (writer 已降级为 R)
+        let r2_retry = a.rdlock(202, LockType::File, "C2");
+        assert!(r2_retry.granted_caps.has_r(), "retry reader 应获得 CAP_R");
+        assert!(!r2_retry.granted_caps.has_w());
+        assert!(!r2_retry.granted_caps.has_x());
+
+        // 又一个 reader C3: SHARED 状态, 立即授予, 无 recall
+        let r3 = a.rdlock(202, LockType::File, "C3");
+        assert!(r3.granted_caps.has_r());
+        assert!(r3.recall_tasks.is_empty());
+
+        let _ = r1;
     }
 
     #[test]

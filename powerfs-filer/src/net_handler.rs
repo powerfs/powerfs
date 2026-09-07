@@ -5,9 +5,9 @@
 //! storage, Raft consensus, and strong consistency metadata operations.
 
 use crate::cap_manager::{CapManager, CapRevoker, CapSet, RecallTimeoutPenalty};
-use crate::lock_arbiter::LockType;
 use crate::inode_lease_manager::InodeLeaseManager;
 use crate::inode_notifier::InodeNotifier;
+use crate::lock_arbiter::LockType;
 use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
 use crate::raft_group_manager_v2::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
@@ -245,16 +245,30 @@ fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
         return Placement::Flat;
     }
 
-    // Stripe: 推断 stripe_size 从前两个 chunk 的 offset 差值
-    let stripe_size = if chunks.len() >= 2 && chunks[0].offset < chunks[1].offset {
-        chunks[1].offset - chunks[0].offset
-    } else {
-        // 兜底: 1MB (对齐 POWERFS_CHUNK_SIZE)
-        1024 * 1024
-    };
+    // Stripe 参数推断 (dense chunks: 每个 chunk 1MB, offset 连续):
+    //
+    // stripe_size = 首个 volume 切换点的 offset. 同一 stripe unit 内的所有
+    // chunk 落在同一 volume, 连续排布; 当 chunk 的 volume_id 与前一个不同时,
+    // 说明进入下一个 stripe unit, 该 chunk 的 offset 就是 stripe_size.
+    //   例: chunks[0..63] 全在 vol0 (offset 0..64MB), chunks[64] 在 vol1
+    //       (offset 64MB) → stripe_size = 64MB.
+    // 旧逻辑用 chunks[1].offset - chunks[0].offset = 1MB (chunk 间距),
+    // 把 stripe_size 误判成 1MB.
+    let stripe_size = chunks
+        .windows(2)
+        .find(|w| w[0].volume_id != w[1].volume_id)
+        .map(|w| w[1].offset)
+        .unwrap_or(1024 * 1024);
 
-    // 收集 volume_ids (按 chunk 顺序, 每个 chunk 代表一个 stripe unit)
-    let volume_ids: Vec<u64> = chunks.iter().map(|c| c.volume_id).collect();
+    // volume_ids = 去重后的卷序列 (按首次出现顺序). 这是 stripe unit → volume
+    // 的映射表, 长度 = stripe_count. 旧逻辑为每个 chunk 放一个 vid (长度=
+    // chunk 数=100), 把 stripe_count 误判成 100 而非实际卷数 (如 3).
+    let mut volume_ids: Vec<u64> = Vec::new();
+    for c in chunks {
+        if !volume_ids.contains(&c.volume_id) {
+            volume_ids.push(c.volume_id);
+        }
+    }
 
     Placement::Stripe {
         stripe_size,
@@ -746,12 +760,20 @@ impl FilerNetHandler {
             return Some(Vec::new());
         }
 
-        // Execute: allocate needle_id from each pick's zone counter.
+        // Execute: allocate a file_key (STRIDE 步长) from each pick's zone
+        // counter. 必须用 alloc_file_key 而非 alloc_needle_id: 客户端按
+        // base_needle + vol_chunk_idx 寻址 (一个 stripe unit 跨多个 chunk, 回绕
+        // 后同一卷还会推进 round*chunks_per_unit), 需要每个 stripe unit 预留
+        // FILE_KEY_STRIDE (65536) 个 needle 的独立区间. 旧逻辑用 alloc_needle_id
+        // (counter+1), 三个 stripe unit 的 base needle 低位连续 (如 ...09/0A/0B),
+        // base+idx 区间互相重叠 → 不同卷的 chunk 写到同一 needle, 跨卷数据互相
+        // 覆盖 (reopen 后 verify 错位/读 0). 与 Flat 的 alloc_for_new_file 一致
+        // (见 net_handler L888 alloc_file_key 说明).
         let mut result = Vec::with_capacity(picks.len());
         for pick in &picks {
             let zone = zones.iter().find(|z| z.zone_id == pick.zone_id);
             if let Some(zone) = zone {
-                let needle_id = crate::zone_client::alloc_needle_id(zone.zone_id, &zone.counter);
+                let needle_id = crate::zone_client::alloc_file_key(zone.zone_id, &zone.counter);
                 result.push((pick.volume_id, needle_id));
             }
         }
@@ -1304,9 +1326,9 @@ impl FilerNetHandler {
         // ---- Authoritative storage mode ----
         //
         // `info.storage_mode` is the persisted state bit, set explicitly
-        // during CREATE (Inline) and MIGRATE/sync (Flat via Raft). It is
-        // the authoritative source for deciding the wire-protocol
-        // Placement — NOT inferred from data fields.
+        // during CREATE (Empty — new layout-prediction feature) and
+        // MIGRATE/sync (Flat via Raft). It is the authoritative source
+        // for deciding the wire-protocol Placement — NOT inferred from data fields.
         //
         // This eliminates the rsync data loss race: previously the Filer
         // inferred Inline from `chunks.is_empty()` during Raft apply lag
@@ -1315,10 +1337,19 @@ impl FilerNetHandler {
         // reads returned 0 bytes for a file whose data was on Volume Server.
         //
         // Transitional safety: old inodes (created before this field) have
-        // `storage_mode = Inline` (serde default). If such an inode has
-        // non-empty chunks, it's actually Flat — treat it as Flat until
-        // the next sync updates the field.
-        let effective_mode = if info.storage_mode.is_inline() && !info.chunks.is_empty() {
+        // `storage_mode = Inline` (serde default, pre-Empty era). If such
+        // an inode has non-empty chunks, it's actually Flat — treat it as
+        // Flat until the next sync updates the field.
+        //
+        // StorageMode::Empty (new files, layout-prediction feature):
+        //   - content_size = 0, no data yet
+        //   - Encode as Inline with empty data so the kernel client enters
+        //     the Inline write path; the Filer will resolve the real layout
+        //     on the first write via LayoutPredictor.
+        let effective_mode = if info.storage_mode.is_empty() {
+            // Empty: new file, no data — encode as Inline empty
+            powerfs_layout::StorageMode::Inline
+        } else if info.storage_mode.is_inline() && !info.chunks.is_empty() {
             powerfs_layout::StorageMode::Flat
         } else {
             info.storage_mode
@@ -1336,7 +1367,9 @@ impl FilerNetHandler {
         );
 
         match effective_mode {
-            powerfs_layout::StorageMode::Inline => {
+            // Empty is mapped to Inline by effective_mode above, but the
+            // compiler's exhaustiveness checker requires an explicit arm.
+            powerfs_layout::StorageMode::Empty | powerfs_layout::StorageMode::Inline => {
                 // Inline mode: data in Filer metadata (inline_data).
                 // Empty file (no data yet) also uses Inline so the kernel
                 // client's write_end enters the Inline path.
@@ -1415,13 +1448,33 @@ impl FilerNetHandler {
 
                 let placement = detect_placement_from_chunks(&chunks);
 
+                // 只发 sparse anchors (每个卷的 base needle), 而非全部 dense
+                // chunks. Stripe 客户端用 Placement::Stripe 的 stripe_size /
+                // stripe_count / volume_ids 做 RAID0 数学寻址 (卷回绕 + 卷内
+                // 偏移推进, 见 powerfs-layout placement.rs locate 与内核
+                // locate_chunk), 不需要 per-chunk ChunkRef.
+                //
+                // 这样 GETATTR/LOOKUP 响应大小与文件大小无关 (≈ stripe_count
+                // × 44B), 避免大文件 dense chunks 撑爆客户端接收缓冲
+                // (RX_TRUNCATE → E2BIG, 200MB=200 chunks×44B > 8.7KB cap).
+                // anchor 取每个 volume_id 第一次出现的 chunk (即该卷 round 0
+                // 的起始 chunk): offset = vol_rank * stripe_size, needle = base.
+                let mut anchors: Vec<ChunkRef> = Vec::new();
+                let mut seen_vids: std::collections::HashSet<u64> =
+                    std::collections::HashSet::new();
+                for c in &chunks {
+                    if seen_vids.insert(c.volume_id) {
+                        anchors.push(c.clone());
+                    }
+                }
+
                 let layout = FileLayout {
                     placement: placement.clone(),
                     reliability: info.reliability.clone(),
                     reliability_state: info.reliability_state.clone(),
                     compression: info.compression_state.clone(),
                     encoding: ChunkEncoding::PerChunk {
-                        chunks: chunks.clone(),
+                        chunks: anchors.clone(),
                     },
                 };
                 encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
@@ -2658,6 +2711,95 @@ impl FilerNetHandler {
         Ok(Self::build_response(msg, overall_status, resp_body))
     }
 
+    /// Handle BatchCreate: flush N locally-created files to Filer in one RPC.
+    /// All entries must belong to the same shard (caller ensures this).
+    /// Uses `batch_create_file` → `propose_many` to submit all CreateInode +
+    /// AddDirEntry commands in a single Raft replication cycle.
+    ///
+    /// For N entries on the same shard, Raft commits = 1 (not 2N).
+    async fn handle_batch_create(&self, msg: &NetMessage, origin_client_id: u64) -> NetResult<NetMessage> {
+        let (shard_id_raw, entries) = match powerfs_net::serialize::decode_batch_create_req(&msg.body) {
+            Ok(e) => e,
+            Err(err) => {
+                warn!("FILER_NET_BATCH_CREATE: decode failed: {}", err);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_BAD_REQUEST,
+                    Vec::new(),
+                ));
+            }
+        };
+
+        if entries.is_empty() {
+            return Ok(Self::build_response(msg, STATUS_OK, Vec::new()));
+        }
+
+        let shard_id = ShardId(shard_id_raw);
+
+        info!(
+            "FILER_NET_BATCH_CREATE: {} entries, shard={}",
+            entries.len(),
+            shard_id.0
+        );
+
+        // Check leader once for the whole batch.
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            warn!(
+                "FILER_NET_BATCH_CREATE: not leader for shard {}, redirecting",
+                shard_id.0
+            );
+            return Ok(redirect);
+        }
+
+        let results = self.meta_shard_manager.batch_create_file(&entries).await;
+
+        let mut flushed: u32 = 0;
+        let mut any_ok = false;
+        for (i, result) in results.iter().enumerate() {
+            let (ino, parent_ino, name, _, _, _, _, _) = &entries[i];
+            match result {
+                Ok(_) => {
+                    flushed += 1;
+                    any_ok = true;
+                    debug!(
+                        "FILER_NET_BATCH_CREATE: created ino={} parent={} name={}",
+                        ino, parent_ino, name
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "FILER_NET_BATCH_CREATE: failed ino={} parent={} name={}: {}",
+                        ino, parent_ino, name, e
+                    );
+                }
+            }
+        }
+
+        // Notify parent dir change so OTHER clients refresh their dir cache.
+        // Exclude the originating client: it already has the new inodes
+        // in its local cache, and receiving its own broadcast would trigger
+        // a redundant dir lease invalidation + SUBSCRIBE + GETATTR cycle.
+        if any_ok {
+            let parent_ino = entries[0].1;
+            let v = self.next_version();
+            if let Some(ref notifier) = self.inode_notifier {
+                let notifier = notifier.clone();
+                tokio::spawn(async move {
+                    let count = notifier.broadcast_exclude(parent_ino, v, Some(origin_client_id));
+                    log::info!(
+                        "FILER_NET_NOTIFY: inode={}, version={}, excluded client={}, notified {} others",
+                        parent_ino, v, origin_client_id, count
+                    );
+                });
+            }
+        }
+
+        let resp_body =
+            powerfs_net::serialize::encode_batch_create_resp(flushed).unwrap_or_default();
+        let overall_status = if any_ok { STATUS_OK } else { STATUS_ERR_SERVER_ERROR };
+        Ok(Self::build_response(msg, overall_status, resp_body))
+    }
+
     /// Handle Rmdir request
     async fn handle_rmdir(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -3289,10 +3431,14 @@ impl FilerNetHandler {
         let mut dec = TlvDecoder::new(&msg.body);
         let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
+        // Desired allocation mode: 0 = Flat (default, legacy), 1 = Stripe.
+        // Sent by clients that detected binary content on the first write of
+        // an Empty-state file (no filename-based prediction matched).
+        let desired_stripe = dec.next_u8(FieldId::DesiredMode).unwrap_or(0) == 1;
 
         info!(
-            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id(raw)={}, inode={}",
-            _shard_id_raw, inode
+            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id(raw)={}, inode={}, desired_stripe={}",
+            _shard_id_raw, inode, desired_stripe
         );
 
         // inode-level write → route by calculate_shard(inode)
@@ -3307,19 +3453,42 @@ impl FilerNetHandler {
         // 否则双客户端并发 migrate 会得到两套不同的 fid → 数据写到两个独立 Volume 文件，
         // 后 sync 的那个覆盖前一个的 chunks 元数据 → 先写的客户端数据永久丢失。
         if let Some(info) = self.meta_shard_manager.get_inode(inode) {
-            // Idempotency: if storage_mode is already Flat, the file has been
-            // migrated. We must return the existing allocation (from chunks or
-            // fid) rather than allocating a new one, preventing dual-client
-            // migrate races that lose data.
+            // storage_mode is volume_backed (Flat/Stripe). If chunks/fid exist,
+            // this is an idempotent reuse (file already allocated). If not,
+            // this is the first allocation for a Flat/Stripe file (either
+            // predicted as Stripe at create, or Flat mode's first write).
             if info.storage_mode.is_volume_backed() {
                 info!(
                     "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} storage_mode={:?} — \
-                     already migrated, attempting idempotent reuse",
+                     volume-backed mode, checking for existing allocation",
                     inode, info.storage_mode
                 );
             }
-            // Case 1: chunks 非空 → 已完成一次迁移并 sync，复用首个 chunk 的位置
-            if let Some(first) = info.chunks.first() {
+            // Case 1: chunks 非空 → 已完成一次迁移并 sync，复用现有 chunk 位置。
+            // Stripe 文件有多个 chunks, 需全部返回; Flat 文件仅首个。
+            if !info.chunks.is_empty() {
+                let is_stripe = info.chunks.len() > 1
+                    || matches!(info.storage_mode, powerfs_layout::StorageMode::Stripe);
+                if is_stripe {
+                    info!(
+                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE (Stripe) — \
+                         returning {} chunks",
+                        inode,
+                        info.chunks.len()
+                    );
+                    let mut enc = TlvEncoder::new();
+                    enc.add_u32(FieldId::StripeCount, info.chunks.len() as u32);
+                    enc.add_u64(
+                        FieldId::StripeSize,
+                        powerfs_layout::policy::PlacementPolicy::default().default_stripe_size,
+                    );
+                    for c in &info.chunks {
+                        enc.add_u64(FieldId::VolumeId, c.volume_id);
+                        enc.add_u64(FieldId::FileKey, c.needle_id);
+                    }
+                    return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+                }
+                let first = &info.chunks[0];
                 info!(
                     "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE — \
                      chunks already exist, returning volume_id={} needle_id={:#x} \
@@ -3364,15 +3533,16 @@ impl FilerNetHandler {
             // 无 inline_data 且无 chunks/fid：通常是新建空文件，正常分配即可
             if info.inline_data.is_none() && info.chunks.is_empty() && info.fid.is_none() {
                 if info.storage_mode.is_volume_backed() {
-                    // storage_mode=Flat but no chunks/fid — indicates a data
-                    // integrity issue (file was truncated to 0 but mode wasn't
-                    // reset, or Raft apply was partial). Log at error level
-                    // so it's visible in monitoring.
-                    log::error!(
-                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} storage_mode={:?} but \
-                         no chunks/fid/inline_data — data integrity anomaly, allocating fresh",
-                        inode,
-                        info.storage_mode
+                    // storage_mode=Flat/Stripe but no chunks/fid.
+                    // This is the NORMAL first-allocation path:
+                    //   - Flat mode: create sets Flat, first write allocates Volume
+                    //   - Stripe mode (layout prediction): create predicts Stripe,
+                    //     first write allocates Volume (no actual migration needed)
+                    // Only log at info level, not error.
+                    info!(
+                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} storage_mode={:?} — \
+                         first allocation (no inline_data, no chunks yet)",
+                        inode, info.storage_mode
                     );
                 } else {
                     warn!(
@@ -3396,7 +3566,68 @@ impl FilerNetHandler {
             ));
         }
 
-        // 分配 (volume_id, needle_id) — 同 CREATE Flat 路径
+        // === Fresh allocation ===
+        // Branch on desired mode: Stripe (binary content detected by client)
+        // allocates N volumes; Flat (text or legacy) allocates a single volume.
+        if desired_stripe {
+            let policy = powerfs_layout::policy::PlacementPolicy::default();
+            let stripe_count = policy.default_stripe_count;
+            let stripe_size = policy.default_stripe_size;
+            let allocs = match self.alloc_for_stripe_file(stripe_count) {
+                Some(v) if !v.is_empty() => v,
+                _ => {
+                    warn!(
+                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} stripe allocation failed \
+                         (no zones/volumes), falling back to Flat",
+                        inode
+                    );
+                    // Fall back to Flat single-volume allocation
+                    return self.alloc_flat_and_respond(msg, inode, false);
+                }
+            };
+            info!(
+                "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} FRESH Stripe allocation count={} size={} \
+                 (inode NOT modified, inline_data preserved for crash safety)",
+                inode,
+                allocs.len(),
+                stripe_size
+            );
+
+            // Stats: Stripe migration from Empty/Inline counts as real migration.
+            if let Some(info) = self.meta_shard_manager.get_inode(inode) {
+                if info.storage_mode.is_volume_backed() {
+                    self.meta_shard_manager
+                        .layout_migration_stats()
+                        .record_first_alloc(true);
+                } else {
+                    self.meta_shard_manager
+                        .layout_migration_stats()
+                        .record_real_migration(true);
+                }
+            }
+
+            let mut enc = TlvEncoder::new();
+            enc.add_u32(FieldId::StripeCount, allocs.len() as u32);
+            enc.add_u64(FieldId::StripeSize, stripe_size);
+            for (vid, nid) in &allocs {
+                enc.add_u64(FieldId::VolumeId, *vid);
+                enc.add_u64(FieldId::FileKey, *nid);
+            }
+            return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+        }
+
+        // Flat allocation (default / legacy / text content)
+        self.alloc_flat_and_respond(msg, inode, false)
+    }
+
+    /// Allocate a single (volume_id, needle_id) for Flat-mode migration and
+    /// build the response. Shared by the Flat path and the Stripe fallback.
+    fn alloc_flat_and_respond(
+        &self,
+        msg: &NetMessage,
+        inode: u64,
+        _is_stripe_fallback: bool,
+    ) -> NetResult<NetMessage> {
         let (volume_id, needle_id) = match self.alloc_for_new_file() {
             Some(v) => v,
             None => {
@@ -3416,6 +3647,24 @@ impl FilerNetHandler {
              (inode NOT modified, inline_data preserved for crash safety)",
             inode, volume_id, needle_id
         );
+
+        // Record layout migration statistics.
+        // Distinguish real migrations (storage_mode was Inline/Empty → layout changed)
+        // from first allocations (storage_mode was already Flat/Stripe, predicted at create).
+        if let Some(info) = self.meta_shard_manager.get_inode(inode) {
+            let is_stripe = matches!(info.storage_mode, powerfs_layout::StorageMode::Stripe);
+            if info.storage_mode.is_volume_backed() {
+                // Flat/Stripe predicted at create — first Volume allocation, not a migration
+                self.meta_shard_manager
+                    .layout_migration_stats()
+                    .record_first_alloc(is_stripe);
+            } else {
+                // Inline/Empty → Flat/Stripe — real layout migration
+                self.meta_shard_manager
+                    .layout_migration_stats()
+                    .record_real_migration(is_stripe);
+            }
+        }
 
         let mut enc = TlvEncoder::new();
         enc.add_u64(FieldId::VolumeId, volume_id);
@@ -4089,8 +4338,15 @@ impl FilerNetHandler {
         let wanted = CapSet(wanted_u8);
 
         if inode == 0 || client_id.is_empty() || token.is_empty() {
-            warn!("CAP_ACQUIRE: missing inode={} or client_id/token empty", inode);
-            return Ok(Self::build_response(msg, STATUS_ERR_BAD_REQUEST, Vec::new()));
+            warn!(
+                "CAP_ACQUIRE: missing inode={} or client_id/token empty",
+                inode
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
         }
 
         // Route to shard leader (same as cap_open_grant)
@@ -4541,10 +4797,7 @@ impl FilerNetHandler {
                 // UNLOCK by client_id (not sn)
                 let _ = arbiter.posix_unlock(inode, &client_id);
                 granted = 1;
-                info!(
-                    "FILE_LOCK: UNLOCK inode={} client={}",
-                    inode, client_id
-                );
+                info!("FILE_LOCK: UNLOCK inode={} client={}", inode, client_id);
                 // After unlock, check if there are waiters to promote
                 // wake_waiters is called inside unlock; if a waiter is granted,
                 // we need to push FileLockGrant notification to it
@@ -4831,6 +5084,7 @@ impl NetHandler for FilerNetHandler {
             MsgType::MkdirPhaseA => self.handle_mkdir_phase_a(msg).await,
             MsgType::MkdirPhaseB => self.handle_mkdir_phase_b(msg).await,
             MsgType::BatchUnlink => self.handle_batch_unlink(msg).await,
+            MsgType::BatchCreate => self.handle_batch_create(msg, ctx.client.client_id).await,
             // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)
             MsgType::AcquireInodeLease => self.handle_acquire_inode_lease(msg).await,
             MsgType::ReleaseInodeLease => self.handle_release_inode_lease(msg).await,
@@ -4854,7 +5108,11 @@ impl NetHandler for FilerNetHandler {
             MsgType::FileLockGrant => {
                 // Filer should not receive FileLockGrant (it's Filer→Client notification)
                 // If we get here, it's a protocol error
-                Ok(Self::build_response(msg, STATUS_ERR_BAD_REQUEST, Vec::new()))
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_BAD_REQUEST,
+                    Vec::new(),
+                ))
             }
             // AssignVolumeV2 removed - volume assignment is handled by Master via MsgType::Assign
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),

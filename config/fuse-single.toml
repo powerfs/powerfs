@@ -1,7 +1,14 @@
+[global]
+log_level = "info"
+redis_url = "redis://redis:6379"
+
 [fuse]
 mount_point = "/mnt/powerfs"
 master_addresses = ["172.20.0.11:9333"]
 filer_addresses = ["172.20.0.35:9334"]
+master_net_port = 9334
+volume_net_port = 8901
+filer_net_port = 9334
 collection = "default"
 replication = "000"
 threads = 4

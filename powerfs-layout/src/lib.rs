@@ -25,20 +25,27 @@
 
 pub mod anti_affinity;
 pub mod codec;
+pub mod content_detector;
 pub mod encoding;
 pub mod error;
 pub mod layout;
 pub mod placement;
 pub mod policy;
+pub mod predictor;
 pub mod reliability;
 pub mod xattr;
 
 // ---- 便捷 re-export (常用类型可直接 `use powerfs_layout::*`) ----
 
 pub use anti_affinity::{NodeId, VolumeInfo};
+pub use content_detector::{detect_content_type, ContentType};
 pub use encoding::{ChunkEncoding, ChunkRef};
 pub use error::LayoutError;
 pub use layout::FileLayout;
 pub use placement::{Placement, PlacementSpec, StorageMode};
 pub use policy::PlacementPolicy;
+pub use predictor::{
+    ClientType, LayoutPredictor, LayoutRule, PredictContext, PredictResult, RuleBasedPredictor,
+    RuleMatcher, RulePlacement,
+};
 pub use reliability::{CompressionState, Reliability, ReliabilityState};

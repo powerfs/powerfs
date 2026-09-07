@@ -19,6 +19,8 @@ pub enum ManageSubcommand {
     UnpinVolume(UnpinVolumeArgs),
     /// Enable/disable maintenance mode for a node
     NodeMaintenance(NodeMaintenanceArgs),
+    /// Permanently remove a data (volume) node and its volume routes
+    NodeRemove(NodeRemoveArgs),
     /// Run a rebalance check (dry_run only previews recommended actions)
     RebalanceCheck(RebalanceCheckArgs),
     /// List active migration tasks
@@ -56,6 +58,15 @@ pub struct NodeMaintenanceArgs {
     pub node_id: String,
     /// "true" = enter maintenance, "false" = exit maintenance (string parsed to bool)
     pub enabled: String,
+}
+
+#[derive(Args, Debug)]
+pub struct NodeRemoveArgs {
+    /// Data-node id (string), e.g. "volume-server-rdma"
+    pub node_id: String,
+    /// Force removal even if the node still appears healthy and owns volumes
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -159,6 +170,19 @@ pub async fn manage(mut client: MasterClient, args: ManageArgs) -> super::Comman
                 .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?
                 .into_inner();
             print_migration_control_response("SetNodeMaintenance", resp);
+        }
+        ManageSubcommand::NodeRemove(a) => {
+            let resp = service
+                .remove_data_node(tonic::Request::new(
+                    powerfs_master::proto::RemoveDataNodeRequest {
+                        node_id: a.node_id,
+                        force: a.force,
+                    },
+                ))
+                .await
+                .map_err(|e| powerfs_common::error::PowerFsError::TonicStatus(Box::new(e)))?
+                .into_inner();
+            print_migration_control_response("RemoveDataNode", resp);
         }
         ManageSubcommand::RebalanceCheck(a) => {
             let resp = service

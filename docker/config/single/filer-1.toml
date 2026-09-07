@@ -1,0 +1,25 @@
+# PowerFS Filer 节点配置 - 单节点环境 (docker-compose-single.yml)
+
+[global]
+log_level = "info"
+redis_url = "redis://redis:6379"
+
+[filer]
+transport = "tcp"
+port = 8888
+grpc_port = 8889
+metrics_port = 8900
+net_port = 9334
+ip = "0.0.0.0"
+master_addresses = ["172.20.0.11:9333"]
+master_net_port = 9334
+data_dir = "/data/filer"
+shard_count = 1
+raft_id = 1
+raft_peers = ["172.20.0.35:8889"]
+inline_max_size = 8192
+registration_token = "powerfs-cluster-test"
+
+[filer.layout]
+# 优化测试: 开启布局预测
+enable_prediction = true

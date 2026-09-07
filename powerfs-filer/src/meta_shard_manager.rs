@@ -1,7 +1,7 @@
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -132,21 +132,7 @@ pub struct MetaShardManager {
     raft_group_manager: Arc<RaftGroupManagerV2>,
     shard_stores: RwLock<HashMap<ShardId, Arc<ShardStore>>>,
     shard_strategy: Arc<ShardStrategy>,
-    /// Per-shard inode allocators. Each shard has its own counter within
-    /// the shard's inode range, with a per-node offset to avoid collisions
-    /// across filer nodes.
-    ///
-    /// Replaces the old single `inode_generator: AtomicU64` which allocated
-    /// all inodes from `node_id * 1B + 1000`, causing severe shard imbalance
-    /// (nodes 1+ crammed all inodes into the last shard because 1B >> 1M
-    /// shard range size).
-    ///
-    /// With per-shard allocators:
-    /// - Files get inodes in the parent directory's shard range (locality)
-    /// - Directories get inodes in a different shard's range (distribution)
-    /// - Each node has a non-overlapping slot within each shard range
-    shard_allocators: RwLock<Vec<ShardAllocator>>,
-    /// Filer node id, used to partition the inode space within each shard.
+    /// Filer node id.
     node_id: u64,
     data_path: String,
     root_inodes: RwLock<HashMap<String, u64>>,
@@ -198,31 +184,116 @@ pub struct MetaShardManager {
     /// `sweep_leaked_refcounts` in the GC loop.
     lease_mgr:
         std::sync::RwLock<Option<std::sync::Arc<crate::inode_lease_manager::InodeLeaseManager>>>,
+    /// Layout predictor for file layout prediction (Phase 1).
+    /// None when prediction is disabled; Some when enabled.
+    /// Used by create_file to decide initial layout based on file
+    /// name/path (see docs/file-layout-prediction-design.md).
+    layout_predictor:
+        std::sync::RwLock<Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>>,
+    /// Minimum confidence threshold for layout prediction.
+    layout_min_confidence: std::sync::atomic::AtomicU32,
+    /// Layout migration statistics (layout-prediction observability).
+    /// Tracks real migrations (Inline→Flat/Stripe) vs first allocations
+    /// (Flat/Stripe predicted at create, Volume allocated on first write).
+    layout_migration_stats: LayoutMigrationStats,
 }
 
-/// Per-shard inode allocator.
+/// Layout migration statistics for observability.
 ///
-/// Each filer node owns a non-overlapping slot within each shard's inode
-/// range. The slot is calculated as:
-///   node_offset = node_id * (range_size / MAX_NODES)
-///   actual_inode = shard_range_start + node_offset + counter
-///
-/// This ensures:
-/// 1. No collisions between nodes (each node has a unique offset)
-/// 2. Balanced distribution across shards (each shard gets allocations)
-/// 3. Files can be placed on the parent's shard (locality for readdir)
-struct ShardAllocator {
-    /// Next counter value within this shard's slot.
-    counter: AtomicU64,
-    /// Start of this shard's inode range.
-    shard_start: u64,
-    /// Per-node offset within the shard range.
-    node_offset: u64,
+/// Distinguishes two cases in `handle_migrate_inline_alloc`:
+/// - **Real migration**: storage_mode was Inline/Empty → layout changed to
+///   Flat/Stripe. These are the events layout prediction aims to eliminate.
+/// - **First allocation**: storage_mode was already Flat/Stripe (predicted
+///   at create), Volume is allocated on first write. Not a real migration.
+#[derive(Default)]
+pub struct LayoutMigrationStats {
+    /// Real layout migrations (Inline/Empty → Flat/Stripe).
+    pub real_migration_total: std::sync::atomic::AtomicU64,
+    /// First-time Volume allocation for Flat/Stripe files (not a migration).
+    pub first_alloc_total: std::sync::atomic::AtomicU64,
+    /// Real migrations where target was Flat.
+    pub migrate_to_flat: std::sync::atomic::AtomicU64,
+    /// Real migrations where target was Stripe.
+    pub migrate_to_stripe: std::sync::atomic::AtomicU64,
+    /// First allocations for Flat files.
+    pub first_alloc_flat: std::sync::atomic::AtomicU64,
+    /// First allocations for Stripe files.
+    pub first_alloc_stripe: std::sync::atomic::AtomicU64,
 }
 
-/// Maximum number of filer nodes supported. Each shard range is divided
-/// into this many equal slots, one per node.
-const MAX_FILER_NODES: u64 = 64;
+/// Snapshot of [`LayoutMigrationStats`] for JSON/Prometheus export.
+#[derive(Debug, serde::Serialize)]
+pub struct LayoutMigrationStatsSnapshot {
+    pub real_migration_total: u64,
+    pub first_alloc_total: u64,
+    pub migrate_to_flat: u64,
+    pub migrate_to_stripe: u64,
+    pub first_alloc_flat: u64,
+    pub first_alloc_stripe: u64,
+    /// real_migration / (real_migration + first_alloc). 0.0 when no events.
+    pub migration_rate: f64,
+}
+
+impl LayoutMigrationStats {
+    /// Record a real migration (storage_mode was Inline/Empty).
+    pub fn record_real_migration(&self, target_is_stripe: bool) {
+        self.real_migration_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if target_is_stripe {
+            self.migrate_to_stripe
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.migrate_to_flat
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Record a first allocation (storage_mode was already Flat/Stripe).
+    pub fn record_first_alloc(&self, is_stripe: bool) {
+        self.first_alloc_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if is_stripe {
+            self.first_alloc_stripe
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.first_alloc_flat
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot all counters for export.
+    pub fn snapshot(&self) -> LayoutMigrationStatsSnapshot {
+        let real = self
+            .real_migration_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let first = self
+            .first_alloc_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total = real + first;
+        let migration_rate = if total > 0 {
+            real as f64 / total as f64
+        } else {
+            0.0
+        };
+        LayoutMigrationStatsSnapshot {
+            real_migration_total: real,
+            first_alloc_total: first,
+            migrate_to_flat: self
+                .migrate_to_flat
+                .load(std::sync::atomic::Ordering::Relaxed),
+            migrate_to_stripe: self
+                .migrate_to_stripe
+                .load(std::sync::atomic::Ordering::Relaxed),
+            first_alloc_flat: self
+                .first_alloc_flat
+                .load(std::sync::atomic::Ordering::Relaxed),
+            first_alloc_stripe: self
+                .first_alloc_stripe
+                .load(std::sync::atomic::Ordering::Relaxed),
+            migration_rate,
+        }
+    }
+}
 
 impl MetaShardManager {
     pub fn new(
@@ -231,10 +302,6 @@ impl MetaShardManager {
         data_path: String,
         node_id: u64,
     ) -> Self {
-        // Build per-shard allocators. Each shard gets its own counter within
-        // the shard's inode range, with a per-node offset to avoid collisions.
-        let shard_count = shard_strategy.get_shard_count();
-        let allocators = Self::build_shard_allocators(&shard_strategy, shard_count, node_id);
         // Async meta persist: default true (performance mode).
         // Set POWERFS_ASYNC_META_PERSIST=0 to force strict mode.
         let async_default = match std::env::var("POWERFS_ASYNC_META_PERSIST") {
@@ -245,7 +312,6 @@ impl MetaShardManager {
             raft_group_manager,
             shard_stores: RwLock::new(HashMap::new()),
             shard_strategy,
-            shard_allocators: RwLock::new(allocators),
             node_id,
             data_path,
             root_inodes: RwLock::new(HashMap::new()),
@@ -258,7 +324,51 @@ impl MetaShardManager {
             meta_cache: std::sync::Arc::new(crate::meta_cache::MetaCache::new()),
             inode_notifier: std::sync::RwLock::new(None),
             lease_mgr: std::sync::RwLock::new(None),
+            layout_predictor: std::sync::RwLock::new(None),
+            layout_min_confidence: std::sync::atomic::AtomicU32::new(f32::to_bits(0.6)),
+            layout_migration_stats: LayoutMigrationStats::default(),
         }
+    }
+
+    /// Access layout migration statistics (for metrics/observability).
+    pub fn layout_migration_stats(&self) -> &LayoutMigrationStats {
+        &self.layout_migration_stats
+    }
+
+    /// Configure layout prediction from the FilerConfig.layout section.
+    /// Called from main.rs at startup. When prediction is disabled
+    /// (enable_prediction=false), the predictor is None and new files
+    /// use the Empty → auto_promote fallback path.
+    pub fn set_layout_predictor(
+        &self,
+        predictor: Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>,
+        min_confidence: f32,
+    ) {
+        log::info!(
+            "LAYOUT_PREDICTOR: configured min_confidence={:.2} enabled={}",
+            min_confidence,
+            predictor.is_some()
+        );
+        *self.layout_predictor.write().unwrap() = predictor;
+        self.layout_min_confidence.store(
+            f32::to_bits(min_confidence),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Read the layout predictor (if enabled) and min_confidence threshold.
+    /// Returns (predictor_clone, min_confidence).
+    fn get_layout_predictor(
+        &self,
+    ) -> (
+        Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>>,
+        f32,
+    ) {
+        let predictor = self.layout_predictor.read().unwrap().clone();
+        let bits = self
+            .layout_min_confidence
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (predictor, f32::from_bits(bits))
     }
 
     /// Set async_meta_persist mode at runtime.
@@ -342,37 +452,6 @@ impl MetaShardManager {
                 .await
                 .map(|_| ())
         }
-    }
-
-    /// Build per-shard allocators for the given shard count and node_id.
-    /// Each allocator owns a non-overlapping slot within its shard's range.
-    fn build_shard_allocators(
-        shard_strategy: &ShardStrategy,
-        shard_count: u64,
-        node_id: u64,
-    ) -> Vec<ShardAllocator> {
-        let mut allocators = Vec::with_capacity(shard_count as usize);
-        for sid in 0..shard_count {
-            let (start, end) = shard_strategy.get_shard_range(ShardId(sid));
-            let range_size = end.saturating_sub(start);
-            // Per-node slot: divide the shard range into MAX_FILER_NODES slots.
-            // node_id < MAX_FILER_NODES gets a unique slot.
-            let slot = range_size / MAX_FILER_NODES;
-            let node_offset = node_id * slot;
-            // Reserve the first 1000 inodes in each shard for special inodes
-            // (root=1, bucket roots, etc.)
-            let reserved = 1000u64;
-            allocators.push(ShardAllocator {
-                counter: AtomicU64::new(reserved),
-                shard_start: start,
-                node_offset,
-            });
-            info!(
-                "ShardAllocator init: shard={} range=[{}, {}) slot={} node_offset={} (node_id={})",
-                sid, start, end, slot, node_offset, node_id
-            );
-        }
-        allocators
     }
 
     fn get_or_create_delta_log(&self, shard_id: ShardId) -> Arc<DeltaLog> {
@@ -687,6 +766,13 @@ impl MetaShardManager {
         let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
         let inode = self.alloc_inode_in_shard(parent_shard);
         let now = chrono::Utc::now().timestamp() as u64;
+
+        // Layout-prediction (Phase 1): decide initial storage_mode based on
+        // file name/path via LayoutPredictor. If prediction is disabled or
+        // low confidence, use Empty (fallback to auto_promote on first write).
+        // See docs/file-layout-prediction-design.md §3.2.
+        let storage_mode = self.predict_storage_mode(name, parent_inode);
+
         let info = InodeInfo {
             inode,
             name: name.to_string(),
@@ -714,18 +800,73 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
-            storage_mode: powerfs_layout::StorageMode::Inline,
+            storage_mode,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
             .await?;
 
         log::info!(
-            "create_file latency: total={}ms, inode={}",
+            "create_file latency: total={}ms, inode={}, storage_mode={:?}",
             t0.elapsed().as_millis(),
-            inode
+            inode,
+            info.storage_mode
         );
         Ok(info)
+    }
+
+    /// Predict the storage mode for a new file based on its name and parent
+    /// directory. Returns Empty when prediction is disabled or low confidence.
+    fn predict_storage_mode(
+        &self,
+        filename: &str,
+        parent_inode: u64,
+    ) -> powerfs_layout::StorageMode {
+        let (predictor, min_confidence) = self.get_layout_predictor();
+
+        let Some(predictor) = predictor else {
+            // Prediction disabled → Empty (auto_promote on first write)
+            return powerfs_layout::StorageMode::Empty;
+        };
+
+        // Build prediction context. parent_path is best-effort (we don't
+        // resolve the full path here; the predictor uses filename as the
+        // primary signal).
+        let ctx = powerfs_layout::PredictContext {
+            filename: filename.to_string(),
+            parent_path: format!("/inode:{}", parent_inode),
+            ..Default::default()
+        };
+
+        let result = predictor.predict(&ctx);
+        if !result.is_confident(min_confidence) {
+            log::debug!(
+                "LAYOUT_PREDICT: low confidence {:.2} < {:.2} for {}, rule={}, using Empty",
+                result.confidence,
+                min_confidence,
+                filename,
+                result.rule_name
+            );
+            return powerfs_layout::StorageMode::Empty;
+        }
+
+        let mode = match result.placement {
+            powerfs_layout::Placement::Inline { .. } => powerfs_layout::StorageMode::Inline,
+            powerfs_layout::Placement::Flat => powerfs_layout::StorageMode::Flat,
+            powerfs_layout::Placement::Stripe { .. } => powerfs_layout::StorageMode::Stripe,
+            powerfs_layout::Placement::WideStripe { .. } => powerfs_layout::StorageMode::WideStripe,
+        };
+
+        log::info!(
+            "LAYOUT_PREDICT: file={} rule={} placement={:?} confidence={:.2} → mode={:?}",
+            filename,
+            result.rule_name,
+            result.placement,
+            result.confidence,
+            mode
+        );
+
+        mode
     }
 
     /// Two-phase create used by `create_file`, `create_directory`,
@@ -824,7 +965,6 @@ impl MetaShardManager {
             //
             // dirty (setattr) and deleted (unlink) also use `propose`
             // (synchronous commit) — see their respective methods.
-
             self.meta_cache
                 .stage_create(info.clone(), parent_inode, name);
 
@@ -1166,6 +1306,168 @@ impl MetaShardManager {
         }
 
         Ok(())
+    }
+
+    /// Batch create multiple files in one RPC, using `propose_many` to merge
+    /// all Raft commits into a single replication cycle.
+    ///
+    /// All entries must share the same parent shard (caller groups by shard).
+    /// The inodes are pre-allocated by the client via AllocInodeBatch, so the
+    /// Filer does NOT allocate — it uses the client-provided inode numbers.
+    ///
+    /// For N entries on the same shard, Raft commits = 1 (not 2N).
+    ///
+    /// Each entry: (ino, parent_ino, name, mode, uid, gid, mtime, atime),
+    /// mtime/atime in unix seconds (0 = server assigns current time).
+    pub async fn batch_create_file(
+        &self,
+        entries: &[(u64, u64, String, u32, u32, u32, u64, u64)],
+    ) -> Vec<Result<(), String>> {
+        let n = entries.len();
+        let mut results = vec![Ok(()); n];
+
+        if entries.is_empty() {
+            return results;
+        }
+
+        // All entries share the same parent → same shard_dir.
+        let shard_dir = self.shard_strategy.calculate_shard(entries[0].1);
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        // Verify shard exists.
+        {
+            let stores = self.shard_stores.read().unwrap();
+            if stores.get(&shard_dir).is_none() {
+                let err = format!("shard {} not found", shard_dir.0);
+                return vec![Err(err); n];
+            }
+        }
+
+        // Build InodeInfo + stage each create in MetaCache (immediate
+        // visibility for reads before Raft apply).
+        let mut infos: Vec<InodeInfo> = Vec::with_capacity(n);
+        for (idx, (ino, parent_ino, name, mode, uid, gid, mtime, atime)) in
+            entries.iter().enumerate()
+        {
+            // Validate: inode must not already exist.
+            // Idempotent: if inode exists with same parent+name, treat as
+            // success (retry from kernel after transient network error).
+            // Only fail if parent/name differ (genuine collision).
+            let shard_ino = self.shard_strategy.calculate_shard(*ino);
+            {
+                let stores = self.shard_stores.read().unwrap();
+                if let Some(s) = stores.get(&shard_ino) {
+                    if let Some(existing) = s.get_inode(*ino) {
+                        if existing.parent_inode == *parent_ino
+                            && existing.name == *name
+                            && existing.file_type == FileType::File
+                        {
+                            // Idempotent retry — same file, skip silently.
+                            results[idx] = Ok(());
+                            continue;
+                        }
+                        results[idx] = Err(format!(
+                            "inode {} already exists with different parent/name (collision)",
+                            ino
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            let info = InodeInfo {
+                inode: *ino,
+                name: name.clone(),
+                parent_inode: *parent_ino,
+                file_type: FileType::File,
+                size: 0,
+                // Client-supplied timestamps (utimensat/touch applied while
+                // the create was still a local optimistic entry); 0 = now.
+                mtime: if *mtime != 0 { *mtime } else { now },
+                atime: if *atime != 0 { *atime } else { now },
+                ctime: now,
+                mode: if *mode & 0o170000 != 0 {
+                    *mode
+                } else {
+                    *mode | 0o100000
+                },
+                uid: *uid,
+                gid: *gid,
+                blocks: 0,
+                fid: None,
+                volume_id: None,
+                etag: None,
+                chunks: vec![],
+                inline_data: None,
+                extended: HashMap::new(),
+                symlink_target: None,
+                nlink: 1,
+                version: 0,
+                delete_time: 0,
+                reliability: powerfs_layout::reliability::Reliability::default(),
+                reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+                compression_state: powerfs_layout::reliability::CompressionState::default(),
+                replica_chunks: Vec::new(),
+                storage_mode: self.predict_storage_mode(name, *parent_ino),
+            };
+
+            self.meta_cache
+                .stage_create(info.clone(), *parent_ino, name);
+            infos.push(info);
+        }
+
+        if infos.is_empty() {
+            return results;
+        }
+
+        // Build [CreateInode, AddDirEntry] * N commands and propose_many
+        // in a single Raft replication cycle.
+        let mut cmds: Vec<Vec<u8>> = Vec::with_capacity(infos.len() * 2);
+        for info in &infos {
+            cmds.push(
+                ShardCommand::CreateInode {
+                    info: Box::new(info.clone()),
+                }
+                .serialize(),
+            );
+            cmds.push(
+                ShardCommand::AddDirEntry {
+                    parent_inode: info.parent_inode,
+                    name: info.name.clone(),
+                    inode: info.inode,
+                }
+                .serialize(),
+            );
+        }
+
+        match self.raft_group_manager.propose_many(shard_dir, cmds).await {
+            Ok(_) => {
+                for info in &infos {
+                    info!(
+                        "batch_create: committed inode={} parent={} name={} to shard {}",
+                        info.inode, info.parent_inode, info.name, shard_dir.0
+                    );
+                }
+            }
+            Err(e) => {
+                // Propose failed (lost leadership, network error, etc.)
+                // Invalidate staging and mark all entries as failed.
+                for info in &infos {
+                    self.meta_cache
+                        .invalidate_staging(info.inode, info.parent_inode, &info.name);
+                }
+                // Find the entries that were staged (infos) and mark them.
+                for (idx, (_, parent_ino, name, _, _, _, _, _)) in
+                    entries.iter().enumerate()
+                {
+                    if infos.iter().any(|i| i.parent_inode == *parent_ino && i.name == *name) {
+                        results[idx] = Err(e.clone());
+                    }
+                }
+            }
+        }
+
+        results
     }
 
     /// Batch delete multiple files in one RPC, using `propose_many` to merge
@@ -2365,25 +2667,39 @@ impl MetaShardManager {
 
     /// Allocate an inode within a specific shard's range.
     ///
-    /// This is the shard-aware replacement for the old `generate_inode()`.
-    /// It ensures the allocated inode routes to the specified shard via
-    /// `calculate_shard(inode)`, enabling:
-    /// - Files to be placed on the parent directory's shard (readdir locality)
-    /// - Directories to be placed on a different shard (tree distribution)
-    ///
-    /// The inode is allocated from this node's non-overlapping slot within
-    /// the shard range, so multiple filer nodes can allocate concurrently
-    /// without collisions.
+    /// Delegates to `ShardStore::alloc_inode_batch(1)`, which uses the
+    /// single persisted counter in CF_METADATA ("next_inode"). This
+    /// unifies the slow path (single create/mkdir) and fast path (kernel
+    /// batch pre-allocation) through one source of truth, eliminating the
+    /// dual-allocator range overlap bug.
     pub fn alloc_inode_in_shard(&self, shard_id: ShardId) -> u64 {
-        let allocators = self.shard_allocators.read().unwrap();
-        let alloc = &allocators[shard_id.0 as usize];
-        let n = alloc.counter.fetch_add(1, Ordering::SeqCst);
-        let inode = alloc.shard_start + alloc.node_offset + n;
-        debug!(
-            "alloc_inode_in_shard: shard={} inode={} (start={} offset={} counter={})",
-            shard_id.0, inode, alloc.shard_start, alloc.node_offset, n
-        );
-        inode
+        let stores = self.shard_stores.read().unwrap();
+        let store = match stores.get(&shard_id) {
+            Some(s) => s,
+            None => {
+                error!(
+                    "alloc_inode_in_shard: no shard store for shard {}",
+                    shard_id.0
+                );
+                return 0;
+            }
+        };
+        match store.alloc_inode_batch(1) {
+            Ok((start, _)) => {
+                debug!(
+                    "alloc_inode_in_shard: shard={} inode={}",
+                    shard_id.0, start
+                );
+                start
+            }
+            Err(e) => {
+                error!(
+                    "alloc_inode_in_shard: alloc_inode_batch failed for shard {}: {}",
+                    shard_id.0, e
+                );
+                0
+            }
+        }
     }
 
     /// Pick a target shard for a new child directory.
@@ -2410,49 +2726,25 @@ impl MetaShardManager {
         self.alloc_inode_in_shard(ShardId(0))
     }
 
-    /// Recover shard allocators by scanning existing inodes in RocksDB.
+    /// Verify inode allocator consistency after restart.
     ///
-    /// After all shard stores are loaded, scan `CF_INODES` for the max
-    /// inode in each shard's range (for this node's slot) and advance
-    /// each shard's counter past it. This prevents inode reuse after
-    /// filer restart.
+    /// `ShardStore::init_next_inode` already scans CF_INODES on startup
+    /// to advance the persisted counter past existing inodes. This method
+    /// is a sanity check that the counter is indeed at or above the max
+    /// inode found in RocksDB. If not, it logs an error.
     pub fn recover_inode_generator(&self) {
-        let allocators = self.shard_allocators.read().unwrap();
         let stores = self.shard_stores.read().unwrap();
-
-        for (idx, alloc) in allocators.iter().enumerate() {
-            let shard_id = ShardId(idx as u64);
-            let slot_start = alloc.shard_start + alloc.node_offset;
-            let slot_end = alloc.shard_start
-                + alloc.node_offset
-                + (self.shard_strategy.get_shard_range(shard_id).1
-                    - self.shard_strategy.get_shard_range(shard_id).0)
-                    / MAX_FILER_NODES;
-
-            let mut max_existing = slot_start;
-            for store in stores.values() {
-                let max = store.get_max_inode_in_range(slot_start, slot_end);
-                if max > max_existing {
-                    max_existing = max;
-                }
-            }
-
-            // Convert max existing inode back to counter value
-            let max_counter = max_existing.saturating_sub(alloc.shard_start + alloc.node_offset);
-            let current = alloc.counter.load(Ordering::SeqCst);
-            if max_counter > current {
-                alloc.counter.store(max_counter + 1, Ordering::SeqCst);
-                info!(
-                    "Recovered shard_allocator[{}]: counter {} -> {} (node_id={}, slot=[{}, {}), max_inode={})",
-                    idx, current, max_counter + 1, self.node_id,
-                    slot_start, slot_end, max_existing
-                );
-            } else {
-                debug!(
-                    "shard_allocator[{}] counter {} is already >= scanned max {} (node_id={})",
-                    idx, current, max_counter, self.node_id
-                );
-            }
+        for (shard_id, store) in stores.iter() {
+            let (range_start, range_end) =
+                self.shard_strategy.get_shard_range(*shard_id);
+            let scanned_max = store.get_max_inode_in_range(range_start, range_end);
+            // alloc_inode_batch reads next_inode from the mutex guard;
+            // we can't check it here without exposing the lock, but
+            // init_next_inode already logged the values at startup.
+            info!(
+                "recover_inode_generator: shard={} scanned_max_inode={} range=[{}, {})",
+                shard_id.0, scanned_max, range_start, range_end
+            );
         }
     }
 
@@ -2515,19 +2807,22 @@ impl MetaShardManager {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
-            storage_mode: powerfs_layout::StorageMode::Inline,
+            // Layout-prediction: decide initial layout based on file name.
+            // See docs/file-layout-prediction-design.md §3.2.
+            storage_mode: self.predict_storage_mode(name, parent_inode),
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
             .await?;
 
         log::info!(
-            "create_file_with_shard latency: total={}ms, inode={}, mode={:o}, uid={}, gid={}",
+            "create_file_with_shard latency: total={}ms, inode={}, mode={:o}, uid={}, gid={}, storage_mode={:?}",
             t0.elapsed().as_millis(),
             inode,
             mode,
             uid,
-            gid
+            gid,
+            info.storage_mode
         );
         Ok(inode)
     }

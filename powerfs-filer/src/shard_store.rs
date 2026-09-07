@@ -1327,7 +1327,10 @@ impl ShardStore {
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
-            storage_mode: powerfs_layout::StorageMode::Inline,
+            // Layout-prediction: new files start as Empty, layout decided
+            // on first write by LayoutPredictor or auto_promote fallback.
+            // See docs/file-layout-prediction-design.md §3.1.
+            storage_mode: powerfs_layout::StorageMode::Empty,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -2776,9 +2779,15 @@ impl ShardStore {
     }
 
     /// 初始化 next_inode：从 CF_METADATA 读，若无用 inode_range.start（§4 1.4）
-    /// 保留 inode 0（无效）和 inode 1（POSIX root），shard 0 起始至少为 2
+    /// 保留 inode 0（无效）和 inode 1（POSIX root），shard 0 起始至少为 2。
+    ///
+    /// 安全兜底：再扫描 CF_INODES 取本 shard 范围内最大已存在 inode+1，
+    /// next_inode 不得低于该值。历史上 meta 层 ShardAllocator（慢路径
+    /// create/mkdir）与本计数器在同一范围发号，已存在 inode 可能远超
+    /// CF_METADATA 持久值；若池计数器从低值重启，会把活 inode 重发给
+    /// BatchCreate，造成 "already exists" 永久失败 + create 幽灵文件。
     fn init_next_inode(&self) {
-        let start = match self.db.cf_handle(CF_METADATA) {
+        let persisted = match self.db.cf_handle(CF_METADATA) {
             Some(cf) => match self.db.get_cf(cf, b"next_inode") {
                 Ok(Some(v)) if v.len() == 8 => {
                     let mut arr = [0u8; 8];
@@ -2789,12 +2798,14 @@ impl ShardStore {
             },
             None => self.inode_range.0,
         };
+        // get_max_inode_in_range returns max_ino+1 (or range_start).
+        let scanned = self.get_max_inode_in_range(self.inode_range.0, self.inode_range.1);
         // 跳过保留 inode：0（无效）和 1（POSIX root）
-        let start = start.max(2);
+        let start = persisted.max(scanned).max(2);
         *self.next_inode.lock().unwrap() = start;
         info!(
-            "Shard {}: init_next_inode = {} (range={:?})",
-            self.shard_id.0, start, self.inode_range
+            "Shard {}: init_next_inode = {} (persisted={}, scanned={}, range={:?})",
+            self.shard_id.0, start, persisted, scanned, self.inode_range
         );
     }
 
@@ -2987,7 +2998,9 @@ impl ShardStore {
             // the migration. Otherwise the stale inline sync would clear
             // the migrated chunks and regress the inode back to Inline,
             // losing the other client's data.
-            if inline_data.is_some() && (!info.chunks.is_empty() || info.storage_mode.is_volume_backed()) {
+            if inline_data.is_some()
+                && (!info.chunks.is_empty() || info.storage_mode.is_volume_backed())
+            {
                 log::warn!(
                     "Shard {} STALE_INLINE_REJECT: inode {} has chunks (len={}) / storage_mode={:?}, \
                      rejecting inline overwrite (size={}, inline_len={}) — client must re-fetch layout",
@@ -3051,8 +3064,22 @@ impl ShardStore {
         // Flat files. Setting the mode here ensures encode_chunks_fields
         // (read path) can use the authoritative state instead of inferring
         // from data fields, which was fragile during Raft apply lag.
+        //
+        // Stripe detection: Stripe 文件的 chunks 分布在多个 volume
+        // (anti-affinity, 每个 stripe unit 一个 volume); Flat 文件即使
+        // 有多个 chunk (如 100MB = 100 chunks) 也全在同一个 volume.
+        // 必须按 volume_id 分布判断, 不能用 chunks.len() > 1 — 那会把
+        // 单卷 Flat 大文件误判成 Stripe. 对齐 detect_placement_from_chunks.
         let new_mode = if info.inline_data.is_some() {
             powerfs_layout::StorageMode::Inline
+        } else if info.chunks.len() > 1 {
+            let first_vid = info.chunks[0].volume_id;
+            let multi_volume = info.chunks.iter().any(|c| c.volume_id != first_vid);
+            if multi_volume {
+                powerfs_layout::StorageMode::Stripe
+            } else {
+                powerfs_layout::StorageMode::Flat
+            }
         } else if !info.chunks.is_empty() {
             powerfs_layout::StorageMode::Flat
         } else {

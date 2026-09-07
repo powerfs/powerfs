@@ -74,6 +74,7 @@ services:
     <<: *rdma-common
     volumes:
       - master-rdma-data:/data/master
+      - ./certs-default:/data/master/ca
       - ./config/rdma-host/master.toml:/app/config/master.toml:ro
       - ../target/release/powerfs-master:/app/powerfs-master:ro
     command: ["/app/powerfs-master", "--config", "/app/config/master.toml"]
@@ -89,6 +90,7 @@ services:
     <<: *rdma-common
     volumes:
       - volume-rdma-data:/data
+      - ./certs-default:/etc/powerfs/certs:ro
       - ./config/rdma-host/volume.toml:/app/config/volume.toml:ro
       - ../target/release/powerfs-volume:/app/powerfs-volume:ro
     command: ["/app/powerfs-volume", "--config", "/app/config/volume.toml"]
@@ -105,6 +107,7 @@ services:
     <<: *rdma-common
     volumes:
       - filer-rdma-data:/data/filer
+      - ./certs-default:/etc/powerfs/certs:ro
       - ./config/rdma-host/filer.toml:/app/config/filer.toml:ro
       - ../target/release/powerfs-filer:/app/powerfs-filer:ro
     command: ["/app/powerfs-filer", "--config", "/app/config/filer.toml"]

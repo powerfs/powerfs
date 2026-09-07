@@ -6,7 +6,7 @@ use crate::write_coalescer::{CoalescerConfig, WriteCoalescer};
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use powerfs_common::{
-    constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET},
+    constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, NEEDLE_ID_SIZE, VOLUME_DATA_OFFSET},
     error::{PowerFsError, Result},
     types::{
         ChecksumAlgorithm, Collection, DiskType, NeedleId, NeedleInfo, Ttl, VolumeId, VolumeInfo,
@@ -410,24 +410,64 @@ impl Volume {
         if let Some(buf) = self.coalescer.read_if_dirty(needle_id, 0, usize::MAX) {
             return Ok(buf);
         }
-        if let Some(mut info) = self.index.get(needle_id) {
+        if let Some(info) = self.index.get(needle_id) {
             if info.deleted_at.is_some() {
                 return Err(PowerFsError::NeedleNotFound(needle_id.clone()));
             }
 
-            let data_size = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
-            let data = self
+            let total = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
+            let raw = self
                 .backend
-                .read_needle(self.backend_volume_id, info.offset, data_size)
+                .read_needle(self.backend_volume_id, info.offset, total)
                 .map_err(backend_err)?;
-            let needle =
-                Needle::from_bytes(&data, self.id(), info.offset, info.checksum_algorithm)?;
 
-            info.last_verified_at = Some(Utc::now());
-            info.verification_count += 1;
-            self.index.insert(needle_id.clone(), info);
-
-            Ok(needle.data)
+            // Normal path: parse + checksum-verify via from_bytes.
+            match Needle::from_bytes(&raw, self.id(), info.offset, info.checksum_algorithm) {
+                Ok(needle) => {
+                    // #75 debug: log data_size and bytes at offset 1044480 (last 4K block)
+                    if needle.data.len() >= 1044484 {
+                        let probe = &needle.data[1044480..1044484];
+                        log::info!(
+                            "READ_NEEDLE_DEBUG needle={} data_size={} offset={} first4_at_1044480={:02x?}",
+                            needle_id.0, needle.data.len(), info.offset, probe
+                        );
+                    } else {
+                        log::info!(
+                            "READ_NEEDLE_DEBUG needle={} data_size={} offset={} (too small for 1044480)",
+                            needle_id.0, needle.data.len(), info.offset
+                        );
+                    }
+                    Ok(needle.data)
+                }
+                Err(PowerFsError::InvalidRequest(ref msg))
+                    if msg.contains("size mismatch") =>
+                {
+                    // Index data_size disagrees with the needle header on disk.
+                    // This can happen during a narrow race in append_needle_version
+                    // (put_needle + write_needle_atomic are two separate RocksDB
+                    // writes).  Rather than failing the read (which maps to
+                    // NOT_FOUND and causes the kernel RMW write path to use a
+                    // zero buffer — silent data loss), extract whatever data we
+                    // actually read using the index's data_size.
+                    let hdr_ds = if raw.len() >= NEEDLE_HEADER_SIZE {
+                        u32::from_be_bytes(
+                            raw[NEEDLE_ID_SIZE..NEEDLE_HEADER_SIZE].try_into().unwrap(),
+                        ) as usize
+                    } else {
+                        0
+                    };
+                    log::warn!(
+                        "read_needle: size mismatch needle={} offset={} \
+                         index_ds={} header_ds={} raw_len={} — using index size",
+                        needle_id.0, info.offset, info.data_size, hdr_ds, raw.len(),
+                    );
+                    let end = (NEEDLE_HEADER_SIZE + info.data_size as usize).min(raw.len());
+                    Ok(Bytes::copy_from_slice(
+                        &raw[NEEDLE_HEADER_SIZE..end],
+                    ))
+                }
+                Err(e) => Err(e),
+            }
         } else {
             Err(PowerFsError::NeedleNotFound(needle_id.clone()))
         }
@@ -728,12 +768,12 @@ impl Volume {
             .write_needle(self.backend_volume_id, new_offset, &needle_bytes)
             .map_err(backend_err)?;
 
-        // 标记旧 needle 为已删除
-        let mut old_updated = old_info.clone();
-        old_updated.deleted_at = Some(Utc::now());
-        self.index.put_needle(&old_updated)?;
-
-        // 构建新 needle 信息
+        // Build new needle info and atomically write it + update allocation.
+        // Previously, a separate put_needle(old_info with deleted_at) was
+        // done first — but it writes the SAME RocksDB key that
+        // write_needle_atomic overwrites moments later.  The intermediate
+        // state (deleted_at=Some) created a race where concurrent readers
+        // saw NeedleNotFound instead of the actual data.
         let new_info = NeedleInfo {
             id: needle_id.clone(),
             volume_id: old_info.volume_id,
@@ -850,13 +890,43 @@ impl Volume {
             return Ok(buf);
         }
         if let Some(info) = self.index.get(&needle_id) {
-            let data_size = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
+            let total = NEEDLE_HEADER_SIZE as u32 + info.data_size + NEEDLE_FOOTER_SIZE as u32;
             let raw_data = self
                 .backend
-                .read_needle(self.backend_volume_id, info.offset, data_size)
+                .read_needle(self.backend_volume_id, info.offset, total)
                 .map_err(backend_err)?;
-            let needle =
-                Needle::from_bytes(&raw_data, self.id(), info.offset, info.checksum_algorithm)?;
+
+            // Extract needle data, tolerant of index/header size mismatch
+            // (same race as read_needle — see comment there).
+            let needle_data: Bytes = match Needle::from_bytes(
+                &raw_data,
+                self.id(),
+                info.offset,
+                info.checksum_algorithm,
+            ) {
+                Ok(n) => n.data,
+                Err(PowerFsError::InvalidRequest(ref msg))
+                    if msg.contains("size mismatch") =>
+                {
+                    let hdr_ds = if raw_data.len() >= NEEDLE_HEADER_SIZE {
+                        u32::from_be_bytes(
+                            raw_data[NEEDLE_ID_SIZE..NEEDLE_HEADER_SIZE]
+                                .try_into()
+                                .unwrap(),
+                        ) as usize
+                    } else {
+                        0
+                    };
+                    log::warn!(
+                        "read_needle_blob: size mismatch needle={} offset={} \
+                         index_ds={} header_ds={} raw_len={} — using index size",
+                        needle_id.0, info.offset, info.data_size, hdr_ds, raw_data.len(),
+                    );
+                    let end = (NEEDLE_HEADER_SIZE + info.data_size as usize).min(raw_data.len());
+                    Bytes::copy_from_slice(&raw_data[NEEDLE_HEADER_SIZE..end])
+                }
+                Err(e) => return Err(e),
+            };
 
             // NOTE: Do NOT write to index during read (no verification_count update).
             // Writing to RocksDB during a read operation causes lock contention
@@ -864,15 +934,15 @@ impl Volume {
 
             let data_offset = offset as usize;
             let data_size = size as usize;
-            if data_offset >= needle.data.len() {
+            if data_offset >= needle_data.len() {
                 // offset 超出数据范围，返回空数据（短读）
                 Ok(Bytes::new())
             } else {
                 // 短读：只返回实际可用的数据，避免最后一个 chunk 读取失败
-                let available = needle.data.len() - data_offset;
+                let available = needle_data.len() - data_offset;
                 let read_size = data_size.min(available);
                 Ok(Bytes::from(
-                    needle.data[data_offset..data_offset + read_size].to_vec(),
+                    needle_data[data_offset..data_offset + read_size].to_vec(),
                 ))
             }
         } else {
@@ -975,6 +1045,53 @@ impl Volume {
         self.coalescer.flush_expired(|id, vec, is_new| {
             self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
         })
+    }
+
+    /// Durability barrier used by fsync: force-materialise the given needles
+    /// (the file's chunks) out of the in-memory coalescer into the data file
+    /// and RocksDB index, then fsync the RocksDB WAL.
+    ///
+    /// Each materialised needle is written through [`flush_coalescer_entry`],
+    /// which persists the data via the storage backend (`fdatasync` on the data
+    /// file for the local backend) and updates the index.  Unlike the periodic
+    /// flush paths, errors are propagated (an fsync must NOT silently succeed
+    /// if the data could not be made durable).  Needles that are not currently
+    /// dirty are skipped — their latest data is already on stable storage.
+    ///
+    /// Returns the number of dirty needles that were materialised.
+    pub fn flush_needles_durable(&self, needle_ids: &[NeedleId]) -> Result<usize> {
+        let mut flush_err: Option<PowerFsError> = None;
+        let n = self.coalescer.flush_specific(needle_ids, |id, vec, is_new| {
+            if flush_err.is_some() {
+                // Keep draining remaining entries even after a failure so the
+                // coalescer does not leak them, but remember the first error.
+                let _ = self.flush_coalescer_entry(id, vec, is_new);
+                return Err(());
+            }
+            let log_id = id.clone();
+            if let Err(e) = self.flush_coalescer_entry(id, vec, is_new) {
+                log::error!("flush_needles_durable: materialise needle {:?} failed: {}", log_id, e);
+                flush_err = Some(e);
+                return Err(());
+            }
+            Ok(())
+        });
+        if let Some(e) = flush_err {
+            return Err(e);
+        }
+        // Always sync the RocksDB WAL, even when n==0 (nothing materialised
+        // in this call).  The regular coalescer flush paths
+        // (flush_expired_dirty / flush_all_dirty) write the index row via
+        // write_needle_atomic but do NOT sync the WAL — only this fsync-driven
+        // barrier does.  If we skip sync_wal when n==0, a needle that was
+        // already flushed by the regular path has its data file sync'd but
+        // its index row still sitting in the RocksDB WAL buffer in memory.
+        // A volume restart then loses the index row → read returns zeros
+        // even though the data file has the bytes.  fsync semantics require
+        // that ALL prior writes (including those flushed by the background
+        // coalescer) are durable, so we must barrier the WAL unconditionally.
+        self.index.sync_wal()?;
+        Ok(n)
     }
 
     /// Opportunistic deadline flush helper: cheap on the hot path (a single

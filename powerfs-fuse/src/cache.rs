@@ -1518,11 +1518,12 @@ impl MetadataCache {
         }
     }
 
-    /// Update FID (file ID)
-    pub fn update_fid(&self, inode: u64, fid: Fid) {
+    /// Update FID (file ID). Pass `None` for Stripe files (which use
+    /// per-chunk needle IDs instead of a single fid).
+    pub fn update_fid(&self, inode: u64, fid: Option<Fid>) {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
-            entry.fid = Some(fid);
+            entry.fid = fid;
         }
     }
 
@@ -1531,6 +1532,15 @@ impl MetadataCache {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
             entry.chunks = chunks;
+        }
+    }
+
+    /// Update placement strategy (used when migrating Inline→Stripe on first
+    /// write of binary content). `None` clears it (Flat/Inline mode).
+    pub fn update_placement(&self, inode: u64, placement: Option<powerfs_layout::Placement>) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            entry.placement = placement;
         }
     }
 

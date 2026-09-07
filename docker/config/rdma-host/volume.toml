@@ -1,5 +1,5 @@
 # PowerFS Volume 节点配置 - 硬件 RDMA host-network 单节点测试
-# 使用 192.168.100.1 (IPoIB) 作为 RDMA 服务地址, dev mode (无证书)
+# 使用 192.168.100.3 (IPoIB ibp160s0f1) 作为 RDMA 服务地址
 
 [global]
 log_level = "info"
@@ -19,3 +19,6 @@ initial_volume_count = 4
 advertise_addr = "192.168.100.3"
 lease_enabled = false
 registration_token = "powerfs-cluster-test"
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/volume-server-1.crt"
+client_key = "/etc/powerfs/certs/volume-server-1.key"

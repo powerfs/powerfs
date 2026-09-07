@@ -96,7 +96,7 @@ pub struct FileLayout {
 | 维度 | 选项 | 触发条件 |
 |------|------|---------|
 | Placement | **Inline** / Flat / Stripe / WideStripe | 文件大小 + 目录属性 + IO 模式 |
-| Reliability | SingleReplica / Replicated(N) / EC(N+M) + 压缩标志 | 文件大小 + 目录属性 + 空闲策略 |
+| Reliability | SingleReplica / EC(N+M) + 压缩标志 | 文件大小 + 目录属性 + 空闲策略 |
 | Encoding | **InlineData** / PerChunk / StripeDescriptor / Paginated | chunk 数 + Placement 类型 |
 
 **正交性原则**：三个维度可任意组合。例如：
@@ -253,7 +253,6 @@ touch /io500/mdtest-hard/f1 # 自动 Inline(max_size=4096)
 - Filer `alloc_for_new_file` 选 volume 时：
   - Flat: 单 volume（无 anti-affinity 要求）
   - Stripe/WideStripe: volume_ids 必须来自不同 node_id
-  - Replicated: 副本必须在不同 node_id
   - EC: data + parity 块分布在不同 node_id
 
 **Volume 选择算法**：
@@ -407,7 +406,7 @@ crash safety:
 1. Inline 数据 ≤ 8KB，zstd 压缩比有限（典型 2x），节省几 KB 意义不大
 2. Raft 已保证可靠性（N=3 副本），无需额外保护
 3. 压缩/解压增加 CPU 开销，对小文件延迟敏感场景不划算
-4. 副本压缩属性（5.4 节）仅适用于 Replicated 模式的 Volume Server 数据
+4. 压缩属性（5.4 节）适用于 Volume Server 数据（EC data shards）
 
 #### 4.6.8 Inline 与 Lease 的关系
 
@@ -429,28 +428,24 @@ Inline 模式下**不需要 Lease**：
 
 ```rust
 pub enum Reliability {
-    /// 单副本 (临时态, 写入不等可靠性时用)
+    /// 单副本 (写入路径临时态, 后台异步转 EC)
     SingleReplica,
-
-    /// N 副本 (含原始副本, 默认 N=2)
-    Replicated { count: u32 },
 
     /// EC(N+M) 纠删码 (默认 4+2)
     EC { data: u32, parity: u32 },
 }
 ```
 
+> **设计决策（2026-09-06 对齐）**：去掉 `Replicated(N)` 模式。
+> 原因：Inline 数据已由 Filer Raft N=3 副本保护；Flat/Stripe 数据
+> 直接走 EC 容错。Volume 层不再维护数据副本，避免副本+EC 双重
+> 可靠性机制的开销与状态机复杂度。
+
 #### ReliabilityState（可靠性状态机）
 
 ```rust
 pub enum ReliabilityState {
-    /// 刚写入, 等待后台转换为 Replicated
-    PendingReplicated,
-
-    /// 已完成副本复制, 等待 EC 转换
-    Replicated,
-
-    /// 副本已就绪, 等待 EC 转换 (手动标记, 暂未使用)
+    /// 刚写入, 等待后台 EC 编码
     PendingEC,
 
     /// EC 编码完成
@@ -464,42 +459,49 @@ pub enum ReliabilityState {
 #### 状态转换图
 
 ```
-  写入完成                    scrubber 复制                 scrubber EC 编码
-      │                            │                             │
-      ▼                            ▼                             ▼
-┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐  ┌────────┐
-│PendingRepli- │  │                  │  │                  │  │        │
-│   cated      │─▶│    Replicated    │─▶│       EC         │  │Degraded│
-│(SingleRepli- │  │ (Replicated(2))  │  │   (EC(4+2))      │  │        │
-│   ca)        │  │                  │  │                  │  │        │
-└──────────────┘  └──────────────────┘  └──────────────────┘  └────────┘
-      ▲                    ▲                      │                  │
-      │                    │   数据变更(追加写)     │  分片丢失         │
-      └────────────────────┴──────────────────────┘                  │
-           任何状态的数据变更 → 回退到 PendingReplicated               │
-                                                                     │
+  写入完成                         scrubber EC 编码
+      │                                  │
+      ▼                                  ▼
+┌──────────────┐              ┌──────────────────┐  ┌────────┐
+│  PendingEC   │─────────────▶│       EC         │  │Degraded│
+│(SingleReplica)│             │   (EC(4+2))      │  │        │
+└──────────────┘              └──────────────────┘  └────────┘
+      ▲                                 │                  │
+      │      数据变更(追加写/截断)       │  分片丢失         │
+      └─────────────────────────────────┘                  │
+           任何状态的数据变更 → 回退到 PendingEC             │
+                                                           │
                                       后台修复 (scrubber 重建丢失分片) ◄┘
 ```
 
 **关键转换规则**：
-- `PendingReplicated → Replicated`：scrubber 完成 chunk 副本复制（anti-affinity volume）
-- `Replicated → EC`：scrubber 完成 EC 编码（data+parity shards 分配到不同 volume）
-- `Replicated | EC → PendingReplicated`：文件数据变更（chunks 改变）时自动回退，重新走完整管线
+- `PendingEC → EC`：scrubber 完成 EC 编码（data+parity shards 分配到不同 volume）
+- `EC → PendingEC`：文件数据变更（chunks 改变）时自动回退，重新走 EC 管线
 - `EC → Degraded`：读路径检测到分片丢失但仍在容错范围内
 - `Degraded → EC`：scrubber 后台重建丢失分片
 
-### 5.2 默认策略表
+### 5.2 默认策略表（分层 EC）
 
-| 文件大小 | 写入时 | 后台目标 | 理由 |
-|---------|--------|---------|------|
-| < 4KB (Inline) | **Raft 复制（隐式 N=3）** | **保持 Raft 复制** | Inline 数据不参与 scrubber，Raft 已保证 |
-| 4KB - 10MB | SingleReplica | Replicated(2, compressed=false) | 小文件副本开销小，恢复快 |
-| 10MB - 1GB | SingleReplica | EC(4+2) | 中等文件 EC 节省空间 50% |
-| 1GB - 100GB | SingleReplica | EC(8+4) | 大文件 EC 节省空间 67% |
-| > 100GB | SingleReplica | EC(16+4) | 极致空间效率 |
-| HPC 标志 | SingleReplica | 保持 SingleReplica 或 EC(16+4) | 由目录属性决定 |
+| 文件大小 | 写入时 | 后台 EC 配置 | Volume 数 | 容错 | 存储开销 | 理由 |
+|---------|--------|-------------|----------|------|---------|------|
+| < 8KB (Inline) | **Raft 复制（隐式 N=3）** | **保持 Raft 复制** | — | 1 node | 3x | Inline 数据不参与 scrubber，Filer Raft 已保证 3 副本 |
+| 8KB - 1MB | SingleReplica | **EC(2+1)** | 3 | 1 failure | 1.5x | 小文件 shard 数少，3 volume 即可 |
+| 1MB - 1GB | SingleReplica | **EC(4+2)** | 6 | 2 failures | 1.5x | 中等文件，6 volume anti-affinity |
+| 1GB - 100GB | SingleReplica | **EC(8+4)** | 12 | 4 failures | 1.5x | 大文件，12 volume 分布广 |
+| > 100GB | SingleReplica | **EC(16+4)** | 20 | 4 failures | 1.25x | 极致空间效率 |
+| HPC 标志 | SingleReplica | **EC(16+4)** 或保持 SingleReplica | 20 | 4 failures | 1.25x | 由目录属性决定 |
 
-**Inline 特例**：Placement=Inline 时，Reliability 隐式为 Raft 复制（Filer Raft 组的副本数，通常 N=3），不参与 scrubber 异步转换。Inline 文件迁移到 Flat 后，Reliability 才按上表转为 SingleReplica → 后台 Replicated(2)。
+**设计要点**：
+- **统一 1.5x 存储开销**（除超大文件 1.25x），避免小文件用 EC(4+2) 浪费 6 个 volume
+- **按需 shard 数**：小文件 3 volume 即可容错，不必拉满 6+ volume
+- **Inline 特例**：Placement=Inline 时，Reliability 隐式为 Raft 复制（Filer Raft 组的副本数，通常 N=3），不参与 scrubber 异步转换。Inline 文件迁移到 Flat 后，Reliability 按上表转为 SingleReplica → 后台分层 EC。
+
+> **可靠性分层（2026-09-06 对齐）**：
+> - **Inline 模式**：数据在 Filer Raft 中（元数据+数据 3 副本），无需 Volume 层保护。
+> - **Flat/Stripe 模式**：数据在 Volume Server，由**分层 EC** 容错（按文件大小选择 shard 数，data+parity shards 跨节点分布）。
+> - **FlushNeedles 定位**：是**数据持久性屏障**（保证 Volume coalescer 内存数据物化到
+>   数据文件 + RocksDB WAL sync），与 EC（**容错机制**，防 disk/node 故障）正交。
+>   FlushNeedles 保证 volume 重启不丢数据；EC 保证多 volume 故障可恢复。两者不可互替。
 
 ### 5.3 写入路径永不等可靠性
 
@@ -507,52 +509,47 @@ pub enum ReliabilityState {
 
 ```
 写入流程:
-1. CREATE: SingleReplica + PendingReplicated
+1. CREATE: SingleReplica + PendingEC
 2. WRITE: 直连 Volume Server 写单副本，快速 ACK
-3. CLOSE: 元数据 (SingleReplica, PendingReplicated)
-4. 后台 scrubber 异步转换:
-   - 扫描 PendingReplicated 状态文件
-   - 复制 chunk 到 anti-affinity volume → Replicated
-   - EC 编码 (Replicated → EC)
-5. 读路径: 任何时候都可读（Degraded 时用 parity 重建）
+3. CLOSE/FSYNC: FlushNeedles 物化 coalescer 数据到数据文件 + WAL sync
+4. 元数据提交 (SingleReplica, PendingEC) 到 Filer Raft
+5. 后台 scrubber 异步转换:
+   - 扫描 PendingEC 状态文件
+   - EC 编码 (data+parity shards 分配到不同 volume) → EC
+6. 读路径: 任何时候都可读（Degraded 时用 parity 重建）
 ```
 
 **数据变更与状态回退**：
 
-文件在 Replicated 或 EC 状态下被追加写/截断时，`update_inode_size_chunks_atomic` 检测到 chunks 变化，自动将状态回退到 `PendingReplicated`：
+文件在 EC 状态下被追加写/截断时，`update_inode_size_chunks_atomic` 检测到 chunks 变化，自动将状态回退到 `PendingEC`：
 
 ```rust
 // shard_store.rs: 数据变更时的状态回退
 if chunks_changed {
     match info.reliability_state {
-        Replicated | EC => {
-            info.reliability_state = PendingReplicated;
-            info.replica_chunks.clear();
+        EC => {
+            info.reliability_state = PendingEC;
+            info.ec_chunks.clear();
         }
-        _ => {} // PendingReplicated 保持不变
+        _ => {} // PendingEC 保持不变
     }
 }
 ```
 
-- Replicated 文件被修改 → 回退 PendingReplicated，scrubber 重新复制
-- EC 文件被修改 → 回退 PendingReplicated，重新走完整管线（复制 → EC 编码）
+- EC 文件被修改 → 回退 PendingEC，重新走 EC 编码管线
 - 旧 EC shards 成为孤儿，由 Volume GC 回收
 
 **风险与缓解**：
-- **风险**：写入完成到转换完成期间，单点故障丢数据
-- **缓解 1**：scrubber 高优先级，10 秒内启动转换
-- **缓解 2**：重要文件可设 `powerfs.reliability=replicated:3`，创建时即多副本（牺牲延迟换安全）
+- **风险**：写入完成到 EC 转换完成期间，单点故障丢数据
+- **缓解 1**：FlushNeedles 在 close/fsync 时保证 volume 数据落盘（持久性），volume 重启不丢
+- **缓解 2**：scrubber 高优先级，10 秒内启动 EC 转换
 - **缓解 3**：Master 持久化写入日志，故障恢复后继续转换
 
-### 5.4 副本压缩属性
+### 5.4 数据压缩属性
 
-**新增能力**：副本支持压缩标志，长时间不用的文件后台压缩。
+**能力**：Volume 数据支持压缩标志，长时间不用的文件后台压缩。
 
 ```rust
-// Reliability::Replicated.compressed 字段
-// true: 副本已压缩存储
-// false: 副本未压缩
-
 // 压缩状态枚举
 pub enum CompressionState {
     Uncompressed,           // 未压缩
@@ -586,15 +583,11 @@ pub enum CompressionState {
 
 #### 5.5.1 Scrubber 架构
 
-Scrubber 是 Filer 内部的后台 worker，每个 Raft leader 节点运行一个实例。周期性扫描（默认 30s） PendingReplicated 和 Replicated 状态的文件，执行副本复制和 EC 转换。
+Scrubber 是 Filer 内部的后台 worker，每个 Raft leader 节点运行一个实例。周期性扫描（默认 30s） PendingEC 状态的文件，执行 EC 编码转换。
 
 ```
 ScrubberWorker
-├── scan_and_replicate()   — P4: PendingReplicated → Replicated
-│   ├── list_pending_replicated()  — 查询待复制文件
-│   ├── replicate_inode()          — 读 chunk + CRC 校验 + 写副本
-│   └── update_reliability()       — Raft 提交状态变更
-├── scan_and_ec_convert()  — P6: Replicated → EC
+├── scan_and_ec_convert()  — PendingEC → EC
 │   ├── list_pending_ec()          — 查询待 EC 文件
 │   ├── ec_convert_inode()         — 读全量 + EC 编码 + 写 shards
 │   └── update_to_ec()             — Raft 提交 EC 状态变更
@@ -603,25 +596,7 @@ ScrubberWorker
     └── ec_skip_count: AtomicU32   — 每 10 轮重检一次
 ```
 
-#### 5.5.2 副本复制流程 (PendingReplicated → Replicated)
-
-```
-1. list_pending_replicated()
-   ├── 过滤: state == PendingReplicated
-   ├── 过滤: delete_time == 0
-   └── 过滤: open_count == 0  ← 避免复制正在写的文件
-
-2. 对每个 inode:
-   a. 读取所有 chunks (从源 volume)
-   b. CRC32 校验 (防止复制损坏数据)
-   c. 选择 anti-affinity volume (与源 volume 不同)
-   d. 写入副本到目标 volume (相同 needle_id)
-   e. Raft 提交: UpdateReliability(state=Replicated, replica_chunks)
-
-3. 每次 scan 最多处理 max_inodes_per_scan 个文件 (默认 50)
-```
-
-#### 5.5.3 EC 转换流程 (Replicated → EC)
+#### 5.5.2 EC 转换流程 (PendingEC → EC)
 
 ```
 1. EC 可行性检查
@@ -632,7 +607,7 @@ ScrubberWorker
    └── zone volume 数 >= data+parity → 清除 ec_infeasible 标记
 
 2. list_pending_ec()
-   ├── 过滤: state == Replicated
+   ├── 过滤: state == PendingEC
    ├── 过滤: delete_time == 0
    ├── 过滤: open_count == 0  ← 避免编码正在写的文件
    └── 过滤: file_size >= ec_min_file_size
@@ -647,7 +622,7 @@ ScrubberWorker
    g. Raft 提交: UpdateToEC(state=EC, ec_chunks)
 ```
 
-#### 5.5.4 Zone Volume 数量自动推导
+#### 5.5.3 Zone Volume 数量自动推导
 
 Master 在 Filer 注册时自动推导 Zone 的 volume 数量，无需用户手动配置：
 
@@ -657,7 +632,7 @@ zone_volume_count = POWERFS_ZONE_VOLUME_COUNT (用户显式覆盖)
 ```
 
 - EC(4+2) → 自动分配 6 个 volume/zone，保证 anti-affinity
-- 无 EC → 默认 3 个，满足副本复制需求
+- 无 EC → 默认 3 个
 - 3 个 Filer (Raft 组) 各自的 Zone 可能共享同一批 physical volume
   (needle_id 嵌入 zone_id 区分, 不冲突)
 
@@ -682,7 +657,7 @@ Volume-6: parity_shard_1  (needle_id = zone_id<<40 | counter+5)
 
 **Volume 数不足处理**：
 - Zone volume 数 < data+parity 时，scrubber 自动禁用 EC (5.5.3)
-- 文件保持 Replicated 状态，不降级也不报错
+- 文件保持 PendingEC 状态，不降级也不报错
 - 集群扩容后，scrubber 周期性重检（每 10 轮），自动恢复 EC 转换
 
 ### 5.7 并发安全：写入与 scrubber 协同
@@ -691,7 +666,6 @@ Volume-6: parity_shard_1  (needle_id = zone_id<<40 | counter+5)
 
 | 场景 | 风险 | 后果 |
 |------|------|------|
-| 文件正在写时 scrubber 复制 | 副本基于不完整数据 | 副本数据不一致 |
 | 文件正在写时 scrubber EC 编码 | EC shards 基于旧数据, Raft 更新覆盖新 chunks | **数据丢失** |
 | EC 文件被追加写 | chunks 变了但状态仍为 EC, 读路径从旧 shards 重建 | **数据损坏** |
 | EC 转换期间文件被写 | TOCTOU 竞态: 检查 open==0 后文件被打开 | **数据丢失** |
@@ -700,7 +674,7 @@ Volume-6: parity_shard_1  (needle_id = zone_id<<40 | counter+5)
 
 **第一层：open_count 检查（防止处理正在写的文件）**
 
-Scrubber 的 `list_pending_replicated` 和 `list_pending_ec` 均跳过 `open_count > 0` 的文件：
+Scrubber 的 `list_pending_ec` 跳过 `open_count > 0` 的文件：
 
 ```rust
 // shard_store.rs: scrubber 查询时过滤
@@ -718,18 +692,18 @@ FUSE `open` 时 `open_count += 1`，`release` 时 `open_count -= 1`。文件关�
 ```rust
 if chunks_changed {
     match info.reliability_state {
-        Replicated | EC => {
-            info.reliability_state = PendingReplicated;
-            info.replica_chunks.clear();
+        EC => {
+            info.reliability_state = PendingEC;
+            info.ec_chunks.clear();
         }
         _ => {}
     }
 }
 ```
 
-- EC 文件被追加写 → 状态回退到 PendingReplicated
+- EC 文件被追加写 → 状态回退到 PendingEC
 - 旧 EC shards 成为孤儿 needle，由 Volume GC 回收
-- Scrubber 下次扫描重新走完整管线（复制 → EC 编码）
+- Scrubber 下次扫描重新走 EC 编码管线
 
 **第三层：EC 转换 CAS 检查（防止转换期间 TOCTOU 竞态）**
 
@@ -794,14 +768,7 @@ match self.ec_convert_inode(inode, &chunks, &addr_map).await {
     ├── open(file) ────────────▶│ open_count=1            │
     ├── write(data) ───────────▶│ chunks=[A]              │
     ├── close(file) ───────────▶│ open_count=0            │
-    │                           │  state=PendingRepl      │
-    │                           │                         │
-    │                           │           scan ────────▶│
-    │                           │           open_count=0 ✓│ ← 第一层
-    │                           │           read chunks[A]│
-    │                           │           copy to vol2  │
-    │                           │◀── Raft UpdateRel ──────│
-    │                           │  state=Replicated       │
+    │                           │  state=PendingEC        │
     │                           │                         │
     │                           │           scan ────────▶│
     │                           │           open_count=0 ✓│ ← 第一层
@@ -818,12 +785,11 @@ match self.ec_convert_inode(inode, &chunks, &addr_map).await {
     │                           │                         │
     ├── open(file) ────────────▶│ open_count=1            │
     ├── write(append) ─────────▶│ chunks=[A,B]            │
-    │                           │  state=EC→PendingRepl ◄── 第二层自动回退
+    │                           │  state=EC→PendingEC ◄── 第二层自动回退
     ├── close(file) ───────────▶│ open_count=0            │
     │                           │                         │
     │                           │           scan ────────▶│
-    │                           │           重新复制 [A,B] │
-    │                           │           重新 EC 编码   │
+    │                           │           重新 EC 编码 [A,B] │
     │                           │  state=EC (新数据)       │
 
 TOCTOU 竞态 (EC 转换期间文件被打开):
@@ -834,7 +800,7 @@ TOCTOU 竞态 (EC 转换期间文件被打开):
     │                           │           read chunks[A]│ (快照)
     ├── open(file) ────────────▶│ open_count=1            │
     ├── write(append) ─────────▶│ chunks=[A,B]            │
-    │                           │  state=EC→PendingRepl ◄── 第二层回退
+    │                           │  state=EC→PendingEC ◄── 第二层回退
     ├── close(file) ───────────▶│ open_count=0            │
     │                           │           EC encode [A]  │
     │                           │           CAS check:     │ ← 第三层
@@ -1086,16 +1052,16 @@ POWERFS_NET_MSG_MIGRATE_INLINE = 0x001D,  // Inline -> Flat 迁移（文件超�
    - Volume Server 返回 CRC32
 
 3. CLOSE:
-   - 客户端同步元数据: PerChunk[1] + content_size + SingleReplica + Pending
+   - 客户端同步元数据: PerChunk[1] + content_size + SingleReplica + PendingEC
    - Filer 持久化到 Raft
 
 4. 后台 scrubber:
-   - 扫描 Pending 状态文件
-   - 按策略复制到另一节点 volume
-   - 状态 -> Completed (Replicated(2))
+   - 扫描 PendingEC 状态文件
+   - EC 编码 (data+parity shards 到 anti-affinity volume)
+   - 状态 -> EC
 
 5. 读:
-   - GETATTR 返回 PerChunk[1] (44B) + Replicated(2) + Completed
+   - GETATTR 返回 PerChunk[1] (44B) + EC + Completed
    - 客户端直接读 Volume Server，校验 CRC32
 ```
 
@@ -1187,10 +1153,10 @@ POWERFS_NET_MSG_MIGRATE_INLINE = 0x001D,  // Inline -> Flat 迁移（文件超�
    - 缓存 chunk 列表
 ```
 
-### 8.5 副本压缩场景
+### 8.5 数据压缩场景
 
 ```
-1. 文件写入完成（PerChunk[1] + Replicated(2) + Completed）
+1. 文件写入完成（PerChunk[1] + EC + Completed）
 2. 30 天未访问（atime 超阈值）
 3. scrubber 检测:
    - powerfs.compress=zstd xattr 或默认策略
@@ -2377,7 +2343,7 @@ if (req->error == -E2BIG) {
 | **Inline** | **数据直接存 Filer 元数据，绕过 Volume Server（< 4KB/8KB 微小文件）** |
 | **InlineData** | **Inline 模式下的数据编码，数据直接在 Filer Raft 日志中** |
 | Placement | 数据分布策略（Inline/Flat/Stripe/WideStripe） |
-| Reliability | 数据保护策略（SingleReplica/Replicated/EC） |
+| Reliability | 数据保护策略（SingleReplica/EC） |
 | ChunkEncoding | 元数据序列化方式（InlineData/PerChunk/StripeDescriptor/Paginated） |
 | anti-affinity | 数据强制分布在不同物理节点的约束 |
 | scrubber | 后台数据扫描和转换 worker |

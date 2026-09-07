@@ -1370,6 +1370,79 @@ pub fn encode_batch_unlink_req(entries: &[(u64, String)]) -> Result<Vec<u8>, Net
     Ok(enc.into_bytes())
 }
 
+/// Batch create entry: (ino, parent_ino, name, mode, uid, gid, mtime, atime)
+/// mtime/atime are unix seconds; 0 means the server assigns the current time.
+pub type BatchCreateEntry = (u64, u64, String, u32, u32, u32, u64, u64);
+
+/// Encode a batch create request (client side)
+/// Format: ShardId(u64) + Count(u32) +
+///         [Entry(Ino+ParentIno+Name+Mode+Uid+Gid+[Mtime]+[Atime])] * count
+pub fn encode_batch_create_req(
+    shard_id: u64,
+    entries: &[BatchCreateEntry],
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::ShardId, shard_id);
+    enc.add_u32(FieldId::Count, entries.len() as u32);
+    for (ino, parent_ino, name, mode, uid, gid, mtime, atime) in entries {
+        let mut entry_enc = TlvEncoder::new();
+        entry_enc.add_u64(FieldId::Ino, *ino);
+        entry_enc.add_u64(FieldId::ParentIno, *parent_ino);
+        entry_enc.add_string(FieldId::Name, name)?;
+        entry_enc.add_u32(FieldId::Mode, *mode);
+        entry_enc.add_u32(FieldId::Uid, *uid);
+        entry_enc.add_u32(FieldId::Gid, *gid);
+        // Optional timestamps: carry utimensat/touch times applied while the
+        // create was still a local (optimistic) entry, so they publish
+        // atomically with the create instead of a separate setattr RPC.
+        if *mtime != 0 {
+            entry_enc.add_u64(FieldId::Mtime, *mtime);
+        }
+        if *atime != 0 {
+            entry_enc.add_u64(FieldId::Atime, *atime);
+        }
+        enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
+    }
+    Ok(enc.into_bytes())
+}
+
+/// Decode a batch create request (server side)
+/// Returns (shard_id, Vec of (ino, parent_ino, name, mode, uid, gid, mtime, atime))
+pub fn decode_batch_create_req(body: &[u8]) -> Result<(u64, Vec<BatchCreateEntry>), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let shard_id = dec.next_u64(FieldId::ShardId)?;
+    let count = dec.next_u32(FieldId::Count)? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let entry_bytes = dec.next_bytes(FieldId::Entry)?;
+        let mut entry_dec = TlvDecoder::new(&entry_bytes);
+        let ino = entry_dec.next_u64(FieldId::Ino)?;
+        let parent_ino = entry_dec.next_u64(FieldId::ParentIno)?;
+        let name = entry_dec.next_string(FieldId::Name)?.to_string();
+        let mode = entry_dec.next_u32(FieldId::Mode)?;
+        let uid = entry_dec.next_u32(FieldId::Uid)?;
+        let gid = entry_dec.next_u32(FieldId::Gid)?;
+        // Optional (older clients don't send them): default 0 = server time.
+        let mtime = entry_dec.next_u64(FieldId::Mtime).unwrap_or(0);
+        let atime = entry_dec.next_u64(FieldId::Atime).unwrap_or(0);
+        entries.push((ino, parent_ino, name, mode, uid, gid, mtime, atime));
+    }
+    Ok((shard_id, entries))
+}
+
+/// Encode a batch create response: Count(u32) of successfully flushed entries
+pub fn encode_batch_create_resp(flushed_count: u32) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u32(FieldId::Count, flushed_count);
+    Ok(enc.into_bytes())
+}
+
+/// Decode a batch create response
+pub fn decode_batch_create_resp(body: &[u8]) -> Result<u32, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    Ok(dec.next_u32(FieldId::Count)?)
+}
+
 /// Decode a batch unlink request (server side)
 /// Returns Vec of (parent_ino, name)
 pub fn decode_batch_unlink_req(body: &[u8]) -> Result<Vec<(u64, String)>, NetError> {
