@@ -571,8 +571,7 @@ impl TlvMasterClient {
         for b in hostname.bytes() {
             hash = hash.wrapping_mul(31).wrapping_add(b as u64);
         }
-        let pre_reg_id = (hash & 0x0FFF_FFFF) * 1000
-            + PRE_REG_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pre_reg_id = (hash & 0x0FFF_FFFF) * 1000 + PRE_REG_SEQ.fetch_add(1, Ordering::Relaxed);
         let net_cfg = ClientConfig {
             addr: host.to_string(),
             port,

@@ -2549,7 +2549,11 @@ impl AsyncWrite for RdmaWriteHalf {
         if buf.len() > max_len {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("RDMA write: frame {} exceeds buffer size {}", buf.len(), max_len),
+                format!(
+                    "RDMA write: frame {} exceeds buffer size {}",
+                    buf.len(),
+                    max_len
+                ),
             )));
         }
         let write_len = buf.len();

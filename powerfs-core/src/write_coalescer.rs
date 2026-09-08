@@ -528,7 +528,10 @@ mod tests {
         seen.sort_by_key(|(k, _)| *k);
         assert_eq!(seen[0], (1, b"aa".to_vec()));
         assert_eq!(seen[1], (3, b"cc".to_vec()));
-        assert!(coal.is_dirty(&NeedleId(2)), "unrequested dirty needle must stay");
+        assert!(
+            coal.is_dirty(&NeedleId(2)),
+            "unrequested dirty needle must stay"
+        );
         assert!(!coal.is_dirty(&NeedleId(1)));
         assert_eq!(coal.dirty_entry_count(), 1);
     }

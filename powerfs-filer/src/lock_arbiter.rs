@@ -702,8 +702,7 @@ impl LockArbiter {
         // writer ACK → gather_complete(ToShared) 后获得 CAP_R.
         let conflict_caps = CapSet::CAP_W | CapSet::CAP_X;
         let need_gather = lock.holders.iter().any(|h| {
-            h.client_id != client_id
-                && !CapSet(h.granted_caps.0 & conflict_caps.0).is_empty()
+            h.client_id != client_id && !CapSet(h.granted_caps.0 & conflict_caps.0).is_empty()
         });
         if need_gather {
             let mut recall_tasks = Vec::new();
