@@ -1,8 +1,8 @@
 # PowerFS ML 自适应预取方案（kernel 客户端 + RDMA）
 
-> 状态: **Phase A-0 完成，待启动 A-1（ML 自动化）**
+> 状态: **Phase A-0/A-1/A-X1 完成，A-X2（fio 基线对比）进行中**
 > 创建: 2026-09-05
-> 规划更新: 2026-09-08
+> 规划更新: 2026-09-08（A-X1 完成）
 > 环境基线: kernel 客户端 + RDMA（QEMU VM），见 [§0 环境基线](./dir-policy-and-concurrency-optimization-plan.md#0-环境基线调整记录-2026-09-05)
 > 参考论文: KML (Kernel-ML) — 单机 Linux 内核 readahead 调优（per-file workload 分类 NN）
 > 关联文档: [`dir-policy-and-concurrency-optimization-plan.md`](./dir-policy-and-concurrency-optimization-plan.md)、[`file-layout-prediction-design.md`](./file-layout-prediction-design.md)
@@ -377,6 +377,31 @@ struct powerfs_io_trace {
 | 规则缺省 (RULE:) | 大文件顺序读好 | 47KB 读灾难 (1.3 MiB/s) |
 | **ML 自适应 (NN:)** | **全场景最优** | 需要采样累积（100 I/O 延迟） |
 
+#### A-X1 RDMA MR 池占用感知的 readahead 上限（§4.3）
+
+**实现**（2026-09-08，kernel 侧 3 文件）：
+
+| 文件 | 改动 |
+|------|------|
+| [powerfs_net_rdma.c](file:///home/portion/powerfs/kernel/powerfs_mod/powerfs_net_rdma.c#L299-L379) | 新增 `powerfs_rdma_cap_readahead_mb(requested_mb)`：遍历所有 `in_use` + `CONN_CONNECTED` + RDMA 传输的 volume conn，取 `data_pool.free` 最小值为瓶颈；`spare = min_free - PFS_RA_MR_RESERVE(4)`，`cap_mb = spare × 2MB`；`spare ≤ 0 → 返回 0`。无 RDMA conn（TCP）原样返回不裁剪 |
+| [powerfs_net.h](file:///home/portion/powerfs/kernel/powerfs_mod/powerfs_net.h#L1549-L1560) | 函数声明；非 `CONFIG_INFINIBAND` 构建为 inline 桩（原样返回） |
+| [powerfs_readahead.c](file:///home/portion/powerfs/kernel/powerfs_mod/powerfs_readahead.c#L207-L208) | `powerfs_readahead_apply()` 中加载 mb 后、写 `f_ra.ra_pages` 前调用裁剪 |
+
+**MR 池事实**：data_pool 共 `PFS_RDMA_DATA_BUF_NUM=48` 个 2MB MR；建链时 32 个 pre-post 到 RQ 作 RECV（`PFS_RDMA_MAX_RECV_WR=32`）→ idle 时 `free ≈ 16`，余量 ~16 个供大帧 SEND（write_needle）与超额并发读。
+
+**VM 验证证据**（QEMU VM1 + RDMA，cold read，NN:16，1M seqread）：
+
+| 场景 | dmesg / 性能 | 结论 |
+|------|--------------|------|
+| 正常 idle（RESERVE=4） | 无 cap 日志；1M seqread = 316→362 MiB/s | free=16 > reserve=4，不裁剪，性能无损 |
+| 强制裁剪（临时 RESERVE=20 > idle free=16） | `readahead capped to 0 (min_free=16 <= reserve=20)` 持续打印；seqread 降至 1.4 MiB/s | 证明函数读到**真实 free=16**（= 48 − 32 pre-post RECV，与设计一致），且 cap 真实驱动 `ra_pages=0` |
+| 恢复 RESERVE=4 重新部署 | cap 日志消失，seqread 恢复 362 MiB/s | 生产参数行为正确，无误裁剪 |
+
+**设计说明**：
+1. cap-to-0（1.4 MiB/s）比 mount `readahead=off`（130 MiB/s）更激进——后者保留 VFS 默认预取，前者彻底关闭。cap-to-0 **仅在 MR 池接近耗尽时作为安全阀触发**（降级避免 RNR），正常负载永不命中。
+2. 裁剪在 `powerfs_readahead_apply` 内逐次 read 时计算，MR 释放后下一次 read 自动恢复，无需额外通知机制。
+3. TCP 传输 / 无 RDMA conn 时不裁剪（MR 池约束为 RDMA 独有）。
+
 ---
 
 ## 5. 对 IO500 的预期效果
@@ -448,7 +473,7 @@ P0-2 解决后，ML 预取对 mdtest 阶段的"关闭无用预取"收益仍有�
 - [x] A-1.7 IO500 全量对比：固定预取 vs 规则缺省 vs ML 自适应
 
 #### 额外（跨阶段通用）
-- [ ] A-X1 RDMA MR 池占用感知的 readahead 上限（§4.3，A-1 阶段加）
+- [x] A-X1 RDMA MR 池占用感知的 readahead 上限（§4.3，A-1 阶段加）— 2026-09-08 完成，VM 验证见 §4.8 A-X1
 - [ ] A-X2 fio 基线，对比 ext4-over-RDMA / NFS-over-RDMA（A-0 起每阶段做）
 
 ### 7.3 Phase B：研究版（filer 端协同 + RDMA 代价感知，冲顶刊 novelty）
@@ -509,5 +534,7 @@ P0-2 解决后，ML 预取对 mdtest 阶段的"关闭无用预取"收益仍有�
 - [x] **P0-2 已解决**：mdtest-easy create = 4630 ops/s（v4 基线确认，optimistic local create 已落地）
 - [x] **O_DIRECT write fast path 已修复**（issue #82，commit 内核 `d8e69a5` + 主仓 `5209349b`）：1M O_DIRECT seqwrite 0→176-192 MiB/s
 - [x] **Phase A-0 完成**（2026-09-08）：kernel readahead 骨架 + hook + xattr 通道（含持久化修复）+ 3×3 测试矩阵验证。readahead 机制效果显著：4K randread xattr=0 +27%，1M seqread xattr=16 +182%，ior-hard-read xattr=16 +744%。
-- [ ] **Phase A-1**：ML 自动化（kernel trace 采集 → filer 聚合 → NN 训练 → xattr 下发 → version invalidation → 缺省规则引擎 → 安全回退）
+- [x] **Phase A-1 完成**（2026-09-08）：ML 自动化（kernel trace 采集 → filer 聚合 → NN 训练 → xattr 下发 → version invalidation → 缺省规则引擎 → 安全回退），IO500 全量对比见 §4.8 A-1.7
+- [x] **A-X1 完成**（2026-09-08）：RDMA MR 池占用感知 readahead 上限（§4.3），空闲不裁剪、近耗尽降级为 0 防 RNR，VM 强制裁剪验证通过
+- [ ] **A-X2**：fio 基线对比 ext4-over-RDMA / NFS-over-RDMA
 - [ ] Phase A 拿到 IO500 数据后再决定是否推进 Phase B 研究版
