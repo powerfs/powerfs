@@ -595,10 +595,10 @@ WriteTraceEntry (packed, 64 bytes):
 
 ### 6.2 Phase C-1：ML 写预测
 
-- [ ] C-1.1 kernel 写 trace 采集（`powerfs_write_predict.c`，1/100 采样）
-- [ ] C-1.2 `PushWriteTrace` RPC + Filer 端 `IoTraceAggregator` 扩展写特征
-- [ ] C-1.3 `write_predict_policy.rs`：WritePredictNN (7→16→1 MLP)
-- [ ] C-1.4 xattr 下发 `user.powerfs.write_predict_policy`
+- [x] C-1.1 kernel 写 trace 采集 — 复用 `powerfs_io_trace_record(kind=1)`, 已在 `powerfs_file.c:799` 调用
+- [x] C-1.2 Filer 端写特征聚合 — `IoTraceAggregator::extract_write_features()` 7 特征, `traces_snapshot()`
+- [x] C-1.3 `write_predict_policy.rs`: WritePredictNN (7→16→1 MLP) — 4 tests pass
+- [x] C-1.4 xattr 下发 `user.powerfs.write_predict_policy` — `apply_ml_write_policy()` 在 trace handler 中触发
 - [ ] C-1.5 客户端预判逻辑 + 指纹计算触发
 - [ ] C-1.6 安全回退：ML 置信度低 → 不算指纹（正常写）
 - [ ] C-1.7 测试：checkpoint 工作负载（周期性覆盖写），验证 ML 正确预判

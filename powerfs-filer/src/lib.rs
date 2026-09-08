@@ -33,6 +33,7 @@ pub mod shard_store;
 pub mod shard_strategy;
 pub mod tlv_volume_client;
 pub mod volume_router;
+pub mod write_predict_policy;
 pub mod zone_client;
 
 pub use bucket_manager::BucketManager;

@@ -3963,6 +3963,22 @@ impl FilerNetHandler {
                     low_conf
                 );
             }
+
+            // C-1.3: 触发写预测 ML 训练 + xattr 下发
+            let (w_total, w_high, w_low) = crate::write_predict_policy::apply_ml_write_policy(
+                &aggregator,
+                &meta_mgr,
+                shard_id,
+            )
+            .await;
+            if w_total > 0 {
+                log::info!(
+                    "FILER_WRITE_PREDICT: trained on {} inodes → {} high-prob, {} low-conf",
+                    w_total,
+                    w_high,
+                    w_low
+                );
+            }
         });
 
         log::info!("FILER_NET_PUSH_IO_TRACE: received {} trace entries", count);
