@@ -1,30 +1,37 @@
 //! Content fingerprint for write prediction & dedup (Phase C-0).
 //!
-//! Blake3-based 256-bit fingerprint computed on the client side after
+//! SHA-256-based 256-bit fingerprint computed on the client side after
 //! WriteCoalescer flush. The fingerprint is sent to the Filer for
 //! matching against the `FingerprintIndex`. An LRU cache avoids
 //! recomputing hashes for identical data seen recently.
+//!
+//! SHA-256 is chosen over Blake3 for kernel compatibility: the Linux
+//! kernel crypto API provides SHA-256 (CONFIG_CRYPTO_SHA256=y) on all
+//! kernels, while Blake3/Blake2s are optional and not available in the
+//! PowerFS QEMU VM kernel. Using the same hash on both kernel and Rust
+//! clients ensures fingerprints match for cross-client dedup.
 //!
 //! See `docs/write-prediction-dedup-design.md` §3.2.
 
 use std::sync::Mutex;
 
-use blake3::Hasher;
+use sha2::{Digest, Sha256};
 
-/// 256-bit content fingerprint (Blake3).
+/// 256-bit content fingerprint (SHA-256).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Fingerprint(pub [u8; 32]);
 
 impl Fingerprint {
-    /// Compute Blake3 hash of `data`.
+    /// Compute SHA-256 hash of `data`.
     ///
-    /// Throughput on modern x86 is ~6 GB/s, so a 1 MiB needle takes <0.2 ms.
+    /// Throughput on modern x86 is ~500 MB/s (software) / ~2 GB/s (SHA-NI),
+    /// so a 256 KiB needle takes <0.5 ms — negligible vs network I/O.
     pub fn compute(data: &[u8]) -> Self {
-        let mut hasher = Hasher::new();
+        let mut hasher = Sha256::new();
         hasher.update(data);
         let hash = hasher.finalize();
         let mut buf = [0u8; 32];
-        buf.copy_from_slice(hash.as_bytes());
+        buf.copy_from_slice(&hash);
         Self(buf)
     }
 
