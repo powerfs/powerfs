@@ -291,9 +291,141 @@ impl IoTraceAggregator {
         self.traces.lock().unwrap().get(&ino).cloned()
     }
 
+    /// C-1.2: 返回所有 trace inode 的快照 (ino → InodeTraceState clone)
+    pub fn traces_snapshot(&self) -> Vec<(u64, InodeTraceState)> {
+        self.traces
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&k, v)| (k, v.clone()))
+            .collect()
+    }
+
     /// 清空所有聚合数据 (训练后调用)
     pub fn clear(&self) {
         self.traces.lock().unwrap().clear();
+    }
+
+    /// C-1.2: 从聚合状态提取写专用特征 (7 特征, 供 WritePredictNN).
+    ///
+    /// 特征见 docs/write-prediction-dedup-design.md §3.1.1:
+    ///   1. write_count        — 写采样次数
+    ///   2. write_offset_delta — 写 offset 差值均值 (覆盖写检测)
+    ///   3. overwrite_ratio   — 写 offset < file_size 的比例
+    ///   4. file_size          — 当前文件大小 (log1p 归一化)
+    ///   5. write_interval    — 写 flush 间隔 (秒)
+    ///   6. write_size_var    — 写大小方差 (固定大小=低方差=高重复概率)
+    ///   7. seq_write_ratio   — 顺序写占比 (seq_run / (seq_run + rand_run))
+    pub fn extract_write_features(&self, ino: u64) -> Option<WriteTraceFeatures> {
+        let traces = self.traces.lock().unwrap();
+        let state = traces.get(&ino)?;
+
+        // 分离写采样
+        let write_kinds: Vec<&u8> = state.kinds.iter().filter(|&&k| k == 1).collect();
+        let write_count = write_kinds.len() as u64;
+
+        if write_count == 0 {
+            return None;
+        }
+
+        // 写 offset 差值均值
+        let write_offsets: Vec<u16> = state
+            .kinds
+            .iter()
+            .zip(state.offsets.iter())
+            .filter(|(&k, _)| k == 1)
+            .map(|(_, &o)| o)
+            .collect();
+
+        let write_offset_delta = if write_offsets.len() < 2 {
+            0.0
+        } else {
+            let mut sum = 0u64;
+            let mut cnt = 0u64;
+            for i in 1..write_offsets.len() {
+                let delta = (write_offsets[i] as i32 - write_offsets[i - 1] as i32).unsigned_abs();
+                sum += delta as u64;
+                cnt += 1;
+            }
+            if cnt > 0 {
+                sum as f64 / cnt as f64
+            } else {
+                0.0
+            }
+        };
+
+        // 覆写比例: offset < file_size (64KB 粒度 → bytes)
+        let file_size_64k = (state.file_size / 65536) as u16;
+        let overwrite_count = write_offsets.iter().filter(|&&o| o < file_size_64k).count();
+        let overwrite_ratio = if write_count > 0 {
+            overwrite_count as f64 / write_count as f64
+        } else {
+            0.0
+        };
+
+        // 写间隔 (秒)
+        let elapsed = state.last_ts.duration_since(state.first_ts).as_secs_f64();
+        let write_interval = if write_count > 0 && elapsed > 0.0 {
+            elapsed / write_count as f64
+        } else {
+            0.0
+        };
+
+        // 写大小方差 (file_size 变化作为代理指标)
+        // 多次写后 file_size 相同 → 覆盖写 → 高重复概率
+        let write_size_var = 0.0; // C-1.2 简化: 需要多次 flush 的 file_size 历史
+
+        // 顺序写占比
+        let total_runs = state.last_seq_run + state.last_rand_run;
+        let seq_write_ratio = if total_runs > 0 {
+            state.last_seq_run as f64 / total_runs as f64
+        } else {
+            0.0
+        };
+
+        Some(WriteTraceFeatures {
+            write_count,
+            write_offset_delta,
+            overwrite_ratio,
+            file_size: state.file_size,
+            write_interval,
+            write_size_var,
+            seq_write_ratio,
+        })
+    }
+}
+
+/// C-1.2: 写专用特征 (7 特征, 供 WritePredictNN)
+#[derive(Debug, Clone, PartialEq)]
+pub struct WriteTraceFeatures {
+    /// 1. 写采样次数 (采样率 1/100, 实际写次数 = write_count * 100)
+    pub write_count: u64,
+    /// 2. 写 offset 差值均值 (64KB 粒度)
+    pub write_offset_delta: f64,
+    /// 3. 覆写比例 (0.0~1.0)
+    pub overwrite_ratio: f64,
+    /// 4. 文件大小 (bytes)
+    pub file_size: u64,
+    /// 5. 写间隔 (秒)
+    pub write_interval: f64,
+    /// 6. 写大小方差 (0.0=固定大小)
+    pub write_size_var: f64,
+    /// 7. 顺序写占比 (0.0~1.0)
+    pub seq_write_ratio: f64,
+}
+
+impl WriteTraceFeatures {
+    /// 转为 NN 输入向量 (7 维, log1p + 线性归一化)
+    pub fn to_nn_input(&self) -> [f64; 7] {
+        [
+            (self.write_count as f64).ln_1p() / 10.0, // 0~~7
+            self.write_offset_delta.ln_1p() / 10.0,   // 0~~10
+            self.overwrite_ratio,                     // 0~1
+            (self.file_size as f64).ln_1p() / 20.0,   // 0~~3
+            self.write_interval.ln_1p() / 5.0,        // 0~~5
+            self.write_size_var.ln_1p() / 10.0,       // 0~~10
+            self.seq_write_ratio,                     // 0~1
+        ]
     }
 }
 
