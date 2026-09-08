@@ -1728,6 +1728,31 @@ impl MetadataCache {
         }
     }
 
+    /// C-1.5: Update a chunk's needle_id / volume_id / crc32 to point at an
+    /// existing (deduped) needle instead of the freshly-written one.
+    ///
+    /// Called after a FingerprintLookup returns Match/Recoverable: the chunk
+    /// now references the matched needle, no data was written to the volume
+    /// server.  The subsequent sync_size_chunks_on_close will sync the new
+    /// (needle_id, volume_id) to the Filer.
+    pub fn update_chunk_needle_ref(
+        &self,
+        inode: u64,
+        chunk_offset: u64,
+        needle_id: u64,
+        volume_id: u64,
+        crc32: u32,
+    ) {
+        let mut cache = self.inode_cache.write().unwrap();
+        if let Some(entry) = cache.get_mut(&inode) {
+            if let Some(chunk) = entry.chunks.iter_mut().find(|c| c.offset == chunk_offset) {
+                chunk.needle_id = needle_id;
+                chunk.volume_id = volume_id;
+                chunk.crc32 = crc32;
+            }
+        }
+    }
+
     pub fn update_attr(&self, inode: u64, params: UpdateAttrParams) {
         let mut cache = self.inode_cache.write().unwrap();
         if let Some(entry) = cache.get_mut(&inode) {
