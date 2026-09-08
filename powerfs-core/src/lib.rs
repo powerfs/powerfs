@@ -2,6 +2,7 @@ pub mod bitrot_scanner;
 pub mod config;
 pub mod crdt;
 pub mod ec_thread;
+pub mod fingerprint;
 pub mod gc_thread;
 pub mod hpc;
 pub mod index;

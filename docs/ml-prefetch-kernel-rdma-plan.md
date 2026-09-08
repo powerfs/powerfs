@@ -474,7 +474,7 @@ P0-2 解决后，ML 预取对 mdtest 阶段的"关闭无用预取"收益仍有�
 
 #### 额外（跨阶段通用）
 - [x] A-X1 RDMA MR 池占用感知的 readahead 上限（§4.3，A-1 阶段加）— 2026-09-08 完成，VM 验证见 §4.8 A-X1
-- [ ] A-X2 fio 基线，对比 ext4-over-RDMA / NFS-over-RDMA（A-0 起每阶段做）
+- [ ] A-X2 fio 自身基线对比（readahead=off vs ML 自适应），ext4/NFS 绝对基线推迟到 Phase B
 
 ### 7.3 Phase B：研究版（filer 端协同 + RDMA 代价感知，冲顶刊 novelty）
 - [ ] B1 filer 端聚合多客户端 trace 训练全局模型
@@ -536,5 +536,6 @@ P0-2 解决后，ML 预取对 mdtest 阶段的"关闭无用预取"收益仍有�
 - [x] **Phase A-0 完成**（2026-09-08）：kernel readahead 骨架 + hook + xattr 通道（含持久化修复）+ 3×3 测试矩阵验证。readahead 机制效果显著：4K randread xattr=0 +27%，1M seqread xattr=16 +182%，ior-hard-read xattr=16 +744%。
 - [x] **Phase A-1 完成**（2026-09-08）：ML 自动化（kernel trace 采集 → filer 聚合 → NN 训练 → xattr 下发 → version invalidation → 缺省规则引擎 → 安全回退），IO500 全量对比见 §4.8 A-1.7
 - [x] **A-X1 完成**（2026-09-08）：RDMA MR 池占用感知 readahead 上限（§4.3），空闲不裁剪、近耗尽降级为 0 防 RNR，VM 强制裁剪验证通过
-- [ ] **A-X2**：fio 基线对比 ext4-over-RDMA / NFS-over-RDMA
+- [ ] **A-X2**：fio 自身基线对比（readahead=off vs ML 自适应），ext4/NFS 绝对基线推迟到 Phase B 严谨 evaluation
 - [ ] Phase A 拿到 IO500 数据后再决定是否推进 Phase B 研究版
+- [ ] **Phase C**：写预测 + 内容指纹去重（见 [write-prediction-dedup-design.md](./write-prediction-dedup-design.md)）

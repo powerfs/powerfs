@@ -641,6 +641,35 @@ pub enum MsgType {
     /// Response: Status only.
     PushIoTrace = 0x0041,
 
+    /// Phase C-0: Content fingerprint lookup for write dedup.
+    /// Request body (raw, little-endian):
+    ///   Fingerprint: [u8; 32]  Blake3 hash
+    ///   DataSize:    u64        data size in bytes
+    ///   DataPrefix:  [u8; 64]  first 64 bytes for collision check
+    ///   Inode:       u64        requesting inode
+    ///   Offset:      u64        write offset
+    /// Response body (raw, little-endian):
+    ///   Match:      u8   0=NoMatch, 1=Match, 2=Recoverable
+    ///   NeedleId:   u64  (if Match/Recoverable)
+    ///   VolumeId:   u64  (if Match/Recoverable)
+    ///   Crc32:      u32  (if Match/Recoverable)
+    ///   DataSize:   u64  (if Match/Recoverable)
+    ///   Refcount:   u32  (if Match)
+    FingerprintLookup = 0x0042,
+
+    /// Phase C-0.5: Record a fingerprint after writing a new needle.
+    /// Called by client after a FingerprintLookup returned NoMatch and
+    /// the client has written the new needle to a volume server.
+    /// Request body (raw, little-endian):
+    ///   Fingerprint: [u8; 32]  Blake3 hash
+    ///   NeedleId:     u64       newly written needle id
+    ///   VolumeId:     u64       volume id
+    ///   Crc32:        u32       needle crc32
+    ///   DataSize:     u64       data size in bytes
+    ///   DataPrefix:   [u8; 64]  first 64 bytes for collision check
+    /// Response: Status only.
+    FingerprintRecord = 0x0043,
+
     // Status
     StatFs = 0x0040,
 
@@ -941,6 +970,8 @@ impl MsgType {
             0x003f => Some(Self::BatchCreate),
             0x0040 => Some(Self::StatFs),
             0x0041 => Some(Self::PushIoTrace),
+            0x0042 => Some(Self::FingerprintLookup),
+            0x0043 => Some(Self::FingerprintRecord),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
             0x0052 => Some(Self::Heartbeat),

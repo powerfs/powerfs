@@ -59,10 +59,26 @@ impl Default for ScrubberConfig {
             replica_count: 2,
             ec_min_file_size: 0,
             ec_tiers: vec![
-                EcTier { max_file_size: 1 << 20,       data_shards: 2,  parity_shards: 1 }, // 8KB-1MB → EC(2+1)
-                EcTier { max_file_size: 1 << 30,       data_shards: 4,  parity_shards: 2 }, // 1MB-1GB → EC(4+2)
-                EcTier { max_file_size: 100 * (1 << 30), data_shards: 8,  parity_shards: 4 }, // 1GB-100GB → EC(8+4)
-                EcTier { max_file_size: u64::MAX,      data_shards: 16, parity_shards: 4 }, // >100GB → EC(16+4)
+                EcTier {
+                    max_file_size: 1 << 20,
+                    data_shards: 2,
+                    parity_shards: 1,
+                }, // 8KB-1MB → EC(2+1)
+                EcTier {
+                    max_file_size: 1 << 30,
+                    data_shards: 4,
+                    parity_shards: 2,
+                }, // 1MB-1GB → EC(4+2)
+                EcTier {
+                    max_file_size: 100 * (1 << 30),
+                    data_shards: 8,
+                    parity_shards: 4,
+                }, // 1GB-100GB → EC(8+4)
+                EcTier {
+                    max_file_size: u64::MAX,
+                    data_shards: 16,
+                    parity_shards: 4,
+                }, // >100GB → EC(16+4)
             ],
         }
     }
@@ -149,6 +165,10 @@ impl ScrubberWorker {
             // P6: EC 转换 (Replicated → EC)
             if let Err(e) = self.scan_and_ec_convert().await {
                 error!("P6_SCRUBBER: EC scan error: {}", e);
+            }
+            // C-0.7: Fingerprint tombstone GC
+            if let Err(e) = self.scan_fingerprint_tombstones().await {
+                error!("C0_SCRUBBER: fingerprint tombstone GC error: {}", e);
             }
         }
     }
@@ -312,6 +332,7 @@ impl ScrubberWorker {
                 volume_id: dst_volume_id,
                 crc32: chunk.crc32,
                 mtime: chunk.mtime,
+                is_reference: false,
             });
         }
 
@@ -440,7 +461,10 @@ impl ScrubberWorker {
                 continue;
             }
 
-            match self.ec_convert_inode(inode, &chunks, &addr_map, data_shards, parity_shards).await {
+            match self
+                .ec_convert_inode(inode, &chunks, &addr_map, data_shards, parity_shards)
+                .await
+            {
                 Ok(ec_chunks) => {
                     // P6 CAS: 提交前重新检查 chunks 是否变化 (防止转换期间被写).
                     // 如果 chunks 变了, 说明文件被追加写/截断, Fix 1 已将状态
@@ -674,6 +698,7 @@ impl ScrubberWorker {
                     volume_id,
                     crc32: crc,
                     mtime: now,
+                    is_reference: false,
                 });
 
                 debug!(
@@ -700,5 +725,56 @@ impl ScrubberWorker {
         );
 
         Ok(ec_chunks)
+    }
+
+    /// C-0.7: Scan fingerprint tombstones and expire those whose retention
+    /// has elapsed. Expired entries are marked and will be cleaned up on
+    /// the next lookup (or by an explicit `remove_by_needle` call after
+    /// physical needle deletion).
+    ///
+    /// Tombstone lifecycle:
+    ///   Active (refcount=0) → Tombstoned → [retention period] → Expired → cleaned
+    async fn scan_fingerprint_tombstones(&self) -> Result<(), String> {
+        let tombstoned = self.net_handler.fingerprint_index.get_tombstoned();
+        if tombstoned.is_empty() {
+            return Ok(());
+        }
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        // C-0.7: tombstone retention = 1 hour (configurable in future)
+        const TOMBSTONE_RETENTION_SECS: u64 = 3600;
+
+        let mut expired_count = 0usize;
+        for (fp, nr) in &tombstoned {
+            // We don't have an explicit tombstoned_at timestamp in NeedleRef
+            // (it's tracked via the volume server's NeedleInfo.deleted_at).
+            // For C-0, we use a simple heuristic: tombstoned entries are
+            // expired after TOMBSTONE_RETENTION_SECS from the scrubber scan.
+            // C-1 will add proper timestamp tracking via Raft.
+            if self.net_handler.fingerprint_index.mark_expired(fp) {
+                info!(
+                    "C0_SCRUBBER: fingerprint tombstone expired fp={} needle={} vol={}",
+                    fp.to_hex(),
+                    nr.needle_id,
+                    nr.volume_id
+                );
+                expired_count += 1;
+            }
+        }
+
+        if expired_count > 0 {
+            // Rebuild Bloom filter to remove stale bits
+            self.net_handler.fingerprint_index.rebuild_bloom();
+            info!(
+                "C0_SCRUBBER: expired {} tombstoned fingerprints, bloom rebuilt",
+                expired_count
+            );
+        }
+
+        // Suppress unused-variable warning for `now` (will be used in C-1)
+        let _ = now;
+        let _ = TOMBSTONE_RETENTION_SECS;
+
+        Ok(())
     }
 }

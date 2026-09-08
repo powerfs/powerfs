@@ -199,6 +199,8 @@ pub struct FilerNetHandler {
     version_counter: std::sync::atomic::AtomicU64,
     /// A-1.2: IO trace 聚合器 (per-inode, 提取 5 KML 特征)
     pub io_trace_aggregator: Arc<crate::readahead_trace::IoTraceAggregator>,
+    /// C-0.2: Filer-side fingerprint index for write dedup
+    pub fingerprint_index: Arc<crate::fingerprint_index::FingerprintIndex>,
 }
 
 /// P2.5: Inline 模式硬上限 (Placement::Inline 的 max_size 不可超过此值)
@@ -304,6 +306,7 @@ impl FilerNetHandler {
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
             version_counter: Self::init_version_counter(),
             io_trace_aggregator: Arc::new(crate::readahead_trace::IoTraceAggregator::new()),
+            fingerprint_index: Arc::new(crate::fingerprint_index::FingerprintIndex::default()),
         }
     }
 
@@ -331,6 +334,7 @@ impl FilerNetHandler {
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
             version_counter: Self::init_version_counter(),
             io_trace_aggregator: Arc::new(crate::readahead_trace::IoTraceAggregator::new()),
+            fingerprint_index: Arc::new(crate::fingerprint_index::FingerprintIndex::default()),
         }
     }
 
@@ -3233,6 +3237,7 @@ impl FilerNetHandler {
                     needle_id: c.needle_id,
                     volume_id: c.volume_id,
                     crc32: c.crc32,
+                    is_reference: false,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -3961,6 +3966,167 @@ impl FilerNetHandler {
         });
 
         log::info!("FILER_NET_PUSH_IO_TRACE: received {} trace entries", count);
+        Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+    }
+
+    /// Handle FingerprintLookup (Phase C-0.3) — content fingerprint
+    /// matching for write dedup.
+    ///
+    /// Request body (raw, little-endian):
+    ///   Fingerprint: [u8; 32]  Blake3 hash
+    ///   DataSize:    u64        data size in bytes
+    ///   DataPrefix:  [u8; 64]  first 64 bytes for collision check
+    ///   Inode:       u64        requesting inode
+    ///   Offset:      u64        write offset
+    ///
+    /// Response body (raw, little-endian):
+    ///   Match:      u8   0=NoMatch, 1=Match, 2=Recoverable
+    ///   NeedleId:   u64  (if Match/Recoverable)
+    ///   VolumeId:   u64  (if Match/Recoverable)
+    ///   Crc32:      u32  (if Match/Recoverable)
+    ///   DataSize:   u64  (if Match/Recoverable)
+    ///   Refcount:   u32  (if Match)
+    async fn handle_fingerprint_lookup(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        use powerfs_core::fingerprint::{Fingerprint, LookupResult};
+
+        let body = &msg.body;
+        // 32 (fp) + 8 (size) + 64 (prefix) + 8 (ino) + 8 (offset) = 120
+        if body.len() < 120 {
+            warn!(
+                "FILER_FINGERPRINT_LOOKUP: body too short ({} < 120)",
+                body.len()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        let mut fp_buf = [0u8; 32];
+        fp_buf.copy_from_slice(&body[0..32]);
+        let fp = Fingerprint(fp_buf);
+
+        let data_size = u64::from_le_bytes(body[32..40].try_into().unwrap());
+        let mut prefix = [0u8; 64];
+        prefix.copy_from_slice(&body[40..104]);
+        let _inode = u64::from_le_bytes(body[104..112].try_into().unwrap());
+        let _offset = u64::from_le_bytes(body[112..120].try_into().unwrap());
+
+        let result = self.fingerprint_index.lookup(&fp, &prefix);
+
+        let resp = match result {
+            LookupResult::Match {
+                needle_id,
+                volume_id,
+                crc32,
+                data_size: ds,
+                refcount,
+            } => {
+                // Increment refcount for the new reference
+                self.fingerprint_index.increment_refcount(&fp);
+                log::info!(
+                    "FILER_FINGERPRINT_LOOKUP: Match fp={} needle={} vol={} refcount={}",
+                    fp.to_hex(),
+                    needle_id,
+                    volume_id,
+                    refcount + 1
+                );
+                let mut buf = Vec::with_capacity(37);
+                buf.push(1u8); // Match
+                buf.extend_from_slice(&needle_id.to_le_bytes());
+                buf.extend_from_slice(&volume_id.to_le_bytes());
+                buf.extend_from_slice(&crc32.to_le_bytes());
+                buf.extend_from_slice(&ds.to_le_bytes());
+                buf.extend_from_slice(&(refcount + 1).to_le_bytes());
+                buf
+            }
+            LookupResult::Recoverable {
+                needle_id,
+                volume_id,
+                crc32,
+                data_size: ds,
+            } => {
+                // Recover from tombstone
+                self.fingerprint_index.recover(&fp);
+                log::info!(
+                    "FILER_FINGERPRINT_LOOKUP: Recovered fp={} needle={} vol={}",
+                    fp.to_hex(),
+                    needle_id,
+                    volume_id
+                );
+                let mut buf = Vec::with_capacity(33);
+                buf.push(2u8); // Recoverable
+                buf.extend_from_slice(&needle_id.to_le_bytes());
+                buf.extend_from_slice(&volume_id.to_le_bytes());
+                buf.extend_from_slice(&crc32.to_le_bytes());
+                buf.extend_from_slice(&ds.to_le_bytes());
+                buf
+            }
+            LookupResult::NoMatch => {
+                log::debug!(
+                    "FILER_FINGERPRINT_LOOKUP: NoMatch fp={} size={}",
+                    fp.to_hex(),
+                    data_size
+                );
+                vec![0u8]
+            }
+        };
+
+        Ok(Self::build_response(msg, STATUS_OK, resp))
+    }
+
+    /// Handle FingerprintRecord (Phase C-0.5) — client records a
+    /// fingerprint after writing a new needle (NoMatch → write → record).
+    ///
+    /// Request body (raw, little-endian):
+    ///   Fingerprint: [u8; 32]  Blake3 hash
+    ///   NeedleId:     u64       newly written needle id
+    ///   VolumeId:     u64       volume id
+    ///   Crc32:        u32       needle crc32
+    ///   DataSize:     u64       data size in bytes
+    ///   DataPrefix:   [u8; 64]  first 64 bytes for collision check
+    async fn handle_fingerprint_record(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        use crate::fingerprint_index::NeedleRef;
+        use powerfs_core::fingerprint::Fingerprint;
+
+        let body = &msg.body;
+        // 32 + 8 + 8 + 4 + 8 + 64 = 124
+        if body.len() < 124 {
+            warn!(
+                "FILER_FINGERPRINT_RECORD: body too short ({} < 124)",
+                body.len()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        let mut fp_buf = [0u8; 32];
+        fp_buf.copy_from_slice(&body[0..32]);
+        let fp = Fingerprint(fp_buf);
+        let needle_id = u64::from_le_bytes(body[32..40].try_into().unwrap());
+        let volume_id = u64::from_le_bytes(body[40..48].try_into().unwrap());
+        let crc32 = u32::from_le_bytes(body[48..52].try_into().unwrap());
+        let data_size = u64::from_le_bytes(body[52..60].try_into().unwrap());
+        let mut prefix = [0u8; 64];
+        prefix.copy_from_slice(&body[60..124]);
+
+        // Insert into the fingerprint index. If an entry already exists
+        // (e.g., Expired → replaced with new needle), overwrite it.
+        let nr = NeedleRef::new(needle_id, volume_id, crc32, data_size, prefix);
+        self.fingerprint_index.insert(fp, nr);
+
+        log::info!(
+            "FILER_FINGERPRINT_RECORD: recorded fp={} needle={} vol={} size={}",
+            fp.to_hex(),
+            needle_id,
+            volume_id,
+            data_size
+        );
+
         Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
     }
 
@@ -5255,6 +5421,10 @@ impl NetHandler for FilerNetHandler {
             MsgType::ListXattr => self.handle_list_xattr(msg).await,
             // Phase A-1.1: kernel IO trace push (ML readahead 数据采集)
             MsgType::PushIoTrace => self.handle_push_io_trace(msg).await,
+            // Phase C-0.3: content fingerprint lookup for write dedup
+            MsgType::FingerprintLookup => self.handle_fingerprint_lookup(msg).await,
+            // Phase C-0.5: record fingerprint after new needle write
+            MsgType::FingerprintRecord => self.handle_fingerprint_record(msg).await,
             // Two-phase Mkdir (client-routed, no server-to-server forwarding)
             // See docs/shard-routing-no-forward-principle.md §3
             MsgType::MkdirPhaseA => self.handle_mkdir_phase_a(msg).await,
