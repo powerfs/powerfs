@@ -599,8 +599,8 @@ WriteTraceEntry (packed, 64 bytes):
 - [x] C-1.2 Filer 端写特征聚合 — `IoTraceAggregator::extract_write_features()` 7 特征, `traces_snapshot()`
 - [x] C-1.3 `write_predict_policy.rs`: WritePredictNN (7→16→1 MLP) — 4 tests pass
 - [x] C-1.4 xattr 下发 `user.powerfs.write_predict_policy` — `apply_ml_write_policy()` 在 trace handler 中触发
-- [ ] C-1.5 客户端预判逻辑 + 指纹计算触发
-- [ ] C-1.6 安全回退：ML 置信度低 → 不算指纹（正常写）
+- [x] C-1.5 客户端预判逻辑 + 指纹计算触发 — `write_predict_threshold()` + `fingerprint_lookup/record` RPC + Flat flush 路径 dedup hook
+- [x] C-1.6 安全回退：ML 置信度低 → 不算指纹（正常写） — threshold=0/off/missing → 跳过指纹计算；filer 端 `check_write_predict_policy` 防御性兜底
 - [ ] C-1.7 测试：checkpoint 工作负载（周期性覆盖写），验证 ML 正确预判
 
 ### 6.3 Phase C-2：性能评估

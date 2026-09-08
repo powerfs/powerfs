@@ -389,6 +389,9 @@ impl FuseApp {
             write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             flush_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             backpressure_lock: Arc::new(std::sync::Mutex::new(())),
+            fingerprint_cache: Arc::new(
+                powerfs_core::fingerprint::FingerprintCache::new(256),
+            ),
             stripe_size: 64 * 1024 * 1024, // 64MB per stripe
             lease_duration_ms: 30000,      // 30 seconds lease
             lease_manager,
@@ -632,6 +635,12 @@ struct PowerFsFs {
     /// each trigger an independent flush while the others keep growing the
     /// cache, defeating the backpressure and causing unbounded memory growth.
     backpressure_lock: Arc<std::sync::Mutex<()>>,
+    /// C-1.5: client-side LRU cache of fingerprint → match/no-match,
+    /// avoiding repeated FingerprintLookup RPCs for identical content.
+    /// (Reserved for follow-up: cache invalidation after FingerprintRecord
+    /// is required for correctness — see docs/write-prediction-dedup-design.md)
+    #[allow(dead_code)]
+    fingerprint_cache: Arc<powerfs_core::fingerprint::FingerprintCache>,
     stripe_size: u64,
     lease_duration_ms: u64,
     /// Step 6: 统一 lease 入口 + 读路径缓存复用。
@@ -1101,6 +1110,29 @@ impl PowerFsFs {
             .facade()
             .meta_shard_client()
             .calculate_shard_id(inode)
+    }
+
+    /// C-1.5/C-1.6: Read the write_predict_policy xattr and return the
+    /// threshold.  Returns 0.0 when the policy is "off", the threshold
+    /// parses to 0, the xattr is missing, or parsing fails — all of
+    /// which mean "do not compute fingerprints" (safety fallback).
+    fn write_predict_threshold(&self, inode: u64) -> f64 {
+        const XATTR: &str = "user.powerfs.write_predict_policy";
+        match self.cache.get_xattr(inode, XATTR) {
+            Some(val) => {
+                let s = std::str::from_utf8(&val).unwrap_or("");
+                if s.eq_ignore_ascii_case("off") {
+                    return 0.0;
+                }
+                if let Some(rest) =
+                    s.strip_prefix("NN:").or_else(|| s.strip_prefix("RULE:"))
+                {
+                    return rest.parse::<f64>().unwrap_or(0.0);
+                }
+                0.0 // parse failure → safe fallback
+            }
+            None => 0.0, // cold start: no ML data yet → don't compute
+        }
     }
 
     /// §13 Phase 3.3: Ensure the client has CAP_X (AUTH_EXCL) before
@@ -1665,9 +1697,96 @@ impl PowerFsFs {
             })
             .collect();
 
-        // Flush in parallel batches
+        // === C-1.5: Fingerprint dedup — try to reference existing needles ===
+        // Before writing to the volume server, check if the content
+        // fingerprint matches an existing needle. If so, reference it
+        // instead of writing (saves network + disk I/O).
+        //
+        // Controlled by xattr user.powerfs.write_predict_policy:
+        //   threshold > 0 → compute fingerprint + lookup
+        //   threshold = 0 / "off" / missing → skip (C-1.6 safety fallback)
+        //
+        // Best-effort: lookup/record failures fall back to normal write.
+        let shard_id = self.routing_shard(inode);
+        let policy_threshold = self.write_predict_threshold(inode);
+
+        let mut deduped_indices: Vec<u64> = Vec::new();
+        let chunks_to_write: Vec<(u64, powerfs_fuse_core::WriteBlobRequest)> =
+            if policy_threshold > 0.0 {
+                let mut to_write = Vec::with_capacity(chunks_to_flush.len());
+                for (chunk_idx, req) in chunks_to_flush {
+                    let chunk_offset = chunk_idx * chunk_size;
+                    let data_size = req.data.len() as u64;
+                    let fp = powerfs_core::fingerprint::Fingerprint::compute(&req.data);
+                    let prefix =
+                        powerfs_core::fingerprint::Fingerprint::extract_prefix(&req.data);
+
+                    let meta_client = self.client.facade().meta_shard_client().clone();
+                    let lookup_result = self.client.block_on(async move {
+                        meta_client
+                            .fingerprint_lookup(
+                                shard_id,
+                                inode,
+                                chunk_offset,
+                                &fp,
+                                data_size,
+                                &prefix,
+                            )
+                            .await
+                    });
+
+                    match lookup_result {
+                        Ok(powerfs_core::fingerprint::LookupResult::Match {
+                            needle_id,
+                            volume_id,
+                            crc32,
+                            ..
+                        })
+                        | Ok(powerfs_core::fingerprint::LookupResult::Recoverable {
+                            needle_id,
+                            volume_id,
+                            crc32,
+                            ..
+                        }) => {
+                            self.cache.update_chunk_needle_ref(
+                                inode,
+                                chunk_offset,
+                                needle_id,
+                                volume_id,
+                                crc32,
+                            );
+                            deduped_indices.push(chunk_idx);
+                            info!(
+                                "FUSE_WRITE_DEDUP: inode={} chunk_idx={} fp={} → ref needle={} vol={}",
+                                inode,
+                                chunk_idx,
+                                fp.to_hex(),
+                                needle_id,
+                                volume_id
+                            );
+                        }
+                        Ok(powerfs_core::fingerprint::LookupResult::NoMatch) => {
+                            to_write.push((chunk_idx, req));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "FUSE_WRITE_DEDUP: lookup failed inode={} chunk_idx={}: {} — normal write",
+                                inode,
+                                chunk_idx,
+                                e
+                            );
+                            to_write.push((chunk_idx, req));
+                        }
+                    }
+                }
+                to_write
+            } else {
+                chunks_to_flush
+            };
+
+        // Flush non-deduped chunks in parallel batches
         let mut flushed_indices: Vec<u64> = Vec::new();
-        for batch in chunks_to_flush.chunks(batch_size) {
+        for batch in chunks_to_write.chunks(batch_size) {
             let requests: Vec<_> = batch.iter().map(|(_, req)| req.clone()).collect();
             let results = self
                 .client
@@ -1686,17 +1805,39 @@ impl PowerFsFs {
                     let crc = crc32fast::hash(&req.data);
                     let chunk_offset = *chunk_idx * chunk_size;
                     self.cache.update_chunk_crc32(inode, chunk_offset, crc);
-                    // Track successfully flushed chunk INDICES (not offsets) to
-                    // clear their dirty flag. The cache key is (inode,
-                    // chunk_index), so clear_dirty_for_chunks expects indices.
-                    // BUGFIX: previously pushed `chunk_idx * chunk_size`
-                    // (offsets), which only matched index 0 (offset 0 == index
-                    // 0), leaving all other chunks permanently dirty and
-                    // un-evictable → unbounded cache growth (1GB+ vs 512MB).
+
+                    // C-1.5: Record fingerprint for future dedup lookups.
+                    // Best-effort: failure only means the next identical
+                    // write won't be deduped (no correctness impact).
+                    if policy_threshold > 0.0 {
+                        let fp = powerfs_core::fingerprint::Fingerprint::compute(&req.data);
+                        let prefix =
+                            powerfs_core::fingerprint::Fingerprint::extract_prefix(&req.data);
+                        let meta_client = self.client.facade().meta_shard_client().clone();
+                        let needle_id = fid.file_key.saturating_add(*chunk_idx);
+                        let volume_id = fid.volume_id.0;
+                        let rec_size = req.data.len() as u64;
+                        let _ = self.client.block_on(async move {
+                            meta_client
+                                .fingerprint_record(
+                                    shard_id,
+                                    &fp,
+                                    needle_id,
+                                    volume_id,
+                                    crc,
+                                    rec_size,
+                                    &prefix,
+                                )
+                                .await
+                        });
+                    }
                     flushed_indices.push(*chunk_idx);
                 }
             }
         }
+
+        // Deduped chunks are also "flushed" — they reference existing data
+        flushed_indices.extend(deduped_indices.iter());
 
         // Clear dirty flag for successfully flushed chunks so they can be evicted.
         if !flushed_indices.is_empty() {
