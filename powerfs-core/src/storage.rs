@@ -22,8 +22,21 @@ fn backend_err(e: StorageBackendError) -> PowerFsError {
 #[allow(clippy::result_large_err)]
 impl StorageManager {
     pub fn new(node_id: NodeId, data_path: String, device_capacity: Option<u64>) -> Result<Self> {
+        Self::new_with_sync(node_id, data_path, device_capacity, false)
+    }
+
+    /// Create StorageManager with explicit durability mode.
+    /// `force_sync=true` → every write_needle calls sync_data() before ack.
+    /// `force_sync=false` (default) → lazy fsync, persistence deferred to
+    ///   sync_volume (called on close/fsync) or NVMe-oF target backend.
+    pub fn new_with_sync(
+        node_id: NodeId,
+        data_path: String,
+        device_capacity: Option<u64>,
+        force_sync: bool,
+    ) -> Result<Self> {
         let backend = Arc::new(
-            LocalFsBackend::new(&data_path, &node_id.0, "default", device_capacity)
+            LocalFsBackend::new_with_sync(&data_path, &node_id.0, "default", device_capacity, force_sync)
                 .map_err(backend_err)?,
         );
         Ok(StorageManager {
@@ -159,6 +172,18 @@ impl StorageManager {
         self.volumes.read().unwrap().len()
     }
 
+    /// 后台 flush：遍历所有 volume，批量 flush 过期的 dirty needle 到后端。
+    /// 由 volume server 的后台线程定期调用（如每 50ms）。
+    /// 返回本次 flush 的 needle 总数。
+    pub fn flush_all_expired(&self) -> usize {
+        let volumes = self.volumes.read().unwrap();
+        let mut total = 0usize;
+        for volume in volumes.values() {
+            total += volume.flush_expired_dirty();
+        }
+        total
+    }
+
     pub fn total_space(&self) -> u64 {
         self.volumes
             .read()
@@ -193,6 +218,26 @@ impl StorageManager {
             .values()
             .find(|v| v.is_available() && !v.is_full())
             .map(|v| v.id())
+    }
+
+    /// 空闲时 WAL 同步：遍历所有 volume，仅对有新写入的 volume 执行 fsync WAL。
+    /// 无新写入的 volume 直接跳过，避免无意义的全量 WAL 刷新。
+    /// 返回 (检查的 volume 数, 实际 fsync 的 volume 数)。
+    pub fn sync_all_wals_if_dirty(&self) -> (usize, usize) {
+        let volumes = self.volumes.read().unwrap();
+        let total = volumes.len();
+        let mut synced = 0usize;
+        for volume in volumes.values() {
+            match volume.index().sync_wal_if_dirty() {
+                Ok(true) => synced += 1,
+                Ok(false) => {} // 无新写入，跳过
+                Err(e) => {
+                    log::warn!("sync_all_wals_if_dirty: volume {} fsync WAL failed: {}",
+                        volume.id().0, e);
+                }
+            }
+        }
+        (total, synced)
     }
 
     pub fn load_volumes(&self) -> Result<()> {

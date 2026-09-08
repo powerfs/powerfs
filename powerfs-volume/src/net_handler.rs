@@ -83,7 +83,7 @@ impl VolumeNetHandler {
         self.register_holder(session_client_id, &holder_client_id)
             .await;
 
-        info!(
+        debug!(
             "NET_WRITE_NEEDLE: volume_id={}, file_key={}, inode={}, size={}, has_lease={}, holder={}",
             volume_id,
             file_key,
@@ -650,9 +650,9 @@ impl VolumeNetHandler {
         }
     }
 
-    /// fsync durability barrier: force-materialise the given needles (the
-    /// file's chunks) from the in-memory coalescer to stable storage and
-    /// fsync the RocksDB WAL.  Empty/already-flushed needles are no-ops.
+    /// 轻量级 flush barrier：kernel 在 fsync/release 时调用。
+    /// 不再 fsync WAL（由后台统一维护线程负责），
+    /// 只触发后台 flush 将指定 needle 从 coalescer 物化到后端数据文件。
     async fn handle_flush_needles(
         &self,
         msg: &NetMessage,
@@ -660,26 +660,15 @@ impl VolumeNetHandler {
         let mut dec = TlvDecoder::new(&msg.body);
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let count = dec.next_u64(FieldId::Limit).unwrap_or(0);
-        info!(
-            "NET_FLUSH_NEEDLES DECODE: body_len={}, decoded_count_from_limit={}",
-            msg.body.len(),
-            count
-        );
         let mut file_keys: Vec<u64> = Vec::with_capacity(count as usize);
-        for i in 0..count {
+        for _ in 0..count {
             match dec.next_u64(FieldId::FileKey) {
-                Ok(k) => {
-                    info!("NET_FLUSH_NEEDLES DECODE: file_key[{}]={}", i, k);
-                    file_keys.push(k);
-                }
-                Err(e) => {
-                    info!("NET_FLUSH_NEEDLES DECODE: file_key[{}] failed: {}", i, e);
-                    break;
-                }
+                Ok(k) => file_keys.push(k),
+                Err(_) => break,
             }
         }
 
-        info!(
+        debug!(
             "NET_FLUSH_NEEDLES: volume_id={}, count={} keys",
             volume_id,
             file_keys.len()
@@ -687,24 +676,21 @@ impl VolumeNetHandler {
 
         let storage_manager = self.volume_server.storage_manager.clone();
         let vid = VolumeId(volume_id);
-        let requested = file_keys.len();
 
         match tokio::task::spawn_blocking(move || -> Result<usize, String> {
             let volume = storage_manager
                 .get_volume(&vid)
                 .ok_or_else(|| format!("volume not found: {}", volume_id))?;
             let ids: Vec<NeedleId> = file_keys.into_iter().map(NeedleId).collect();
-            volume.flush_needles_durable(&ids).map_err(|e| {
-                warn!("flush_needles_durable failed: {}", e);
-                format!("{}", e)
-            })
+            // flush_specific 只物化数据到后端文件，不 fsync WAL
+            volume.flush_specific_needles(&ids).map_err(|e| format!("{}", e))
         })
         .await
         {
             Ok(Ok(n)) => {
-                info!(
-                    "NET_FLUSH_NEEDLES: volume_id={} materialised {} needles (requested {})",
-                    volume_id, n, requested
+                debug!(
+                    "NET_FLUSH_NEEDLES: volume_id={} materialised {} needles",
+                    volume_id, n
                 );
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()))
             }
