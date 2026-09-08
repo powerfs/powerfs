@@ -172,10 +172,10 @@ pub async fn apply_ml_write_policy(
     shard_id: ShardId,
 ) -> (usize, usize, usize) {
     // 收集所有有写 trace 的 inode 及其特征
-    let all_features: Vec<(u64, crate::readahead_trace::WriteTraceFeatures)> = aggregator
-        .traces_snapshot()
-        .into_iter()
-        .filter_map(|(ino, _)| aggregator.extract_write_features(ino).map(|f| (ino, f)))
+    let snapshot = aggregator.traces_snapshot();
+    let all_features: Vec<(u64, crate::readahead_trace::WriteTraceFeatures)> = snapshot
+        .iter()
+        .filter_map(|(ino, _)| aggregator.extract_write_features(*ino).map(|f| (*ino, f)))
         .collect();
 
     if all_features.is_empty() {
