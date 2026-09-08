@@ -673,6 +673,7 @@ impl FilerMetaService for FilerMetaServiceImpl {
                 needle_id: c.needle_id,
                 volume_id: c.volume_id,
                 crc32: c.crc32,
+                is_reference: false,
             })
             .collect();
 
