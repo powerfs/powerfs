@@ -2213,7 +2213,10 @@ impl MasterNode {
         match serving {
             None => {
                 // Node already absent from topology — nothing to remove.
-                info!("remove_data_node: node={} not present in topology (already removed)", node_id);
+                info!(
+                    "remove_data_node: node={} not present in topology (already removed)",
+                    node_id
+                );
                 Ok(())
             }
             Some(true) if !force => {
@@ -2285,7 +2288,10 @@ impl MasterNode {
                 .set_node_state(&node_id, powerfs_common::types::NodeState::Unavailable)
                 .await
             {
-                warn!("Node liveness: failed to mark node={} Unavailable: {}", node_id, e);
+                warn!(
+                    "Node liveness: failed to mark node={} Unavailable: {}",
+                    node_id, e
+                );
             }
         }
     }

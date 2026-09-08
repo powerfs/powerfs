@@ -4026,8 +4026,21 @@ impl FilerNetHandler {
         let data_size = u64::from_le_bytes(body[32..40].try_into().unwrap());
         let mut prefix = [0u8; 64];
         prefix.copy_from_slice(&body[40..104]);
-        let _inode = u64::from_le_bytes(body[104..112].try_into().unwrap());
+        let inode = u64::from_le_bytes(body[104..112].try_into().unwrap());
         let _offset = u64::from_le_bytes(body[112..120].try_into().unwrap());
+
+        // C-1.5: Check write_predict_policy xattr — if "off", skip lookup
+        // C-1.6: Safe fallback — if xattr missing or parse fails, allow lookup
+        // (default behavior: compute fingerprint for safety)
+        let policy_allowed = self.check_write_predict_policy(inode);
+        if !policy_allowed {
+            // Policy says "off" → skip fingerprint, return NoMatch
+            log::debug!(
+                "FILER_FINGERPRINT_LOOKUP: skipped (policy=off) ino={}",
+                inode
+            );
+            return Ok(Self::build_response(msg, STATUS_OK, vec![0u8]));
+        }
 
         let result = self.fingerprint_index.lookup(&fp, &prefix);
 
@@ -4144,6 +4157,31 @@ impl FilerNetHandler {
         );
 
         Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+    }
+
+    /// C-1.5/C-1.6: Check write_predict_policy xattr for an inode.
+    /// Returns `false` only if xattr is explicitly "off".
+    /// Missing xattr or parse failure → `true` (safe fallback: allow lookup).
+    fn check_write_predict_policy(&self, inode: u64) -> bool {
+        if let Some(info) = self.meta_shard_manager.get_inode(inode) {
+            if let Some(val) = info
+                .extended
+                .get(crate::write_predict_policy::WRITE_PREDICT_XATTR_NAME)
+            {
+                let s = std::str::from_utf8(val).unwrap_or("");
+                if s.eq_ignore_ascii_case("off") {
+                    return false;
+                }
+                // "NN:0.0" or "RULE:0.0" → threshold 0 → skip
+                if let Some(rest) = s.strip_prefix("NN:").or_else(|| s.strip_prefix("RULE:")) {
+                    if let Ok(threshold) = rest.parse::<f64>() {
+                        return threshold > 0.0;
+                    }
+                }
+            }
+        }
+        // Default: allow (safe fallback)
+        true
     }
 
     /// Handle RemoveXattr request — remove an extended attribute via Raft.

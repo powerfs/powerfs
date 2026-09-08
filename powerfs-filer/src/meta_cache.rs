@@ -800,6 +800,49 @@ impl MetaCache {
         }
     }
 
+    /// Project a setxattr into MetaCache so subsequent get_inode calls
+    /// (e.g. from handle_getxattr) return the updated extended attributes
+    /// immediately, without waiting for Raft apply.
+    ///
+    /// Root cause: shard_store.set_xattr only updates shard_store.inodes +
+    /// RocksDB, leaving MetaCache with a stale Clean copy that has no xattr.
+    /// handle_getxattr → meta_shard_manager.get_inode returns the stale
+    /// cached InodeInfo → extended.get(key) = None → NOT_FOUND, even though
+    /// the xattr was persisted. Mirrors the project_update_size_chunks /
+    /// project_setattr_meta projection pattern.
+    pub fn project_set_xattr(&self, inode: u64, key: String, value: Vec<u8>) {
+        let mut tbl = self.inode_table.write().unwrap();
+        let Some(existing) = tbl.get_mut(&inode) else {
+            return;
+        };
+        match existing.state {
+            CacheState::Deleted | CacheState::Trimming => return,
+            CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
+        }
+        existing.info.extended.insert(key, value);
+        existing.info.mtime = crate::shard_store::ShardStore::current_time();
+        existing.state = CacheState::Dirty;
+        existing.touch();
+    }
+
+    /// Project a removexattr into MetaCache. See project_set_xattr for the
+    /// rationale — without this, stale cached InodeInfo still carries the
+    /// removed xattr after Raft apply.
+    pub fn project_remove_xattr(&self, inode: u64, key: &str) {
+        let mut tbl = self.inode_table.write().unwrap();
+        let Some(existing) = tbl.get_mut(&inode) else {
+            return;
+        };
+        match existing.state {
+            CacheState::Deleted | CacheState::Trimming => return,
+            CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
+        }
+        existing.info.extended.remove(key);
+        existing.info.mtime = crate::shard_store::ShardStore::current_time();
+        existing.state = CacheState::Dirty;
+        existing.touch();
+    }
+
     // ---------- delete staging ----------
 
     /// Mark an inode and its directory entry as `Deleted` (pending Raft).

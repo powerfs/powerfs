@@ -182,9 +182,9 @@ impl InodeNotifier {
         version: u64,
         exclude_client_id: Option<u64>,
     ) -> usize {
-        let count = self
-            .connection_manager
-            .broadcast_invalidate_exclude(inode, version, exclude_client_id);
+        let count =
+            self.connection_manager
+                .broadcast_invalidate_exclude(inode, version, exclude_client_id);
         log::debug!(
             "InodeNotifier: broadcast_exclude Invalidate(inode={}, v={}, exclude={:?}) to {} clients",
             inode,

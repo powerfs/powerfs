@@ -439,9 +439,7 @@ impl Volume {
                     }
                     Ok(needle.data)
                 }
-                Err(PowerFsError::InvalidRequest(ref msg))
-                    if msg.contains("size mismatch") =>
-                {
+                Err(PowerFsError::InvalidRequest(ref msg)) if msg.contains("size mismatch") => {
                     // Index data_size disagrees with the needle header on disk.
                     // This can happen during a narrow race in append_needle_version
                     // (put_needle + write_needle_atomic are two separate RocksDB
@@ -459,12 +457,14 @@ impl Volume {
                     log::warn!(
                         "read_needle: size mismatch needle={} offset={} \
                          index_ds={} header_ds={} raw_len={} — using index size",
-                        needle_id.0, info.offset, info.data_size, hdr_ds, raw.len(),
+                        needle_id.0,
+                        info.offset,
+                        info.data_size,
+                        hdr_ds,
+                        raw.len(),
                     );
                     let end = (NEEDLE_HEADER_SIZE + info.data_size as usize).min(raw.len());
-                    Ok(Bytes::copy_from_slice(
-                        &raw[NEEDLE_HEADER_SIZE..end],
-                    ))
+                    Ok(Bytes::copy_from_slice(&raw[NEEDLE_HEADER_SIZE..end]))
                 }
                 Err(e) => Err(e),
             }
@@ -905,9 +905,7 @@ impl Volume {
                 info.checksum_algorithm,
             ) {
                 Ok(n) => n.data,
-                Err(PowerFsError::InvalidRequest(ref msg))
-                    if msg.contains("size mismatch") =>
-                {
+                Err(PowerFsError::InvalidRequest(ref msg)) if msg.contains("size mismatch") => {
                     let hdr_ds = if raw_data.len() >= NEEDLE_HEADER_SIZE {
                         u32::from_be_bytes(
                             raw_data[NEEDLE_ID_SIZE..NEEDLE_HEADER_SIZE]
@@ -920,7 +918,11 @@ impl Volume {
                     log::warn!(
                         "read_needle_blob: size mismatch needle={} offset={} \
                          index_ds={} header_ds={} raw_len={} — using index size",
-                        needle_id.0, info.offset, info.data_size, hdr_ds, raw_data.len(),
+                        needle_id.0,
+                        info.offset,
+                        info.data_size,
+                        hdr_ds,
+                        raw_data.len(),
                     );
                     let end = (NEEDLE_HEADER_SIZE + info.data_size as usize).min(raw_data.len());
                     Bytes::copy_from_slice(&raw_data[NEEDLE_HEADER_SIZE..end])
@@ -1061,21 +1063,27 @@ impl Volume {
     /// Returns the number of dirty needles that were materialised.
     pub fn flush_needles_durable(&self, needle_ids: &[NeedleId]) -> Result<usize> {
         let mut flush_err: Option<PowerFsError> = None;
-        let n = self.coalescer.flush_specific(needle_ids, |id, vec, is_new| {
-            if flush_err.is_some() {
-                // Keep draining remaining entries even after a failure so the
-                // coalescer does not leak them, but remember the first error.
-                let _ = self.flush_coalescer_entry(id, vec, is_new);
-                return Err(());
-            }
-            let log_id = id.clone();
-            if let Err(e) = self.flush_coalescer_entry(id, vec, is_new) {
-                log::error!("flush_needles_durable: materialise needle {:?} failed: {}", log_id, e);
-                flush_err = Some(e);
-                return Err(());
-            }
-            Ok(())
-        });
+        let n = self
+            .coalescer
+            .flush_specific(needle_ids, |id, vec, is_new| {
+                if flush_err.is_some() {
+                    // Keep draining remaining entries even after a failure so the
+                    // coalescer does not leak them, but remember the first error.
+                    let _ = self.flush_coalescer_entry(id, vec, is_new);
+                    return Err(());
+                }
+                let log_id = id.clone();
+                if let Err(e) = self.flush_coalescer_entry(id, vec, is_new) {
+                    log::error!(
+                        "flush_needles_durable: materialise needle {:?} failed: {}",
+                        log_id,
+                        e
+                    );
+                    flush_err = Some(e);
+                    return Err(());
+                }
+                Ok(())
+            });
         if let Some(e) = flush_err {
             return Err(e);
         }

@@ -702,7 +702,10 @@ impl VolumeNetHandler {
         .await
         {
             Ok(Ok(n)) => {
-                info!("NET_FLUSH_NEEDLES: volume_id={} materialised {} needles (requested {})", volume_id, n, requested);
+                info!(
+                    "NET_FLUSH_NEEDLES: volume_id={} materialised {} needles (requested {})",
+                    volume_id, n, requested
+                );
                 Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()))
             }
             Ok(Err(e)) => {
