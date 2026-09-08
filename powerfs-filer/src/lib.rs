@@ -16,6 +16,8 @@ pub mod metadata_store;
 pub mod metrics;
 pub mod net_handler;
 pub mod posix_service;
+pub mod readahead_policy;
+pub mod readahead_trace;
 pub mod scrubber;
 pub mod powerfs {
     #![allow(clippy::result_large_err)]

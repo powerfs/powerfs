@@ -633,6 +633,14 @@ pub enum MsgType {
     /// See docs/optimistic-local-create-design.md §4.3
     BatchCreate = 0x003f,
 
+    /// Phase A-1.1: ML readahead IO trace push (kernel → filer).
+    /// Kernel 批量上报 per-inode IO 访问模式, filer 端聚合后供 NN 训练.
+    /// Request: ShardId(u64) + Count(u32) + [TraceEntry]*Count
+    /// TraceEntry: Ino(u64)+Placement(u8)+FileSize(u64)+Offsets[16](u16)+
+    ///             Kinds[16](u8)+SeqRun(u16)+RandRun(u16)
+    /// Response: Status only.
+    PushIoTrace = 0x0041,
+
     // Status
     StatFs = 0x0040,
 
@@ -932,6 +940,7 @@ impl MsgType {
             0x003e => Some(Self::BatchUnlink),
             0x003f => Some(Self::BatchCreate),
             0x0040 => Some(Self::StatFs),
+            0x0041 => Some(Self::PushIoTrace),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
             0x0052 => Some(Self::Heartbeat),
