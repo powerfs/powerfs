@@ -781,6 +781,7 @@ fn build_config(
             device_capacity: None,
             advertise_addr: Some(ip.to_string()),
             lease_enabled: true,
+            force_sync_on_write: false,
             registration_token: None,
             ca_crt: None,
             client_crt: None,

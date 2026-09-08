@@ -125,6 +125,23 @@ pub struct VolumeConfig {
     /// enforced by the Filer's lock_arbiter (§13 Cap model) instead.
     #[serde(default = "default_true")]
     pub lease_enabled: bool,
+    /// Durability mode for write_needle:
+    /// - `false` (default): write acks after data reaches volume server's
+    ///   memory/page cache, no fsync. Persistence is delegated to the backend
+    ///   (NVMe-oF target 盘阵 guarantees; local fsync happens lazily via
+    ///   `sync_volume` on close/fsync). Maximises write throughput.
+    /// - `true`: every write_needle calls sync_data() before ack, forcing
+    ///   platters/NAND flush. Use only when the backend is a local disk
+    ///   without battery-backed cache or NVMe-oF guarantee, and correctness
+    ///   demands immediate durability. Costs ~10-100× write latency.
+    #[serde(default)]
+    pub force_sync_on_write: bool,
+    /// 后台 WAL 空闲 fsync 间隔（秒）。后台线程每隔此时间检查一次：
+    /// 若自上次 fsync 后有新写入（无锁计数器 > 0），则 fsync WAL；
+    /// 若无新写入则跳过 fsync，避免无意义的全量 WAL 刷新。
+    /// 缺省 30 秒。仅在 force_sync_on_write=false 时生效（true 时每次写已 fsync）。
+    #[serde(default = "default_wal_idle_sync_secs")]
+    pub wal_idle_sync_secs: u64,
     /// Registration token for authenticating with the master on KeepConnected.
     /// Must match the master's expected token; empty = no auth (dev only).
     #[serde(default)]
@@ -1134,4 +1151,9 @@ fn default_initial_volume_count() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+/// 后台 WAL 空闲 fsync 间隔缺省值：30 秒
+fn default_wal_idle_sync_secs() -> u64 {
+    30
 }

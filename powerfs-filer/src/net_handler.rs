@@ -3931,7 +3931,7 @@ impl FilerNetHandler {
                     .find(|e| e.ino == *ino)
                     .map(|e| (e.seq_run, e.rand_run))
                     .unwrap_or((0, 0));
-                log::info!(
+                log::debug!(
                     "FILER_IO_TRACE_FEATURES: ino={} iops={:.1} offset_cma={:.1} \
                      delta_mean={:.1} size={} readahead_mb={} [seq_run={} rand_run={}]",
                     ino,
@@ -3981,7 +3981,7 @@ impl FilerNetHandler {
             }
         });
 
-        log::info!("FILER_NET_PUSH_IO_TRACE: received {} trace entries", count);
+        log::debug!("FILER_NET_PUSH_IO_TRACE: received {} trace entries", count);
         Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
     }
 
