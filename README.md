@@ -34,7 +34,10 @@ Unified POSIX / S3 / KV cache in a single cluster — eliminating the three-stac
 
 PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency + Cap model distributed locking, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
 
-![3-Layer Decoupled Architecture](docs/architecture.png)
+[![3-Layer Decoupled Architecture](docs/architecture.png)](https://www.powerfs.org/architecture)
+
+> 👆 **Click the image above** for the interactive architecture page with layer breakdowns, Rust code examples (FilerEntry / StripeLease), Callback Invalidation subscription table, and dual-consistency deep dive.
+> Visit **[www.powerfs.org/architecture](https://www.powerfs.org/architecture)** for the full story.
 
 **Control Plane / Data Plane Separation**: the three layers can scale independently — Volume nodes handle raw data throughput, Filer Raft shards scale metadata concurrency via horizontal bucket sharding, and Master handles cluster management with HA failover.
 
