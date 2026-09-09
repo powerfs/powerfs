@@ -1,27 +1,53 @@
 # =============================================================================
 # PowerFS 硬件 RDMA 传输测试 — 独立 compose 文件 (非覆盖)
 # =============================================================================
-# 用法:
-#   # 1. 先停止 TCP 服务 (避免端口冲突)
-#   docker compose -f docker-compose.yml down
-#   # 2. 启动硬件 RDMA 服务 (host 网络模式)
+# 用法 (推荐): 通过 kernel/vm/qemuctl.sh 一键启动 (自动处理证书):
+#   cd kernel/vm
+#   1. bash qemuctl.sh build                  # 编译 ko + initramfs (WRITE_PREDICT=y)
+#   2. bash qemuctl.sh service start --rdma   # 启动服务 + auto cert generate + restart 存储节点
+#   3. bash qemuctl2.sh start                 # 启动 2 台 QEMU VM
+#   4. bash qemuctl2.sh mount vm1             # VM mount (自动从 9p share 同步最新证书)
+#
+# 手动启动:
+#   # 1. 先停 TCP 服务 (端口冲突)
+#   cd docker && docker compose -f docker-compose.yml down
+#   # 2. 启动 RDMA 服务 (master 启动, 但 filer/volume 会因无证书 rejected)
 #   docker compose -f docker-compose.rdma.yml up -d
+#   # 3. 生成证书 (master 启动后)
+#   cd .. && bash scripts/generate-certs.sh --topology single
+#   # 4. 关键: restart filer + 3 volume 让它们重新加载 leaf 证书
+#   cd docker && docker compose -f docker-compose.rdma.yml restart filer-1 volume-1 volume-2 volume-3
+#   # 5. 启动 VM + mount (见 kernel/vm/qemuctl2.sh)
+#   cd kernel/vm && bash qemuctl2.sh start && bash qemuctl2.sh mount vm1
 #
 # 架构:
 #   - 所有服务使用 network_mode: host (共享宿主机 netns)
+#   - 单节点 master (9333/9334) + 单节点 filer (8888/8900/9336)
+#   - **三 volume** (8080/8081/8082 + 8901/8902/8903) — 单 master + 单 filer + 3 volume, 共 12 initial volumes
 #   - Redis 复用 bridge 网络 (172.30.0.50), host 网络可直接访问
-#   - 硬件 RDMA: mlx5_1 (ConnectX-5, IB 端口 ACTIVE, LID=1)
-#   - IPoIB: ibp160s0f1, IP 192.168.100.1/24
-#   - 单节点 master/volume/filer (功能验证, 非 HA)
-#   - 服务地址: 192.168.100.1 (IPoIB)
+#   - 硬件 RDMA: mlx5_1, IPoIB ibp160s0f1 192.168.100.3/24
+#   - VM VF: mlx5_1 virtfn0/virtfn1 → VM ib0 192.168.100.100/101
+#
+# host 网络端口规划 (必须全部唯一):
+#   master-1 :  9333 (TCP), 9334 (net), 9335 (raft), 9300 (metrics)
+#   volume-1 :  8080 (grpc), 8091 (http), 8901 (net/RDMA)
+#   volume-2 :  8081 (grpc), 8092 (http), 8902 (net/RDMA)
+#   volume-3 :  8082 (grpc), 8093 (http), 8903 (net/RDMA)
+#   filer-1  :  8888 (HTTP), 8889 (gRPC), 8900 (metrics), 9336 (net/RDMA)
+#   redis    :  172.30.0.50:6379 (bridge)
+#
+# RDMA 队列参数 (powerfs-net/src/transport_rdma.rs + transport.rs):
+#   Rust 客户端 CQ depth   32→128, max_send_wr 16→64, max_recv_wr 16→64
+#   Rust 服务端 CQ depth   64→256, max_send_wr 16→64, max_recv_wr 32→64
+#   服务端 PRE_POST_N      24→48, 客户端 pre_post_recv 16→32
+#   TransportConfig 默认   rdma_buf_num 32→128 (MR pool 256MB/conn)
+#   调参公式: CQ ≥ 2×(send_wr+recv_wr), QP depth ≥ 2×kernel burst, PRE_POST ≥ kernel_burst × 1.5
+#   改完必须重编 cargo + restart volume/filer (见 scripts/README.md "RDMA 队列参数表")
 #
 # 前置条件:
-#   1. GRUB: intel_iommu=on iommu=pt (已配置, 需重启生效)
-#   2. sudo modprobe ib_umad ib_uverbs
-#   3. sudo systemctl restart opensm
-#   4. 验证: cat /sys/class/infiniband/mlx5_1/ports/1/state → ACTIVE
-#   5. IPoIB: sudo ip addr add 192.168.100.1/24 dev ibp160s0f1
-#   6. SR-IOV VF 已直通给 QEMU VM (vfio-pci)
+#   1. GRUB: intel_iommu=on iommu=pt
+#   2. mlx5_1 端口 ACTIVE (ibp160s0f1 已有 192.168.100.3)
+#   3. SR-IOV VF 已直通给 QEMU VM (vfio-pci)
 # =============================================================================
 
 # Redis 复用 bridge 网络 (单独定义, 不受 host 网络影响)
@@ -89,9 +115,43 @@ services:
     network_mode: host
     <<: *rdma-common
     volumes:
-      - volume-rdma-data:/data
+      - volume-rdma-data-1:/data
       - ./certs-default:/etc/powerfs/certs:ro
       - ./config/rdma-host/volume.toml:/app/config/volume.toml:ro
+      - ../target/release/powerfs-volume:/app/powerfs-volume:ro
+    command: ["/app/powerfs-volume", "--config", "/app/config/volume.toml"]
+    depends_on:
+      - redis
+      - master-1
+    logging: *default-logging
+
+  volume-2:
+    image: powerfs:latest
+    container_name: volume-2
+    restart: unless-stopped
+    network_mode: host
+    <<: *rdma-common
+    volumes:
+      - volume-rdma-data-2:/data
+      - ./certs-default:/etc/powerfs/certs:ro
+      - ./config/rdma-host/volume-2.toml:/app/config/volume.toml:ro
+      - ../target/release/powerfs-volume:/app/powerfs-volume:ro
+    command: ["/app/powerfs-volume", "--config", "/app/config/volume.toml"]
+    depends_on:
+      - redis
+      - master-1
+    logging: *default-logging
+
+  volume-3:
+    image: powerfs:latest
+    container_name: volume-3
+    restart: unless-stopped
+    network_mode: host
+    <<: *rdma-common
+    volumes:
+      - volume-rdma-data-3:/data
+      - ./certs-default:/etc/powerfs/certs:ro
+      - ./config/rdma-host/volume-3.toml:/app/config/volume.toml:ro
       - ../target/release/powerfs-volume:/app/powerfs-volume:ro
     command: ["/app/powerfs-volume", "--config", "/app/config/volume.toml"]
     depends_on:
@@ -115,10 +175,14 @@ services:
       - redis
       - master-1
       - volume-1
+      - volume-2
+      - volume-3
     logging: *default-logging
 
 volumes:
   redis-data:
   master-rdma-data:
-  volume-rdma-data:
+  volume-rdma-data-1:
+  volume-rdma-data-2:
+  volume-rdma-data-3:
   filer-rdma-data:
