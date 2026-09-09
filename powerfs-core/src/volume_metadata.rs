@@ -263,12 +263,14 @@ impl VolumeMetadata {
     }
 
     /// 启动时重建 allocation 统计：扫描 needles CF + deleted CF
-    /// 返回 (used_bytes, append_offset, active_count, deleted_count)
+    /// 返回 (used_bytes, append_offset, active_count, deleted_count, garbage_bytes)
     ///
     /// used_bytes: 活跃 needle 总大小（逻辑空间使用，删除后已回收）
     /// append_offset: 物理文件末尾（包括 deleted needle 的 hole，append-only）
+    /// garbage_bytes: 物理垃圾 = 物理已用区间 - 活跃 needle 字节，
+    ///   即删除 hole + 覆写/重试遗留的孤儿副本，只能由 compact 回收。
     /// free_bytes = volume_size - used_bytes（逻辑可用空间）
-    pub fn rebuild_allocation_stats(&self) -> Result<(u64, u64, u64, u64)> {
+    pub fn rebuild_allocation_stats(&self) -> Result<(u64, u64, u64, u64, u64)> {
         use powerfs_common::constants::{
             NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET,
         };
@@ -302,7 +304,18 @@ impl VolumeMetadata {
             }
         }
 
-        Ok((used_bytes, max_end, active_count, deleted_count))
+        // 物理垃圾 = 物理文件已用区间 - 存活 needle 字节。
+        // 存活 needle 可能因碎片不连续排布，差值即删除 hole + 覆写孤儿副本。
+        let physical_span = max_end.saturating_sub(VOLUME_DATA_OFFSET);
+        let garbage_bytes = physical_span.saturating_sub(used_bytes);
+
+        Ok((
+            used_bytes,
+            max_end,
+            active_count,
+            deleted_count,
+            garbage_bytes,
+        ))
     }
 
     /// GC 清理：永久删除 deleted CF 中已过期的条目，返回清理数量
@@ -376,6 +389,10 @@ impl VolumeMetadata {
             use powerfs_common::constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE};
             let old_total =
                 (NEEDLE_HEADER_SIZE as u64) + (old.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
+            // append-only：旧物理副本不会被覆盖，新副本追加在 append_offset，
+            // 旧副本成为不可复用的物理垃圾，计入 garbage_bytes 供 compact 回收。
+            // （客户端重试/重发同一 needle、inline 迁移后 writeback 重写等都会走到这里。）
+            stats.garbage_bytes = stats.garbage_bytes.saturating_add(old_total);
             if data_size > old_total {
                 stats.used_bytes += data_size - old_total;
             } else if data_size < old_total {
@@ -465,6 +482,8 @@ impl VolumeMetadata {
             let needle_size =
                 (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
             stats.used_bytes = stats.used_bytes.saturating_sub(needle_size);
+            // 物理副本成为 hole，计入 garbage_bytes 供 compact 回收
+            stats.garbage_bytes = stats.garbage_bytes.saturating_add(needle_size);
             stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
             stats.active_count = stats.active_count.saturating_sub(1);
             stats.deleted_count += 1;
@@ -532,6 +551,8 @@ impl VolumeMetadata {
             let needle_size =
                 (NEEDLE_HEADER_SIZE as u64) + (info.data_size as u64) + (NEEDLE_FOOTER_SIZE as u64);
             stats.used_bytes = stats.used_bytes.saturating_add(needle_size);
+            // 与 delete 对称：物理副本重新成为存活数据，从 garbage 中扣减
+            stats.garbage_bytes = stats.garbage_bytes.saturating_sub(needle_size);
             stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
             stats.active_count += 1;
             stats.deleted_count = stats.deleted_count.saturating_sub(1);
@@ -582,6 +603,8 @@ impl VolumeMetadata {
         stats.append_offset = new_append_offset;
         stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
         stats.deleted_count = 0;
+        // 所有物理垃圾（删除 hole + 覆写孤儿副本）已随 truncate 回收
+        stats.garbage_bytes = 0;
         stats.last_modified_at = Utc::now().timestamp();
 
         let alloc_data = serde_json::to_vec(&stats)
@@ -734,6 +757,12 @@ impl VolumeMetadata {
         }
 
         stats.free_bytes = volume_size.saturating_sub(stats.used_bytes);
+        // 物理垃圾 = 扫描到的物理区间 - 存活（最新版本）needle 字节，
+        // 即数据文件中所有被覆写的旧版本副本。
+        stats.garbage_bytes = stats
+            .append_offset
+            .saturating_sub(powerfs_common::constants::VOLUME_DATA_OFFSET)
+            .saturating_sub(stats.used_bytes);
         stats.last_modified_at = Utc::now().timestamp();
         self.put_allocation(&stats)?;
 
@@ -947,6 +976,110 @@ mod tests {
         let stats = meta.get_allocation().unwrap();
         assert_eq!(stats.active_count, 0);
         assert_eq!(stats.deleted_count, 1);
+    }
+
+    /// 构造测试用 NeedleInfo（data_size=100, 总物理大小 120）
+    fn make_needle_info(id: u64, offset: u64) -> NeedleInfo {
+        NeedleInfo {
+            id: NeedleId(id),
+            volume_id: VolumeId(1),
+            data_size: 100,
+            offset,
+            checksum: 12345,
+            checksum_algorithm: ChecksumAlgorithm::CRC32C,
+            last_verified_at: None,
+            verification_count: 0,
+            deleted_at: None,
+            delete_retention_until: None,
+            worm_retention_until: None,
+            created_at: Utc::now(),
+            ec_enabled: false,
+            ec_k: None,
+            ec_m: None,
+            ec_shards: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_garbage_accounting_overwrite_delete_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = VolumeMetadata::open(dir.path()).unwrap();
+        let volume_size = 1024 * 1024 * 1024u64;
+        // data_size=100 -> physical needle size = 12 (header) + 100 + 8 (footer)
+        let needle_total = 120u64;
+
+        // 首次写入：无垃圾
+        meta.write_needle_atomic(&make_needle_info(1, 0), needle_total, volume_size)
+            .unwrap();
+        // 覆写同一 needle：旧副本成为垃圾
+        meta.write_needle_atomic(
+            &make_needle_info(1, needle_total),
+            needle_total,
+            volume_size,
+        )
+        .unwrap();
+        let stats = meta.get_allocation().unwrap();
+        assert_eq!(
+            stats.garbage_bytes, needle_total,
+            "overwrite must account old copy as garbage"
+        );
+        assert_eq!(stats.used_bytes, needle_total, "logical used unchanged");
+        assert_eq!(stats.append_offset, 2 * needle_total);
+
+        // 删除：物理 hole 再计入一份垃圾
+        meta.delete_needle_atomic(&NeedleId(1), volume_size)
+            .unwrap();
+        let stats = meta.get_allocation().unwrap();
+        assert_eq!(
+            stats.garbage_bytes,
+            2 * needle_total,
+            "delete adds physical hole to garbage"
+        );
+        // 恢复：与 delete 对称扣减
+        meta.restore_needle_atomic(&NeedleId(1), volume_size)
+            .unwrap();
+        let stats = meta.get_allocation().unwrap();
+        assert_eq!(
+            stats.garbage_bytes, needle_total,
+            "restore subtracts garbage symmetrically"
+        );
+        // compact 清理：垃圾归零
+        meta.compact_cleanup(needle_total, volume_size).unwrap();
+        let stats = meta.get_allocation().unwrap();
+        assert_eq!(stats.garbage_bytes, 0, "compact must reset garbage to zero");
+    }
+
+    #[test]
+    fn test_rebuild_stats_counts_overwrite_garbage() {
+        use powerfs_common::constants::VOLUME_DATA_OFFSET;
+        let dir = tempfile::tempdir().unwrap();
+        let meta = VolumeMetadata::open(dir.path()).unwrap();
+        let volume_size = 1024 * 1024 * 1024u64;
+        let needle_total = 120u64;
+
+        // 模拟 append-only：同一 needle 两个物理版本（旧版本不在索引中）
+        meta.write_needle_atomic(
+            &make_needle_info(1, VOLUME_DATA_OFFSET),
+            needle_total,
+            volume_size,
+        )
+        .unwrap();
+        meta.write_needle_atomic(
+            &make_needle_info(1, VOLUME_DATA_OFFSET + needle_total),
+            needle_total,
+            volume_size,
+        )
+        .unwrap();
+
+        let (used, end, active, deleted, garbage) = meta.rebuild_allocation_stats().unwrap();
+        assert_eq!(active, 1);
+        assert_eq!(deleted, 0);
+        assert_eq!(used, needle_total, "only the live version counts as used");
+        assert_eq!(end, VOLUME_DATA_OFFSET + 2 * needle_total);
+        assert_eq!(
+            garbage, needle_total,
+            "orphaned old version counted as garbage"
+        );
     }
 
     #[test]

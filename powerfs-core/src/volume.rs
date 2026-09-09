@@ -137,10 +137,18 @@ impl Volume {
             Err(e) => return Err(backend_err(e)),
         }
 
-        let (used, _next_offset, active_count, deleted_count) = index.rebuild_allocation_stats()?;
+        let (used, physical_end, active_count, deleted_count, _rebuilt_garbage) =
+            index.rebuild_allocation_stats()?;
 
         // 同步 RocksDB allocation CF（启动时确保一致性）
-        Self::sync_allocation_from_index(&index, used, size, active_count, deleted_count)?;
+        Self::sync_allocation_from_index(
+            &index,
+            used,
+            physical_end,
+            size,
+            active_count,
+            deleted_count,
+        )?;
 
         let info = VolumeInfo {
             id,
@@ -184,38 +192,60 @@ impl Volume {
     fn sync_allocation_from_index(
         index: &VolumeMetadata,
         rebuilt_used: u64,
+        rebuilt_physical_end: u64,
         volume_size: u64,
         active_count: u64,
         deleted_count: u64,
     ) -> Result<()> {
         let stats = index.get_allocation()?;
         let rebuilt_free = volume_size.saturating_sub(rebuilt_used);
+        // 物理末尾取 allocation CF 记录值与索引重建值的较大者：
+        // CF 的 append_offset 累计了所有追加（含已被 purge 的删除副本），
+        // 索引重建的 max_end 覆盖存活 + deleted CF 中的 needle。
+        // 注意绝不能用 rebuilt_used + VOLUME_DATA_OFFSET 作为追加位置——
+        // 碎片情况下存活 needle 可以分布在更高偏移，那样会覆写存活数据。
+        let physical_end = stats
+            .append_offset
+            .max(rebuilt_physical_end)
+            .max(VOLUME_DATA_OFFSET);
+        // 物理垃圾 = 物理已用区间 - 存活 needle 字节（删除 hole + 覆写孤儿副本）
+        let rebuilt_garbage = physical_end
+            .saturating_sub(VOLUME_DATA_OFFSET)
+            .saturating_sub(rebuilt_used);
 
-        // 如果 allocation CF 为空（首次启动）或统计不匹配（crash 恢复），则更新
+        // 如果 allocation CF 为空（首次启动）、统计不匹配（crash 恢复/版本升级），
+        // 或 garbage_bytes / append_offset 需要校正，则更新
         if stats.used_bytes != rebuilt_used
             || stats.free_bytes != rebuilt_free
             || stats.active_count != active_count
             || stats.deleted_count != deleted_count
+            || stats.append_offset != physical_end
+            || stats.garbage_bytes != rebuilt_garbage
         {
             log::info!(
-                "Syncing allocation CF: rocksdb used={} free={} active={} deleted={} -> rebuilt used={} free={} active={} deleted={}",
+                "Syncing allocation CF: rocksdb used={} free={} active={} deleted={} garbage={} offset={} -> rebuilt used={} free={} active={} deleted={} garbage={} offset={}",
                 stats.used_bytes,
                 stats.free_bytes,
                 stats.active_count,
                 stats.deleted_count,
+                stats.garbage_bytes,
+                stats.append_offset,
                 rebuilt_used,
                 rebuilt_free,
                 active_count,
-                deleted_count
+                deleted_count,
+                rebuilt_garbage,
+                physical_end
             );
 
             let new_stats = powerfs_common::volume_config::AllocationStats {
                 used_bytes: rebuilt_used,
                 free_bytes: rebuilt_free,
                 next_needle_id: stats.next_needle_id,
-                append_offset: rebuilt_used + VOLUME_DATA_OFFSET,
+                append_offset: physical_end,
                 active_count,
                 deleted_count,
+                garbage_bytes: rebuilt_garbage,
                 last_modified_at: Utc::now().timestamp(),
             };
             index.put_allocation(&new_stats)?;
@@ -273,12 +303,27 @@ impl Volume {
         merged: Vec<u8>,
         is_new_needle: bool,
     ) -> Result<()> {
+        // 外部刷盘（后台 coalescer 线程 / 强制 flush）若撞上 compact，等待其完成：
+        // compact 会 truncate 数据文件，期间追加可能被截断丢失。
+        if self.compacting.load(Ordering::SeqCst) {
+            for _ in 0..600 {
+                if !self.compacting.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if self.compacting.load(Ordering::SeqCst) {
+                return Err(PowerFsError::Internal(
+                    "Volume is compacting, retry later".to_string(),
+                ));
+            }
+        }
         let data = Bytes::from(merged);
         if is_new_needle {
             // No index entry yet — first write.  write_needle uses the
             // needle_id = file_key convention already; just pass `data` with
             // the full (possibly zero-padded) logical payload.
-            let write_res = self.write_needle(needle_id.0, data);
+            let write_res = self.write_needle_nowait(needle_id.0, data);
             match write_res {
                 Ok(_ni) => Ok(()),
                 Err(e) => Err(e),
@@ -292,7 +337,8 @@ impl Volume {
                 None => {
                     // Race (index was deleted since dirty buffer was
                     // created).  Fall back to writing as a brand-new needle.
-                    self.write_needle(needle_id.0, data)?;
+                    // compacting 已在入口等待，直接走 nowait。
+                    self.write_needle_nowait(needle_id.0, data)?;
                     return Ok(());
                 }
             };
@@ -310,7 +356,30 @@ impl Volume {
         Ok(())
     }
 
+    /// 外部写入口：若 volume 正在 compact 则短暂等待（compact 会重写存活 needle
+    /// 并 truncate 数据文件，并发追加可能被截断且索引仍指向已失效偏移）。
+    /// compact 自身的 coalescer flush 走 write_needle_nowait 以避免自死锁。
     pub fn write_needle(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
+        if self.compacting.load(Ordering::SeqCst) {
+            for _ in 0..600 {
+                if !self.compacting.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if self.compacting.load(Ordering::SeqCst) {
+                return Err(PowerFsError::Internal(
+                    "Volume is compacting, retry later".to_string(),
+                ));
+            }
+        }
+        self.write_needle_nowait(file_key, data)
+    }
+
+    /// 实际追加逻辑（不检查 compacting）。仅在以下场景直接调用：
+    /// - write_needle（外部入口，已完成等待）
+    /// - compact_inner 起始的 coalescer flush_all（此时 compacting=true 是自身）
+    fn write_needle_nowait(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
         let mut info_guard = self.info.write().unwrap();
         if info_guard.state != VolumeState::Available {
             return Err(PowerFsError::InvalidVolumeState(
@@ -337,6 +406,25 @@ impl Volume {
         self.coalescer.invalidate(&needle_id);
         let needle =
             Needle::new_with_algorithm(needle_id.clone(), volume_id, data, self.checksum_algorithm);
+
+        // 幂等写入：相同 needle_id 已存在且内容（长度 + checksum）完全一致时，
+        // 跳过追加。覆盖客户端重试/重发场景（如 RDMA 重连后的 RPC replay、
+        // 超时后重发）——append-only 存储中重复追加会产生永久孤儿副本。
+        // checksum 算法为卷级固定，同算法同长度同 checksum 即内容一致。
+        if let Some(existing) = self.index.get(&needle_id) {
+            if existing.deleted_at.is_none()
+                && existing.data_size as usize == needle.data.len()
+                && existing.checksum == needle.checksum
+            {
+                log::debug!(
+                    "write_needle: needle {} identical to existing (len={}, checksum={:#x}), skip append",
+                    needle_id.0,
+                    needle.data.len(),
+                    needle.checksum
+                );
+                return Ok(existing);
+            }
+        }
 
         let required_space = needle.size() as u64;
         let volume_size = info_guard.size;
@@ -637,9 +725,20 @@ impl Volume {
     }
 
     fn compact_inner(&self) -> Result<(u64, u64)> {
-        // 开始前先 flush coalescer，避免 dirty 数据与 compact 冲突
+        // 开始前先 flush coalescer，避免 dirty 数据与 compact 冲突。
+        // 注意：compacting 标志已由 compact() 置位，此处必须走 nowait 路径
+        // （write_needle_nowait / append_needle_version），否则会自我等待死锁。
         self.coalescer.flush_all(|id, vec, is_new| {
-            self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
+            let data = Bytes::from(vec);
+            let res = if is_new {
+                self.write_needle_nowait(id.0, data).map(|_| ())
+            } else {
+                match self.index.get(&id) {
+                    Some(old) => self.append_needle_version(id, data, old),
+                    None => self.write_needle_nowait(id.0, data).map(|_| ()),
+                }
+            };
+            res.map_err(|_| ())
         });
 
         let mut active_needles: Vec<NeedleInfo> = Vec::new();
@@ -714,7 +813,14 @@ impl Volume {
         self.compacting.load(Ordering::SeqCst)
     }
 
-    /// 检查是否应该触发 compact（deleted 比例超过阈值）
+    /// 检查是否应该触发 compact。
+    ///
+    /// 两个触发条件（任一满足即可）：
+    /// 1. 删除墓碑比例：deleted_count / (active + deleted) > 30%（历史行为）；
+    /// 2. 物理垃圾比例：garbage_bytes（覆写/重试孤儿副本 + 删除 hole）占物理已用
+    ///    区间 > 30%，且绝对量 ≥ 32MB。该条件覆盖"无文件删除、只有反复覆写/重发"
+    ///    的工作负载（fio randwrite、客户端重试、inline 迁移重写等）——这类负载
+    ///    不产生 deleted 墓碑，旧逻辑永远不会触发 compact，物理文件单调膨胀。
     pub fn should_compact(&self) -> bool {
         let stats = match self.index.get_allocation() {
             Ok(s) => s,
@@ -723,13 +829,27 @@ impl Volume {
         if stats.active_count == 0 {
             return false;
         }
-        // 当 deleted_count 占总 needle 比例超过 30% 时触发
+
+        // 条件 1：删除墓碑比例
         let total = stats.active_count + stats.deleted_count;
-        if total == 0 {
-            return false;
-        }
-        let deleted_ratio = stats.deleted_count as f64 / total as f64;
-        deleted_ratio > 0.3
+        let deleted_trigger = if total == 0 {
+            false
+        } else {
+            let deleted_ratio = stats.deleted_count as f64 / total as f64;
+            deleted_ratio > 0.3
+        };
+
+        // 条件 2：物理垃圾比例
+        const COMPACT_MIN_GARBAGE_BYTES: u64 = 32 * 1024 * 1024;
+        let physical_span = stats.append_offset.saturating_sub(VOLUME_DATA_OFFSET);
+        let garbage_trigger = if physical_span > 0 {
+            stats.garbage_bytes >= COMPACT_MIN_GARBAGE_BYTES
+                && (stats.garbage_bytes as f64 / physical_span as f64) > 0.3
+        } else {
+            false
+        };
+
+        deleted_trigger || garbage_trigger
     }
 
     fn append_needle_version(
@@ -744,6 +864,8 @@ impl Volume {
                 "volume not available".to_string(),
             ));
         }
+        // 调用方负责 compacting 等待（flush_coalescer_entry 入口统一等待；
+        // compact 自身的 flush_all 不受此限）。
 
         let new_needle = Needle::new_with_algorithm(
             needle_id.clone(),
@@ -753,6 +875,20 @@ impl Volume {
         );
         let new_size = new_needle.size() as u64;
         let volume_size = info_guard.size;
+
+        // 幂等：合并后的内容与磁盘上当前版本完全一致（长度 + checksum）时跳过追加。
+        // 场景：coalescer 合并后内容未变化的重复 flush / 重发，避免孤儿副本。
+        if old_info.deleted_at.is_none()
+            && old_info.data_size as usize == new_needle.data.len()
+            && old_info.checksum == new_needle.checksum
+        {
+            log::debug!(
+                "append_needle_version: needle {} identical to on-disk version (checksum={:#x}), skip append",
+                needle_id.0,
+                new_needle.checksum
+            );
+            return Ok(());
+        }
 
         // 从 RocksDB allocation CF 读取当前分配状态
         let alloc_stats = self.index.get_allocation()?;
@@ -1060,7 +1196,8 @@ impl Volume {
                 if let Err(e) = self.flush_coalescer_entry(id, vec, is_new) {
                     log::error!(
                         "flush_specific_needles: materialise needle {:?} failed: {}",
-                        log_id, e
+                        log_id,
+                        e
                     );
                     return Err(());
                 }

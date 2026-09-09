@@ -754,6 +754,97 @@ fn test_compact_empty_volume() {
 }
 
 #[test]
+fn test_overwrite_garbage_accounting_and_compact() {
+    use powerfs_common::constants::{NEEDLE_FOOTER_SIZE, NEEDLE_HEADER_SIZE, VOLUME_DATA_OFFSET};
+
+    let (_dir, volume) = create_test_volume(1, 512 * 1024 * 1024);
+    let chunk = 32 * 1024 * 1024;
+    let needle_total = (NEEDLE_HEADER_SIZE + chunk + NEEDLE_FOOTER_SIZE) as u64;
+
+    volume
+        .write_needle(1, Bytes::from(vec![0xAAu8; chunk]))
+        .unwrap();
+    let s1 = volume.index().get_allocation().unwrap();
+    assert_eq!(s1.garbage_bytes, 0, "fresh write leaves no garbage");
+
+    // Overwrite the SAME needle id with different content: append-only storage
+    // appends a new copy; the old physical copy becomes reclaimable garbage.
+    volume
+        .write_needle(1, Bytes::from(vec![0xBBu8; chunk]))
+        .unwrap();
+    let s2 = volume.index().get_allocation().unwrap();
+    assert_eq!(
+        s2.garbage_bytes, needle_total,
+        "overwritten physical copy must be accounted as garbage"
+    );
+    assert!(s2.append_offset > s1.append_offset, "append must advance");
+    assert_eq!(
+        s2.used_bytes, s1.used_bytes,
+        "logical used unchanged (same size)"
+    );
+    assert_eq!(s2.deleted_count, 0, "no file deletes happened");
+    assert!(
+        volume.should_compact(),
+        "should_compact must trigger on physical garbage even without delete tombstones"
+    );
+
+    let (reclaimed, _moved) = volume.compact().unwrap();
+    assert!(reclaimed > 0, "compact must reclaim the orphaned old copy");
+    let s3 = volume.index().get_allocation().unwrap();
+    assert_eq!(s3.garbage_bytes, 0, "garbage must be zero after compact");
+    assert_eq!(
+        s3.append_offset,
+        s3.used_bytes + VOLUME_DATA_OFFSET,
+        "physical file must be truncated to live data"
+    );
+
+    // Data integrity: newest version readable
+    let data = volume.read_needle(&NeedleId(1)).unwrap();
+    assert_eq!(data.len(), chunk);
+    assert_eq!(data[0], 0xBB);
+}
+
+#[test]
+fn test_idempotent_identical_write_skips_append() {
+    let (_dir, volume) = create_test_volume(1, 64 * 1024 * 1024);
+    let payload = vec![0x42u8; 1024 * 1024];
+
+    volume
+        .write_needle(7, Bytes::from(payload.clone()))
+        .unwrap();
+    let s1 = volume.index().get_allocation().unwrap();
+
+    // Identical re-send (client retry / replay) must not append another copy.
+    volume
+        .write_needle(7, Bytes::from(payload.clone()))
+        .unwrap();
+    let s2 = volume.index().get_allocation().unwrap();
+    assert_eq!(
+        s2.append_offset, s1.append_offset,
+        "identical write must not advance append_offset"
+    );
+    assert_eq!(
+        s2.garbage_bytes, 0,
+        "identical write must not create garbage"
+    );
+    assert_eq!(s2.used_bytes, s1.used_bytes);
+
+    // Different content for same id appends and accounts the old copy as garbage.
+    volume
+        .write_needle(7, Bytes::from(vec![0x43u8; 1024 * 1024]))
+        .unwrap();
+    let s3 = volume.index().get_allocation().unwrap();
+    assert!(
+        s3.append_offset > s2.append_offset,
+        "changed content must append"
+    );
+    assert!(s3.garbage_bytes > 0, "old copy must be garbage");
+
+    let data = volume.read_needle(&NeedleId(7)).unwrap();
+    assert_eq!(data[0], 0x43);
+}
+
+#[test]
 fn test_storage_manager_compact_volume() {
     use powerfs_common::types::NodeId;
     use powerfs_core::storage::StorageManager;
