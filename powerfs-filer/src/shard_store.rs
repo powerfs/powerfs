@@ -170,6 +170,11 @@ pub struct StoredFileChunk {
     pub volume_id: u64,
     pub crc32: u32,
     pub mtime: u64,
+    /// C-0.4: true if this chunk references an existing needle via
+    /// fingerprint dedup (no new data was written). Used for metrics
+    /// and GC awareness (decrement refcount on chunk removal).
+    #[serde(default)]
+    pub is_reference: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1836,6 +1841,7 @@ impl ShardStore {
                     needle_id,
                     volume_id,
                     crc32: 0,
+                    is_reference: false,
                 });
 
                 // Persist to RocksDB
@@ -3888,6 +3894,7 @@ mod tests {
             needle_id: 200,
             volume_id: 1,
             crc32: 0xDEADBEEF,
+            is_reference: false,
         };
 
         // 初始为空

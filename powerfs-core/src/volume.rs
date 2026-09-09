@@ -439,9 +439,7 @@ impl Volume {
                     }
                     Ok(needle.data)
                 }
-                Err(PowerFsError::InvalidRequest(ref msg))
-                    if msg.contains("size mismatch") =>
-                {
+                Err(PowerFsError::InvalidRequest(ref msg)) if msg.contains("size mismatch") => {
                     // Index data_size disagrees with the needle header on disk.
                     // This can happen during a narrow race in append_needle_version
                     // (put_needle + write_needle_atomic are two separate RocksDB
@@ -459,12 +457,14 @@ impl Volume {
                     log::warn!(
                         "read_needle: size mismatch needle={} offset={} \
                          index_ds={} header_ds={} raw_len={} — using index size",
-                        needle_id.0, info.offset, info.data_size, hdr_ds, raw.len(),
+                        needle_id.0,
+                        info.offset,
+                        info.data_size,
+                        hdr_ds,
+                        raw.len(),
                     );
                     let end = (NEEDLE_HEADER_SIZE + info.data_size as usize).min(raw.len());
-                    Ok(Bytes::copy_from_slice(
-                        &raw[NEEDLE_HEADER_SIZE..end],
-                    ))
+                    Ok(Bytes::copy_from_slice(&raw[NEEDLE_HEADER_SIZE..end]))
                 }
                 Err(e) => Err(e),
             }
@@ -825,15 +825,15 @@ impl Volume {
         // for this needle_id; if yes, skip the backend RMW completely and
         // merge straight into RAM.
         if self.coalescer.is_dirty(&needle_id) {
-            let maybe_flush = self.coalescer.record_write(
+            // record_write 现在总是返回 None（不触发同步 flush），
+            // flush 由后台线程异步执行，写入路径零 IO
+            let _ = self.coalescer.record_write(
                 &needle_id,
                 data_offset,
                 &data[..data_size],
                 data_offset + data_size,
                 None,
             );
-            self.flush_option(maybe_flush)?;
-            self.opportunistic_flush_expired();
             return Ok(());
         }
 
@@ -868,15 +868,15 @@ impl Volume {
             existing_data = None;
         }
 
-        let maybe_flush = self.coalescer.record_write(
+        // record_write 现在总是返回 None（不触发同步 flush），
+        // flush 由后台线程异步执行，写入路径零 IO
+        let _ = self.coalescer.record_write(
             &needle_id,
             data_offset,
             &data[..data_size],
             full_size_hint,
             existing_data,
         );
-        self.flush_option(maybe_flush)?;
-        self.opportunistic_flush_expired();
         Ok(())
     }
 
@@ -905,9 +905,7 @@ impl Volume {
                 info.checksum_algorithm,
             ) {
                 Ok(n) => n.data,
-                Err(PowerFsError::InvalidRequest(ref msg))
-                    if msg.contains("size mismatch") =>
-                {
+                Err(PowerFsError::InvalidRequest(ref msg)) if msg.contains("size mismatch") => {
                     let hdr_ds = if raw_data.len() >= NEEDLE_HEADER_SIZE {
                         u32::from_be_bytes(
                             raw_data[NEEDLE_ID_SIZE..NEEDLE_HEADER_SIZE]
@@ -920,7 +918,11 @@ impl Volume {
                     log::warn!(
                         "read_needle_blob: size mismatch needle={} offset={} \
                          index_ds={} header_ds={} raw_len={} — using index size",
-                        needle_id.0, info.offset, info.data_size, hdr_ds, raw_data.len(),
+                        needle_id.0,
+                        info.offset,
+                        info.data_size,
+                        hdr_ds,
+                        raw_data.len(),
                     );
                     let end = (NEEDLE_HEADER_SIZE + info.data_size as usize).min(raw_data.len());
                     Bytes::copy_from_slice(&raw_data[NEEDLE_HEADER_SIZE..end])
@@ -1047,50 +1049,23 @@ impl Volume {
         })
     }
 
-    /// Durability barrier used by fsync: force-materialise the given needles
-    /// (the file's chunks) out of the in-memory coalescer into the data file
-    /// and RocksDB index, then fsync the RocksDB WAL.
-    ///
-    /// Each materialised needle is written through [`flush_coalescer_entry`],
-    /// which persists the data via the storage backend (`fdatasync` on the data
-    /// file for the local backend) and updates the index.  Unlike the periodic
-    /// flush paths, errors are propagated (an fsync must NOT silently succeed
-    /// if the data could not be made durable).  Needles that are not currently
-    /// dirty are skipped — their latest data is already on stable storage.
-    ///
-    /// Returns the number of dirty needles that were materialised.
-    pub fn flush_needles_durable(&self, needle_ids: &[NeedleId]) -> Result<usize> {
-        let mut flush_err: Option<PowerFsError> = None;
-        let n = self.coalescer.flush_specific(needle_ids, |id, vec, is_new| {
-            if flush_err.is_some() {
-                // Keep draining remaining entries even after a failure so the
-                // coalescer does not leak them, but remember the first error.
-                let _ = self.flush_coalescer_entry(id, vec, is_new);
-                return Err(());
-            }
-            let log_id = id.clone();
-            if let Err(e) = self.flush_coalescer_entry(id, vec, is_new) {
-                log::error!("flush_needles_durable: materialise needle {:?} failed: {}", log_id, e);
-                flush_err = Some(e);
-                return Err(());
-            }
-            Ok(())
-        });
-        if let Some(e) = flush_err {
-            return Err(e);
-        }
-        // Always sync the RocksDB WAL, even when n==0 (nothing materialised
-        // in this call).  The regular coalescer flush paths
-        // (flush_expired_dirty / flush_all_dirty) write the index row via
-        // write_needle_atomic but do NOT sync the WAL — only this fsync-driven
-        // barrier does.  If we skip sync_wal when n==0, a needle that was
-        // already flushed by the regular path has its data file sync'd but
-        // its index row still sitting in the RocksDB WAL buffer in memory.
-        // A volume restart then loses the index row → read returns zeros
-        // even though the data file has the bytes.  fsync semantics require
-        // that ALL prior writes (including those flushed by the background
-        // coalescer) are durable, so we must barrier the WAL unconditionally.
-        self.index.sync_wal()?;
+    /// 轻量级 flush barrier：将指定 needle 从 coalescer 物化到后端数据文件。
+    /// 由 kernel 的 fsync/release 路径通过 FlushNeedles RPC 调用。
+    /// 不 fsync WAL（由后台统一维护线程负责）。
+    pub fn flush_specific_needles(&self, needle_ids: &[NeedleId]) -> Result<usize> {
+        let n = self
+            .coalescer
+            .flush_specific(needle_ids, |id, vec, is_new| {
+                let log_id = id.clone();
+                if let Err(e) = self.flush_coalescer_entry(id, vec, is_new) {
+                    log::error!(
+                        "flush_specific_needles: materialise needle {:?} failed: {}",
+                        log_id, e
+                    );
+                    return Err(());
+                }
+                Ok(())
+            });
         Ok(n)
     }
 
@@ -1104,13 +1079,12 @@ impl Volume {
     /// even when per-entry triggers never fire and no external scheduler
     /// is driving us periodically.
     fn opportunistic_flush_expired(&self) {
-        const FLUSH_EVERY: u32 = 32;
-        let prev = self
+        // 后台统一维护线程（main.rs 中的 BG_FLUSH）每 50ms 扫描所有 volume
+        // 并 flush 过期 needle，写入路径完全不触发 flush，零 IO 阻塞。
+        // op_counter 保留用于统计，但不再触发同步 flush。
+        let _ = self
             .op_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if prev.wrapping_add(1).is_multiple_of(FLUSH_EVERY) {
-            let _ = self.flush_expired_dirty();
-        }
     }
 }
 

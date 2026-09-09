@@ -9,6 +9,7 @@ use powerfs_common::{
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, WriteBatch, DB};
 use serde_json;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// RocksDB Column Family 名称
@@ -24,6 +25,10 @@ const KEY_ALLOCATION: &[u8] = b"allocation_stats";
 /// Volume 元数据管理器 — 封装 RocksDB，提供原子读写操作
 pub struct VolumeMetadata {
     db: Arc<DB>,
+    /// 自上次 WAL fsync 以来的写入计数（无锁）。
+    /// write_needle_atomic 中 fetch_add(1) 累加；
+    /// sync_wal_if_dirty 中读计数，>0 则 flush_wal(true) 并清零。
+    write_counter: AtomicU64,
 }
 
 impl VolumeMetadata {
@@ -50,7 +55,10 @@ impl VolumeMetadata {
 
         info!("VolumeMetadata opened at {:?}", path);
 
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            write_counter: AtomicU64::new(0),
+        })
     }
 
     fn cf_config(&self) -> &ColumnFamily {
@@ -393,6 +401,9 @@ impl VolumeMetadata {
             .write(batch)
             .map_err(|e| PowerFsError::Internal(format!("RocksDB atomic write failed: {}", e)))?;
 
+        // 累加写入计数，供后台空闲 WAL 同步线程判断是否有新写入
+        self.write_counter.fetch_add(1, Ordering::Release);
+
         debug!(
             "Atomic write: needle={}, used={}, free={}, offset={}",
             info.id.0, stats.used_bytes, stats.free_bytes, stats.append_offset
@@ -401,16 +412,23 @@ impl VolumeMetadata {
         Ok(stats)
     }
 
-    /// Force-fsync the RocksDB write-ahead log so all index rows written
-    /// since the last WAL sync survive a power loss.  Called after an
-    /// fsync-driven coalescer flush (the data file itself is already
-    /// `fdatasync`'d by the storage backend) to make the needle→offset
-    /// index durable as well.
-    pub fn sync_wal(&self) -> Result<()> {
-        log::info!("VOLUME_SYNC_WAL: flushing RocksDB WAL (full barrier)");
+    /// 空闲时 WAL 同步：仅在自上次 fsync 后有新写入时才调用 flush_wal(true)。
+    /// 由 volume server 后台线程在空闲阈值（缺省 30 秒）后调用。
+    /// 无锁设计：原子读取计数 → 判 0 跳过；>0 则 fsync 后清零。
+    /// 返回 true 表示实际执行了 fsync，false 表示无新写入已跳过。
+    pub fn sync_wal_if_dirty(&self) -> Result<bool> {
+        let pending = self.write_counter.load(Ordering::Acquire);
+        if pending == 0 {
+            // 自上次 fsync 以来无新写入，跳过 fsync
+            return Ok(false);
+        }
         self.db
             .flush_wal(true)
-            .map_err(|e| PowerFsError::Internal(format!("RocksDB flush_wal failed: {}", e)))
+            .map_err(|e| PowerFsError::Internal(format!("RocksDB flush_wal failed: {}", e)))?;
+        // 清零：本次 fsync 已覆盖这些写入。后续新写入会重新累加。
+        self.write_counter.store(0, Ordering::Release);
+        debug!("VOLUME_SYNC_WAL_IF_DIRTY: fsync'd WAL, pending={}", pending);
+        Ok(true)
     }
 
     /// 原子删除 Needle + 更新分配状态，返回被删除的 NeedleInfo

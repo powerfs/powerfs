@@ -197,6 +197,10 @@ pub struct FilerNetHandler {
     /// clients only saw the first change per second, missing concurrent
     /// appends from other clients.
     version_counter: std::sync::atomic::AtomicU64,
+    /// A-1.2: IO trace 聚合器 (per-inode, 提取 5 KML 特征)
+    pub io_trace_aggregator: Arc<crate::readahead_trace::IoTraceAggregator>,
+    /// C-0.2: Filer-side fingerprint index for write dedup
+    pub fingerprint_index: Arc<crate::fingerprint_index::FingerprintIndex>,
 }
 
 /// P2.5: Inline 模式硬上限 (Placement::Inline 的 max_size 不可超过此值)
@@ -301,6 +305,8 @@ impl FilerNetHandler {
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
             version_counter: Self::init_version_counter(),
+            io_trace_aggregator: Arc::new(crate::readahead_trace::IoTraceAggregator::new()),
+            fingerprint_index: Arc::new(crate::fingerprint_index::FingerprintIndex::default()),
         }
     }
 
@@ -327,6 +333,8 @@ impl FilerNetHandler {
             filer_allocator: powerfs_allocator::FilerAllocator::new(),
             inline_max_size: std::sync::atomic::AtomicU32::new(0),
             version_counter: Self::init_version_counter(),
+            io_trace_aggregator: Arc::new(crate::readahead_trace::IoTraceAggregator::new()),
+            fingerprint_index: Arc::new(crate::fingerprint_index::FingerprintIndex::default()),
         }
     }
 
@@ -1886,6 +1894,19 @@ impl FilerNetHandler {
 
         match result {
             Ok(_) => {
+                // A-1.5: truncate 改变文件大小时也触发规则引擎.
+                // setattr 的 size=Some(new_size) 表示 truncate 操作,
+                // 需要更新 readahead 策略 (大→小可能从 RULE:16 变 RULE:0).
+                if let Some(sz) = size {
+                    let _ = crate::readahead_policy::apply_size_based_policy(
+                        &self.meta_shard_manager,
+                        shard_id,
+                        ino,
+                        sz,
+                    )
+                    .await;
+                }
+
                 // File data truncate is handled in ShardStore::setattr
                 // (Raft-replicated), so no need to truncate inline_data here.
                 // Notify other clients that this inode's metadata (and
@@ -2717,18 +2738,23 @@ impl FilerNetHandler {
     /// AddDirEntry commands in a single Raft replication cycle.
     ///
     /// For N entries on the same shard, Raft commits = 1 (not 2N).
-    async fn handle_batch_create(&self, msg: &NetMessage, origin_client_id: u64) -> NetResult<NetMessage> {
-        let (shard_id_raw, entries) = match powerfs_net::serialize::decode_batch_create_req(&msg.body) {
-            Ok(e) => e,
-            Err(err) => {
-                warn!("FILER_NET_BATCH_CREATE: decode failed: {}", err);
-                return Ok(Self::build_response(
-                    msg,
-                    STATUS_ERR_BAD_REQUEST,
-                    Vec::new(),
-                ));
-            }
-        };
+    async fn handle_batch_create(
+        &self,
+        msg: &NetMessage,
+        origin_client_id: u64,
+    ) -> NetResult<NetMessage> {
+        let (shard_id_raw, entries) =
+            match powerfs_net::serialize::decode_batch_create_req(&msg.body) {
+                Ok(e) => e,
+                Err(err) => {
+                    warn!("FILER_NET_BATCH_CREATE: decode failed: {}", err);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
 
         if entries.is_empty() {
             return Ok(Self::build_response(msg, STATUS_OK, Vec::new()));
@@ -2796,7 +2822,11 @@ impl FilerNetHandler {
 
         let resp_body =
             powerfs_net::serialize::encode_batch_create_resp(flushed).unwrap_or_default();
-        let overall_status = if any_ok { STATUS_OK } else { STATUS_ERR_SERVER_ERROR };
+        let overall_status = if any_ok {
+            STATUS_OK
+        } else {
+            STATUS_ERR_SERVER_ERROR
+        };
         Ok(Self::build_response(msg, overall_status, resp_body))
     }
 
@@ -3207,6 +3237,7 @@ impl FilerNetHandler {
                     needle_id: c.needle_id,
                     volume_id: c.volume_id,
                     crc32: c.crc32,
+                    is_reference: false,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -3280,6 +3311,20 @@ impl FilerNetHandler {
             .await
         {
             Ok(_) => {
+                // A-1.5: 按文件大小自动设置 readahead 策略 xattr (RULE:<mb>).
+                // 直接 await (不用 tokio::spawn): 保证同一 inode 多次
+                // update_size_chunks 触发的 set_xattr 按顺序提交到 Raft.
+                // 用 spawn 会导致 RULE:0 和 RULE:16 的 propose_ff 乱序,
+                // 最终 shard_store 留下 RULE:0.
+                // 策略是 best-effort 优化, 失败不影响主流程.
+                let _ = crate::readahead_policy::apply_size_based_policy(
+                    &self.meta_shard_manager,
+                    shard_id,
+                    inode,
+                    size,
+                )
+                .await;
+
                 // Invalidate 策略（T1.3 修复, 2026-08-22）:
                 //
                 // 区分 inline 小文件和 chunk 大文件:
@@ -3788,6 +3833,355 @@ impl FilerNetHandler {
                 Ok(Self::build_response(msg, STATUS_ERR_NOT_FOUND, Vec::new()))
             }
         }
+    }
+
+    /// Handle PushIoTrace (Phase A-1.1) — kernel 批量上报 IO trace.
+    ///
+    /// Request body (raw, 非 TLV, 对齐 kernel powerfs_readahead.c 序列化):
+    ///   ShardId: u64 LE (8)
+    ///   Count:   u32 LE (4)
+    ///   TraceEntry[Count]:
+    ///     ino:       u64 LE (8)
+    ///     placement: u8     (1)
+    ///     file_size: u64 LE (8)
+    ///     offsets:   [u16 LE; 16] (32)
+    ///     kinds:     [u8; 16]     (16)
+    ///     seq_run:   u16 LE (2)
+    ///     rand_run:  u16 LE (2)
+    ///   entry size = 8+1+8+32+16+2+2 = 69
+    ///
+    /// Response: STATUS_OK (trace 是 best-effort, 永远成功).
+    /// A-1.2: 解析 + 聚合到 IoTraceAggregator + 提取 5 特征 (info 日志).
+    /// A-1.3: 在此触发 NN 训练 (待实现).
+    async fn handle_push_io_trace(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        use crate::readahead_trace::{parse_trace_entry, TRACE_ENTRY_SIZE};
+
+        let body = &msg.body;
+        if body.len() < 12 {
+            warn!(
+                "FILER_NET_PUSH_IO_TRACE: body too short ({} < 12)",
+                body.len()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+            ));
+        }
+
+        // ShardId (8) + Count (4)
+        let count = u32::from_le_bytes([body[8], body[9], body[10], body[11]]) as usize;
+        let expected_len = 12 + count * TRACE_ENTRY_SIZE;
+        if body.len() < expected_len {
+            warn!(
+                "FILER_NET_PUSH_IO_TRACE: body too short ({} < {}, count={})",
+                body.len(),
+                expected_len,
+                count
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_SERVER_ERROR,
+                Vec::new(),
+            ));
+        }
+
+        // 解析所有 trace entries
+        let mut entries = Vec::with_capacity(count);
+        let mut pos = 12;
+        for _ in 0..count {
+            if let Some(entry) = parse_trace_entry(&body[pos..pos + TRACE_ENTRY_SIZE]) {
+                entries.push(entry);
+            }
+            pos += TRACE_ENTRY_SIZE;
+        }
+
+        // 聚合: per-inode 累积 trace 数据
+        // current_readahead_mb 从 meta_cache 查 xattr (best-effort, 失败返回 0)
+        let meta_mgr = &self.meta_shard_manager;
+        let touched = self.io_trace_aggregator.ingest(&entries, |ino| {
+            if let Some(info) = meta_mgr.get_inode(ino) {
+                if let Some(val) = info
+                    .extended
+                    .get(crate::readahead_policy::READAHEAD_XATTR_NAME)
+                {
+                    let s = std::str::from_utf8(val).unwrap_or("");
+                    let num_str = s
+                        .strip_prefix("RULE:")
+                        .or_else(|| s.strip_prefix("NN:"))
+                        .unwrap_or(s);
+                    return num_str.parse::<u32>().unwrap_or(0);
+                }
+            }
+            0
+        });
+
+        // 提取特征并日志 (A-1.3 将用于 NN 训练)
+        // 去重: 同一 ino 只日志一次, 用最后一条 entry 的 seq/rand run
+        let mut seen = std::collections::HashSet::new();
+        for ino in &touched {
+            if !seen.insert(*ino) {
+                continue;
+            }
+            if let Some(features) = self.io_trace_aggregator.extract_features(*ino) {
+                // 取该 ino 在本批次最后一条 entry 的 seq/rand run
+                let (seq_run, rand_run) = entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.ino == *ino)
+                    .map(|e| (e.seq_run, e.rand_run))
+                    .unwrap_or((0, 0));
+                log::debug!(
+                    "FILER_IO_TRACE_FEATURES: ino={} iops={:.1} offset_cma={:.1} \
+                     delta_mean={:.1} size={} readahead_mb={} [seq_run={} rand_run={}]",
+                    ino,
+                    features.iops,
+                    features.offset_cma,
+                    features.offset_delta_mean,
+                    features.file_size,
+                    features.current_readahead_mb,
+                    seq_run,
+                    rand_run,
+                );
+            }
+        }
+
+        // A-1.3: 触发 ML 训练 + 推理 + 下发 (异步, 不阻塞 trace 响应)
+        // 需要 ≥4 个 inode 有 trace 数据才训练
+        let aggregator = self.io_trace_aggregator.clone();
+        let meta_mgr = self.meta_shard_manager.clone();
+        tokio::spawn(async move {
+            let shard_id: ShardId = ShardId(0); // trace 是全局的, 用 shard 0
+            let (total, seq, rand, low_conf) =
+                crate::readahead_policy::apply_ml_policy(&aggregator, &meta_mgr, shard_id).await;
+            if total > 0 {
+                log::info!(
+                    "FILER_ML_POLICY: trained on {} samples → {}→NN:16, {}→NN:0, {} low-confidence",
+                    total,
+                    seq,
+                    rand,
+                    low_conf
+                );
+            }
+
+            // C-1.3: 触发写预测 ML 训练 + xattr 下发
+            let (w_total, w_high, w_low) = crate::write_predict_policy::apply_ml_write_policy(
+                &aggregator,
+                &meta_mgr,
+                shard_id,
+            )
+            .await;
+            if w_total > 0 {
+                log::info!(
+                    "FILER_WRITE_PREDICT: trained on {} inodes → {} high-prob, {} low-conf",
+                    w_total,
+                    w_high,
+                    w_low
+                );
+            }
+        });
+
+        log::debug!("FILER_NET_PUSH_IO_TRACE: received {} trace entries", count);
+        Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+    }
+
+    /// Handle FingerprintLookup (Phase C-0.3) — content fingerprint
+    /// matching for write dedup.
+    ///
+    /// Request body (raw, little-endian):
+    ///   Fingerprint: [u8; 32]  Blake3 hash
+    ///   DataSize:    u64        data size in bytes
+    ///   DataPrefix:  [u8; 64]  first 64 bytes for collision check
+    ///   Inode:       u64        requesting inode
+    ///   Offset:      u64        write offset
+    ///
+    /// Response body (raw, little-endian):
+    ///   Match:      u8   0=NoMatch, 1=Match, 2=Recoverable
+    ///   NeedleId:   u64  (if Match/Recoverable)
+    ///   VolumeId:   u64  (if Match/Recoverable)
+    ///   Crc32:      u32  (if Match/Recoverable)
+    ///   DataSize:   u64  (if Match/Recoverable)
+    ///   Refcount:   u32  (if Match)
+    async fn handle_fingerprint_lookup(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        use powerfs_core::fingerprint::{Fingerprint, LookupResult};
+
+        let body = &msg.body;
+        // 32 (fp) + 8 (size) + 64 (prefix) + 8 (ino) + 8 (offset) = 120
+        if body.len() < 120 {
+            warn!(
+                "FILER_FINGERPRINT_LOOKUP: body too short ({} < 120)",
+                body.len()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        let mut fp_buf = [0u8; 32];
+        fp_buf.copy_from_slice(&body[0..32]);
+        let fp = Fingerprint(fp_buf);
+
+        let data_size = u64::from_le_bytes(body[32..40].try_into().unwrap());
+        let mut prefix = [0u8; 64];
+        prefix.copy_from_slice(&body[40..104]);
+        let inode = u64::from_le_bytes(body[104..112].try_into().unwrap());
+        let _offset = u64::from_le_bytes(body[112..120].try_into().unwrap());
+
+        // C-1.5: Check write_predict_policy xattr — if "off", skip lookup
+        // C-1.6: Safe fallback — if xattr missing or parse fails, allow lookup
+        // (default behavior: compute fingerprint for safety)
+        let policy_allowed = self.check_write_predict_policy(inode);
+        if !policy_allowed {
+            // Policy says "off" → skip fingerprint, return NoMatch
+            log::debug!(
+                "FILER_FINGERPRINT_LOOKUP: skipped (policy=off) ino={}",
+                inode
+            );
+            return Ok(Self::build_response(msg, STATUS_OK, vec![0u8]));
+        }
+
+        let result = self.fingerprint_index.lookup(&fp, &prefix);
+
+        let resp = match result {
+            LookupResult::Match {
+                needle_id,
+                volume_id,
+                crc32,
+                data_size: ds,
+                refcount,
+            } => {
+                // Increment refcount for the new reference
+                self.fingerprint_index.increment_refcount(&fp);
+                log::info!(
+                    "FILER_FINGERPRINT_LOOKUP: Match fp={} needle={} vol={} refcount={}",
+                    fp.to_hex(),
+                    needle_id,
+                    volume_id,
+                    refcount + 1
+                );
+                let mut buf = Vec::with_capacity(37);
+                buf.push(1u8); // Match
+                buf.extend_from_slice(&needle_id.to_le_bytes());
+                buf.extend_from_slice(&volume_id.to_le_bytes());
+                buf.extend_from_slice(&crc32.to_le_bytes());
+                buf.extend_from_slice(&ds.to_le_bytes());
+                buf.extend_from_slice(&(refcount + 1).to_le_bytes());
+                buf
+            }
+            LookupResult::Recoverable {
+                needle_id,
+                volume_id,
+                crc32,
+                data_size: ds,
+            } => {
+                // Recover from tombstone
+                self.fingerprint_index.recover(&fp);
+                log::info!(
+                    "FILER_FINGERPRINT_LOOKUP: Recovered fp={} needle={} vol={}",
+                    fp.to_hex(),
+                    needle_id,
+                    volume_id
+                );
+                let mut buf = Vec::with_capacity(33);
+                buf.push(2u8); // Recoverable
+                buf.extend_from_slice(&needle_id.to_le_bytes());
+                buf.extend_from_slice(&volume_id.to_le_bytes());
+                buf.extend_from_slice(&crc32.to_le_bytes());
+                buf.extend_from_slice(&ds.to_le_bytes());
+                buf
+            }
+            LookupResult::NoMatch => {
+                log::debug!(
+                    "FILER_FINGERPRINT_LOOKUP: NoMatch fp={} size={}",
+                    fp.to_hex(),
+                    data_size
+                );
+                vec![0u8]
+            }
+        };
+
+        Ok(Self::build_response(msg, STATUS_OK, resp))
+    }
+
+    /// Handle FingerprintRecord (Phase C-0.5) — client records a
+    /// fingerprint after writing a new needle (NoMatch → write → record).
+    ///
+    /// Request body (raw, little-endian):
+    ///   Fingerprint: [u8; 32]  Blake3 hash
+    ///   NeedleId:     u64       newly written needle id
+    ///   VolumeId:     u64       volume id
+    ///   Crc32:        u32       needle crc32
+    ///   DataSize:     u64       data size in bytes
+    ///   DataPrefix:   [u8; 64]  first 64 bytes for collision check
+    async fn handle_fingerprint_record(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        use crate::fingerprint_index::NeedleRef;
+        use powerfs_core::fingerprint::Fingerprint;
+
+        let body = &msg.body;
+        // 32 + 8 + 8 + 4 + 8 + 64 = 124
+        if body.len() < 124 {
+            warn!(
+                "FILER_FINGERPRINT_RECORD: body too short ({} < 124)",
+                body.len()
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+            ));
+        }
+
+        let mut fp_buf = [0u8; 32];
+        fp_buf.copy_from_slice(&body[0..32]);
+        let fp = Fingerprint(fp_buf);
+        let needle_id = u64::from_le_bytes(body[32..40].try_into().unwrap());
+        let volume_id = u64::from_le_bytes(body[40..48].try_into().unwrap());
+        let crc32 = u32::from_le_bytes(body[48..52].try_into().unwrap());
+        let data_size = u64::from_le_bytes(body[52..60].try_into().unwrap());
+        let mut prefix = [0u8; 64];
+        prefix.copy_from_slice(&body[60..124]);
+
+        // Insert into the fingerprint index. If an entry already exists
+        // (e.g., Expired → replaced with new needle), overwrite it.
+        let nr = NeedleRef::new(needle_id, volume_id, crc32, data_size, prefix);
+        self.fingerprint_index.insert(fp, nr);
+
+        log::info!(
+            "FILER_FINGERPRINT_RECORD: recorded fp={} needle={} vol={} size={}",
+            fp.to_hex(),
+            needle_id,
+            volume_id,
+            data_size
+        );
+
+        Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+    }
+
+    /// C-1.5/C-1.6: Check write_predict_policy xattr for an inode.
+    /// Returns `false` only if xattr is explicitly "off".
+    /// Missing xattr or parse failure → `true` (safe fallback: allow lookup).
+    fn check_write_predict_policy(&self, inode: u64) -> bool {
+        if let Some(info) = self.meta_shard_manager.get_inode(inode) {
+            if let Some(val) = info
+                .extended
+                .get(crate::write_predict_policy::WRITE_PREDICT_XATTR_NAME)
+            {
+                let s = std::str::from_utf8(val).unwrap_or("");
+                if s.eq_ignore_ascii_case("off") {
+                    return false;
+                }
+                // "NN:0.0" or "RULE:0.0" → threshold 0 → skip
+                if let Some(rest) = s.strip_prefix("NN:").or_else(|| s.strip_prefix("RULE:")) {
+                    if let Ok(threshold) = rest.parse::<f64>() {
+                        return threshold > 0.0;
+                    }
+                }
+            }
+        }
+        // Default: allow (safe fallback)
+        true
     }
 
     /// Handle RemoveXattr request — remove an extended attribute via Raft.
@@ -5079,6 +5473,12 @@ impl NetHandler for FilerNetHandler {
             MsgType::GetXattr => self.handle_getxattr(msg).await,
             MsgType::RemoveXattr => self.handle_remove_xattr(ctx, msg).await,
             MsgType::ListXattr => self.handle_list_xattr(msg).await,
+            // Phase A-1.1: kernel IO trace push (ML readahead 数据采集)
+            MsgType::PushIoTrace => self.handle_push_io_trace(msg).await,
+            // Phase C-0.3: content fingerprint lookup for write dedup
+            MsgType::FingerprintLookup => self.handle_fingerprint_lookup(msg).await,
+            // Phase C-0.5: record fingerprint after new needle write
+            MsgType::FingerprintRecord => self.handle_fingerprint_record(msg).await,
             // Two-phase Mkdir (client-routed, no server-to-server forwarding)
             // See docs/shard-routing-no-forward-principle.md §3
             MsgType::MkdirPhaseA => self.handle_mkdir_phase_a(msg).await,

@@ -63,10 +63,10 @@ pub struct CoalescerConfig {
 impl Default for CoalescerConfig {
     fn default() -> Self {
         Self {
-            deadline: Duration::from_millis(4),
-            min_pending_writes: 8,
-            max_dirty_bytes_per_entry: 1 << 20, // 1 MiB
-            max_dirty_bytes_total: 16 << 20,    // 16 MiB
+            deadline: Duration::from_millis(50),
+            min_pending_writes: 32,
+            max_dirty_bytes_per_entry: 4 << 20, // 4 MiB
+            max_dirty_bytes_total: 64 << 20,    // 64 MiB
             disabled: false,
         }
     }
@@ -277,20 +277,17 @@ impl WriteCoalescer {
 
         drop(inner);
 
-        // ---- 4. Return self flush ONLY when the caller's own needle hit
-        // a per-entry synchronous trigger (size / count / age).  Victims
-        // are never returned synchronously – they flow via flush_expired.
+        // ---- 4. 不再同步返回 flush 数据。
+        // 触发 flush 时只标记 flush_after 为过去，数据留在 coalescer 中。
+        // 后台 flush 线程（StorageManager::start_flush_thread）定期扫描
+        // 所有过期的 needle 并批量 flush，避免阻塞写入线程。
         if need_flush_this {
             let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
-            if let Some(e) = inner.entries.remove(needle_id) {
-                inner.dirty_bytes_total = inner.dirty_bytes_total.saturating_sub(e.merged.len());
-                Some((needle_id.clone(), e.merged, e.is_new_needle))
-            } else {
-                None
+            if let Some(e) = inner.entries.get_mut(needle_id) {
+                e.flush_after = now.checked_sub(Duration::from_nanos(1)).unwrap_or(now);
             }
-        } else {
-            None
         }
+        None
     }
 
     /// Try to read a range directly from the dirty buffer for `needle_id`,
@@ -528,7 +525,10 @@ mod tests {
         seen.sort_by_key(|(k, _)| *k);
         assert_eq!(seen[0], (1, b"aa".to_vec()));
         assert_eq!(seen[1], (3, b"cc".to_vec()));
-        assert!(coal.is_dirty(&NeedleId(2)), "unrequested dirty needle must stay");
+        assert!(
+            coal.is_dirty(&NeedleId(2)),
+            "unrequested dirty needle must stay"
+        );
         assert!(!coal.is_dirty(&NeedleId(1)));
         assert_eq!(coal.dirty_entry_count(), 1);
     }

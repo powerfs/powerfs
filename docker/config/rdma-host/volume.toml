@@ -6,7 +6,7 @@ log_level = "info"
 redis_url = "redis://172.30.0.50:6379"
 
 [volume]
-transport = "tcp"  # 内核 vol_route 仅支持TCP, volume需TCP listener; filer继续 auto(rdma+tcp)
+transport = "rdma"
 grpc_port = 8080
 http_port = 8091
 net_port = 8901
@@ -18,6 +18,8 @@ max_volume_size = 107374182400
 initial_volume_count = 4
 advertise_addr = "192.168.100.3"
 lease_enabled = false
+force_sync_on_write = false      # 持久化策略: false=内存ack(NVMe-oF盘阵保证持久化); true=每次写强制fsync
+wal_idle_sync_secs = 30   # 后台空闲 WAL fsync 间隔(秒): 0=禁用, >0 空闲时检查并 fsync 有新写入的 WAL
 registration_token = "powerfs-cluster-test"
 ca_crt = "/etc/powerfs/certs/ca.crt"
 client_crt = "/etc/powerfs/certs/volume-server-1.crt"
