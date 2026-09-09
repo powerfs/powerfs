@@ -32,38 +32,13 @@ Unified POSIX / S3 / KV cache in a single cluster — eliminating the three-stac
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                    POSIX (FUSE/Kernel) / S3 / KV              │
-│                    FuseClientFacade (Unified)                 │
-│  ┌────────────┐  ┌──────────────┐  ┌───────────────────────┐ │
-│  │MasterClient│  │MetaShardClient│  │    VolumeClient       │ │
-│  │ (Topology) │  │(Filer Raft)  │  │  (Read/Write + Lease) │ │
-│  └─────┬──────┘  └──────┬───────┘  └──────────┬────────────┘ │
-└────────┼────────────────┼─────────────────────┼──────────────┘
-         │                │ ← Callback Invalidation Push ──┐
-         │                │                               │
-┌────────▼────────────────▼───────────────────────────────▼────┐
-│              Filer (Raft Strong Consistency)                  │
-│  Bucket-based sharding, each bucket = independent Raft group  │
-│  [Shard 0: Raft+RocksDB] [Shard 1] [Shard N] ...             │
-└────────┬────────────────┬───────────────────────────────────┘
-┌────────▼────────────────▼───────────────────────────────────┐
-│              Master (Raft Scheduling + Volume Routing)        │
-└────────┬─────────────────────────────────────────────────────┘
-         │
-         │  Two storage modes:
-         │  ┌─────────────────────────────────────────────────┐
-         ▼  ▼                                                 │
-┌─────────────────────────────┐  ┌─────────────────────────────┴──┐
-│  Mode A: Volume Server      │  │  Mode B: NVMe-oF Direct         │
-│  SPDK NVMe bare-disk I/O    │  │  Connect NVMe-oF Target array   │
-│  Needle + Lease Lock        │  │  directly, no Volume Server      │
-│  [Volume 1] [Volume 2] ...  │  │  All-flash array handles I/O     │
-└─────────────────────────────┘  └──────────────────────────────────┘
-│  Unified Needle Binary Format + RocksDB Index                │
-└──────────────────────────────────────────────────────────────┘
-```
+PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency + Cap model distributed locking, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
+
+![3-Layer Decoupled Architecture](docs/architecture.png)
+
+**Control Plane / Data Plane Separation**: the three layers can scale independently — Volume nodes handle raw data throughput, Filer Raft shards scale metadata concurrency via horizontal bucket sharding, and Master handles cluster management with HA failover.
+
+1. **Filer Raft Strong-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. Bucket-based sharding where each bucket is an independent Raft group. All metadata operations (mkdir, create, unlink, setattr, content_size, chunks) go through Raft commit for linearizability. Cap model + lock_arbiter manages distributed write locks; Callback Invalidation push ensures cross-client cache coherence without broadcast storms.
 
 **Dual storage modes**:
 - **Mode A (Volume Server)**: SPDK NVMe bare-disk I/O, bypassing kernel filesystem — for clusters with local NVMe SSDs
@@ -111,18 +86,6 @@ docker run -d --name redis -p 6379:6379 redis:7-alpine
 **Default credentials**: admin / admin123 · **S3**: powerfs / powerfs123 @ http://localhost:9000
 
 ---
-
-## Architecture
-
-PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency + Cap model distributed locking, three-interface unified** overall architecture, realizing complete separation of control plane and data plane:
-
-### 3-Layer Decoupled Architecture
-
-![3-Layer Decoupled Architecture](docs/architecture.png)
-
-**Control Plane / Data Plane Separation**: the three layers can scale independently — Volume nodes handle raw data throughput, Filer Raft shards scale metadata concurrency via horizontal bucket sharding, and Master handles cluster management with HA failover.
-
-1. **Filer Raft Strong-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. Bucket-based sharding where each bucket is an independent Raft group. All metadata operations (mkdir, create, unlink, setattr, content_size, chunks) go through Raft commit for linearizability. Cap model + lock_arbiter manages distributed write locks; Callback Invalidation push ensures cross-client cache coherence without broadcast storms.
 
 ## Benchmark
 
