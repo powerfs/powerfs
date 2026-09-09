@@ -2040,7 +2040,9 @@ impl Transport for RdmaTransport {
 
         // Pre-post recv buffers so the server can send responses
         // without hitting RNR (Receiver Not Ready) retry exhaustion.
-        channel_inner.pre_post_recv(4).await?;
+        // 16: 对端单连接在途突发 (kernel client wr_slot cap=16) + 调度余量;
+        // 深度不足时 RNR NAK 退避等待可达秒级 (实测 2.1s/4.3s 长尾).
+        channel_inner.pre_post_recv(16).await?;
 
         info!("RdmaTransport: connected to {}", addr);
         Ok(Box::new(RdmaStream {
@@ -2737,7 +2739,7 @@ impl TransportListener for RdmaListenerAdapter {
                             continue;
                         }
                     };
-                    let send_cq = match IbvCq::create(&ctx, 32, Some(send_comp_ch)) {
+                    let send_cq = match IbvCq::create(&ctx, 64, Some(send_comp_ch)) {
                         Ok(c) => Arc::new(c),
                         Err(e) => {
                             warn!("accept: IbvCq::create(send) failed: {}", e);
@@ -2745,7 +2747,7 @@ impl TransportListener for RdmaListenerAdapter {
                             continue;
                         }
                     };
-                    let recv_cq = match IbvCq::create(&ctx, 32, Some(recv_comp_ch)) {
+                    let recv_cq = match IbvCq::create(&ctx, 64, Some(recv_comp_ch)) {
                         Ok(c) => Arc::new(c),
                         Err(e) => {
                             warn!("accept: IbvCq::create(recv) failed: {}", e);
@@ -2766,7 +2768,7 @@ impl TransportListener for RdmaListenerAdapter {
                             recv_cq.as_ptr(),
                             ptr::null_mut(),
                             16,
-                            16,
+                            32,
                             1,
                             1,
                             0,
@@ -2828,7 +2830,13 @@ impl TransportListener for RdmaListenerAdapter {
                     // NOTE: Must NOT use .await inside this loop here because `new_id`
                     // (raw *mut rdma_cm_id) is not Send and would create a Send-error
                     // in async_trait. Use try_acquire_sync + release_sync (try_lock).
-                    const PRE_POST_N: usize = 8;
+                    // PRE_POST_N=24: kernel client 单连接在途写突发上限
+                    // wr_slot=16 (max_active_per_conn/4); RQ 深度必须 >= 该值
+                    // 并留出 tokio 调度余量。实测旧值 8 在写洪泛下触发 RNR
+                    // NAK (服务端 RQ 耗尽), 对端 rnr_retry=7 退避累积成
+                    // 2.1s/4.3s 秒级长尾, 吞吐被压到 20-45 MiB/s。
+                    // MR 池 32 个: 24 recv + 8 留作 send (read 响应等)。
+                    const PRE_POST_N: usize = 24;
                     let mut recv_pre_posted = std::collections::VecDeque::with_capacity(PRE_POST_N);
                     let mut prepost_ok = true;
                     for i in 0..PRE_POST_N {
