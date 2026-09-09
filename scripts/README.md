@@ -134,14 +134,186 @@ cargo test --package powerfs-master --test coherence_phase3_test
 
 ## 配置说明
 
-### 默认端口
-| 服务 | 端口 | 说明 |
+### 硬件 RDMA kernel-VM 测试流程 (kernel/vm)
+
+PowerFS 内核模块必须在 QEMU VM 里测试（VM 直通 SR-IOV VF RDMA）。
+这是性能测试的主路径 — 完整的一键流程如下。
+
+### 环境前置条件
+
+| 项 | 值 |
+|----|----|
+| Host kernel | Linux 5.15+, GRUB: `intel_iommu=on iommu=pt` |
+| 硬件 RDMA | mlx5_1 端口 ACTIVE (如 `ip link set ibp160s0f1 up`), IPoIB 配置 `192.168.100.3/24` |
+| SR-IOV VF | mlx5_1 已创建 2 个 VF, 绑定 `vfio-pci` (见 kernel/vm/qemuctl2.sh setup-vf) |
+| Rust 工具链 | nightly (rdma 特性需要), `cargo build --release -p powerfs-filer -p powerfs-volume -p powerfs-master --features rdma` |
+| VM kernel | 6.17 (source at `/home/portion/powerfs/linux-6.17`) |
+
+### 一键启动 (推荐)
+
+```bash
+cd /home/portion/powerfs
+
+# 1. 编译 Rust 二进制 (只跑一次, 后续改动后重编)
+cargo build --release -p powerfs-filer -p powerfs-volume -p powerfs-master --features rdma
+
+# 2. 编译 ko + initramfs (WRITE_PREDICT=y 默认开启 dedup 方向②异步路径)
+#    环境变量可覆盖: WRITE_PREDICT=n 编译无 dedup 的 ko
+cd kernel/vm && bash qemuctl.sh build
+
+# 3. 启动 Docker RDMA 服务 (master + 3 volume + filer + redis)
+#    自动 generate-certs.sh + sync 到 VM share + restart 存储节点
+bash qemuctl.sh service start --rdma
+
+# 4. 启动 2 台 QEMU VM (各自一个 VF)
+bash qemuctl2.sh start
+
+# 5. VM1 mount (自动从 9p share 同步最新证书到 /etc/powerfs/)
+bash qemuctl2.sh mount vm1
+
+# 6. 验证
+bash qemuctl2.sh exec vm1 "time dd if=/dev/zero of=/mnt/powerfs/t.bin bs=1M count=128 conv=fdatasync"
+```
+
+### 脚本清单
+
+| 脚本 | 路径 | 说明 |
 |------|------|------|
-| Master (HTTP) | 9460 | Master 服务端口 |
-| Master (Net) | 9461 | Master 网络协议端口 |
-| Volume (gRPC) | 8197 | Volume 服务端口 |
-| Volume (HTTP) | 8198 | Volume HTTP 端口 |
-| Filer (Net) | 8890 | Filer 网络协议端口 |
+| `qemuctl.sh` | `kernel/vm/qemuctl.sh` | ko 编译, initramfs 打包, Docker 服务启停 (TCP + RDMA), RDMA 环境自检 |
+| `qemuctl2.sh` | `kernel/vm/qemuctl2.sh` | QEMU VM 启停, VF 直通, SSH/EXEC, mount (含自动证书同步) |
+| `generate-certs.sh` | `scripts/generate-certs.sh` | master CA 签发所有 leaf 证书 (filer, volume-1/2/3, kernel-client-1/2) |
+| `build.sh` | `scripts/build.sh` | 全部 Rust 二进制编译 (替代手动 `cargo build`) |
+| `build-rdma.sh` | `scripts/build-rdma.sh` | 带 RDMA 特性的 Rust 编译 |
+| `docker-compose.rdma.yml` | `docker/docker-compose.rdma.yml` | 硬件 RDMA host-network compose (3 volume, 独立于 docker-compose.yml) |
+
+### 架构图
+
+```
+  Host (192.168.100.3)                     QEMU VM1          QEMU VM2
+  ┌──────────────────────┐                ┌──────────┐       ┌──────────┐
+  │ mlx5_1 硬件 RDMA      │                │ ib0 VF   │       │ ib0 VF   │
+  │ uverbs1 + rdma_cm     │                │ 192.168  │       │ 192.168  │
+  │ /dev/infiniband/*     │                │ .100     │       │ .101     │
+  └───────┬──────────────┘                └────┬─────┘       └────┬─────┘
+          │ SR-IOV VF 直通                     │                  │
+  ┌───────┴────────────────────────────────────┴──────────────────┴──────┐
+  │                         RDMA 网络 (RoCE)                             │
+  └──────────────────────────────────────────────────────────────────────┘
+          │
+  ┌───────┴──────────────────────────────────────────────────────────────┐
+  │ Docker containers (network_mode: host, 共享 host netns)              │
+  │   master-1   :9333 (TCP raft)  :9334 (RDMA net)   :9300 (metrics)   │
+  │   filer-1    :8888 (HTTP)       :8889 (gRPC)       :9336 (RDMA net)   │
+  │   volume-1   :8080 (gRPC)       :8901 (RDMA net)                     │
+  │   volume-2   :8081 (gRPC)       :8902 (RDMA net)                     │
+  │   volume-3   :8082 (gRPC)       :8903 (RDMA net)                     │
+  └──────────────────────────────────────────────────────────────────────┘
+          │ redis 172.30.0.50:6379 (bridge network)
+```
+
+### RDMA 队列参数表 (powerfs-net + kernel)
+
+**ENOTCONN (-107) / RNR NAK / CQ overflow 通常是队列深度不足导致的.**
+以下是 `powerfs-net/src/transport_rdma.rs` + `transport.rs` 中的调优参数.
+
+| 参数 | 旧值 | 新值 | 公式 | 说明 |
+|------|------|------|------|------|
+| **Rust 客户端** (filer→volume) | | | | |
+| `send_cq` / `recv_cq` | 32 | **128** | 2 × (64+64) | CQ 深度留 100% 余量防 overflow |
+| `max_send_wr` | 16 | **64** | ≥ 2× kernel burst | send queue 足够 ACK + read 响应 |
+| `max_recv_wr` | 16 | **64** | ≥ 2× kernel burst | recv queue 不触发 RNR NAK |
+| `max_send_sge` / `max_recv_sge` | 1 | **2** | | 大帧多段 (inline 0→256 也配合) |
+| `max_inline_data` | 0 | **256** | | 小数据 inline 零拷贝 |
+| `pre_post_recv()` | 16 | **32** | ≥ kernel burst × 1.5 | 预投递 recv WR, 防 RQ 空 |
+| **Rust 服务端** (accept 新连接) | | | | |
+| `send_cq` / `recv_cq` | 64 | **256** | 2 × (64+64) | 客户端 CQ 也要对应用量 |
+| `max_send_wr` | 16 | **64** | ≥ 2× kernel burst | 服务端 send 给客户端的 ACK/read |
+| `max_recv_wr` | 32 | **64** | ≥ kernel burst × 2 | 接收 kernel write_needle 突发 |
+| `PRE_POST_N` (服务端 RQ 预投递) | 24 | **48** | ≥ kernel burst × 1.5 | 48 对应 kernel 单连接 write burst cap=32 |
+| **TransportConfig 默认** | | | | |
+| `rdma_buf_num` (MR pool 大小) | 32 | **128** | ≥ PRE_POST_N + send_slack | 48 recv + 32 send + 48 slack |
+| `rdma_buf_size` | 2MB | 2MB | | 与 kernel `PFS_RDMA_DATA_BUF_SIZE` 对齐 |
+| **Kernel 客户端** (powerfs_net_rdma.h) | | | | |
+| `CQ_SEND_SIZE` / `CQ_RECV_SIZE` | 128/64 | 128/64 | | 已足够, 无需调整 |
+| `QP_MAX_SEND_WR` / `QP_MAX_RECV_WR` | 64/32 | 64/32 | | 已足够 |
+| `PRE_POST_N` (kernel RQ 预投递) | 24 | 24 | | 服务端已扩, 客户端无需 |
+| `WR_SLOT_PER_CONN` (kernel per-conn in-flight cap) | 16 | 16 | | 配合服务端 PRE_POST_N=48 (1.5× burst) |
+
+**调参 checklist (改完必须做):**
+```bash
+# 改 Rust 参数后重编 + restart
+cargo build --release -p powerfs-filer -p powerfs-volume -p powerfs-master --features rdma
+cd docker && docker compose -f docker-compose.rdma.yml restart volume-1 volume-2 volume-3 filer-1
+
+# 改 kernel 参数后重编 ko + rebuild initramfs + restart VM
+cd kernel/vm && bash qemuctl.sh build && bash qemuctl2.sh stop && bash qemuctl2.sh start && bash qemuctl2.sh mount vm1
+```
+
+### WRITE_PREDICT 内核编译选项
+
+`powerfs-net/src/powerfs_write_predict.c` 实现了异步 dedup 方向②:
+热路径零阻塞 (lockless READ_ONCE 检查), SHA-256 + FingerprintLookup/Record 全部下沉到 workqueue.
+
+```bash
+# 开启 dedup (默认):
+bash qemuctl.sh build                  # WRITE_PREDICT=y
+ls -la powerfs.ko                      # 应是 16MB
+
+# 关闭 dedup (对照实验):
+WRITE_PREDICT=n bash qemuctl.sh build  # 15MB ko, dedup 字段 #ifdef out
+
+# 验证 ko 是否包含 write_predict 符号:
+nm powerfs.ko | grep write_predict
+```
+
+### 端口规划 (host-network 必须唯一)
+
+| 服务 | TCP/gRPC | HTTP | RDMA net | 其他 |
+|------|----------|------|----------|------|
+| master-1 | 9333 (raft) | 9300 (metrics) | 9334 | — |
+| volume-1 | 8080 | 8091 | 8901 | — |
+| volume-2 | 8081 | 8092 | 8902 | — |
+| volume-3 | 8082 | 8093 | 8903 | — |
+| filer-1 | 8889 (gRPC) | 8888 | 9336 | 8900 (metrics) |
+| redis | 172.30.0.50:6379 (bridge) | — | — | — |
+
+> Docker TCP 模式 (docker-compose.yml) 端口不同, **RDMA compose 和 TCP compose 互斥**:
+> 启动 RDMA 前必须 `docker compose -f docker-compose.yml down`, 反之亦然.
+
+### 常见故障排查
+
+| 现象 | 原因 | 修复 |
+|------|------|------|
+| `mount denied by master blacklist: client certificate rejected` | VM 用了 initramfs 里打包的旧证书, master CA 已变 | `qemuctl2.sh mount` 会自动从 9p share 同步. 如还不行: `qemuctl.sh service start --rdma` (自动 generate certs + restart 存储节点) |
+| `Master filer discovery failed (-107)` | master 看不到已注册的 filer/volume, 通常是 filer/volume 重启后没带上新 leaf 证书 | 手动 `docker compose -f docker-compose.rdma.yml restart filer-1 volume-1 volume-2 volume-3`; 或看 master 日志确认无 `missing ClientCert TLV` |
+| `ENOTCONN / Transport endpoint is not connected` (写路径) | RDMA CQ overflow 或 RNR NAK 耗尽 — Rust 侧 CQ/QP 深度不足 | 看上面的 "RDMA 队列参数表", 改完重编 Rust + restart 容器 |
+| `write_needle failed: -107, needle_id=... leaked` | 同上, 服务端 RQ 空 → RNR NAK → 退避 → 超时 | 检查 PRE_POST_N 和 rdma_buf_num |
+| `failed to read client cert /etc/powerfs/certs/filer-1.crt: No such file` | 容器启动时证书还没生成, 进程读过空文件 | `generate-certs.sh` 后必须 restart 对应容器 |
+| Docker compose 报端口冲突 | TCP compose 和 RDMA compose 同时在跑 | `docker compose -f docker-compose.yml down` |
+| `/dev/infiniband/uverbs2 不存在` (旧错误) | 硬件 RDMA 用 uverbs0/uverbs1, uverbs2 是 Soft-RoCE | `qemuctl.sh service start --rdma` 已改为探测 uverbs[0-4], 不再硬检查 |
+
+### 验证命令速查
+
+```bash
+# Docker 服务状态
+docker ps --format 'table {{.Names}}\t{{.Status}}'
+
+# Master 注册状态 (3 volume + 1 filer 全部 OK 才算正常)
+docker logs master-1 --tail 50 | grep -iE 'registered filer|node=volume-server'
+
+# RDMA 队列参数生效验证
+docker logs filer-1 2>&1 | grep -iE 'RdmaTransport.*buf_num|MrPool.*registered'
+# 期望看到: buf_num=128, registered 128 buffers
+
+# VM mount + RDMA 连接验证
+qemuctl2.sh exec vm1 "dmesg | grep -iE 'rdma.*connected|handshake|RDMA_ERR'"
+
+# DD 快速验证 (1M seqwrite ≥ 300 MB/s, 4K randread ≥ 300 MB/s)
+qemuctl2.sh exec vm1 "time dd if=/dev/zero of=/mnt/powerfs/t.bin bs=1M count=128 conv=fdatasync"
+
+# FIO 套件
+qemuctl2.sh exec vm1 "bash /mnt/host/fio_pfs_rdma.sh vm1"
+```
 
 ### 默认路径
 | 路径 | 说明 |

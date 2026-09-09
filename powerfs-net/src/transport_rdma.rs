@@ -1934,13 +1934,17 @@ impl Transport for RdmaTransport {
         };
         let send_comp_ch = IbvCompChannel::create(&ctx)?;
         let recv_comp_ch = IbvCompChannel::create(&ctx)?;
-        let send_cq = IbvCq::create(&ctx, 32, Some(send_comp_ch))?;
-        let recv_cq = IbvCq::create(&ctx, 32, Some(recv_comp_ch))?;
+        // CQ 深度 ≥ 2×(max_send_wr + max_recv_wr) — 零余量会 overflow → QP error → ENOTCONN.
+        // 旧值 32 刚好等于 16+16, 无余量; 新值 128 = 2×(64+64).
+        let send_cq = IbvCq::create(&ctx, 128, Some(send_comp_ch))?;
+        let recv_cq = IbvCq::create(&ctx, 128, Some(recv_comp_ch))?;
 
         // 6. Create QP via rdma_create_qp (C wrapper). This sets both
         //    cm_id->qp AND the internal id_priv->qp, so rdma_cm correctly
         //    manages QP state transitions (RESET→INIT→RTR→RTS) during
         //    rdma_connect. The C wrapper avoids Rust struct layout issues.
+        // QP 深度 16→64: kernel per-conn 在途 write_needle 上限 = 32,
+        // send 需要足够发回 ACK + read 响应, recv 需要足够接收 kernel 发来的帧.
         let rc = unsafe {
             ffi::powerfs_rdma_create_qp(
                 cm_id.0,
@@ -1949,11 +1953,11 @@ impl Transport for RdmaTransport {
                 send_cq.as_ptr(),
                 recv_cq.as_ptr(),
                 ptr::null_mut(),
-                16,
-                16,
-                1,
-                1,
-                0,
+                64,    // max_send_wr
+                64,    // max_recv_wr
+                2,     // max_send_sge
+                2,     // max_recv_sge
+                256,   // max_inline_data
                 ffi::IBV_QPT_RC,
                 1,
             )
@@ -2040,9 +2044,9 @@ impl Transport for RdmaTransport {
 
         // Pre-post recv buffers so the server can send responses
         // without hitting RNR (Receiver Not Ready) retry exhaustion.
-        // 16: 对端单连接在途突发 (kernel client wr_slot cap=16) + 调度余量;
-        // 深度不足时 RNR NAK 退避等待可达秒级 (实测 2.1s/4.3s 长尾).
-        channel_inner.pre_post_recv(16).await?;
+        // 32: kernel client 单连接在途突发 max_active_per_conn/2=32 + 调度余量.
+        // CQ 深度必须 ≥ pre_post 数 (已扩到 128).
+        channel_inner.pre_post_recv(32).await?;
 
         info!("RdmaTransport: connected to {}", addr);
         Ok(Box::new(RdmaStream {
@@ -2739,7 +2743,9 @@ impl TransportListener for RdmaListenerAdapter {
                             continue;
                         }
                     };
-                    let send_cq = match IbvCq::create(&ctx, 64, Some(send_comp_ch)) {
+                    // CQ 深度 ≥ 2×(max_send_wr + max_recv_wr). 旧值 64 刚好等于 16+32+余量,
+                    // 但改为 128/128 后 send_wr=64+recv_wr=64 需要 256 total → CQ=256.
+                    let send_cq = match IbvCq::create(&ctx, 256, Some(send_comp_ch)) {
                         Ok(c) => Arc::new(c),
                         Err(e) => {
                             warn!("accept: IbvCq::create(send) failed: {}", e);
@@ -2747,7 +2753,7 @@ impl TransportListener for RdmaListenerAdapter {
                             continue;
                         }
                     };
-                    let recv_cq = match IbvCq::create(&ctx, 64, Some(recv_comp_ch)) {
+                    let recv_cq = match IbvCq::create(&ctx, 256, Some(recv_comp_ch)) {
                         Ok(c) => Arc::new(c),
                         Err(e) => {
                             warn!("accept: IbvCq::create(recv) failed: {}", e);
@@ -2759,6 +2765,9 @@ impl TransportListener for RdmaListenerAdapter {
                     // Create QP via rdma_create_qp (C wrapper). This sets both
                     // cm_id->qp AND internal id_priv->qp, so rdma_cm correctly
                     // manages QP state transitions during rdma_accept.
+                    // 服务端 QP 深度必须 ≥ kernel 客户端在途突发 (32) × 2 (双向):
+                    //   max_send_wr 64 — 足够 ACK + read 响应 + 元数据帧
+                    //   max_recv_wr 64 — 足够接收 kernel 32 write + 32 read 并发
                     let rc = unsafe {
                         ffi::powerfs_rdma_create_qp(
                             new_id,
@@ -2767,11 +2776,11 @@ impl TransportListener for RdmaListenerAdapter {
                             send_cq.as_ptr(),
                             recv_cq.as_ptr(),
                             ptr::null_mut(),
-                            16,
-                            32,
-                            1,
-                            1,
-                            0,
+                            64,    // max_send_wr
+                            64,    // max_recv_wr
+                            2,     // max_send_sge
+                            2,     // max_recv_sge
+                            256,   // max_inline_data
                             ffi::IBV_QPT_RC,
                             1,
                         )
@@ -2830,13 +2839,12 @@ impl TransportListener for RdmaListenerAdapter {
                     // NOTE: Must NOT use .await inside this loop here because `new_id`
                     // (raw *mut rdma_cm_id) is not Send and would create a Send-error
                     // in async_trait. Use try_acquire_sync + release_sync (try_lock).
-                    // PRE_POST_N=24: kernel client 单连接在途写突发上限
-                    // wr_slot=16 (max_active_per_conn/4); RQ 深度必须 >= 该值
-                    // 并留出 tokio 调度余量。实测旧值 8 在写洪泛下触发 RNR
-                    // NAK (服务端 RQ 耗尽), 对端 rnr_retry=7 退避累积成
-                    // 2.1s/4.3s 秒级长尾, 吞吐被压到 20-45 MiB/s。
-                    // MR 池 32 个: 24 recv + 8 留作 send (read 响应等)。
-                    const PRE_POST_N: usize = 24;
+                    // PRE_POST_N=48: kernel client 单连接在途 write 上限 32,
+                    // 服务端 RQ 必须 ≥ 该值 + tokio 调度余量 (1.5×) = 48.
+                    // 旧值 24 在 dd 128MB/1M 时刚好被 32 个 write 打满 → RNR NAK.
+                    // MR 池 128 个 (TransportConfig 默认已 32→64):
+                    // 48 recv + 16 send (read 响应等) + 16 slack = 80, 留余量.
+                    const PRE_POST_N: usize = 48;
                     let mut recv_pre_posted = std::collections::VecDeque::with_capacity(PRE_POST_N);
                     let mut prepost_ok = true;
                     for i in 0..PRE_POST_N {
