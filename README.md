@@ -118,40 +118,9 @@ PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency + Cap mo
 
 ### 3-Layer Decoupled Architecture
 
-```
-┌────────────────────────────────────────────────────────────┐
-│                      Client Layer                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────────────┐  │
-│  │  FUSE    │  │    S3    │  │      KV Cache Client     │  │
-│  │ (POSIX)  │  │  Client  │  │    (for LLM Inference)   │  │
-│  └────┬─────┘  └────┬─────┘  └───────────┬──────────────┘  │
-└───────┼─────────────┼────────────────────┼─────────────────┘
-        │             │                    │
-┌───────▼─────────────▼────────────────────▼─────────────────┐
-│    Filer Raft Strong-Consistency Metadata Layer (Core)      │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Bucket Sharding | Cap Model | lock_arbiter          │  │
-│  │  Callback Invalidation Push | Multi-Protocol Isolation│  │
-│  └──────────────────────────────────────────────────────┘  │
-└─────────────────────────────┬──────────────────────────────┘
-                              │
-┌─────────────────────────────▼──────────────────────────────┐
-│              Master (Raft Scheduling + CA + Volume Routing)  │
-│              (High-Availability Cluster)                   │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Cluster Mgmt | Resource Alloc | Topology | CA Cert  │  │
-│  └──────────────────────────────────────────────────────┘  │
-└─────────────────────────────┬──────────────────────────────┘
-                              │
-┌─────────────────────────────▼──────────────────────────────┐
-│             Multi-Interface Unified Data Layer             │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │  Volume 1    │  │  Volume 2    │  │  Volume N    │      │
-│  │  (Needle)    │  │  (Needle)    │  │  (Needle)    │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-│               [Unified Needle Binary Format + RocksDB]     │
-└────────────────────────────────────────────────────────────┘
-```
+![3-Layer Decoupled Architecture](docs/architecture.png)
+
+**Control Plane / Data Plane Separation**: the three layers can scale independently — Volume nodes handle raw data throughput, Filer Raft shards scale metadata concurrency via horizontal bucket sharding, and Master handles cluster management with HA failover.
 
 1. **Filer Raft Strong-Consistency Metadata Layer (Core)**: The heart of PowerFS architecture. Bucket-based sharding where each bucket is an independent Raft group. All metadata operations (mkdir, create, unlink, setattr, content_size, chunks) go through Raft commit for linearizability. Cap model + lock_arbiter manages distributed write locks; Callback Invalidation push ensures cross-client cache coherence without broadcast storms.
 
