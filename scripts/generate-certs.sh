@@ -16,7 +16,7 @@
 #   3. 可达 master admin API (metrics_port, 默认 9300)
 #
 # 用法:
-#   # 单节点 RDMA 拓扑 (docker-compose.rdma.yml, host network 192.168.100.3)
+#   # Host RDMA 拓扑 (docker-compose.rdma.yml, host network 192.168.100.3)
 #   ./scripts/generate-certs.sh
 #
 #   # 三节点 HA 拓扑 (docker-compose.yml, bridge 172.30.0.x)
@@ -35,7 +35,7 @@ set -euo pipefail
 MASTER_API="${MASTER_API:-192.168.100.3:9300}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-powerfs-admin-test}"
 OUTPUT_DIR="${OUTPUT_DIR:-docker/certs-default}"
-TOPOLOGY="single"
+TOPOLOGY="host"
 MOUNT_DIR="${MOUNT_DIR:-/mnt/powerfs}"
 
 # 自动探测 powerfs-cli (CLI 参数优先级最高, 然后是 repo-root/target/release/powerfs-cli,
@@ -54,11 +54,11 @@ if [ -z "${CLI:-}" ]; then
     fi
 fi
 
-# 单节点 RDMA: 所有存储节点共享 host IP 192.168.100.3
-SINGLE_NODE_IP="${SINGLE_NODE_IP:-192.168.100.3}"
+# host RDMA 拓扑: 所有存储节点共享 host IP 192.168.100.3
+HOST_NODE_IP="${HOST_NODE_IP:-192.168.100.3}"
 # VM kernel-client 源 IP (ib0 IPoIB 优先, eth0 docker-net 兜底)
-SINGLE_VM1_IPS=(192.168.100.100 172.30.0.100)
-SINGLE_VM2_IPS=(192.168.100.101 172.30.0.101)
+HOST_VM1_IPS=(192.168.100.100 172.30.0.100)
+HOST_VM2_IPS=(192.168.100.101 172.30.0.101)
 
 # 三节点 HA: 各服务独立 IP (bridge 172.30.0.x)
 # IP 必须与 docker-compose.yml 的 ipv4_address 一致, 否则 master 证书验证拒绝.
@@ -72,7 +72,7 @@ THREE_FUSE_IPS=(172.30.0.41 172.30.0.42)
 usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
-  --topology single|three   拓扑 (默认 single)
+  --topology host|three     拓扑 (默认 host)
   --master-api HOST:PORT    master admin API (默认 192.168.100.3:9300)
   --admin-token TOKEN       admin token (默认 powerfs-admin-test)
   --output-dir DIR          输出目录 (默认 docker/certs-default)
@@ -172,11 +172,11 @@ sign_node() {
         -o "$OUTPUT_DIR"
 }
 
-if [[ "$TOPOLOGY" == "single" ]]; then
-    sign_node filer-1 "$SINGLE_NODE_IP"
-    sign_node volume-server-1 "$SINGLE_NODE_IP"
-    sign_node volume-server-2 "$SINGLE_NODE_IP"
-    sign_node volume-server-3 "$SINGLE_NODE_IP"
+if [[ "$TOPOLOGY" == "host" ]]; then
+    sign_node filer-1 "$HOST_NODE_IP"
+    sign_node volume-server-1 "$HOST_NODE_IP"
+    sign_node volume-server-2 "$HOST_NODE_IP"
+    sign_node volume-server-3 "$HOST_NODE_IP"
 elif [[ "$TOPOLOGY" == "three" ]]; then
     for i in "${!THREE_FILER_IDS[@]}"; do
         sign_node "${THREE_FILER_IDS[i]}" "${THREE_FILER_IPS[i]}"
@@ -185,7 +185,7 @@ elif [[ "$TOPOLOGY" == "three" ]]; then
         sign_node "${THREE_VOLUME_IDS[i]}" "${THREE_VOLUME_IPS[i]}"
     done
 else
-    echo "ERROR: unknown topology '$TOPOLOGY' (use single|three)" >&2
+    echo "ERROR: unknown topology '$TOPOLOGY' (use host|three)" >&2
     exit 1
 fi
 
@@ -207,9 +207,9 @@ sign_client() {
         -o "$OUTPUT_DIR"
 }
 
-if [[ "$TOPOLOGY" == "single" ]]; then
-    sign_client kernel-client-1 "${SINGLE_VM1_IPS[@]}"
-    sign_client kernel-client-2 "${SINGLE_VM2_IPS[@]}"
+if [[ "$TOPOLOGY" == "host" ]]; then
+    sign_client kernel-client-1 "${HOST_VM1_IPS[@]}"
+    sign_client kernel-client-2 "${HOST_VM2_IPS[@]}"
 elif [[ "$TOPOLOGY" == "three" ]]; then
     # kernel-client (VM, 假设 VM eth0 172.30.0.100/101)
     sign_client kernel-client-1 172.30.0.100

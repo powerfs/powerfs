@@ -220,33 +220,22 @@ ca_dir = "/data/master/ca"              # CA证书存储目录
 registration_token = "your-cluster-token" # 节点注册认证令牌
 ```
 
-### Quick Start (Single Node)
+### Quick Start (Docker Compose)
 
-> **Note**: Single-node mode is for development/testing only. Production environments must use 3+ Raft nodes.
+> **Note**: Docker Compose is the recommended way for development/testing. Production environments must use 3+ Raft nodes with TLS certificates.
 
 ```bash
-# Step 1: Start Redis (metadata cache)
-docker run -d --name redis -p 6379:6379 redis:7-alpine
+# Host RDMA 拓扑 (单 host + 3 volume, 使用 host network)
+docker compose -f docker/docker-compose.rdma.yml up -d
 
-# Step 2: Start Master node
-./target/release/powerfs-master --config config/master-single.toml
+# 三节点 HA 拓扑 (bridge network, 172.30.0.x)
+docker compose -f docker/docker-compose.yml up -d
+```
 
-# Step 3: Start Volume node
-./target/release/powerfs-volume --config config/volume-single.toml
-
-# Step 4: Initialize Filer metadata (format POSIX root BEFORE starting Filer)
-./target/release/powerfs-init --config config/filer-single.toml
-
-# Step 5: Start Filer node
-./target/release/powerfs-filer --config config/filer-single.toml
-
-# Step 6: Mount FUSE filesystem
-./target/release/powerfs-fuse --config config/fuse-single.toml
-
-# Step 7: Test
-ls /mnt/powerfs
-echo "hello PowerFS" > /mnt/powerfs/test.txt
-cat /mnt/powerfs/test.txt
+证书生成（master 启动后）：
+```bash
+bash scripts/generate-certs.sh                  # 默认 host 拓扑
+bash scripts/generate-certs.sh --topology three # 三节点 HA
 ```
 
 ### Quick Start (3-Node Raft Cluster)
@@ -284,9 +273,6 @@ docker run -d --name redis -p 6379:6379 redis:7-alpine
 #### Master Node
 
 ```bash
-# Single node (development)
-powerfs-master --config config/master-single.toml
-
 # 3-node Raft cluster
 powerfs-master --config config/master-1.toml
 powerfs-master --config config/master-2.toml

@@ -14,7 +14,7 @@
 #   # 2. 启动 RDMA 服务 (master 启动, 但 filer/volume 会因无证书 rejected)
 #   docker compose -f docker-compose.rdma.yml up -d
 #   # 3. 生成证书 (master 启动后)
-#   cd .. && bash scripts/generate-certs.sh --topology single
+#   cd .. && bash scripts/generate-certs.sh --topology host
 #   # 4. 关键: restart filer + 3 volume 让它们重新加载 leaf 证书
 #   cd docker && docker compose -f docker-compose.rdma.yml restart filer-1 volume-1 volume-2 volume-3
 #   # 5. 启动 VM + mount (见 kernel/vm/qemuctl2.sh)
