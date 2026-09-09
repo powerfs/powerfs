@@ -118,8 +118,11 @@ impl Default for TransportConfig {
             // poll_write truncates to buf_size per RDMA SEND — with 2MB
             // buffers, frames up to 2MB are sent as a single message
             // (correct RDMA message semantics).
-            // 32 × 2MB = 64MB per connection (8 RECV + 24 SEND).
-            rdma_buf_num: 32,
+            // 128 × 2MB = 256MB per connection:
+            //   48 pre-post RECV (kernel per-conn write in-flight cap=32 × 1.5× slack)
+            //   + 32 SEND (ACK + read response + metadata) + 48 slack.
+            // 旧值 32 在 PRE_POST_N 48 时 MR 池不够 → MR pool exhausted.
+            rdma_buf_num: 128,
             rdma_buf_size: 2 * 1024 * 1024,
             conn_per_node: 1,
             require_rdma: false,
