@@ -36,8 +36,23 @@ MASTER_API="${MASTER_API:-192.168.100.3:9300}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-powerfs-admin-test}"
 OUTPUT_DIR="${OUTPUT_DIR:-docker/certs-default}"
 TOPOLOGY="single"
-CLI="${CLI:-target/release/powerfs-cli}"
 MOUNT_DIR="${MOUNT_DIR:-/mnt/powerfs}"
+
+# 自动探测 powerfs-cli (CLI 参数优先级最高, 然后是 repo-root/target/release/powerfs-cli,
+# 然后是 CWD/target/release/powerfs-cli, 最后 PATH)
+if [ -z "${CLI:-}" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+    if [ -x "${REPO_ROOT}/target/release/powerfs-cli" ]; then
+        CLI="${REPO_ROOT}/target/release/powerfs-cli"
+    elif [ -x "target/release/powerfs-cli" ]; then
+        CLI="target/release/powerfs-cli"
+    elif command -v powerfs-cli &>/dev/null; then
+        CLI="$(command -v powerfs-cli)"
+    else
+        CLI="target/release/powerfs-cli"  # 保留原缺省让后置 error 生效
+    fi
+fi
 
 # 单节点 RDMA: 所有存储节点共享 host IP 192.168.100.3
 SINGLE_NODE_IP="${SINGLE_NODE_IP:-192.168.100.3}"
@@ -160,6 +175,8 @@ sign_node() {
 if [[ "$TOPOLOGY" == "single" ]]; then
     sign_node filer-1 "$SINGLE_NODE_IP"
     sign_node volume-server-1 "$SINGLE_NODE_IP"
+    sign_node volume-server-2 "$SINGLE_NODE_IP"
+    sign_node volume-server-3 "$SINGLE_NODE_IP"
 elif [[ "$TOPOLOGY" == "three" ]]; then
     for i in "${!THREE_FILER_IDS[@]}"; do
         sign_node "${THREE_FILER_IDS[i]}" "${THREE_FILER_IPS[i]}"

@@ -1,0 +1,24 @@
+# PowerFS Volume 节点配置 - 硬件 RDMA host-network (volume-2)
+# 与 volume-1 共享 host IP 192.168.100.3, 端口必须独立
+
+[global]
+log_level = "info"
+redis_url = "redis://172.30.0.50:6379"
+
+[volume]
+transport = "rdma"
+grpc_port = 8081
+http_port = 8092
+net_port = 8902
+data_dir = "/data"
+master_addresses = ["192.168.100.3:9333"]
+master_net_port = 9334
+node_id = "volume-server-2"
+max_volume_size = 107374182400
+initial_volume_count = 4
+advertise_addr = "192.168.100.3"
+lease_enabled = false
+registration_token = "powerfs-cluster-test"
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/volume-server-2.crt"
+client_key = "/etc/powerfs/certs/volume-server-2.key"
