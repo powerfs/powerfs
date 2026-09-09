@@ -3,9 +3,10 @@ use bytes::Bytes;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 type Result<T> = StorageResult<T>;
 
@@ -39,6 +40,35 @@ struct VolumeMeta {
     physical_offset: u64,
     state: VolumeState,
     data_file: PathBuf,
+    /// 缓存的文件句柄，避免每次 write/read 都 open/close。
+    /// 首次使用时 lazy open，后续复用同一个 File。
+    /// 用 Mutex 保护（File 不可 Clone，需独占访问 seek 位置）。
+    data_file_handle: Mutex<Option<File>>,
+}
+
+impl VolumeMeta {
+    /// 获取或打开缓存的文件句柄（read+write 模式）。
+    /// 首次调用时打开文件并缓存，后续调用直接复用。
+    fn get_or_open_file(&self) -> StorageResult<std::sync::MutexGuard<Option<File>>> {
+        let mut guard = self.data_file_handle.lock().map_err(|e| {
+            StorageBackendError::BackendError(format!("data_file_handle mutex poisoned: {}", e))
+        })?;
+        if guard.is_none() {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(false)
+                .open(&self.data_file)
+                .map_err(|e| {
+                    StorageBackendError::BackendError(format!(
+                        "open data file {:?} failed: {}",
+                        self.data_file, e
+                    ))
+                })?;
+            *guard = Some(file);
+        }
+        Ok(guard)
+    }
 }
 
 pub struct LocalFsBackend {
@@ -48,6 +78,10 @@ pub struct LocalFsBackend {
     base_path: PathBuf,
     node_id: String,
     _checksum_algo: ChecksumAlgorithm,
+    /// 当为 true 时, write_needle 在返回前调用 sync_data() 强制落盘.
+    /// 缺省为 false: 数据到内存即 ack, 由 NVMe-oF target 盘阵或后续
+    /// sync_volume 保证持久化 (lazy fsync, 高吞吐).
+    force_sync: bool,
 }
 
 struct DeviceState {
@@ -62,6 +96,18 @@ impl LocalFsBackend {
         node_id: &str,
         device_name: &str,
         device_capacity: Option<u64>,
+    ) -> Result<Self> {
+        Self::new_with_sync(base_path, node_id, device_name, device_capacity, false)
+    }
+
+    /// Create with explicit durability mode. `force_sync=true` makes
+    /// every write_needle call sync_data() before returning.
+    pub fn new_with_sync(
+        base_path: &str,
+        node_id: &str,
+        device_name: &str,
+        device_capacity: Option<u64>,
+        force_sync: bool,
     ) -> Result<Self> {
         let base_path = PathBuf::from(base_path);
         std::fs::create_dir_all(&base_path)?;
@@ -110,6 +156,7 @@ impl LocalFsBackend {
             base_path,
             node_id: node_id.to_string(),
             _checksum_algo: ChecksumAlgorithm::default(),
+            force_sync,
         })
     }
 
@@ -283,6 +330,7 @@ impl StorageBackend for LocalFsBackend {
             physical_offset: alloc_offset,
             state: VolumeState::Active,
             data_file,
+            data_file_handle: Mutex::new(None),
         };
 
         let mut volumes = self.volumes.write().unwrap();
@@ -347,17 +395,26 @@ impl StorageBackend for LocalFsBackend {
             ));
         }
 
-        let mut file = File::open(&volume.data_file)?;
-        file.seek(SeekFrom::Start(offset))?;
+        // 复用缓存的文件句柄，避免每次 read 都 open/close
+        // 用 pread 避免并发 seek 竞态（文件句柄被复用时 lseek 会互相干扰）
+        let guard = volume.get_or_open_file()?;
+        let file = guard.as_ref().expect("file opened above");
 
         let mut buf = vec![0u8; size as usize];
-        file.read_exact(&mut buf)?;
+        let n = file.read_at(&mut buf, offset)?;
+        if n < buf.len() {
+            return Err(StorageBackendError::IoError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("short read: {} < {}", n, buf.len()),
+            )));
+        }
 
         Ok(Bytes::from(buf))
     }
 
     fn write_needle(&self, volume_id: u64, offset: u64, data: &[u8]) -> Result<u32> {
-        let data_file = {
+        // 先用 read 锁检查边界条件和获取文件句柄
+        {
             let volumes = self.volumes.read().unwrap();
             let volume = volumes
                 .get(&volume_id)
@@ -369,14 +426,28 @@ impl StorageBackend for LocalFsBackend {
                 ));
             }
 
-            volume.data_file.clone()
-        };
+            // 复用缓存的文件句柄，避免每次 write 都 open/close
+            // 用 pwrite 避免并发 seek 竞态（文件句柄被复用时 lseek 会互相干扰）
+            let guard = volume.get_or_open_file()?;
+            let file = guard.as_ref().expect("file opened above");
+            let n = file.write_at(data, offset)?;
+            if n < data.len() {
+                return Err(StorageBackendError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("short write: {} < {}", n, data.len()),
+                )));
+            }
 
-        let mut file = OpenOptions::new().read(true).write(true).open(&data_file)?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(data)?;
-        file.sync_data()?;
+            // Durability: only fsync when force_sync is enabled (default false).
+            // For NVMe-oF target backends or battery-backed storage, persistence
+            // is guaranteed by the device; fsync here only burns CPU + IO time.
+            // sync_volume (called on close/fsync) still does the real flush.
+            if self.force_sync {
+                file.sync_data()?;
+            }
+        }
 
+        // 更新 used_size 需要 write 锁
         let mut volumes = self.volumes.write().unwrap();
         if let Some(vol) = volumes.get_mut(&volume_id) {
             let new_used = offset + data.len() as u64;
@@ -394,7 +465,9 @@ impl StorageBackend for LocalFsBackend {
             .get(&volume_id)
             .ok_or(StorageBackendError::VolumeNotFound(volume_id))?;
 
-        let file = File::open(&volume.data_file)?;
+        // 复用缓存的文件句柄
+        let mut guard = volume.get_or_open_file()?;
+        let file = guard.as_mut().expect("file opened above");
         file.sync_all()?;
         Ok(())
     }

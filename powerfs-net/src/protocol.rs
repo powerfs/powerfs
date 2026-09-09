@@ -633,6 +633,43 @@ pub enum MsgType {
     /// See docs/optimistic-local-create-design.md §4.3
     BatchCreate = 0x003f,
 
+    /// Phase A-1.1: ML readahead IO trace push (kernel → filer).
+    /// Kernel 批量上报 per-inode IO 访问模式, filer 端聚合后供 NN 训练.
+    /// Request: ShardId(u64) + Count(u32) + [TraceEntry]*Count
+    /// TraceEntry: Ino(u64)+Placement(u8)+FileSize(u64)+Offsets[16](u16)+
+    ///             Kinds[16](u8)+SeqRun(u16)+RandRun(u16)
+    /// Response: Status only.
+    PushIoTrace = 0x0041,
+
+    /// Phase C-0: Content fingerprint lookup for write dedup.
+    /// Request body (raw, little-endian):
+    ///   Fingerprint: [u8; 32]  Blake3 hash
+    ///   DataSize:    u64        data size in bytes
+    ///   DataPrefix:  [u8; 64]  first 64 bytes for collision check
+    ///   Inode:       u64        requesting inode
+    ///   Offset:      u64        write offset
+    /// Response body (raw, little-endian):
+    ///   Match:      u8   0=NoMatch, 1=Match, 2=Recoverable
+    ///   NeedleId:   u64  (if Match/Recoverable)
+    ///   VolumeId:   u64  (if Match/Recoverable)
+    ///   Crc32:      u32  (if Match/Recoverable)
+    ///   DataSize:   u64  (if Match/Recoverable)
+    ///   Refcount:   u32  (if Match)
+    FingerprintLookup = 0x0042,
+
+    /// Phase C-0.5: Record a fingerprint after writing a new needle.
+    /// Called by client after a FingerprintLookup returned NoMatch and
+    /// the client has written the new needle to a volume server.
+    /// Request body (raw, little-endian):
+    ///   Fingerprint: [u8; 32]  Blake3 hash
+    ///   NeedleId:     u64       newly written needle id
+    ///   VolumeId:     u64       volume id
+    ///   Crc32:        u32       needle crc32
+    ///   DataSize:     u64       data size in bytes
+    ///   DataPrefix:   [u8; 64]  first 64 bytes for collision check
+    /// Response: Status only.
+    FingerprintRecord = 0x0043,
+
     // Status
     StatFs = 0x0040,
 
@@ -706,10 +743,9 @@ pub enum MsgType {
     /// Response TLV: empty body on STATUS_OK (success is implied).
     WriteNeedleBlob = 0x006B,
 
-    /// fsync durability barrier.  Asks the volume to force-materialise the
-    /// given needles (a file's chunks) out of the in-memory write coalescer
-    /// into the data file + RocksDB index and to fsync the WAL, so that data
-    /// written before fsync is on stable storage.
+    /// 轻量级 flush barrier：kernel 在 fsync/release 时调用。
+    /// 要求 volume server 将指定 needle 从 coalescer 物化到数据文件。
+    /// 不再 fsync WAL（由后台统一维护线程负责）。
     /// Request TLV: VolumeId (Ino) + Count (Limit, u64 number of keys) +
     ///              Count × FileKey.
     /// Response TLV: empty body on STATUS_OK.
@@ -932,6 +968,9 @@ impl MsgType {
             0x003e => Some(Self::BatchUnlink),
             0x003f => Some(Self::BatchCreate),
             0x0040 => Some(Self::StatFs),
+            0x0041 => Some(Self::PushIoTrace),
+            0x0042 => Some(Self::FingerprintLookup),
+            0x0043 => Some(Self::FingerprintRecord),
             0x0050 => Some(Self::Assign),
             0x0051 => Some(Self::LookupVolume),
             0x0052 => Some(Self::Heartbeat),
@@ -1804,7 +1843,7 @@ pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
         // WriteNeedleBlob (0x006B) - partial write within a needle, data ≤ 2MB
         0x006B => Some((4 * 1024, 2 * 1024 * 1024)),
 
-        // FlushNeedles (0x006C) - fsync barrier, response is status only
+        // FlushNeedles (0x006C) - flush barrier, response is status only
         0x006C => Some((256, 0)),
 
         // 其他消息类型无大小约束

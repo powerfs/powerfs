@@ -788,11 +788,7 @@ mod tests {
 
         // Subsequent failures grow the backoff exponentially (attempts counter).
         pool.record_connect_failure(&key, "10.0.0.99", 8901, CHANNEL_DATA);
-        let attempts = pool
-            .failures
-            .get(&key)
-            .map(|f| f.attempts)
-            .unwrap_or(0);
+        let attempts = pool.failures.get(&key).map(|f| f.attempts).unwrap_or(0);
         assert_eq!(attempts, 2);
 
         // After the (short) window elapses, the check passes again.

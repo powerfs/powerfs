@@ -1457,10 +1457,11 @@ impl MetaShardManager {
                         .invalidate_staging(info.inode, info.parent_inode, &info.name);
                 }
                 // Find the entries that were staged (infos) and mark them.
-                for (idx, (_, parent_ino, name, _, _, _, _, _)) in
-                    entries.iter().enumerate()
-                {
-                    if infos.iter().any(|i| i.parent_inode == *parent_ino && i.name == *name) {
+                for (idx, (_, parent_ino, name, _, _, _, _, _)) in entries.iter().enumerate() {
+                    if infos
+                        .iter()
+                        .any(|i| i.parent_inode == *parent_ino && i.name == *name)
+                    {
                         results[idx] = Err(e.clone());
                     }
                 }
@@ -2686,10 +2687,7 @@ impl MetaShardManager {
         };
         match store.alloc_inode_batch(1) {
             Ok((start, _)) => {
-                debug!(
-                    "alloc_inode_in_shard: shard={} inode={}",
-                    shard_id.0, start
-                );
+                debug!("alloc_inode_in_shard: shard={} inode={}", shard_id.0, start);
                 start
             }
             Err(e) => {
@@ -2735,8 +2733,7 @@ impl MetaShardManager {
     pub fn recover_inode_generator(&self) {
         let stores = self.shard_stores.read().unwrap();
         for (shard_id, store) in stores.iter() {
-            let (range_start, range_end) =
-                self.shard_strategy.get_shard_range(*shard_id);
+            let (range_start, range_end) = self.shard_strategy.get_shard_range(*shard_id);
             let scanned_max = store.get_max_inode_in_range(range_start, range_end);
             // alloc_inode_batch reads next_inode from the mutex guard;
             // we can't check it here without exposing the lock, but
@@ -3346,6 +3343,11 @@ impl MetaShardManager {
         key: &str,
         value: Vec<u8>,
     ) -> Result<(), String> {
+        // Clone before moving into ShardCommand so we can project into
+        // MetaCache after propose_meta (mirrors update_inode_size_chunks_atomic).
+        let key_for_projection = key.to_string();
+        let value_for_projection = value.clone();
+
         let cmd = ShardCommand::SetXattr {
             inode,
             key: key.to_string(),
@@ -3353,6 +3355,14 @@ impl MetaShardManager {
         };
 
         self.propose_meta(shard_id, cmd.serialize()).await?;
+
+        // Project into MetaCache so subsequent getxattr (which reads
+        // meta_shard_manager.get_inode → meta_cache first) sees the new
+        // xattr immediately. Without this, MetaCache holds a stale Clean
+        // copy without the xattr and handle_getxattr returns NOT_FOUND even
+        // though shard_store + RocksDB were updated.
+        self.meta_cache
+            .project_set_xattr(inode, key_for_projection, value_for_projection);
 
         // Strict mode only: Wait for the command to be applied.
         // In async mode, propose_meta returns immediately; readers retry.
@@ -3387,12 +3397,20 @@ impl MetaShardManager {
         shard_id: ShardId,
         key: &str,
     ) -> Result<(), String> {
+        // Clone before moving into ShardCommand for MetaCache projection.
+        let key_for_projection = key.to_string();
+
         let cmd = ShardCommand::RemoveXattr {
             inode,
             key: key.to_string(),
         };
 
         self.propose_meta(shard_id, cmd.serialize()).await?;
+
+        // Project into MetaCache so stale cached InodeInfo no longer carries
+        // the removed xattr. See set_xattr projection comment for rationale.
+        self.meta_cache
+            .project_remove_xattr(inode, &key_for_projection);
 
         // Strict mode only: Wait for the command to be applied.
         // In async mode, propose_meta returns immediately; readers retry.
@@ -4470,6 +4488,7 @@ impl MetaShardManager {
                                                 needle_id: c.needle_id,
                                                 volume_id: c.volume_id,
                                                 crc32: c.crc32,
+                                                is_reference: false,
                                             })
                                             .collect();
                                     }
@@ -4746,6 +4765,7 @@ impl MetaShardManager {
                                 needle_id: c.needle_id,
                                 volume_id: c.volume_id,
                                 crc32: c.crc32,
+                                is_reference: false,
                             })
                             .collect();
                     }

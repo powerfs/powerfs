@@ -1,5 +1,5 @@
 use clap::Parser;
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use powerfs_common::{
     config::{PowerFsConfig, ServiceType},
     error::PowerFsError,
@@ -128,18 +128,85 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
     info!("  Rack: {}", rack);
     info!("  Masters: {}", master_address.join(", "));
     info!("  Data Dir: {}", data_dir);
+    info!("  Force Sync on Write: {}", volume_cfg.force_sync_on_write);
+    info!("  WAL Idle Sync Secs: {}", volume_cfg.wal_idle_sync_secs);
     info!("  Initial Volume Count: {}", initial_volume_count);
     info!("  Volume Size: {}", volume_size);
 
     let node_id = NodeId(node_id);
     let storage_manager = Arc::new(
-        StorageManager::new(
+        StorageManager::new_with_sync(
             node_id.clone(),
             data_dir.clone(),
             volume_cfg.device_capacity,
+            volume_cfg.force_sync_on_write,
         )
         .expect("Failed to create storage manager"),
     );
+
+    // 后台统一维护线程：承担两个职责
+    // 1. 高频 flush（50ms）：扫描所有 volume 的过期 dirty needle，批量 flush 到后端
+    //    —— 写入路径只做内存 copy，flush 完全异步化，零 IO 阻塞
+    // 2. 低频 WAL fsync（30 秒）：仅对有新写入的 volume 执行 fsync WAL
+    //    —— 无新写入则跳过，避免无意义的全量 WAL 刷新
+    // 注：force_sync_on_write=true 时不需要后台 WAL fsync（每次写已 fsync）
+    {
+        let sm = storage_manager.clone();
+        let wal_interval_secs = if volume_cfg.force_sync_on_write {
+            0
+        } else {
+            volume_cfg.wal_idle_sync_secs
+        };
+        tokio::spawn(async move {
+            // 高频 flush：50ms 一次
+            let mut flush_interval = tokio::time::interval(Duration::from_millis(50));
+            flush_interval.tick().await; // 跳过首次立即触发
+            // 低频 WAL fsync：仅在 force_sync_on_write=false 时启用
+            let mut wal_interval_opt =
+                if wal_interval_secs > 0 {
+                    Some(tokio::time::interval(Duration::from_secs(wal_interval_secs)))
+                } else {
+                    None
+                };
+            if let Some(ref mut iv) = wal_interval_opt {
+                iv.tick().await; // 跳过首次立即触发
+            }
+            let mut flush_tick_count = 0u64;
+            loop {
+                tokio::select! {
+                    _ = flush_interval.tick() => {
+                        let n = sm.flush_all_expired();
+                        flush_tick_count += 1;
+                        if n > 0 && flush_tick_count % 20 == 0 {
+                            // 每 1 秒（20×50ms）输出一次 flush 统计
+                            debug!("BG_FLUSH: flushed {} needles", n);
+                        }
+                    }
+                    _ = async {
+                        if let Some(ref mut iv) = wal_interval_opt {
+                            iv.tick().await;
+                        } else {
+                            // WAL fsync 禁用，永不返回
+                            std::future::pending::<()>().await;
+                        }
+                    } => {
+                        let (total, synced) = sm.sync_all_wals_if_dirty();
+                        if synced > 0 {
+                            info!(
+                                "WAL_IDLE_SYNC: checked {} volumes, fsync'd {} (interval={}s)",
+                                total, synced, wal_interval_secs
+                            );
+                        } else {
+                            debug!(
+                                "WAL_IDLE_SYNC: checked {} volumes, all idle (interval={}s)",
+                                total, wal_interval_secs
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Pre-create volumes at startup with UUID-based IDs
     // First check if volumes already exist on disk (for recovery after restart)

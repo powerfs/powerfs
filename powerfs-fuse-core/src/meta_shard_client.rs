@@ -1770,6 +1770,124 @@ impl MetaShardClient {
         }
     }
 
+    /// C-1.5: Look up a content fingerprint on the Filer for write dedup.
+    ///
+    /// Sends a raw (non-TLV) body matching the filer's
+    /// `handle_fingerprint_lookup` wire format:
+    ///   fp[32] + data_size[8] + prefix[64] + inode[8] + offset[8] = 120 bytes
+    ///
+    /// Response: match[u8] + optional fields:
+    ///   0 = NoMatch, 1 = Match(+needle_id/vol/crc/size/refcount),
+    ///   2 = Recoverable(+needle_id/vol/crc/size)
+    pub async fn fingerprint_lookup(
+        &self,
+        shard_id: u64,
+        inode: u64,
+        offset: u64,
+        fp: &powerfs_core::fingerprint::Fingerprint,
+        data_size: u64,
+        prefix: &[u8; 64],
+    ) -> Result<powerfs_core::fingerprint::LookupResult, String> {
+        use powerfs_core::fingerprint::LookupResult;
+
+        // Raw body: fp[32] + data_size[8] + prefix[64] + inode[8] + offset[8]
+        let mut body = Vec::with_capacity(120);
+        body.extend_from_slice(&fp.0);
+        body.extend_from_slice(&data_size.to_le_bytes());
+        body.extend_from_slice(prefix);
+        body.extend_from_slice(&inode.to_le_bytes());
+        body.extend_from_slice(&offset.to_le_bytes());
+
+        let resp = self
+            .send_coherence_msg(powerfs_net::MsgType::FingerprintLookup, shard_id, body)
+            .await?;
+
+        if resp.is_empty() {
+            return Ok(LookupResult::NoMatch);
+        }
+        let kind = resp[0];
+        match kind {
+            0u8 => Ok(LookupResult::NoMatch),
+            1u8 => {
+                // Match: needle_id[8] + volume_id[8] + crc32[4] + data_size[8] + refcount[4]
+                // = 33 bytes after the match byte
+                if resp.len() < 1 + 33 {
+                    log::warn!(
+                        "fingerprint_lookup: Match response too short ({} < 34)",
+                        resp.len()
+                    );
+                    return Ok(LookupResult::NoMatch);
+                }
+                let needle_id = u64::from_le_bytes(resp[1..9].try_into().unwrap());
+                let volume_id = u64::from_le_bytes(resp[9..17].try_into().unwrap());
+                let crc32 = u32::from_le_bytes(resp[17..21].try_into().unwrap());
+                let ds = u64::from_le_bytes(resp[21..29].try_into().unwrap());
+                let refcount = u32::from_le_bytes(resp[29..33].try_into().unwrap());
+                Ok(LookupResult::Match {
+                    needle_id,
+                    volume_id,
+                    crc32,
+                    data_size: ds,
+                    refcount,
+                })
+            }
+            2u8 => {
+                // Recoverable: needle_id[8] + volume_id[8] + crc32[4] + data_size[8]
+                // = 29 bytes after the match byte
+                if resp.len() < 1 + 29 {
+                    log::warn!(
+                        "fingerprint_lookup: Recoverable response too short ({} < 30)",
+                        resp.len()
+                    );
+                    return Ok(LookupResult::NoMatch);
+                }
+                let needle_id = u64::from_le_bytes(resp[1..9].try_into().unwrap());
+                let volume_id = u64::from_le_bytes(resp[9..17].try_into().unwrap());
+                let crc32 = u32::from_le_bytes(resp[17..21].try_into().unwrap());
+                let ds = u64::from_le_bytes(resp[21..29].try_into().unwrap());
+                Ok(LookupResult::Recoverable {
+                    needle_id,
+                    volume_id,
+                    crc32,
+                    data_size: ds,
+                })
+            }
+            other => {
+                log::warn!("fingerprint_lookup: unknown match byte {}", other);
+                Ok(LookupResult::NoMatch)
+            }
+        }
+    }
+
+    /// C-1.5: Record a fingerprint after writing a new needle
+    /// (FingerprintLookup returned NoMatch → write data → record).
+    ///
+    /// Raw body matching the filer's `handle_fingerprint_record`:
+    ///   fp[32] + needle_id[8] + volume_id[8] + crc32[4] + data_size[8]
+    ///   + prefix[64] = 124 bytes
+    pub async fn fingerprint_record(
+        &self,
+        shard_id: u64,
+        fp: &powerfs_core::fingerprint::Fingerprint,
+        needle_id: u64,
+        volume_id: u64,
+        crc32: u32,
+        data_size: u64,
+        prefix: &[u8; 64],
+    ) -> Result<(), String> {
+        let mut body = Vec::with_capacity(124);
+        body.extend_from_slice(&fp.0);
+        body.extend_from_slice(&needle_id.to_le_bytes());
+        body.extend_from_slice(&volume_id.to_le_bytes());
+        body.extend_from_slice(&crc32.to_le_bytes());
+        body.extend_from_slice(&data_size.to_le_bytes());
+        body.extend_from_slice(prefix);
+
+        self.send_coherence_msg(powerfs_net::MsgType::FingerprintRecord, shard_id, body)
+            .await?;
+        Ok(())
+    }
+
     /// Phase 3.5.3: open_count 递增——fuse open 时通知 filer（leader only）。
     ///
     /// TLV 编码: Request = ShardId + Ino

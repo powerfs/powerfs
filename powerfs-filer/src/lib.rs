@@ -5,6 +5,7 @@ pub mod crdt_meta;
 pub mod crdt_orset;
 pub mod early_grant;
 pub mod entry_manager;
+pub mod fingerprint_index;
 pub mod grpc_service;
 pub mod inode_lease_manager;
 pub mod inode_notifier;
@@ -16,6 +17,8 @@ pub mod metadata_store;
 pub mod metrics;
 pub mod net_handler;
 pub mod posix_service;
+pub mod readahead_policy;
+pub mod readahead_trace;
 pub mod scrubber;
 pub mod powerfs {
     #![allow(clippy::result_large_err)]
@@ -30,6 +33,7 @@ pub mod shard_store;
 pub mod shard_strategy;
 pub mod tlv_volume_client;
 pub mod volume_router;
+pub mod write_predict_policy;
 pub mod zone_client;
 
 pub use bucket_manager::BucketManager;
