@@ -387,6 +387,35 @@ impl WalIndex {
         assert_eq!(self.stats.active_count, self.needles.len() as u64);
         assert_eq!(self.stats.deleted_count, self.tombstones.len() as u64);
     }
+
+    /// 从 checkpoint 条目重建索引（恢复路径装配，统计同步重算）。
+    ///
+    /// 重放游标（last_lsn/max_needle_id）从条目 version_lsn / needle_id
+    /// 推导；CKPT_ANCHOR 等 lsn 高于全部条目的记录由重放侧补齐。
+    pub fn load_from(
+        &mut self,
+        needles: impl Iterator<Item = NeedleEntry>,
+        tombstones: impl Iterator<Item = TombstoneEntry>,
+        dead: impl Iterator<Item = DeadCopy>,
+    ) {
+        for n in needles {
+            self.max_needle_id = self.max_needle_id.max(n.needle_id);
+            self.last_lsn = self.last_lsn.max(n.version_lsn);
+            self.stats.used_bytes += n.data_len as u64;
+            self.stats.active_count += 1;
+            self.needles.insert(n.needle_id, n);
+        }
+        for t in tombstones {
+            self.last_lsn = self.last_lsn.max(t.version_lsn);
+            self.stats.staging_bytes += t.data_len as u64;
+            self.stats.deleted_count += 1;
+            self.tombstones.insert(t.needle_id, t);
+        }
+        for d in dead {
+            self.stats.garbage_bytes += d.data_len as u64;
+            self.dead_copies.push(d);
+        }
+    }
 }
 
 /// DATA 记录的头部解析（不复制数据本体，重放路径零拷贝）。
