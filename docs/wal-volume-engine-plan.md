@@ -377,6 +377,21 @@ mount():
 - `OutOfSpace` 判定：`free ≤ 0`（free 含义见 §9.3）→ `VolumeState::Full`，恢复条件与 v1 相同（删除释放）。
 - 物理超卖保护：`sum(segments 有效区) ≤ volume_size` 由段分配器保证（v1 的"逻辑 free 高但物理 append_offset 满"分裂问题在段模型下天然消失）。
 
+### 11.1 容量伸缩（扩容 / 缩容）
+
+**扩容（grow）**
+- 管理命令 → 一条 `VOLUME_META` 记录（field_mask 携带 new_volume_size）→ 组提交后原子生效；superblock 下次轮换同步。
+- 生效后 free 立即重算（`free = new_size − used − staging − pinned`），不触碰已有段、无数据搬移。
+- 物理前提仅为底层文件系统有空间：段是独立文件，天然跟随 backend/设备扩容，无 v1 一次性预分配大文件的限制。
+
+**缩容（shrink）**
+- 前置校验：`new_size ≥ used + staging + pinned`（pinned 必须计入，否则快照钉住的旧版本会被挤出盘），不满足则拒绝并返回缺口值。
+- 通过后同样走 `VOLUME_META` 记录；已有段不回收（回收只由 GC 依引用驱动），仅影响 OutOfSpace 判定与新段创建。
+
+**换盘 / 在线迁移（演进）**
+- 段文件模型使 backend 接口退化为段文件 create/append/read/delete；v1 的 `allocate_volume`（全量预分配）与 `truncate_volume`（compact 专用）均不再需要。
+- 在线搬卷（换设备/跨节点）= 段级搬运：目标侧逐段复制 → 源侧尾部增量重放 → superblock 原子切换，归入 §16 send/recv 演进。
+
 ---
 
 ## 12. 客户端协同（Kernel 为主 / FUSE 为辅）
@@ -405,7 +420,7 @@ FUSE 客户端（Rust，ClientType=Fuse 0x01）走同一命令面，天然跟随
 
 ### 12.3 快照的客户端暴露（P3 后）
 
-- 控制面经 Monitor/Filer 管理 API（前端仅经 Monitor，遵守既有约束），Kernel/FUSE 数据面无感知。
+- 控制面双通道（遵守既有约束）：CLI 经 Master 代理（§19.1 `VolumeAdminProxy`）；Web 前端仅经 Monitor。Kernel/FUSE 数据面无感知。
 - 回滚在 volume server 执行前需安全条件：该 volume 无活跃写客户端（或先广播 recall）——沿用既有 lease 机制实现。
 
 ---
@@ -433,6 +448,7 @@ pub trait WalEngine: Send + Sync {
     fn snapshot_list(&self) -> Result<Vec<SnapshotMeta>>;  // SnapshotMeta 含 group_id
     fn snapshot_rollback(&self, id: SnapshotId) -> Result<()>;
     fn clone_to(&self, id: SnapshotId, target_volume: VolumeId) -> Result<()>;
+    fn resize(&self, new_size: u64) -> Result<()>;  // 扩/缩容，VOLUME_META 记录（§11.1）
 }
 ```
 
@@ -485,9 +501,9 @@ pub trait WalEngine: Send + Sync {
 | 阶段 | 内容 | 交付/验收 |
 |------|------|-----------|
 | **P1 日志核心** | 段管理 + 记录帧（哈希链）+ 组提交（async/strict）+ FlushNeedles 屏障 + 崩溃恢复（tolerate_tail）+ `WalEngine` trait 与 v1 并行可切换（`volume_engine=needle|wal` 启动参数） | 模拟器断言 I1/I2；kernel fio 回归 |
-| **P2 Checkpoint + GC** | checkpoint 文件 + superblock 双副本 + 三档恢复模式 + 段 GC（整段删/搬移/限速）+ tombstone purge + 四项空间统计 | WAL 保留量有界；断电恢复时长可测；I3/I4 断言 |
-| **P3 快照** | SNAP_TAKE/DROP/rollback/clone + 懒 CoW（VersionTable）+ pinned 统计 + 管理 API（经 Monitor）+ GC 引用兑现 | 快照 O(1) 创建；快照存在时覆写正确性模拟测试 |
-| **P4 高级** | 快照只读挂载、迁移工具（needle→WAL）、确定性模拟器扩展（位翻转/段损坏矩阵）、压测调参 | 迁移全量校验通过；长稳运行 |
+| **P2 Checkpoint + GC** | checkpoint 文件 + superblock 双副本 + 三档恢复模式 + 段 GC（整段删/搬移/限速）+ tombstone purge + 四项空间统计 + 容量伸缩（§11.1）+ 管理工具（本地只读命令 + gc/checkpoint/resize 双面，§19.5） | WAL 保留量有界；断电恢复时长可测；I3/I4 断言 |
+| **P3 快照** | SNAP_TAKE/DROP/rollback/clone + 懒 CoW（VersionTable）+ pinned 统计 + GC 引用兑现 + 快照 CLI 双面与 EC 组操作（§9.4/§19.4） | 快照 O(1) 创建；快照存在时覆写正确性模拟测试 |
+| **P4 高级** | 快照只读挂载、迁移工具 needle→WAL 与 CLI（Master 编排在线搬卷，§19.2）、确定性模拟器扩展（位翻转/段损坏矩阵）、压测调参 | 迁移全量校验通过；长稳运行 |
 
 配置项汇总（volume server 配置新增）：`volume_engine`、`wal_mode`、`wal_segment_size`、`wal_async_interval`、`max_dirty_bytes`、`ckpt_interval`、`ckpt_lsn_distance`、`recovery_mode`、`gc_ratio`、`gc_min_bytes`、`gc_max_bytes_per_sec`。
 
@@ -497,6 +513,67 @@ pub trait WalEngine: Send + Sync {
 
 - 离线工具 `volume-migrate`：停写 → 扫描旧 needle（索引为准）→ 流式生成 DATA 记录写入新引擎 → 全量 checksum 校验 → 切换目录布局（旧数据转 `legacy/` 保留回退）。
 - 在线双跑（可选，P4 后评估）：新引擎挂旁路，双写观察期，校验一致后切换。考虑实施成本，默认离线迁移。
+
+---
+
+## 19. 管理工具（本地 + CLI 双执行面）
+
+### 19.1 双执行面定位
+
+| 执行面 | 形态 | 适用场景 | 路径 |
+|--------|------|---------|------|
+| **本地面** | `powerfs-volume admin <cmd>`（volume server 二进制子命令，直接打开本地 volume 目录） | 维护窗口、网络断裂、紧急恢复、离线迁移（§18 工具天然本地） | 本地文件系统，不经网络 |
+| **远程面** | `powerfs-cli volume <cmd> -m <master:9333>` | 日常运维、批量操作、审计集中 | CLI → Master `VolumeAdminProxy` gRPC → Master 以自身客户端身份调用目标 volume server 的 AdminService |
+
+约束对齐：
+- CLI 只跟 Master 交互（既有硬约束）→ 远程面一律经 Master；Master 依心跳拓扑定位 volume 所在节点。
+- "server 不转发"原则不受影响：Master→volume 是 Master **主动发起的新请求**（代理），不是存储数据面的请求转发。
+- admin 权限校验在 Master（远程面）；审计日志双写（Master 记 who/when/cmd/target，volume 记执行结果）。
+
+### 19.2 命令树（映射 §13 引擎 API）
+
+```text
+powerfs-volume admin                      # 本地面
+  stats       <volume_dir>                # 只读：四项空间统计 + 段/ckpt/快照概览
+  list-needles <volume_dir> [--prefix N]  # 只读：索引枚举
+  verify      <volume_dir> [--deep]       # 只读：checksum 校验（deep=全量读）
+  scrub       <volume_dir> [--dry-run]
+  gc          <volume_dir> trigger|status [--ratio R]
+  checkpoint  <volume_dir> trigger|status
+  snapshot    <volume_dir> take|list|drop|rollback|clone ...
+  resize      <volume_dir> --size <bytes>            # §11.1
+  migrate     <src_volume_dir> <dst_volume_dir>      # P4，仅本地（§18）
+
+powerfs-cli volume                        # 远程面（-m 指定 Master）
+  powerfs-cli volume status   -m <m> --volume <id>
+  powerfs-cli volume stats    -m <m> --volume <id>
+  powerfs-cli volume resize   -m <m> --volume <id> --size <bytes>
+  powerfs-cli volume gc       -m <m> --volume <id> trigger|status
+  powerfs-cli volume checkpoint -m <m> --volume <id> trigger|status
+  powerfs-cli volume snapshot -m <m> take --volume <id> --name <n>
+  powerfs-cli volume snapshot -m <m> take-group --ec-group <gid> --name <n>   # §9.4 组快照
+  powerfs-cli volume snapshot -m <m> drop|rollback|clone ...
+  powerfs-cli volume scrub    -m <m> --volume <id> [--dry-run]
+  powerfs-cli volume migrate  -m <m> --volume <id> --to-node <node>            # P4：Master 编排（下发指令，实际搬运由两端 volume server 执行）
+```
+
+### 19.3 并发安全与单写者原则
+
+- **引擎文件锁**：`<volume_dir>/lock`（flock）。运行中的 volume server 启动即持锁、退出释放——这是"单写者"的物理保证。
+- 本地面写命令（gc/checkpoint/snapshot/resize/migrate）先取锁：取锁失败 → 明确报 EBUSY 并提示"server 运行中，走 powerfs-cli 或停服后重试"。
+- 本地面只读命令（stats/list-needles/verify/scrub --dry-run）**不取锁、只读打开**：仅读 superblock + 最新 checkpoint + sealed 段，不触碰 active 段（与 server 并发安全，读到的可能是略旧的一致快照，符合检查用途）。
+- 远程面命令全部经运行中的 server（gRPC），与写路径共用引擎内部并发控制，无锁冲突。
+
+### 19.4 EC 组操作约定
+
+- `take-group / rollback-group / clone-group`（组操作）仅远程面提供，由 Master 协调：对条带 k+m 卷并发下发同一 snapshot_id + group_id，汇总各卷结果；部分失败时组状态标记 partial 并支持重试幂等补齐（引擎幂等写/幂等 SNAP_TAKE 保证）。
+- 单卷面提交组回滚请求 → 拒绝（错误信息指明该卷属于 EC 组），`--force` 可越过但计入高危审计。
+
+### 19.5 交付阶段
+
+- P2：本地只读命令 + gc/checkpoint/resize 双面（引擎能力就绪即暴露）。
+- P3：snapshot 双面 + 组操作（Master 协调器随 §9.4 落地）。
+- P4：migrate 双面（本地工具 + Master 编排的在线搬卷）。
 
 ---
 
