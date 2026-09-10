@@ -121,7 +121,7 @@ offset  size  field
 
 ```text
 offset  size  field
-0       8     prev_crc   u64  # 前一条记录的 crc 字段（段首记录填段头 crc 的 u64 扩展）
+0       8     prev_crc   u64  # 前一条记录的 crc 字段（段首记录填链种子：段头不可变字段区 [0..44) 的 crc32c 的 u64 扩展，封段置位 flags 不改种子）
 8       4     crc        u32  # crc32c(type|flags|lsn|payload)
 12      4     len        u32  # payload 长度
 16      1     rtype      u8
@@ -627,8 +627,8 @@ P1 范围（§17）：段管理 + 记录帧（哈希链）+ 组提交（async/st
 
 | #  | 状态  | 完成内容   | 验证结果   | 提交     |
 | -- | --- | ------ | ------ | ------ |
-| S1 | 完成 | `wal/frame.rs`：帧头 26B 编解码（prev_crc/crc/len/rtype/flags/lsn）、8 种 rtype 及全部 payload 编解码（DATA/DELETE/ATTR/SNAP_TAKE/SNAP_DROP/CKPT_ANCHOR/VOLUME_META/PAD）、`encode_frame`/`encode_pad_frame`（PAD 恰好填满剩余空间）、`scan_one` 逐帧扫描（CRC + 哈希链校验）；全零头部识别为预分配 slack，非零残头/声明长度越界识别为撕裂 | 9 个单测全绿：全 rtype roundtrip、payload roundtrip 与畸形拒收、哈希链缺帧检出、CRC 位翻转检出、撕裂尾检出（半头/半帧）、零 slack 判定、PAD 填充/跳过/最小形态、lsn+flags 极值 roundtrip；`cargo clippy -p powerfs-core --lib` 对 wal/ 无告警 | (随本次提交) |
-| S2 | 未开始 | <br /> | <br /> | <br /> |
+| S1 | 完成 | `wal/frame.rs`：帧头 26B 编解码（prev_crc/crc/len/rtype/flags/lsn）、8 种 rtype 及全部 payload 编解码（DATA/DELETE/ATTR/SNAP_TAKE/SNAP_DROP/CKPT_ANCHOR/VOLUME_META/PAD）、`encode_frame`/`encode_pad_frame`（PAD 恰好填满剩余空间）、`scan_one` 逐帧扫描（CRC + 哈希链校验）；全零头部识别为预分配 slack，非零残头/声明长度越界识别为撕裂 | 9 个单测全绿：全 rtype roundtrip、payload roundtrip 与畸形拒收、哈希链缺帧检出、CRC 位翻转检出、撕裂尾检出（半头/半帧）、零 slack 判定、PAD 填充/跳过/最小形态、lsn+flags 极值 roundtrip；`cargo clippy -p powerfs-core --lib` 对 wal/ 无告警 | 8bcd142b |
+| S2 | 完成 | `wal/segment.rs`：SegmentHeader 68B 编解码（CRC 覆盖 [0..64)）、SegWriter（create/reopen/append/pad_to_end/seal/sync、fallocate 预分配、seal 先 fsync 数据再改段头）、SegReader（流式扫描 + 链校验 + scan_summary 定位撕裂尾）；`wal/manifest.rs`：SegManifest 目录扫描构建、归一化规则（有后继段的段一律 Sealed）、next_seg_id/register/mark_sealed | 19 个单测全绿（frame 9 + segment 10）：段头损坏检出、append/scan roundtrip 与偏移连续、段尾 PAD 恰好填满 + 换段链重播种、跨重启 reopen 续链、撕裂尾定位与 reopen 截断续写、fallocate 预分配零读、manifest 归一化/文件名校验/seal 幂等。**设计修正**：链种子改为段头不可变字段区 [0..44) 的 crc32c（seal 改写 flags 不改种子，避免封段后链校验失败） | (随本次提交) |
 | S3 | 未开始 | <br /> | <br /> | <br /> |
 | S4 | 未开始 | <br /> | <br /> | <br /> |
 | S5 | 未开始 | <br /> | <br /> | <br /> |
