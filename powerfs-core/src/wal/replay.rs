@@ -325,8 +325,10 @@ mod tests {
             idx.stats(),
             crate::wal::index::IndexStats {
                 used_bytes: 200,
-                // needle5 覆写淘汰的 100（死副本账本）+ needle6 tombstone 的 50
-                garbage_bytes: 150,
+                // needle5 覆写淘汰的 100 进 garbage；needle6 tombstone 的 50 进 staging
+                staging_bytes: 50,
+                garbage_bytes: 100,
+                pinned_bytes: 0,
                 active_count: 1,
                 deleted_count: 1
             }

@@ -24,6 +24,7 @@ pub struct WalInspectReport {
     pub active_count: u64,
     pub deleted_count: u64,
     pub used_bytes: u64,
+    pub staging_bytes: u64,
     pub garbage_bytes: u64,
     pub dead_copies: usize,
     pub last_lsn: u64,
@@ -55,6 +56,7 @@ fn inspect_impl(dir: &Path, seg_size: u64) -> Result<WalInspectReport, String> {
         active_count: st.active_count,
         deleted_count: st.deleted_count,
         used_bytes: st.used_bytes,
+        staging_bytes: st.staging_bytes,
         garbage_bytes: st.garbage_bytes,
         dead_copies: replay.index.dead_copies().len(),
         last_lsn: replay.index.last_lsn(),
@@ -94,6 +96,7 @@ pub fn format_report(r: &WalInspectReport) -> String {
     out.push_str(&format!("active_needles: {}\n", r.active_count));
     out.push_str(&format!("tombstones:     {}\n", r.deleted_count));
     out.push_str(&format!("used_bytes:     {}\n", r.used_bytes));
+    out.push_str(&format!("staging_bytes:  {}\n", r.staging_bytes));
     out.push_str(&format!("garbage_bytes:  {}\n", r.garbage_bytes));
     out.push_str(&format!("dead_copies:    {}\n", r.dead_copies));
     out.push_str(&format!("last_lsn:       {}\n", r.last_lsn));
@@ -134,7 +137,8 @@ mod tests {
         assert_eq!(r.active_count, 2);
         assert_eq!(r.deleted_count, 1);
         assert_eq!(r.used_bytes, 5 + 5);
-        assert_eq!(r.garbage_bytes, 11); // "beta-longer" 被删除计入垃圾
+        assert_eq!(r.staging_bytes, 11); // "beta-longer" tombstone 保留期物理字节
+        assert_eq!(r.garbage_bytes, 0);
         assert_eq!(r.last_lsn, 4);
         assert_eq!(r.frames_replayed, 4);
         assert_eq!(r.segments.len(), 1);
