@@ -110,6 +110,9 @@ fn no_autosync() -> WalEngineConfig {
             async_interval: std::time::Duration::from_secs(3600),
             ..Default::default()
         },
+        // 停机不写 checkpoint：保持「crash = page cache 丢失」盘面语义，
+        // 否则停机 ckpt 会把非 durable 操作带回恢复态（I1 违约假阳性）。
+        ckpt_on_close: false,
         ..Default::default()
     }
 }

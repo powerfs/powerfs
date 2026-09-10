@@ -35,7 +35,10 @@ pub struct WalInspectReport {
 
 fn inspect_impl(dir: &Path, seg_size: u64) -> Result<WalInspectReport, String> {
     let manifest = SegManifest::load(dir, seg_size).map_err(|e| e.to_string())?;
-    let replay = replay_all(dir, &manifest, true).map_err(|e| e.to_string())?;
+    // 只读检查全量重放（不装载 checkpoint：与 server 并发时 ckpt 可能
+    // 正被写出；全量重放只依赖不可变的 sealed 段 + tolerate_tail）。
+    let replay = replay_all(dir, &manifest, crate::wal::index::WalIndex::new(), true, 0)
+        .map_err(|e| e.to_string())?;
 
     let segments = manifest
         .segments()
@@ -139,8 +142,10 @@ mod tests {
         assert_eq!(r.used_bytes, 5 + 5);
         assert_eq!(r.staging_bytes, 11); // "beta-longer" tombstone 保留期物理字节
         assert_eq!(r.garbage_bytes, 0);
-        assert_eq!(r.last_lsn, 4);
-        assert_eq!(r.frames_replayed, 4);
+        // last_lsn 含停机 CKPT_ANCHOR（3 write + 1 delete = lsn 4，anchor
+        // 为 lsn 5）；帧数同。
+        assert_eq!(r.last_lsn, 5);
+        assert_eq!(r.frames_replayed, 5);
         assert_eq!(r.segments.len(), 1);
         assert!(r.active_seg_id.is_some());
         assert!(r.truncated.is_empty());

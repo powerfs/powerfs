@@ -316,6 +316,15 @@ impl WalIndex {
         }
     }
 
+    /// 推进重放游标到 checkpoint 的 applied_lsn（恢复路径装配）。
+    ///
+    /// checkpoint 条目的 version_lsn 都 ≤ applied_lsn，load_from 推导的
+    /// last_lsn 可能小于 applied_lsn（例如只有 CKPT_ANCHOR 在其后）；
+    /// 恢复重放以 applied_lsn 为起点，跳过前缀后从 applied_lsn+1 继续。
+    pub fn advance_replay_cursor(&mut self, applied_lsn: u64) {
+        self.last_lsn = self.last_lsn.max(applied_lsn);
+    }
+
     /// 保留期内 restore：tombstone 转活跃（引用原位置数据，不搬移）。
     pub fn restore(&mut self, needle_id: u64) -> Result<(), IndexError> {
         let Some(tb) = self.tombstones.remove(&needle_id) else {
@@ -415,6 +424,18 @@ impl WalIndex {
             self.stats.garbage_bytes += d.data_len as u64;
             self.dead_copies.push(d);
         }
+    }
+
+    /// 冻结索引快照（checkpoint 写入用；P2 简化为锁内克隆）。
+    ///
+    /// 返回 (needles, tombstones, dead 账本, 统计)。统计由调用方按过滤
+    /// 后的条目重算时忽略本统计（checkpoint 路径）。
+    pub fn clone_state(&self) -> (Vec<NeedleEntry>, Vec<TombstoneEntry>, Vec<DeadCopy>) {
+        (
+            self.needles.values().cloned().collect(),
+            self.tombstones.values().cloned().collect(),
+            self.dead_copies.clone(),
+        )
     }
 }
 
