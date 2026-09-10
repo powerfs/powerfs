@@ -3,7 +3,6 @@
 linux*
 prompt.md
 xfstests-dev/
-docs/
 kernel/
 openraft/
 dynalock/
