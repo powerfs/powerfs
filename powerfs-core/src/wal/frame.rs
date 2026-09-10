@@ -45,17 +45,9 @@ pub enum FrameError {
     #[error("frame too small: need {need} bytes, got {got}")]
     TooSmall { need: usize, got: usize },
     #[error("crc mismatch at lsn {lsn}: expected {expected:#010x}, got {got:#010x}")]
-    CrcMismatch {
-        lsn: u64,
-        expected: u32,
-        got: u32,
-    },
+    CrcMismatch { lsn: u64, expected: u32, got: u32 },
     #[error("chain broken at lsn {lsn}: prev_crc expected {expected:#018x}, got {got:#018x}")]
-    ChainMismatch {
-        lsn: u64,
-        expected: u64,
-        got: u64,
-    },
+    ChainMismatch { lsn: u64, expected: u64, got: u64 },
     #[error("unknown record type {rtype:#04x} at offset {offset}")]
     UnknownType { rtype: u8, offset: u64 },
     #[error("invalid payload for record type {rtype:#04x}: {reason}")]
@@ -209,7 +201,10 @@ pub fn decode_header(buf: &[u8], offset: u64) -> Result<FrameHeader, FrameError>
     let rt_u8 = buf[16];
     let flags = buf[17];
     let lsn = u64::from_le_bytes(buf[18..26].try_into().unwrap());
-    let rtype = RecordType::from_u8(rt_u8).ok_or(FrameError::UnknownType { rtype: rt_u8, offset })?;
+    let rtype = RecordType::from_u8(rt_u8).ok_or(FrameError::UnknownType {
+        rtype: rt_u8,
+        offset,
+    })?;
     Ok(FrameHeader {
         prev_crc,
         crc,
@@ -353,7 +348,10 @@ impl DataPayload {
 
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
         if buf.len() < 12 {
-            return Err(payload_err(RT_DATA, format!("need >= 12 bytes, got {}", buf.len())));
+            return Err(payload_err(
+                RT_DATA,
+                format!("need >= 12 bytes, got {}", buf.len()),
+            ));
         }
         let needle_id = read_u64(buf, 0)?;
         let data_len = read_u32(buf, 8)? as usize;
@@ -420,7 +418,10 @@ impl AttrPayload {
 
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
         if buf.len() < 12 {
-            return Err(payload_err(RT_ATTR, format!("need >= 12 bytes, got {}", buf.len())));
+            return Err(payload_err(
+                RT_ATTR,
+                format!("need >= 12 bytes, got {}", buf.len()),
+            ));
         }
         Ok(AttrPayload {
             needle_id: read_u64(buf, 0)?,
@@ -451,7 +452,10 @@ impl SnapTakePayload {
 
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
         if buf.len() < 26 {
-            return Err(payload_err(RT_SNAP_TAKE, format!("need >= 26 bytes, got {}", buf.len())));
+            return Err(payload_err(
+                RT_SNAP_TAKE,
+                format!("need >= 26 bytes, got {}", buf.len()),
+            ));
         }
         let snapshot_id = read_u64(buf, 0)?;
         let group_id = read_u64(buf, 8)?;
@@ -545,7 +549,10 @@ impl VolumeMetaPayload {
 
     pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
         if buf.len() < 4 {
-            return Err(payload_err(RT_VOLUME_META, format!("need >= 4 bytes, got {}", buf.len())));
+            return Err(payload_err(
+                RT_VOLUME_META,
+                format!("need >= 4 bytes, got {}", buf.len()),
+            ));
         }
         Ok(VolumeMetaPayload {
             field_mask: read_u32(buf, 0)?,
@@ -613,97 +620,83 @@ mod tests {
     #[test]
     fn frame_roundtrip_all_rtypes() {
         let payloads: Vec<(RecordType, Vec<u8>)> = vec![
-            (
-                RecordType::Data,
-                {
-                    let p = DataPayload {
-                        needle_id: 0xdead_beef,
-                        data: Bytes::from_static(b"hello wal"),
-                    };
-                    let mut v = Vec::new();
-                    p.encode(&mut v);
-                    v
-                },
-            ),
-            (
-                RecordType::Delete,
-                {
-                    let p = DeletePayload {
-                        needle_id: 7,
-                        deleted_at: 1000,
-                        retention_until: 2000,
-                    };
-                    let mut v = Vec::new();
-                    p.encode(&mut v);
-                    v
-                },
-            ),
-            (
-                RecordType::Attr,
-                {
-                    let p = AttrPayload {
-                        needle_id: 9,
-                        attr_mask: 0b101,
-                        values: Bytes::from_static(b"worm"),
-                    };
-                    let mut v = Vec::new();
-                    p.encode(&mut v);
-                    v
-                },
-            ),
-            (
-                RecordType::SnapTake,
-                {
-                    let p = SnapTakePayload {
-                        snapshot_id: 42,
-                        group_id: 100,
-                        name: "snap-1".to_string(),
-                        ts: 123456,
-                    };
-                    let mut v = Vec::new();
-                    p.encode(&mut v);
-                    v
-                },
-            ),
-            (
-                RecordType::SnapDrop,
-                {
-                    let p = SnapDropPayload { snapshot_id: 42 };
-                    let mut v = Vec::new();
-                    p.encode(&mut v);
-                    v
-                },
-            ),
-            (
-                RecordType::CkptAnchor,
-                {
-                    let p = CkptAnchorPayload {
-                        ckpt_seq: 3,
-                        applied_lsn: 999,
-                    };
-                    let mut v = Vec::new();
-                    p.encode(&mut v);
-                    v
-                },
-            ),
-            (
-                RecordType::VolumeMeta,
-                {
-                    let p = VolumeMetaPayload {
-                        field_mask: 0x7,
-                        values: Bytes::from_static(b"collection-a"),
-                    };
-                    let mut v = Vec::new();
-                    p.encode(&mut v);
-                    v
-                },
-            ),
+            (RecordType::Data, {
+                let p = DataPayload {
+                    needle_id: 0xdead_beef,
+                    data: Bytes::from_static(b"hello wal"),
+                };
+                let mut v = Vec::new();
+                p.encode(&mut v);
+                v
+            }),
+            (RecordType::Delete, {
+                let p = DeletePayload {
+                    needle_id: 7,
+                    deleted_at: 1000,
+                    retention_until: 2000,
+                };
+                let mut v = Vec::new();
+                p.encode(&mut v);
+                v
+            }),
+            (RecordType::Attr, {
+                let p = AttrPayload {
+                    needle_id: 9,
+                    attr_mask: 0b101,
+                    values: Bytes::from_static(b"worm"),
+                };
+                let mut v = Vec::new();
+                p.encode(&mut v);
+                v
+            }),
+            (RecordType::SnapTake, {
+                let p = SnapTakePayload {
+                    snapshot_id: 42,
+                    group_id: 100,
+                    name: "snap-1".to_string(),
+                    ts: 123456,
+                };
+                let mut v = Vec::new();
+                p.encode(&mut v);
+                v
+            }),
+            (RecordType::SnapDrop, {
+                let p = SnapDropPayload { snapshot_id: 42 };
+                let mut v = Vec::new();
+                p.encode(&mut v);
+                v
+            }),
+            (RecordType::CkptAnchor, {
+                let p = CkptAnchorPayload {
+                    ckpt_seq: 3,
+                    applied_lsn: 999,
+                };
+                let mut v = Vec::new();
+                p.encode(&mut v);
+                v
+            }),
+            (RecordType::VolumeMeta, {
+                let p = VolumeMetaPayload {
+                    field_mask: 0x7,
+                    values: Bytes::from_static(b"collection-a"),
+                };
+                let mut v = Vec::new();
+                p.encode(&mut v);
+                v
+            }),
         ];
 
         let frames: Vec<(RecordType, u8, u64, Vec<u8>)> = payloads
             .iter()
             .enumerate()
-            .map(|(i, (rt, p))| (*rt, if i == 1 { FLAG_SYNC_BARRIER } else { 0 }, i as u64, p.clone()))
+            .map(|(i, (rt, p))| {
+                (
+                    *rt,
+                    if i == 1 { FLAG_SYNC_BARRIER } else { 0 },
+                    i as u64,
+                    p.clone(),
+                )
+            })
             .collect();
         let (buf, headers) = build_segment(&frames);
         let scanned = scan_all(&buf);
@@ -715,15 +708,14 @@ mod tests {
             assert_eq!(header.flags, want.1, "frame {i} flags");
             assert_eq!(&payload[..], &want.3[..], "frame {i} payload");
             assert_eq!(header.total_size(), FRAME_HEADER_SIZE + want.3.len());
-            assert_eq!(
-                header.is_sync_barrier(),
-                i == 1,
-                "frame {i} barrier flag"
-            );
+            assert_eq!(header.is_sync_barrier(), i == 1, "frame {i} barrier flag");
         }
         // 帧头解码独立于扫描路径也应一致。
         for (i, h) in headers.iter().enumerate() {
-            let off = scanned[..i].iter().map(|(_, p)| FRAME_HEADER_SIZE + p.len()).sum::<usize>();
+            let off = scanned[..i]
+                .iter()
+                .map(|(_, p)| FRAME_HEADER_SIZE + p.len())
+                .sum::<usize>();
             assert_eq!(&decode_header(&buf[off..], off as u64).unwrap(), h);
         }
     }
@@ -769,7 +761,9 @@ mod tests {
         snap.encode(&mut v);
         assert_eq!(SnapTakePayload::decode(&v).unwrap(), snap);
 
-        let drop = SnapDropPayload { snapshot_id: u64::MAX };
+        let drop = SnapDropPayload {
+            snapshot_id: u64::MAX,
+        };
         let mut v = Vec::new();
         drop.encode(&mut v);
         assert_eq!(v.len(), 8);
@@ -863,12 +857,7 @@ mod tests {
 
     #[test]
     fn crc_corruption_detected() {
-        let (mut buf, _) = build_segment(&[(
-            RecordType::Data,
-            0,
-            1,
-            vec![7u8; 64],
-        )]);
+        let (mut buf, _) = build_segment(&[(RecordType::Data, 0, 1, vec![7u8; 64])]);
         // 翻转 payload 中间一个字节。
         let mid = FRAME_HEADER_SIZE + 32;
         buf[mid] ^= 0x01;
@@ -951,21 +940,14 @@ mod tests {
         // PAD 最小形态：len=0。
         let (pad0, _) = encode_pad_frame(SEED, 0, FRAME_HEADER_SIZE);
         assert_eq!(pad0.len(), FRAME_HEADER_SIZE);
-        assert!(matches!(
-            scan_one(&pad0, SEED),
-            ScanOne::Frame { .. }
-        ));
+        assert!(matches!(scan_one(&pad0, SEED), ScanOne::Frame { .. }));
         assert!(std::panic::catch_unwind(|| encode_pad_frame(SEED, 0, 5)).is_err());
     }
 
     #[test]
     fn lsn_and_flags_survive_roundtrip() {
-        let (buf, _) = build_segment(&[(
-            RecordType::Data,
-            FLAG_SYNC_BARRIER,
-            u64::MAX,
-            b"x".to_vec(),
-        )]);
+        let (buf, _) =
+            build_segment(&[(RecordType::Data, FLAG_SYNC_BARRIER, u64::MAX, b"x".to_vec())]);
         let scanned = scan_all(&buf);
         assert_eq!(scanned[0].0.lsn, u64::MAX);
         assert!(scanned[0].0.is_sync_barrier());
