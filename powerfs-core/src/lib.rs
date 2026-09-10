@@ -16,4 +16,5 @@ pub mod storage_backend;
 pub mod volume;
 pub mod volume_bootstrap;
 pub mod volume_metadata;
+pub mod wal;
 pub mod write_coalescer;
