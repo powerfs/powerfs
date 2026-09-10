@@ -119,8 +119,57 @@ def main():
                 f"{float(r['byte_equal_ratio']):.3f} | {r['zstd_single_ratio']} | "
                 f"{r['zstd_xor_ratio']} |")
 
+    # positive controls: container images and source archives
+    ppath = os.path.join(raw, "positive_overlap.csv")
+    if os.path.exists(ppath):
+        pos = read_csv(ppath)
+        lines += ["",
+                  "## 5. Positive controls — where byte-level dedup DOES work",
+                  "",
+                  "Same BLAKE2b-128 fixed-chunk measurement. `perfile` chunks every",
+                  "file independently from offset 0 (the POSIX filesystem view);",
+                  "`raw` chunks the archive byte stream (misaligned by tar ordering).",
+                  "hit-any = fraction of chunks already present in ANY earlier version.",
+                  "",
+                  "| group | view | version | 4K | 64K | 1M |",
+                  "|---|---|---|---:|---:|---:|"]
+        cells = {}
+        for r in pos:
+            cells[(r["group"], r["view"], r["version"], int(r["chunk_size"]))] = \
+                float(r["hit_any_ratio"])
+        for g in ("rootfs", "source", "images"):
+            versions = sorted({r["version"] for r in pos if r["group"] == g})
+            for view in ("perfile", "raw", "layers-perfile"):
+                for ver in versions[1:] if view != "raw" else versions:
+                    ckey = (g, view, ver)
+                    vals = [cells.get(ckey + (s,)) for s in (4096, 65536, 1048576)]
+                    if vals[0] is None:
+                        continue
+                    lines.append(f"| {g} | {view} | {ver} | " +
+                                 " | ".join(f"{x:.4f}" for x in vals) + " |")
+        lpath = os.path.join(raw, "positive_layers.csv")
+        if os.path.exists(lpath):
+            lays = [r for r in read_csv(lpath)
+                    if r["new_vs_prev"] in ("True", "False")]
+            base = {}
+            for r in lays:
+                base.setdefault(r["digest"], []).append(r["version"])
+            shared = {d: vs for d, vs in base.items() if len(vs) > 1}
+            total_csize = sum(int(r["compressed_size"]) for r in lays
+                              if r["version"] == "v3")
+            shared_csize = sum(int(r["compressed_size"]) for r in lays
+                               if r["digest"] in shared and r["version"] == "v3")
+            lines += ["",
+                      f"OCI layer blobs (v3 image): {len([r for r in lays if r['version']=='v3'])}; "
+                      f"{len(shared)} shared across all 3 versions "
+                      f"({shared_csize/1e6:.0f} of {total_csize/1e6:.0f} MB, "
+                      "content-addressable, zero transfer/storage). "
+                      "Shared digests:"]
+            for d, vs in sorted(shared.items()):
+                lines.append(f"- `{d}…` in {', '.join(vs)}")
+
     # go/no-go: 1M file-view torchsave + weights
-    lines += ["", "## 5. Go/no-go (decision rules)", ""]
+    lines += ["", "## 6. Go/no-go (decision rules)", ""]
     for fmt in ("torchsave", "weights", "dcp"):
         v1m = key["steady_state_step5plus"].get(f"{fmt}/file/{1048576}", {}).get("hit_any")
         lines.append(f"- {fmt} @1M file view, hit-any = {v1m} "

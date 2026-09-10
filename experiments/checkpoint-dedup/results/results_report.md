@@ -104,7 +104,39 @@ hit ratio when the reference stream is shifted by N bytes (detects content that 
 | torchsave | 9->10 | 0.0037 | 0.0037 | 0.263 | 1.085 | 1.223 |
 | torchsave | 18->19 | 0.0037 | 0.0037 | 0.303 | 1.085 | 1.275 |
 
-## 5. Go/no-go (decision rules)
+## 5. Positive controls — where byte-level dedup DOES work
+
+Same BLAKE2b-128 fixed-chunk measurement. `perfile` chunks every
+file independently from offset 0 (the POSIX filesystem view);
+`raw` chunks the archive byte stream (misaligned by tar ordering).
+hit-any = fraction of chunks already present in ANY earlier version.
+
+| group | view | version | 4K | 64K | 1M |
+|---|---|---|---:|---:|---:|
+| rootfs | perfile | rootfs_v2 | 0.5859 | 0.6232 | 0.6602 |
+| rootfs | perfile | rootfs_v3 | 0.9775 | 0.9740 | 0.9810 |
+| rootfs | raw | rootfs_v1 | 0.0000 | 0.0000 | 0.0000 |
+| rootfs | raw | rootfs_v2 | 0.0393 | 0.0141 | 0.0000 |
+| rootfs | raw | rootfs_v3 | 0.1036 | 0.0162 | 0.0000 |
+| source | perfile | src_s2 | 0.3243 | 0.1148 | 0.0000 |
+| source | perfile | src_s3 | 0.7046 | 0.5625 | 0.0000 |
+| source | perfile | src_s4 | 0.7536 | 0.5846 | 0.0000 |
+| source | perfile | src_s5 | 0.9477 | 0.9559 | 0.0000 |
+| source | raw | src_s1 | 0.0000 | 0.0000 | 0.0000 |
+| source | raw | src_s2 | 0.0142 | 0.0000 | 0.0000 |
+| source | raw | src_s3 | 0.0455 | 0.0050 | 0.0000 |
+| source | raw | src_s4 | 0.1169 | 0.0049 | 0.0000 |
+| source | raw | src_s5 | 0.5431 | 0.0047 | 0.0000 |
+| images | raw | v1 | 0.0000 | 0.0000 | 0.0000 |
+| images | raw | v2 | 0.0033 | 0.0002 | 0.0000 |
+| images | raw | v3 | 0.1908 | 0.0000 | 0.0000 |
+| images | layers-perfile | v2 | 0.5860 | 0.6233 | 0.6602 |
+| images | layers-perfile | v3 | 0.9775 | 0.9740 | 0.9810 |
+
+OCI layer blobs (v3 image): 2; 1 shared across all 3 versions (75 of 272 MB, content-addressable, zero transfer/storage). Shared digests:
+- `470b66ea5123c93b0d5…` in v1, v2, v3
+
+## 6. Go/no-go (decision rules)
 
 - torchsave @1M file view, hit-any = 0.001404 (go >0.30, no-go <0.05)
 - weights @1M file view, hit-any = 0.0 (go >0.30, no-go <0.05)
