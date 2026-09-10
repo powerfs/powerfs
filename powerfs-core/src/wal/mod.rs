@@ -6,7 +6,9 @@
 //! - 段清单（目录内段文件的内存索引）：[`manifest`]。
 //! - 内存索引（needle/tombstone/统计）：[`index`]。
 //! - 重放器（段序重放 + tolerate_tail）：[`replay`]。
+//! - 组提交与 fsync 屏障（方案 §5）：[`commit`]。
 
+pub mod commit;
 pub mod frame;
 pub mod index;
 pub mod manifest;
