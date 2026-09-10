@@ -19,7 +19,11 @@ use crate::wal::segment::{SegReader, SegmentError};
 #[derive(Debug, thiserror::Error)]
 pub enum ReplayError {
     #[error("segment error on seg {seg_id}: {source}")]
-    Segment { seg_id: u64, #[source] source: SegmentError },
+    Segment {
+        seg_id: u64,
+        #[source]
+        source: SegmentError,
+    },
     #[error("corrupt frame in seg {seg_id} at offset {offset}: {source}")]
     Corrupt {
         seg_id: u64,
@@ -65,8 +69,8 @@ pub fn replay_all(
     for (i, entry) in segments.iter().enumerate() {
         let seg_id = entry.seg_id;
         let path = dir.join(crate::wal::segment::seg_file_name(seg_id));
-        let mut reader = SegReader::open(&path)
-            .map_err(|source| ReplayError::Segment { seg_id, source })?;
+        let mut reader =
+            SegReader::open(&path).map_err(|source| ReplayError::Segment { seg_id, source })?;
 
         loop {
             match reader.next_frame() {
@@ -154,13 +158,15 @@ fn apply_frame(
                     rtype: meta.rtype.to_u8(),
                 })
         }
-        RecordType::Delete => index
-            .apply_delete(meta.lsn, payload)
-            .map_err(|_| ReplayError::MalformedPayload {
-                seg_id,
-                lsn: meta.lsn,
-                rtype: meta.rtype.to_u8(),
-            }),
+        RecordType::Delete => {
+            index
+                .apply_delete(meta.lsn, payload)
+                .map_err(|_| ReplayError::MalformedPayload {
+                    seg_id,
+                    lsn: meta.lsn,
+                    rtype: meta.rtype.to_u8(),
+                })
+        }
         RecordType::CkptAnchor => {
             if payload.len() == 16 {
                 let ckpt_seq = u64::from_le_bytes(payload[0..8].try_into().unwrap());
@@ -292,11 +298,16 @@ mod tests {
             false,
         )
         .unwrap();
-        w.append(RecordType::Data, 0, 1, &data_payload(5, 100)).unwrap();
-        w.append(RecordType::Delete, 0, 2, &delete_payload(5)).unwrap();
-        w.append(RecordType::Data, 0, 3, &data_payload(5, 200)).unwrap(); // 复活
-        w.append(RecordType::Data, 0, 4, &data_payload(6, 50)).unwrap();
-        w.append(RecordType::Delete, 0, 5, &delete_payload(6)).unwrap(); // 保持删除
+        w.append(RecordType::Data, 0, 1, &data_payload(5, 100))
+            .unwrap();
+        w.append(RecordType::Delete, 0, 2, &delete_payload(5))
+            .unwrap();
+        w.append(RecordType::Data, 0, 3, &data_payload(5, 200))
+            .unwrap(); // 复活
+        w.append(RecordType::Data, 0, 4, &data_payload(6, 50))
+            .unwrap();
+        w.append(RecordType::Delete, 0, 5, &delete_payload(6))
+            .unwrap(); // 保持删除
         w.seal().unwrap();
         drop(w);
         mf.register(seg_id, 1, 1);
@@ -379,7 +390,9 @@ mod tests {
         );
         let pos2 = w2.write_pos();
         w2.file_mut().seek(std::io::SeekFrom::Start(pos2)).unwrap();
-        w2.file_mut().write_all(&bytes2[..bytes2.len() / 2]).unwrap();
+        w2.file_mut()
+            .write_all(&bytes2[..bytes2.len() / 2])
+            .unwrap();
         drop(w2);
         assert!(matches!(
             replay_all(dir.path(), &mf2, false),
@@ -443,16 +456,10 @@ mod tests {
     #[test]
     fn ckpt_anchor_replayed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut w = SegWriter::create(
-            &dir.path().join(seg_file_name(1)),
-            1,
-            1,
-            1,
-            SEG_SIZE,
-            false,
-        )
-        .unwrap();
-        w.append(RecordType::Data, 0, 1, &data_payload(1, 16)).unwrap();
+        let mut w = SegWriter::create(&dir.path().join(seg_file_name(1)), 1, 1, 1, SEG_SIZE, false)
+            .unwrap();
+        w.append(RecordType::Data, 0, 1, &data_payload(1, 16))
+            .unwrap();
         let mut p = Vec::new();
         p.extend_from_slice(&7u64.to_le_bytes());
         p.extend_from_slice(&1u64.to_le_bytes());

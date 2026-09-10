@@ -243,11 +243,7 @@ impl WalIndex {
     }
 
     /// 应用一条 DELETE 记录（tombstone，保留期内可 restore）。
-    pub fn apply_delete(
-        &mut self,
-        frame_lsn: u64,
-        payload: &[u8],
-    ) -> Result<(), IndexError> {
+    pub fn apply_delete(&mut self, frame_lsn: u64, payload: &[u8]) -> Result<(), IndexError> {
         if payload.len() != 24 {
             return Err(IndexError::ShortPayload {
                 op: "DELETE",
@@ -359,7 +355,8 @@ impl WalIndex {
 
 /// DATA 记录的头部解析（不复制数据本体，重放路径零拷贝）。
 pub fn parse_data_header(payload: &[u8]) -> Option<(u64, u32)> {
-    if payload.len() < 12 || payload.len() != 12 + u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize
+    if payload.len() < 12
+        || payload.len() != 12 + u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize
     {
         return None;
     }
@@ -432,23 +429,27 @@ mod tests {
     #[test]
     fn stale_lsn_skipped_idempotent() {
         let mut idx = WalIndex::new();
-        idx.apply_data(1, 68, 1, 5, &data_payload(1, 50), 0).unwrap();
+        idx.apply_data(1, 68, 1, 5, &data_payload(1, 50), 0)
+            .unwrap();
         let snap = idx.stats();
 
         // 旧 lsn 重放（乱序/重复）→ 跳过。
-        idx.apply_data(1, 999, 2, 3, &data_payload(1, 80), 0).unwrap();
+        idx.apply_data(1, 999, 2, 3, &data_payload(1, 80), 0)
+            .unwrap();
         assert_eq!(idx.lookup(1).unwrap().offset, 68 + 26);
         assert_eq!(idx.stats(), snap);
 
         // 同 lsn 重复 DATA → 跳过（重放两次结果一致）。
-        idx.apply_data(1, 68, 1, 5, &data_payload(1, 50), 0).unwrap();
+        idx.apply_data(1, 68, 1, 5, &data_payload(1, 50), 0)
+            .unwrap();
         assert_eq!(idx.stats(), snap);
     }
 
     #[test]
     fn delete_then_restore() {
         let mut idx = WalIndex::new();
-        idx.apply_data(2, 68, 1, 1, &data_payload(7, 200), 100).unwrap();
+        idx.apply_data(2, 68, 1, 1, &data_payload(7, 200), 100)
+            .unwrap();
 
         idx.apply_delete(2, &delete_payload(7, 500, 500 + 7 * 86400))
             .unwrap();
@@ -491,12 +492,14 @@ mod tests {
     #[test]
     fn data_after_delete_revives() {
         let mut idx = WalIndex::new();
-        idx.apply_data(1, 68, 1, 1, &data_payload(3, 40), 0).unwrap();
+        idx.apply_data(1, 68, 1, 1, &data_payload(3, 40), 0)
+            .unwrap();
         idx.apply_delete(2, &delete_payload(3, 10, 20)).unwrap();
         assert_eq!(idx.tombstone_count(), 1);
 
         // DELETE 之后的 DATA（新位置）→ 复活；旧副本留在死副本账本。
-        idx.apply_data(4, 500, 3, 3, &data_payload(3, 60), 0).unwrap();
+        idx.apply_data(4, 500, 3, 3, &data_payload(3, 60), 0)
+            .unwrap();
         assert!(idx.tombstone_of(3).is_none());
         let e = idx.lookup(3).unwrap();
         assert_eq!(e.seg_id, 4);
@@ -545,7 +548,8 @@ mod tests {
     fn max_needle_and_last_lsn_tracked() {
         let mut idx = WalIndex::new();
         idx.apply_data(1, 0, 0, 3, &data_payload(9, 10), 0).unwrap();
-        idx.apply_data(1, 0, 0, 7, &data_payload(100, 10), 0).unwrap();
+        idx.apply_data(1, 0, 0, 7, &data_payload(100, 10), 0)
+            .unwrap();
         assert_eq!(idx.max_needle_id(), 100);
         assert_eq!(idx.last_lsn(), 7);
     }
