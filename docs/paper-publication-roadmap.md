@@ -2,7 +2,7 @@
 
 > 目的：在 [write-prediction-related-work.md](write-prediction-related-work.md) 的相关工作边界之上，结合 2026 年存储领域热点与 venue 时间窗口，确定可投方向、优先级与执行路线。
 >
-> 记录日期：2026-09-10（阶段 A 结果同日填入第 7.1 节）。结论先行：**go/no-go 已判定——checkpoint 字节级去重 no-go（全同块 ≈0，压缩/CDC 同步失效），方向二否决；方向一转为"语义级冗余为何在 POSIX 字节层不可见"的能力边界测量论文，下一步做容器镜像/源码包正向对照。KVCache 赛道明确不进。**
+> 记录日期：2026-09-10；阶段 A（7.1）与正向对照（7.2）分别于 09-10 / 09-11 完成。结论先行：**checkpoint 字节级去重 no-go（全同块 ≈0，压缩/CDC/bf16/长间隔对照全部失效），方向二否决；正向对照证明同一方法在容器镜像层/源码多版本上命中 59–98%，能力边界图成立，方向一定位为"语义级冗余为何在 POSIX 字节层不可见"的测量论文。KVCache 赛道明确不进。**
 
 ## 1. Venue 时间窗口（2026-09 核实）
 
@@ -135,7 +135,7 @@ FAST'26 两篇的边界：**AdaCheck** 需张量级离线分析；**AITURBO** �
 | 时间 | 事项 | 产出 / 决策点 |
 |---|---|---|
 | 2026-09 中旬（本周） | **写侧 go/no-go**：容器内 CPU 装 PyTorch，GPT-2 small 连存 20 个 checkpoint（torch.save + DCP 两格式），离线切 1MB chunk 算跨 step 重复率与偏移敏感度 | **已完成 2026-09-10：NO-GO（全同块 0-0.37%、shift/CDC/压缩/bf16/长间隔对照全部失效，见 7.1）**；方向二否决，方向一改为能力边界测量 |
-| 2026-09 下旬 | **正向对照（提前，最高优先）**：字节级去重主场 workload——≥3 个共享 base 的容器镜像 `docker save` tar、同源码树多版本 tar（内核源码打包场景）、日志；跑同一分析器多档 chunk 重复率与跨版本距离 | 给出"字节级透明去重有效区间 vs 失效区间"完整边界图；短文核心表 |
+| 2026-09 下旬 | **正向对照（已完成 2026-09-11，见 7.2）**：共享 base 的容器镜像 v1/v2/v3（docker commit/save/export）+ powerfs 5 个历史 commit 的 git archive，同一分析器 per-file/raw/layer 三视图 | 边界图成立：镜像 59–98%、源码 32–96%（近版本）、checkpoint ≈0；附边界对齐发现（tar raw 流塌到 0.3–19%） |
 | 2026-09 下旬 | **读侧最小验证**：复用同一批 checkpoint，全量加载 + 部分加载（model.* 子集）× readahead off/RULE:16/auto，cold cache 各 3 次；记录加载时延、读放大、volume IOPS | 确认"按加载意图自适应"分叉（独立于去重结论） |
 | 2026-10 ~ 11 | FIU trace 测量；实现指纹 hit/miss 真实标签回流（checkpoint 作为负样本），根治策略死穴 | 规则 vs NN 在陌生 trace 上的 precision/recall/FPR |
 | 2026-12 ~ 2027-03 | 撰写 HotStorage'27 短文（8 页） | 投稿 |
@@ -179,3 +179,26 @@ FAST'26 两篇的边界：**AdaCheck** 需张量级离线分析；**AITURBO** �
 2. **方向一反而更强**：论文卖点从"透明去重有效"改为**能力边界的实证划分**——"Why semantic checkpoint dedup (AdaCheck/AITURBO: 6-896×) is invisible at the POSIX byte layer: a measurement study"。HotStorage 风格的负面测量 + 立场，且非对称损失门控论点在 checkpoint 场景的正确行为是**学会不 hash**（NN 门控需要 checkpoint 作为负样本，反哺真实标签闭环）。
 3. **必须补正向对照**（下一步，原 C1 提前）：字节级去重在哪有效——容器镜像层 / 源码 tar 多版本 / 日志，形成完整边界图后短文证据链才闭环。
 4. 读侧实验（阶段 B）价值下降但不取消：checkpoint load 的 readahead 分叉仍独立成立（与去重无关）。
+
+### 7.2 正向对照：字节级去重的有效区间 —— 已完成（2026-09-11）
+
+为避免"测量方法失效"的 reviewer 质疑，用同一套 BLAKE2b-128 定长块机械测两个**应当有效**的 workload（脚本 `analyze_archives.py`，原始数据 `positive_overlap.csv` / `positive_layers.csv`）：
+
+- **容器镜像**：ubuntu:20.04 上用 apt 装包构造 posctrl:v1/v2/v3（147/260/266MB；三个应用层是同一 base 的兄弟全量层，非增量链，比增量链更严苛的对照）；
+- **源码多版本**：powerfs 仓库 5 个跨度递增的历史 commit（s1 最早 → s5=HEAD，间隔约 276/60/60/20 commits）的 `git archive` tar。
+
+**关键数字（文件系统视图：每个文件从偏移 0 独立切块，跨历史所有版本 hit-any）**：
+
+| workload | 4K | 64K | 1M |
+|---|---:|---:|---:|
+| 镜像 rootfs v2（vs v1） | 0.586 | 0.623 | 0.660 |
+| 镜像 rootfs v3（vs v1+v2） | **0.978** | 0.974 | **0.981** |
+| 源码 s2（跨 ~276 commits） | 0.324 | 0.115 | — |
+| 源码 s3 / s4 | 0.705 / 0.754 | 0.563 / 0.585 | — |
+| 源码 s5（相邻版本） | **0.948** | **0.956** | — |
+| checkpoint（7.1 对照） | **0**（bf16 0.0001） | 0 | 0 |
+
+- OCI 内容寻址层：v3 的 272MB 中 base 层 75MB 与 v1/v2 digest 完全相同（零传输/存储）；即使三个应用层各自全量打包，191MB v2 层 59% 块、197MB v3 层 98% 块已在历史中（dpkg 重装/升级覆盖同内容文件）；
+- **边界对齐的必要性（附带发现）**：若不按文件边界、直接对 tar 字节流切块，镜像/源码命中率也塌到 0.3–19%（tar 成员顺序与头错位）；checkpoint 的 zipdata 视图已按 entry 边界对齐却仍为 0 → 证明 checkpoint 失败不是边界问题，而是**边界内的 fp32 训练状态版本间不具字节稳定性**。
+
+**边界图结论（短文核心表）**：字节级透明去重在"版本间保持字节稳定的文件单元"（系统二进制、库、源码、镜像层）上命中 59–98%；在"每步全参数浮点更新"的训练 checkpoint 上 ≈0。NN 门控的价值正是在接触字节前区分这两类工作负载。
