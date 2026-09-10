@@ -641,3 +641,34 @@ P1 范围（§17）：段管理 + 记录帧（哈希链）+ 组提交（async/st
 - 每步独立英文提交（`feat(wal): ...`），提交前 `cargo check` + 该步测试必须绿。
 - 与 write-predict-dedup 的衔接点：幂等去重检查（同 id+长度+checksum 跳过）在 enqueue 前执行，S7 接线时保留语义。
 
+***
+
+## 附录 C：P2 执行计划与进度记录
+
+P2 范围（§17）：checkpoint 文件（§4.4）+ superblock 双副本（§4.5）+ 三档恢复模式（§10）+ 段 GC（§8，整段删/搬移/限速）+ tombstone purge + 四项空间统计（§9.3，pinned 留位 P3 恒 0）+ 容量伸缩（§11.1）+ 管理工具（§19.5：本地只读命令扩展 + gc/checkpoint/resize 双面）。
+
+### C.1 步骤分解
+
+每步完成即运行测试验证，并在 C.2 回填状态与提交。
+
+| #  | 步骤            | 内容                                                                                                                                  | 涉及文件（powerfs-core/src/wal/）                 | 测试与验收                                                                     |
+| -- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------------------------------- |
+| T1 | 空间统计四分        | IndexStats 拆分 staging（tombstone 保留期物理字节）与 garbage（死副本字节），pinned 留位恒 0；purge 语义（tombstone→死副本账本）与 assert_consistent 重定义               | `index.rs`                                 | 单测：delete/restore/revive/purge 各状态统计迁移严格一致（I4）                            |
+| T2 | checkpoint 编解码 | ckpt\_<seq\>.bin 读写器（header/segments[per-seg live/dead]/needles/tombstones/dead 账本/snapshots 留位/alloc_stats/footer CRC）、tmp→rename→fsync 原子落盘、CRC 损坏拒载 | `checkpoint.rs`                            | 单测：roundtrip、CRC 破坏拒载、空表/多段边界                                             |
+| T3 | superblock 双副本 | superblock.a/b 128B 轮换（seq 递增、barrier write：tmp→fsync→rename→fsync dir）、加载取合法最大 seq、双损坏拒绝挂载、初始化（首次挂载写 seq=0）                          | `superblock.rs`                            | 单测：轮换写读、单副本损坏回退、双副本全损坏拒绝、撕裂尾（残头）拒载                                        |
+| T4 | checkpoint 调度与恢复接线 | 引擎接线：CKPT_ANCHOR 入组提交（strict）→ superblock 轮换；恢复路径 = superblock → ckpt 装载（损坏回退上一 ckpt_seq，无 ckpt 全量重放）→ 重放 base_lsn > applied_lsn 的段（幂等防护过滤已应用前缀）；调度（ckpt_lsn_distance / ckpt_interval / 手动 / 优雅停机前强制） | `engine.rs` + `checkpoint.rs`              | 单测：ckpt 加速重开（状态一致）、ckpt 后续写恢复、ckpt 文件损坏回退、crash 于 ckpt 写后 anchor 前恢复正确     |
+| T5 | 三档恢复模式        | recovery\_mode 配置（tolerate\_tail 默认 / point\_in\_time / absolute）；中部断链语义：tolerate\_tail 与 point\_in\_time 停在最后完整记录（截断 + 弃后继段 + 告警），absolute 任何校验失败拒载；尾撕裂三者均截断但告警级别不同 | `replay.rs` + `engine.rs`                  | 单测：三模式 × 尾撕裂/中部断链矩阵；absolute 拒载；停点后重放幂等                                   |
+| T6 | 段 GC 与 purge  | GcWorker 后台扫描 sealed 段：case A 整段删（无活跃/无未过期 tombstone/无活跃快照引用——P2 无快照）、case B 搬移（dead/live > gc\_ratio 且 dead ≥ gc\_min\_bytes，存活 needle 经组提交重写入 active 段，限速 gc\_max\_bytes\_per\_sec）、case C tombstone 过期 purge；段清单收缩 + fsync 目录项 | `gc.rs` + `engine.rs`                      | 单测：case A/B/C 触发条件、搬移后读一致、限速生效、GC 后重开恢复一致；触发参数边界（ratio/min bytes 不满足不动）    |
+| T7 | 容量伸缩          | VOLUME\_META 记录（field\_mask + new\_volume\_size）入组提交；grow 直接生效重算 free；shrink 前置校验 new\_size ≥ used+staging+pinned（不足拒绝并返回缺口）；superblock volume\_size 同步；free ≤ 0 → Full | `engine.rs` + `wal_volume.rs`              | 单测：grow/shrink roundtrip、shrink 缺口拒绝、resize 持久化（重开保持）、Full 转换               |
+| T8 | 管理工具双面        | 本地面：admin gc/checkpoint/resize（取锁，server 运行中报 EBUSY 引导走远程面）+ list-needles 只读；远程面：volume AdminService gRPC（stats/gc/checkpoint/resize/trigger）+ Master VolumeAdminProxy + CLI `powerfs-cli volume`；C.2 回填 | `powerfs-volume` + master/CLI proto        | 集成测试：双面命令端到端；grpc\_test 双引擎回归                                              |
+
+### C.2 进度记录
+
+| #  | 状态  | 完成内容   | 验证结果   | 提交     |
+| -- | --- | ------ | ------ | ------ |
+| T1 | 进行中 | （见 C.1 T1） | — | — |
+
+### C.3 执行约定
+
+同 B.3；另：GC/后台线程的 Drop 顺序必须保证「停调度 → 排空组提交 → 释放 flock」。
+
