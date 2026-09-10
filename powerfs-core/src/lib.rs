@@ -15,6 +15,8 @@ pub mod storage;
 pub mod storage_backend;
 pub mod volume;
 pub mod volume_bootstrap;
+pub mod volume_engine;
 pub mod volume_metadata;
 pub mod wal;
+pub mod wal_volume;
 pub mod write_coalescer;

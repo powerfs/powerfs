@@ -8,7 +8,9 @@
 //! - 重放器（段序重放 + tolerate_tail）：[`replay`]。
 //! - 组提交与 fsync 屏障（方案 §5）：[`commit`]。
 //! - 引擎装配与恢复（方案 §5 / §6）：[`engine`]。
+//! - 本地面只读检查（admin stats/verify，方案 §19.3）：[`admin`]。
 
+pub mod admin;
 pub mod commit;
 pub mod engine;
 pub mod frame;

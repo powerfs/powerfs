@@ -293,6 +293,16 @@ impl WalEngine {
         })
     }
 
+    /// 单个 needle 的索引条目（适配层 read_needle_meta 用）。
+    pub fn needle_entry(&self, needle_id: u64) -> Option<crate::wal::index::NeedleEntry> {
+        self.index.read().unwrap().lookup(needle_id).cloned()
+    }
+
+    /// 全部活跃 needle 的索引条目（适配层 list/scrub 用）。
+    pub fn needle_entries(&self) -> Vec<crate::wal::index::NeedleEntry> {
+        self.index.read().unwrap().needles().cloned().collect()
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -300,6 +310,11 @@ impl WalEngine {
     /// 分配一个新 needle id（从重放终态 max+1 起单调递增）。
     pub fn alloc_needle_id(&self) -> u64 {
         self.next_needle_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// 下一个待分配 needle id（不推进计数器）。
+    pub fn next_needle_id(&self) -> u64 {
+        self.next_needle_id.load(Ordering::Relaxed)
     }
 
     /// 写入/覆写一个 needle。返回回执（strict 模式下 durable=true）。

@@ -1,5 +1,8 @@
 use crate::storage_backend::{LocalFsBackend, StorageBackend, StorageBackendError};
 use crate::volume::{ScrubResult, Volume};
+use crate::volume_engine::{EngineKind, VolumeEngine};
+use crate::wal::engine::WalEngineConfig;
+use crate::wal_volume::WalVolume;
 use powerfs_common::{
     error::{PowerFsError, Result},
     types::{ChecksumAlgorithm, Collection, NeedleId, NodeId, VolumeId, VolumeInfo},
@@ -8,11 +11,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 pub struct StorageManager {
-    volumes: RwLock<HashMap<VolumeId, Arc<Volume>>>,
+    volumes: RwLock<HashMap<VolumeId, Arc<VolumeEngine>>>,
     node_id: NodeId,
     data_path: String,
     checksum_algorithm: ChecksumAlgorithm,
     backend: Arc<dyn StorageBackend>,
+    /// 新建卷使用的引擎（v1/v2 并行切换，方案 §17 P1）。
+    engine_kind: EngineKind,
+    /// WAL 引擎段大小（engine_kind=Wal 时生效）。
+    wal_seg_size: u64,
+    /// 持久化模式：true = 每写 strict（WAL）/ 写前 fsync（v1）。
+    force_sync: bool,
 }
 
 fn backend_err(e: StorageBackendError) -> PowerFsError {
@@ -35,9 +44,36 @@ impl StorageManager {
         device_capacity: Option<u64>,
         force_sync: bool,
     ) -> Result<Self> {
+        Self::new_for_engine(
+            node_id,
+            data_path,
+            device_capacity,
+            force_sync,
+            EngineKind::Needle,
+            crate::wal::engine::WalEngineConfig::default().seg_size,
+        )
+    }
+
+    /// 指定引擎种类的构造（volume_engine=needle|wal 配置贯通点，方案 §13）。
+    /// `force_sync` 语义随引擎映射：v1 = 写前 fsync 数据文件；WAL = 每写
+    /// strict（durable 后 ack）。缺省 false 时两引擎都是异步持久化。
+    pub fn new_for_engine(
+        node_id: NodeId,
+        data_path: String,
+        device_capacity: Option<u64>,
+        force_sync: bool,
+        engine_kind: EngineKind,
+        wal_seg_size: u64,
+    ) -> Result<Self> {
         let backend = Arc::new(
-            LocalFsBackend::new_with_sync(&data_path, &node_id.0, "default", device_capacity, force_sync)
-                .map_err(backend_err)?,
+            LocalFsBackend::new_with_sync(
+                &data_path,
+                &node_id.0,
+                "default",
+                device_capacity,
+                force_sync,
+            )
+            .map_err(backend_err)?,
         );
         Ok(StorageManager {
             volumes: RwLock::new(HashMap::new()),
@@ -45,6 +81,9 @@ impl StorageManager {
             data_path,
             checksum_algorithm: ChecksumAlgorithm::default(),
             backend,
+            engine_kind,
+            wal_seg_size,
+            force_sync,
         })
     }
 
@@ -59,6 +98,9 @@ impl StorageManager {
             data_path,
             checksum_algorithm: ChecksumAlgorithm::default(),
             backend,
+            engine_kind: EngineKind::Needle,
+            wal_seg_size: WalEngineConfig::default().seg_size,
+            force_sync: false,
         }
     }
 
@@ -78,6 +120,9 @@ impl StorageManager {
             data_path,
             checksum_algorithm: algorithm,
             backend,
+            engine_kind: EngineKind::Needle,
+            wal_seg_size: WalEngineConfig::default().seg_size,
+            force_sync: false,
         })
     }
 
@@ -91,6 +136,33 @@ impl StorageManager {
 
     pub fn create_volume(&self, volume_id: VolumeId, size: u64) -> Result<VolumeInfo> {
         self.create_volume_with_collection(volume_id, size, Collection::default())
+    }
+
+    /// 引擎分支构造：v1 needle / v2 WAL（按 self.engine_kind，方案 §13）。
+    fn build_engine(&self, volume_id: VolumeId, size: u64) -> Result<Arc<VolumeEngine>> {
+        let volume = match self.engine_kind {
+            EngineKind::Needle => VolumeEngine::Needle(Box::new(Volume::new_with_algorithm(
+                volume_id,
+                &self.node_id.0,
+                &self.data_path,
+                size,
+                self.checksum_algorithm,
+                self.backend.clone(),
+            )?)),
+            EngineKind::Wal => VolumeEngine::Wal(Box::new(WalVolume::new(
+                volume_id,
+                &self.node_id.0,
+                &self.data_path,
+                size,
+                self.checksum_algorithm,
+                WalEngineConfig {
+                    seg_size: self.wal_seg_size,
+                    ..Default::default()
+                },
+                self.force_sync,
+            )?)),
+        };
+        Ok(Arc::new(volume))
     }
 
     /// Create a volume bound to a specific collection.
@@ -110,14 +182,7 @@ impl StorageManager {
             return Err(PowerFsError::VolumeExists(volume_id));
         }
 
-        let volume = Arc::new(Volume::new_with_algorithm(
-            volume_id,
-            &self.node_id.0,
-            &self.data_path,
-            size,
-            self.checksum_algorithm,
-            self.backend.clone(),
-        )?);
+        let volume = self.build_engine(volume_id, size)?;
 
         let normalized = if collection.0.is_empty() {
             Collection::default()
@@ -132,7 +197,7 @@ impl StorageManager {
         Ok(info)
     }
 
-    pub fn get_volume(&self, volume_id: &VolumeId) -> Option<Arc<Volume>> {
+    pub fn get_volume(&self, volume_id: &VolumeId) -> Option<Arc<VolumeEngine>> {
         self.volumes.read().unwrap().get(volume_id).cloned()
     }
 
@@ -142,9 +207,8 @@ impl StorageManager {
         if let Some(volume) = volumes.remove(volume_id) {
             volume.set_deleting();
 
-            self.backend
-                .delete_volume(volume_id.0)
-                .map_err(backend_err)?;
+            // 引擎侧 backend 清理（WAL 引擎无 backend 注册，no-op）。
+            volume.remove_backend_volume(&self.backend)?;
 
             let volume_path =
                 std::path::Path::new(&self.data_path).join(format!("volume_{}", volume.id().0));
@@ -228,12 +292,15 @@ impl StorageManager {
         let total = volumes.len();
         let mut synced = 0usize;
         for volume in volumes.values() {
-            match volume.index().sync_wal_if_dirty() {
+            match volume.sync_wal_if_dirty() {
                 Ok(true) => synced += 1,
                 Ok(false) => {} // 无新写入，跳过
                 Err(e) => {
-                    log::warn!("sync_all_wals_if_dirty: volume {} fsync WAL failed: {}",
-                        volume.id().0, e);
+                    log::warn!(
+                        "sync_all_wals_if_dirty: volume {} fsync WAL failed: {}",
+                        volume.id().0,
+                        e
+                    );
                 }
             }
         }
@@ -262,14 +329,47 @@ impl StorageManager {
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 volumes.entry(volume_id)
                             {
-                                let volume = Arc::new(Volume::new_with_algorithm(
-                                    volume_id,
-                                    &self.node_id.0,
-                                    &self.data_path,
-                                    powerfs_common::constants::DEFAULT_VOLUME_SIZE,
-                                    self.checksum_algorithm,
-                                    self.backend.clone(),
-                                )?);
+                                // 按目录形态识别引擎：WAL 卷含 seg_*.log /
+                                // volume.lock；v1 卷含 metadata/（RocksDB）。
+                                // 保证 v1/v2 并行时重启各自按原引擎打开。
+                                let is_wal_dir = path.join("volume.lock").exists()
+                                    || std::fs::read_dir(&path)
+                                        .map(|rd| {
+                                            rd.flatten().any(|f| {
+                                                f.file_name()
+                                                    .to_str()
+                                                    .map(|n| {
+                                                        n.starts_with("seg_") && n.ends_with(".log")
+                                                    })
+                                                    .unwrap_or(false)
+                                            })
+                                        })
+                                        .unwrap_or(false);
+                                let volume = if is_wal_dir {
+                                    Arc::new(VolumeEngine::Wal(Box::new(WalVolume::new(
+                                        volume_id,
+                                        &self.node_id.0,
+                                        &self.data_path,
+                                        powerfs_common::constants::DEFAULT_VOLUME_SIZE,
+                                        self.checksum_algorithm,
+                                        WalEngineConfig {
+                                            seg_size: self.wal_seg_size,
+                                            ..Default::default()
+                                        },
+                                        self.force_sync,
+                                    )?)))
+                                } else {
+                                    Arc::new(VolumeEngine::Needle(Box::new(
+                                        Volume::new_with_algorithm(
+                                            volume_id,
+                                            &self.node_id.0,
+                                            &self.data_path,
+                                            powerfs_common::constants::DEFAULT_VOLUME_SIZE,
+                                            self.checksum_algorithm,
+                                            self.backend.clone(),
+                                        )?,
+                                    )))
+                                };
                                 e.insert(volume);
                             }
                         }
