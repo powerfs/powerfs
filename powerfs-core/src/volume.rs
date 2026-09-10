@@ -877,18 +877,25 @@ impl Volume {
         let volume_size = info_guard.size;
 
         // 幂等：合并后的内容与磁盘上当前版本完全一致（长度 + checksum）时跳过追加。
-        // 场景：coalescer 合并后内容未变化的重复 flush / 重发，避免孤儿副本。
-        if old_info.deleted_at.is_none()
-            && old_info.data_size as usize == new_needle.data.len()
-            && old_info.checksum == new_needle.checksum
-        {
-            log::debug!(
-                "append_needle_version: needle {} identical to on-disk version (checksum={:#x}), skip append",
-                needle_id.0,
-                new_needle.checksum
-            );
-            return Ok(());
+        // 注意：必须在 info 写锁内重新读取 index 最新条目，而非使用调用方传入的
+        // old_info（后者在锁外读取，可能已被并发 flush 过期）——否则并发 flush
+        // 同一 needle 时会比对过期数据、绕过幂等，产生孤儿副本。
+        let latest = self.index.get(&needle_id);
+        if let Some(cur) = latest.as_ref() {
+            if cur.deleted_at.is_none()
+                && cur.data_size as usize == new_needle.data.len()
+                && cur.checksum == new_needle.checksum
+            {
+                log::debug!(
+                    "append_needle_version: needle {} identical to on-disk version (checksum={:#x}), skip append",
+                    needle_id.0,
+                    new_needle.checksum
+                );
+                return Ok(());
+            }
         }
+        // 以最新 index 条目作为新 needle_info 的字段基准（保留创建时间、保留策略等）。
+        let base_info = latest.as_ref().unwrap_or(&old_info);
 
         // 从 RocksDB allocation CF 读取当前分配状态
         let alloc_stats = self.index.get_allocation()?;
@@ -912,7 +919,7 @@ impl Volume {
         // saw NeedleNotFound instead of the actual data.
         let new_info = NeedleInfo {
             id: needle_id.clone(),
-            volume_id: old_info.volume_id,
+            volume_id: base_info.volume_id,
             data_size: new_needle.data.len() as u32,
             offset: new_offset,
             checksum: new_needle.checksum,
@@ -920,13 +927,13 @@ impl Volume {
             last_verified_at: None,
             verification_count: 0,
             deleted_at: None,
-            delete_retention_until: old_info.delete_retention_until,
-            worm_retention_until: old_info.worm_retention_until,
-            created_at: old_info.created_at,
-            ec_enabled: old_info.ec_enabled,
-            ec_k: old_info.ec_k,
-            ec_m: old_info.ec_m,
-            ec_shards: old_info.ec_shards.clone(),
+            delete_retention_until: base_info.delete_retention_until,
+            worm_retention_until: base_info.worm_retention_until,
+            created_at: base_info.created_at,
+            ec_enabled: base_info.ec_enabled,
+            ec_k: base_info.ec_k,
+            ec_m: base_info.ec_m,
+            ec_shards: base_info.ec_shards.clone(),
         };
 
         // 原子写入新 needle + 更新 allocation CF
