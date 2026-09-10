@@ -282,6 +282,12 @@ impl SegReader {
         &self.path
     }
 
+    /// 已扫描验证的数据末尾（下一个完整帧的起始偏移；撕裂时为最后
+    /// 完整帧的结束位置）。
+    pub fn valid_end(&self) -> u64 {
+        self.valid_end
+    }
+
     /// 扫描下一条完整记录。段尾撕裂返回 [`ScanError::TornTail`]；
     /// CRC/链校验失败返回 [`ScanError::Corrupt`]；正常结束返回 `Ok(None)`。
     pub fn next_frame(&mut self) -> Result<Option<ScannedFrame>, ScanError> {
@@ -541,6 +547,12 @@ impl SegWriter {
 
     pub fn last_crc(&self) -> u64 {
         self.prev_crc
+    }
+
+    /// 测试/工具用途：底层文件句柄（写入撕裂模拟等）。
+    #[cfg(test)]
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
     }
 
     /// 追加一条记录。
