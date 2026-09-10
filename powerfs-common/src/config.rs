@@ -166,6 +166,16 @@ pub struct VolumeConfig {
     /// #47 硬化: 为 true 时, 启动时检查二进制是否以 --features rdma 编译.
     #[serde(default)]
     pub require_rdma: bool,
+    /// 存储引擎选择（v1/v2 并行切换，方案 §17 P1）：
+    /// - "needle"（默认）：v1 needle 引擎（RocksDB 索引 + 数据文件 append）；
+    /// - "wal"：v2 统一日志引擎（docs/wal-volume-engine-plan.md）。
+    /// 只影响本节点新建卷；已有卷按原引擎目录形态打开（v1 卷目录含
+    /// metadata/，WAL 卷目录含 seg_*.log）。
+    #[serde(default)]
+    pub volume_engine: Option<String>,
+    /// WAL 引擎段大小（字节），默认 64 MiB。
+    #[serde(default)]
+    pub wal_segment_size: Option<u64>,
 }
 
 /// Filer 节点配置 - 所有端口和地址必须显式配置

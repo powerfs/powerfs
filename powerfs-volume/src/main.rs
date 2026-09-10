@@ -7,6 +7,9 @@ use powerfs_common::{
     types::{NodeId, VolumeId},
 };
 use powerfs_core::storage::StorageManager;
+use powerfs_core::volume_engine::EngineKind;
+use powerfs_core::wal::admin as wal_admin;
+use powerfs_core::wal::engine::WalEngineConfig;
 use powerfs_master_net::{TlvMasterClient, TlvMasterClientConfig};
 use powerfs_net::{MsgType, NetMessage, NotificationHandler, PowerFsNetServer};
 use powerfs_volume::{
@@ -20,9 +23,9 @@ use tokio::time::Duration;
 #[command(version = "0.1.0")]
 #[command(about = "PowerFS Volume Server")]
 struct Args {
-    /// 配置文件路径（必填，所有端口和地址必须在配置文件中设置）
-    #[arg(short, long, required = true)]
-    config: String,
+    /// 配置文件路径（server 运行必填；admin 子命令不需要）
+    #[arg(short, long)]
+    config: Option<String>,
 
     /// 可选：覆盖节点ID
     #[arg(long)]
@@ -51,16 +54,83 @@ struct Args {
     /// 可选：是否注册到Master
     #[arg(long)]
     register_with_master: Option<bool>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// 本地面管理子命令（方案 §19.2 / §19.3：只读命令不取锁，与运行中的
+/// server 并发安全）。
+#[derive(clap::Subcommand)]
+enum Command {
+    /// WAL 卷只读检查（直接打开本地 volume 目录，不经网络）
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum AdminCmd {
+    /// 段清单 + 索引统计 + LSN 概览
+    Stats {
+        /// WAL 卷目录（如 /data/volume_123）
+        volume_dir: String,
+        /// 段大小（需与 server 配置 wal_segment_size 一致）
+        #[arg(long, default_value_t = 64 << 20)]
+        segment_size: u64,
+    },
+    /// 全量重放校验（逐帧 CRC + 哈希链）
+    Verify {
+        /// WAL 卷目录（如 /data/volume_123）
+        volume_dir: String,
+        /// 段大小（需与 server 配置 wal_segment_size 一致）
+        #[arg(long, default_value_t = 64 << 20)]
+        segment_size: u64,
+    },
 }
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let cfg = load_config(&args.config);
+    // 本地面 admin 子命令：不启动 server、不加载 config，只读检查后退出。
+    if let Some(Command::Admin { cmd }) = &args.command {
+        return run_admin(cmd);
+    }
+
+    let config_path = args.config.clone().unwrap_or_else(|| {
+        eprintln!("ERROR: --config is required to run the volume server");
+        std::process::exit(1);
+    });
+
+    let cfg = load_config(&config_path);
 
     run_volume(cfg, args).await?;
 
+    Ok(())
+}
+
+fn run_admin(cmd: &AdminCmd) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let (dir, seg_size) = match cmd {
+        AdminCmd::Stats {
+            volume_dir,
+            segment_size,
+        }
+        | AdminCmd::Verify {
+            volume_dir,
+            segment_size,
+        } => (volume_dir.as_str(), *segment_size),
+    };
+    let path = std::path::Path::new(dir);
+    if !path.is_dir() {
+        return Err(format!("volume dir not found: {dir}").into());
+    }
+    let report = wal_admin::inspect(path, seg_size)?;
+    print!("{}", wal_admin::format_report(&report));
+    if let AdminCmd::Verify { .. } = cmd {
+        println!("verify: OK (full replay passed)");
+    }
     Ok(())
 }
 
@@ -133,13 +203,30 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
     info!("  Initial Volume Count: {}", initial_volume_count);
     info!("  Volume Size: {}", volume_size);
 
+    // 存储引擎选择（v1/v2 并行切换，方案 §17 P1）。
+    let engine_kind = EngineKind::parse(volume_cfg.volume_engine.as_deref())?;
+    let wal_seg_size = volume_cfg
+        .wal_segment_size
+        .unwrap_or_else(|| WalEngineConfig::default().seg_size);
+    info!(
+        "  Storage Engine: {:?}{}",
+        engine_kind,
+        if engine_kind == EngineKind::Wal {
+            format!(" (wal_segment_size={}MiB)", wal_seg_size >> 20)
+        } else {
+            String::new()
+        }
+    );
+
     let node_id = NodeId(node_id);
     let storage_manager = Arc::new(
-        StorageManager::new_with_sync(
+        StorageManager::new_for_engine(
             node_id.clone(),
             data_dir.clone(),
             volume_cfg.device_capacity,
             volume_cfg.force_sync_on_write,
+            engine_kind,
+            wal_seg_size,
         )
         .expect("Failed to create storage manager"),
     );
@@ -161,13 +248,14 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
             // 高频 flush：50ms 一次
             let mut flush_interval = tokio::time::interval(Duration::from_millis(50));
             flush_interval.tick().await; // 跳过首次立即触发
-            // 低频 WAL fsync：仅在 force_sync_on_write=false 时启用
-            let mut wal_interval_opt =
-                if wal_interval_secs > 0 {
-                    Some(tokio::time::interval(Duration::from_secs(wal_interval_secs)))
-                } else {
-                    None
-                };
+                                         // 低频 WAL fsync：仅在 force_sync_on_write=false 时启用
+            let mut wal_interval_opt = if wal_interval_secs > 0 {
+                Some(tokio::time::interval(Duration::from_secs(
+                    wal_interval_secs,
+                )))
+            } else {
+                None
+            };
             if let Some(ref mut iv) = wal_interval_opt {
                 iv.tick().await; // 跳过首次立即触发
             }
