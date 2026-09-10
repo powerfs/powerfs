@@ -45,6 +45,8 @@ pub struct ReplayResult {
     pub index: WalIndex,
     /// 重放帧总数（含 PAD）。
     pub frames_replayed: u64,
+    /// 因 lsn ≤ skip_lsn 被跳过的帧数（checkpoint 前缀，CRC/链已校验）。
+    pub frames_skipped: u64,
     /// tolerate_tail 截断的段（seg_id → 截断位置）。
     pub truncated: HashMap<u64, u64>,
     /// 重放覆盖的段数。
@@ -55,13 +57,21 @@ pub struct ReplayResult {
 ///
 /// `tolerate_tail` 生效时，最后一段的撕裂尾被物理截断到最后一个完整帧
 /// （fsync 截断结果），重放可安全重复执行（幂等）。
+///
+/// `index`：重放初态（checkpoint 装载路径传入 ckpt 索引，全量重放传空）。
+/// `skip_lsn`：重放起点（方案 §10 步骤 4）——lsn ≤ skip_lsn 的记录由
+/// checkpoint 索引承载，跳过 apply，但帧级 CRC/哈希链校验照常执行
+/// （完整性检查不因加速而弱化）。全量重放传 0。
 pub fn replay_all(
     dir: &Path,
     manifest: &SegManifest,
+    index: WalIndex,
     tolerate_tail: bool,
+    skip_lsn: u64,
 ) -> Result<ReplayResult, ReplayError> {
-    let mut index = WalIndex::new();
+    let mut index = index;
     let mut frames_replayed = 0u64;
+    let mut frames_skipped = 0u64;
     let mut truncated: HashMap<u64, u64> = HashMap::new();
     let segments = manifest.segments();
     let last_idx = segments.len().saturating_sub(1);
@@ -75,6 +85,12 @@ pub fn replay_all(
         loop {
             match reader.next_frame() {
                 Ok(Some(frame)) => {
+                    // checkpoint 前缀跳过：CRC/链校验已在 next_frame 内完成，
+                    // 仅跳过 apply（不更新 last_lsn，单调检查不适用）。
+                    if frame.meta.rtype != RecordType::Pad && frame.meta.lsn <= skip_lsn {
+                        frames_skipped += 1;
+                        continue;
+                    }
                     // LSN 跨段单调递增（PAD 不消耗 lsn 语义，仅跳过）。
                     if frame.meta.rtype != RecordType::Pad {
                         let lsn = frame.meta.lsn;
@@ -134,6 +150,7 @@ pub fn replay_all(
     Ok(ReplayResult {
         index,
         frames_replayed,
+        frames_skipped,
         truncated,
         segments_scanned: segments.len(),
     })
@@ -267,14 +284,14 @@ mod tests {
         let mf = SegManifest::load(dir.path(), SEG_SIZE).unwrap();
         assert!(mf.segments().len() > 1, "expect multiple segments");
 
-        let r1 = replay_all(dir.path(), &mf, true).unwrap();
+        let r1 = replay_all(dir.path(), &mf, WalIndex::new(), true, 0).unwrap();
         assert_eq!(r1.index.needle_count(), 100);
         assert_eq!(r1.index.stats().used_bytes, 100 * 64);
         r1.index.assert_consistent();
         assert!(r1.truncated.is_empty());
 
         // 重放幂等：第二次重放结果与第一次完全一致。
-        let r2 = replay_all(dir.path(), &mf, true).unwrap();
+        let r2 = replay_all(dir.path(), &mf, WalIndex::new(), true, 0).unwrap();
         assert_eq!(r1.index.stats(), r2.index.stats());
         assert_eq!(r1.index.max_needle_id(), r2.index.max_needle_id());
         assert_eq!(r1.index.last_lsn(), r2.index.last_lsn());
@@ -312,7 +329,7 @@ mod tests {
         drop(w);
         mf.register(seg_id, 1, 1);
 
-        let r = replay_all(mf_path, &mf, true).unwrap();
+        let r = replay_all(mf_path, &mf, WalIndex::new(), true, 0).unwrap();
         let idx = &r.index;
         // needle 5：复活后指向第三条 DATA。
         let e5 = idx.lookup(5).unwrap();
@@ -339,7 +356,7 @@ mod tests {
 
         // restore 语义：tombstone 保留期内恢复（用第二次重放得到的
         // 独立 index 验证，等价于恢复路径）。
-        let r2 = replay_all(mf_path, &mf, true).unwrap();
+        let r2 = replay_all(mf_path, &mf, WalIndex::new(), true, 0).unwrap();
         let mut idx2 = r2.index;
         idx2.restore(6).unwrap();
         assert_eq!(idx2.lookup(6).unwrap().data_len, 50);
@@ -370,14 +387,14 @@ mod tests {
         drop(w);
 
         // tolerate_tail=true：截断并重放成功，结果 == 完整帧集合的终态。
-        let r = replay_all(dir.path(), &mf, true).unwrap();
+        let r = replay_all(dir.path(), &mf, WalIndex::new(), true, 0).unwrap();
         assert_eq!(r.truncated.get(&last.seg_id), Some(&pos));
         assert_eq!(r.index.lookup(999), None, "torn frame must not be visible");
         r.index.assert_consistent();
 
         // 截断后重放幂等（再跑一次不再报撕裂）。
         let mf2 = SegManifest::load(dir.path(), SEG_SIZE).unwrap();
-        let r2 = replay_all(dir.path(), &mf2, true).unwrap();
+        let r2 = replay_all(dir.path(), &mf2, WalIndex::new(), true, 0).unwrap();
         assert!(r2.truncated.is_empty());
         assert_eq!(r.index.stats(), r2.index.stats());
 
@@ -397,7 +414,7 @@ mod tests {
             .unwrap();
         drop(w2);
         assert!(matches!(
-            replay_all(dir.path(), &mf2, false),
+            replay_all(dir.path(), &mf2, WalIndex::new(), false, 0),
             Err(ReplayError::TornNonTail { .. })
         ));
     }
@@ -423,7 +440,7 @@ mod tests {
         }
 
         assert!(matches!(
-            replay_all(dir.path(), &mf, true),
+            replay_all(dir.path(), &mf, WalIndex::new(), true, 0),
             Err(ReplayError::TornNonTail { .. })
         ));
     }
@@ -450,7 +467,7 @@ mod tests {
         }
         let mf = SegManifest::load(dir.path(), SEG_SIZE).unwrap();
         assert!(matches!(
-            replay_all(dir.path(), &mf, true),
+            replay_all(dir.path(), &mf, WalIndex::new(), true, 0),
             Err(ReplayError::LsnRegression { .. })
         ));
     }
@@ -470,7 +487,7 @@ mod tests {
         drop(w);
 
         let mf = SegManifest::load(dir.path(), SEG_SIZE).unwrap();
-        let r = replay_all(dir.path(), &mf, true).unwrap();
+        let r = replay_all(dir.path(), &mf, WalIndex::new(), true, 0).unwrap();
         assert_eq!(r.index.last_ckpt_anchor(), Some((7, 1)));
     }
 }

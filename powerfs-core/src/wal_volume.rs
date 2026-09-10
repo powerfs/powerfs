@@ -67,6 +67,7 @@ impl WalVolume {
         std::fs::create_dir_all(&volume_path)?;
 
         wal_config.volume_id = id.0;
+        wal_config.volume_size = size;
         let engine = WalEngine::open(&volume_path, wal_config).map_err(engine_err)?;
 
         // 重放终态恢复 info：used 取索引统计，next_file_key 接续 max+1。
