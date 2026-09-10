@@ -595,3 +595,41 @@ powerfs-cli volume                        # 远程面（-m 指定 Master）
 与 BlueStore 的定位差异：其细粒度 extent 分配为任意随机覆写负载服务；本方案面向 4MB 顺序 chunk 负载取统一日志甜区，细粒度覆写列为 §16 演进项。
 
 调研来源：RocksDB Wiki（WAL Format / Pipelined Write / WAL Recovery Modes / Track WAL in MANIFEST / Backup）、Ceph 官方文档（BlueStore Internals / RBD Layering）与 ;login: "File Systems Unfit as Distributed Storage Back Ends"、SeaweedFS volume/compaction、JuiceFS GC 深度文章、TiKV raftstore 配置与 snapshot 机制、SQLite WAL checkpoint、PostgreSQL FPW、OpenZFS CoW、TigerBeetle data_file/VOPR 内部文档。
+
+---
+
+## 附录 B：P1 执行计划与进度记录
+
+P1 范围（§17）：段管理 + 记录帧（哈希链）+ 组提交（async/strict）+ FlushNeedles 屏障 + 崩溃恢复（tolerate_tail）+ `WalEngine` trait 与 v1 并行切换。快照/checkpoint/GC 属 P2/P3，本阶段接口留位但不实现。
+
+### B.1 步骤分解
+
+每步完成即运行测试验证，并在 B.2 回填状态与提交。
+
+| # | 步骤 | 内容 | 新增文件（powerfs-core/src/wal/） | 测试与验收 |
+|---|------|------|-----------------------------------|-----------|
+| S1 | 记录帧与编解码 | 帧结构（prev_crc/crc/len/type/flags/lsn，§4.2）、rtype 定义与 payload 编解码（DATA/DELETE/ATTR/SNAP_*/VOLUME_META/PAD）、帧级读写器 | `frame.rs` | 单测：编解码 roundtrip、哈希链校验、尾帧撕裂检出、PAD 填充 |
+| S2 | 段文件与段管理 | 段头（§4.1）读写、SegWriter（append/seal/fallocate/剩余空间 PAD 换段）、SegReader（顺序扫描+链校验）、SegManifest（内存段清单） | `segment.rs`, `manifest.rs` | 单测：seal/roll、段尾边界 PAD、跨重启重扫一致性、torn tail 定位 |
+| S3 | 内存索引与重放器 | WalIndex（needle 索引 + tombstone + 统计）、Replayer（段序重放 → 索引，tolerate_tail 截断） | `index.rs`, `replay.rs` | 单测：重放幂等（重放两次结果一致）、DELETE/restore 语义、统计与索引严格一致（I4 的重放侧） |
+| S4 | 组提交与 fsync 屏障 | CommitQueue（leader 聚批、async 批量 fsync / strict 同步、max_dirty_bytes 背压、两阶段流水）、flush barrier（按 LSN 集合等待） | `commit.rs` | 单测：并发组提交正确性、strict ack 即 durable、async 窗口语义、barrier 等待指定 LSN |
+| S5 | 引擎装配与恢复 | WalEngine（open→load ckpt 位（P1 跳过）→重放→开新段；write/read/delete/flush/stats）、卷级 flock 单写者锁 | `engine.rs` | 单测：kill -9 式 crash 注入（帧中/fsync 前）→ 重启恢复 == 已 ack 操作重放结果（I1/I2） |
+| S6 | 确定性故障模拟器 | 模拟 IO 层（可注入 crash 点/位翻转/截断）、随机操作序列 + 断言模型（shadow model 比对） | `sim/`（tests 或独立 crate） | 随机种子回放：数千 crash 点组合全部通过 I1/I2 断言 |
+| S7 | v1/v2 并行切换 | `volume_engine=needle\|wal` 配置贯通 volume server；`WalEngine` 适配现有 Volume API 面（§13 兼容方法）；本地面 admin 只读命令（stats/verify）最小集 | config 修改 + volume server 接线 + `wal_admin` | 集成测试：双引擎跑同一测试集；grpc_test 回归 |
+
+### B.2 进度记录
+
+| # | 状态 | 完成内容 | 验证结果 | 提交 |
+|---|------|---------|---------|------|
+| S1 | 未开始 | | | |
+| S2 | 未开始 | | | |
+| S3 | 未开始 | | | |
+| S4 | 未开始 | | | |
+| S5 | 未开始 | | | |
+| S6 | 未开始 | | | |
+| S7 | 未开始 | | | |
+
+### B.3 执行约定
+
+- 代码注释仅描述 PowerFS 自身设计，不引用外部参考系统名称。
+- 每步独立提交（`feat(wal): ...`），提交前 `cargo check` + 该步测试必须绿。
+- 与 write-predict-dedup 的衔接点：幂等去重检查（同 id+长度+checksum 跳过）在 enqueue 前执行，S7 接线时保留语义。
