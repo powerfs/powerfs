@@ -43,13 +43,17 @@ pub struct TombstoneEntry {
     pub retention_until: i64,
 }
 
-/// 索引统计（与索引内容严格一致，I4）。
+/// 索引统计（与索引内容严格一致，I4；四项空间统计 §9.3 的重放侧）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct IndexStats {
     /// 活跃 needle 数据字节之和。
     pub used_bytes: u64,
-    /// 被覆写/删除淘汰的旧版本数据字节之和（GC 待回收）。
+    /// tombstone 保留期内的物理字节（可 restore，purge 后转 garbage）。
+    pub staging_bytes: u64,
+    /// 被覆写/复活/purge 淘汰的旧版本数据字节之和（GC 待回收）。
     pub garbage_bytes: u64,
+    /// 被活跃快照钉住的旧版本字节（P3 快照接入，本阶段恒 0）。
+    pub pinned_bytes: u64,
     pub active_count: u64,
     pub deleted_count: u64,
 }
@@ -199,8 +203,8 @@ impl WalIndex {
             flags: 0,
         };
 
-        // tombstone → revive（复活）语义：tombstone 引用的旧副本仍是死
-        // 副本，转入 dead_copies；新 DATA 副本成为活跃版本。
+        // tombstone → revive（复活）语义：tombstone 引用的旧副本转为死
+        // 副本账本（staging 迁出、garbage 迁入），新 DATA 副本成为活跃版本。
         if let Some(tb) = self.tombstones.remove(&needle_id) {
             self.dead_copies.push(DeadCopy {
                 seg_id: tb.seg_id,
@@ -210,6 +214,8 @@ impl WalIndex {
                 version_lsn: tb.version_lsn,
             });
             self.stats.deleted_count -= 1;
+            self.stats.staging_bytes -= tb.data_len as u64;
+            self.stats.garbage_bytes += tb.data_len as u64;
             self.stats.used_bytes += data_len;
             self.stats.active_count += 1;
             self.needles.insert(needle_id, entry);
@@ -278,7 +284,7 @@ impl WalIndex {
 
         self.stats.used_bytes -= active.data_len as u64;
         self.stats.active_count -= 1;
-        self.stats.garbage_bytes += active.data_len as u64;
+        self.stats.staging_bytes += active.data_len as u64;
         self.stats.deleted_count += 1;
         self.tombstones.insert(
             needle_id,
@@ -316,7 +322,7 @@ impl WalIndex {
             return Ok(()); // 已活跃或不存在：幂等
         };
         self.stats.deleted_count -= 1;
-        self.stats.garbage_bytes -= tb.data_len as u64;
+        self.stats.staging_bytes -= tb.data_len as u64;
         self.stats.used_bytes += tb.data_len as u64;
         self.stats.active_count += 1;
         self.needles.insert(
@@ -335,18 +341,48 @@ impl WalIndex {
         Ok(())
     }
 
+    /// purge 已过保留期的 tombstone（case C）：物理副本迁入死副本账本
+    /// （staging → garbage），此后该副本只等 GC 按段回收。返回 purge 数。
+    pub fn purge_expired(&mut self, now: i64) -> usize {
+        let expired: Vec<u64> = self
+            .tombstones
+            .values()
+            .filter(|tb| tb.retention_until <= now)
+            .map(|tb| tb.needle_id)
+            .collect();
+        for needle_id in &expired {
+            if let Some(tb) = self.tombstones.remove(needle_id) {
+                self.dead_copies.push(DeadCopy {
+                    seg_id: tb.seg_id,
+                    offset: tb.offset,
+                    data_len: tb.data_len,
+                    crc: tb.crc,
+                    version_lsn: tb.version_lsn,
+                });
+                self.stats.deleted_count -= 1;
+                self.stats.staging_bytes -= tb.data_len as u64;
+                self.stats.garbage_bytes += tb.data_len as u64;
+            }
+        }
+        expired.len()
+    }
+
     /// 校验统计与索引内容严格一致（I4）。
     ///
-    /// garbage_bytes = 死副本账本 + tombstone 引用的死副本，逐字节核对。
+    /// garbage_bytes == 死副本账本字节之和；staging_bytes == tombstone
+    /// 字节之和，逐字节核对。
     pub fn assert_consistent(&self) {
         let used: u64 = self.needles.values().map(|e| e.data_len as u64).sum();
         let dead_list: u64 = self.dead_copies.iter().map(|d| d.data_len as u64).sum();
         let dead_tomb: u64 = self.tombstones.values().map(|e| e.data_len as u64).sum();
         assert_eq!(self.stats.used_bytes, used, "used_bytes mismatch");
         assert_eq!(
-            self.stats.garbage_bytes,
-            dead_list + dead_tomb,
-            "garbage mismatch"
+            self.stats.garbage_bytes, dead_list,
+            "garbage mismatch (dead copy ledger)"
+        );
+        assert_eq!(
+            self.stats.staging_bytes, dead_tomb,
+            "staging mismatch (tombstones)"
         );
         assert_eq!(self.stats.active_count, self.needles.len() as u64);
         assert_eq!(self.stats.deleted_count, self.tombstones.len() as u64);
@@ -402,7 +438,9 @@ mod tests {
             idx.stats(),
             IndexStats {
                 used_bytes: 100,
+                staging_bytes: 0,
                 garbage_bytes: 0,
+                pinned_bytes: 0,
                 active_count: 1,
                 deleted_count: 0
             }
@@ -418,7 +456,9 @@ mod tests {
             idx.stats(),
             IndexStats {
                 used_bytes: 150,
+                staging_bytes: 0,
                 garbage_bytes: 100,
+                pinned_bytes: 0,
                 active_count: 1,
                 deleted_count: 0
             }
@@ -461,7 +501,9 @@ mod tests {
             idx.stats(),
             IndexStats {
                 used_bytes: 0,
-                garbage_bytes: 200,
+                staging_bytes: 200,
+                garbage_bytes: 0,
+                pinned_bytes: 0,
                 active_count: 0,
                 deleted_count: 1
             }
@@ -477,7 +519,9 @@ mod tests {
             idx.stats(),
             IndexStats {
                 used_bytes: 200,
+                staging_bytes: 0,
                 garbage_bytes: 0,
+                pinned_bytes: 0,
                 active_count: 1,
                 deleted_count: 0
             }
@@ -487,6 +531,51 @@ mod tests {
         // restore 幂等。
         idx.restore(7).unwrap();
         assert_eq!(idx.stats().used_bytes, 200);
+    }
+
+    /// purge 过期 tombstone：staging → garbage（死副本账本），未过期不动。
+    #[test]
+    fn purge_expired_moves_staging_to_garbage() {
+        let mut idx = WalIndex::new();
+        // needle 1：deleted_at=100，保留到 100+86400；needle 2：已过期。
+        idx.apply_data(1, 68, 1, 1, &data_payload(1, 100), 0).unwrap();
+        idx.apply_data(1, 68, 2, 2, &data_payload(2, 50), 0).unwrap();
+        idx.apply_delete(3, &delete_payload(1, 100, 100 + 86400))
+            .unwrap();
+        idx.apply_delete(4, &delete_payload(2, 100, 50))
+            .unwrap();
+        assert_eq!(idx.stats().staging_bytes, 150);
+        assert_eq!(idx.stats().garbage_bytes, 0);
+
+        let now = 200i64; // needle 2 过期（retention_until=50），needle 1 未过期
+        let purged = idx.purge_expired(now);
+        assert_eq!(purged, 1);
+        assert_eq!(
+            idx.stats(),
+            IndexStats {
+                used_bytes: 0,
+                staging_bytes: 100,
+                garbage_bytes: 50,
+                pinned_bytes: 0,
+                active_count: 0,
+                deleted_count: 1
+            }
+        );
+        assert!(idx.tombstone_of(1).is_some(), "未过期 tombstone 保留");
+        assert!(idx.tombstone_of(2).is_none());
+        assert_eq!(idx.dead_copies().len(), 1);
+        assert_eq!(idx.dead_copies()[0].data_len, 50);
+        idx.assert_consistent();
+
+        // 保留期过后再 purge：needle 1 迁出。
+        assert_eq!(idx.purge_expired(100 + 86400 + 1), 1);
+        assert_eq!(idx.stats().staging_bytes, 0);
+        assert_eq!(idx.stats().garbage_bytes, 150);
+        assert_eq!(idx.stats().deleted_count, 0);
+        idx.assert_consistent();
+
+        // 幂等：无过期 tombstone 时返回 0。
+        assert_eq!(idx.purge_expired(999_999), 0);
     }
 
     #[test]
@@ -510,7 +599,9 @@ mod tests {
             idx.stats(),
             IndexStats {
                 used_bytes: 60,
+                staging_bytes: 0,
                 garbage_bytes: 40,
+                pinned_bytes: 0,
                 active_count: 1,
                 deleted_count: 0
             }
