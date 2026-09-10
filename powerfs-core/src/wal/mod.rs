@@ -7,8 +7,10 @@
 //! - 内存索引（needle/tombstone/统计）：[`index`]。
 //! - 重放器（段序重放 + tolerate_tail）：[`replay`]。
 //! - 组提交与 fsync 屏障（方案 §5）：[`commit`]。
+//! - 引擎装配与恢复（方案 §5 / §6）：[`engine`]。
 
 pub mod commit;
+pub mod engine;
 pub mod frame;
 pub mod index;
 pub mod manifest;

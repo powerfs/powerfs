@@ -34,16 +34,33 @@ use std::time::{Duration, Instant};
 
 use crate::wal::frame::{RecordType, FLAG_SYNC_BARRIER, FRAME_HEADER_SIZE};
 
-/// 组提交的底层追加/持久化接口（S5 由 WalEngine 基于 SegWriter + 换段实现）。
+/// sink 追加的物理落位（索引侧 read-your-writes 定位与校验用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// 记录所在段。
+    pub seg_id: u64,
+    /// 帧起始在段内的偏移（含段头前缀）。
+    pub offset: u64,
+    /// 帧 CRC（覆盖 rtype|flags|lsn|payload）。
+    pub crc: u32,
+    pub payload_len: u32,
+}
+
+/// 组提交的底层追加/持久化接口（由 WalEngine 基于 SegWriter + 换段实现）。
 ///
 /// 契约：
 /// - `append` 只要求落 OS page cache 即可返回（追加由队列锁串行化，调用方
-///   之间不并发）；
+///   之间不并发），并返回物理落位；
 /// - `sync` 返回 `Ok` 时，**在 sync 调用之前完成的全部 append 必须已
 ///   durable**。队列保证"sync 调用之前"以锁内快照 `flushed_lsn` 为界。
 pub trait CommitSink: Send + Sync {
-    fn append(&self, lsn: u64, rtype: RecordType, flags: u8, payload: &[u8])
-        -> std::io::Result<()>;
+    fn append(
+        &self,
+        lsn: u64,
+        rtype: RecordType,
+        flags: u8,
+        payload: &[u8],
+    ) -> std::io::Result<Placement>;
     /// 持久化屏障：本调用返回后，此前 append 的记录全部 durable。
     fn sync(&self) -> std::io::Result<()>;
 }
@@ -114,6 +131,8 @@ impl<'a> CommitRequest<'a> {
 pub struct CommitReceipt {
     pub lsn: u64,
     pub durable: bool,
+    /// 本记录的物理落位。
+    pub placement: Placement,
 }
 
 /// 组提交错误。
@@ -206,15 +225,16 @@ impl Drop for WaitDereg<'_> {
 }
 
 impl CommitQueue {
-    /// 创建队列并启动 fsync worker 线程。
-    pub fn new(sink: Arc<dyn CommitSink>, config: CommitConfig) -> Self {
+    /// 创建队列并启动 fsync worker 线程。`next_lsn` 为起始 LSN（恢复场景
+    /// 传入重放 last_lsn + 1，保证跨重启单调；全新卷传 1）。
+    pub fn new(sink: Arc<dyn CommitSink>, config: CommitConfig, next_lsn: u64) -> Self {
         assert!(config.max_dirty_bytes > 0, "max_dirty_bytes must be > 0");
         let core = CommitCore {
             config,
             sink,
-            next_lsn: 1,
-            flushed_lsn: 0,
-            durable_lsn: 0,
+            next_lsn,
+            flushed_lsn: next_lsn.saturating_sub(1),
+            durable_lsn: next_lsn.saturating_sub(1),
             dirty_bytes: 0,
             undurable: VecDeque::new(),
             kick: false,
@@ -274,15 +294,18 @@ impl CommitQueue {
 
         let lsn = core.next_lsn;
         core.next_lsn += 1;
-        if let Err(e) = core.sink.append(lsn, req.rtype, req.flags, req.payload) {
-            // append 失败后 lsn 已消耗且盘上状态未知：sticky 错误。
-            let err = CommitError::Sink(e.to_string());
-            core.error = Some(err.clone());
-            self.shared.sync_cv.notify_one();
-            self.shared.durable_cv.notify_all();
-            self.shared.space_cv.notify_all();
-            return Err(err);
-        }
+        let placement = match core.sink.append(lsn, req.rtype, req.flags, req.payload) {
+            Ok(p) => p,
+            Err(e) => {
+                // append 失败后 lsn 已消耗且盘上状态未知：sticky 错误。
+                let err = CommitError::Sink(e.to_string());
+                core.error = Some(err.clone());
+                self.shared.sync_cv.notify_one();
+                self.shared.durable_cv.notify_all();
+                self.shared.space_cv.notify_all();
+                return Err(err);
+            }
+        };
         core.flushed_lsn = lsn;
         core.dirty_bytes += bytes;
         core.undurable.push_back(Undurable {
@@ -303,7 +326,11 @@ impl CommitQueue {
                     return Err(e.clone());
                 }
                 if core.durable_lsn >= lsn {
-                    return Ok(CommitReceipt { lsn, durable: true });
+                    return Ok(CommitReceipt {
+                        lsn,
+                        durable: true,
+                        placement,
+                    });
                 }
                 core = self.shared.durable_cv.wait(core).unwrap();
             }
@@ -313,6 +340,7 @@ impl CommitQueue {
         Ok(CommitReceipt {
             lsn,
             durable: false,
+            placement,
         })
     }
 
@@ -470,7 +498,7 @@ fn worker_run(shared: Arc<Shared>) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io::{Error as IoError, ErrorKind as IoErrorKind};
+    use std::io::Error as IoError;
 
     /// 测试用 sink：内存记录 + durable 计数，可注入 append/sync 失败。
     #[derive(Default)]
@@ -505,7 +533,7 @@ mod tests {
             self.records.lock().unwrap()[idx].clone()
         }
         fn injected(msg: &str) -> IoError {
-            IoError::new(IoErrorKind::Other, msg.to_string())
+            IoError::other(msg.to_string())
         }
     }
 
@@ -516,18 +544,25 @@ mod tests {
             rtype: RecordType,
             flags: u8,
             payload: &[u8],
-        ) -> std::io::Result<()> {
+        ) -> std::io::Result<Placement> {
             let fail_at = self.fail_append_at.load(Ordering::SeqCst);
             if fail_at != 0 && self.len() as u64 + 1 >= fail_at {
                 return Err(Self::injected("injected append failure"));
             }
-            self.records.lock().unwrap().push(MockRecord {
+            let mut records = self.records.lock().unwrap();
+            let placement = Placement {
+                seg_id: 1,
+                offset: records.len() as u64,
+                crc: 0,
+                payload_len: payload.len() as u32,
+            };
+            records.push(MockRecord {
                 lsn,
                 rtype,
                 flags,
                 payload: payload.to_vec(),
             });
-            Ok(())
+            Ok(placement)
         }
 
         fn sync(&self) -> std::io::Result<()> {
@@ -556,6 +591,7 @@ mod tests {
         let q = Arc::new(CommitQueue::new(
             sink.clone(),
             cfg(Duration::from_secs(3600), 1 << 20),
+            1,
         ));
         const THREADS: usize = 8;
         const PER: usize = 50;
@@ -612,6 +648,7 @@ mod tests {
         let q = Arc::new(CommitQueue::new(
             sink.clone(),
             cfg(Duration::from_secs(3600), 1 << 20),
+            1,
         ));
         const THREADS: usize = 16;
         const PER: usize = 10;
@@ -657,7 +694,7 @@ mod tests {
     fn async_window_semantics() {
         // 窗口内：无任何 fsync。
         let sink = Arc::new(MockSink::default());
-        let q = CommitQueue::new(sink.clone(), cfg(Duration::from_secs(3600), 1 << 20));
+        let q = CommitQueue::new(sink.clone(), cfg(Duration::from_secs(3600), 1 << 20), 1);
         let r = q
             .enqueue(CommitRequest::new(RecordType::Data, b"win"))
             .unwrap();
@@ -674,7 +711,7 @@ mod tests {
 
         // interval 到期自动 sync。
         let sink2 = Arc::new(MockSink::default());
-        let q2 = CommitQueue::new(sink2.clone(), cfg(Duration::from_millis(5), 1 << 20));
+        let q2 = CommitQueue::new(sink2.clone(), cfg(Duration::from_millis(5), 1 << 20), 1);
         let r2 = q2
             .enqueue(CommitRequest::new(RecordType::Data, b"tick"))
             .unwrap();
@@ -695,6 +732,7 @@ mod tests {
         let q = Arc::new(CommitQueue::new(
             sink.clone(),
             cfg(Duration::from_secs(3600), 1 << 20),
+            1,
         ));
         for i in 0..5u64 {
             q.enqueue(CommitRequest::new(
@@ -746,6 +784,7 @@ mod tests {
         let q = Arc::new(CommitQueue::new(
             sink.clone(),
             cfg(Duration::from_secs(3600), 256),
+            1,
         ));
         let _r1 = q
             .enqueue(CommitRequest::new(RecordType::Data, &[0u8; 100]))
@@ -775,7 +814,7 @@ mod tests {
     #[test]
     fn sync_barrier_flag_forces_durable() {
         let sink = Arc::new(MockSink::default());
-        let q = CommitQueue::new(sink.clone(), cfg(Duration::from_secs(3600), 1 << 20));
+        let q = CommitQueue::new(sink.clone(), cfg(Duration::from_secs(3600), 1 << 20), 1);
         let r = q
             .enqueue(CommitRequest::new(RecordType::Data, b"anchor").barrier())
             .unwrap();
@@ -797,7 +836,7 @@ mod tests {
             fail_append_at: AtomicU64::new(3),
             ..Default::default()
         });
-        let q = CommitQueue::new(sink, cfg(Duration::from_secs(3600), 1 << 20));
+        let q = CommitQueue::new(sink, cfg(Duration::from_secs(3600), 1 << 20), 1);
         q.enqueue(CommitRequest::new(RecordType::Data, b"1"))
             .unwrap();
         q.enqueue(CommitRequest::new(RecordType::Data, b"2"))
@@ -823,7 +862,7 @@ mod tests {
             fail_sync: AtomicBool::new(true),
             ..Default::default()
         });
-        let q = CommitQueue::new(sink, cfg(Duration::from_secs(3600), 1 << 20));
+        let q = CommitQueue::new(sink, cfg(Duration::from_secs(3600), 1 << 20), 1);
         assert!(matches!(
             q.enqueue(CommitRequest::new(RecordType::Data, b"x").strict()),
             Err(CommitError::Sink(_))
@@ -842,7 +881,7 @@ mod tests {
     #[test]
     fn close_drains_and_rejects_new_writes() {
         let sink = Arc::new(MockSink::default());
-        let q = CommitQueue::new(sink.clone(), cfg(Duration::from_secs(3600), 1 << 20));
+        let q = CommitQueue::new(sink.clone(), cfg(Duration::from_secs(3600), 1 << 20), 1);
         for i in 0..3u64 {
             q.enqueue(CommitRequest::new(
                 RecordType::Data,

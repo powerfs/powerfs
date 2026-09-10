@@ -17,8 +17,8 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::wal::frame::{
-    encode_frame, encode_pad_frame, scan_one, FrameError, RecordType, ScanOne,
-    FLAG_SYNC_BARRIER, FRAME_HEADER_SIZE,
+    encode_frame, encode_pad_frame, scan_one, FrameError, RecordType, ScanOne, FLAG_SYNC_BARRIER,
+    FRAME_HEADER_SIZE,
 };
 
 /// 段文件 magic："PFWLSEG\0"。
@@ -146,7 +146,9 @@ impl SegmentHeader {
             });
         }
         let stored_crc = u32::from_le_bytes(
-            buf[SEG_HEADER_FIELD_SIZE..SEG_HEADER_SIZE].try_into().unwrap(),
+            buf[SEG_HEADER_FIELD_SIZE..SEG_HEADER_SIZE]
+                .try_into()
+                .unwrap(),
         );
         let got_crc = crc32c::crc32c(&buf[0..SEG_HEADER_CRC_INPUT]);
         if stored_crc != got_crc {
@@ -262,7 +264,10 @@ impl SegReader {
         file.read_exact(&mut hdr)
             .map_err(|e| SegmentError::io(path, e))?;
         let header = SegmentHeader::decode(path, &hdr)?;
-        let file_size = file.metadata().map_err(|e| SegmentError::io(path, e))?.len();
+        let file_size = file
+            .metadata()
+            .map_err(|e| SegmentError::io(path, e))?
+            .len();
         Ok(SegReader {
             file,
             header,
@@ -465,7 +470,8 @@ impl SegWriter {
         let enc = header.encode();
         file.seek(SeekFrom::Start(0))
             .map_err(|e| SegmentError::io(path, e))?;
-        file.write_all(&enc).map_err(|e| SegmentError::io(path, e))?;
+        file.write_all(&enc)
+            .map_err(|e| SegmentError::io(path, e))?;
         file.sync_data().map_err(|e| SegmentError::io(path, e))?;
 
         Ok(SegWriter {
@@ -484,9 +490,9 @@ impl SegWriter {
     /// 恢复哈希链后可继续追加。
     pub fn reopen(path: &Path, seg_size: u64) -> Result<(Self, ScanSummary), SegmentError> {
         let mut reader = SegReader::open(path)?;
-        let summary = reader.scan_summary().map_err(|e| {
-            SegmentError::Scan(path.to_path_buf(), e)
-        })?;
+        let summary = reader
+            .scan_summary()
+            .map_err(|e| SegmentError::Scan(path.to_path_buf(), e))?;
         drop(reader);
 
         let mut file = OpenOptions::new()
@@ -510,7 +516,10 @@ impl SegWriter {
             path: path.to_path_buf(),
             seg_size,
             write_pos: summary.valid_end,
-            prev_crc: summary.last_crc.map(|c| c as u64).unwrap_or_else(|| header.chain_seed()),
+            prev_crc: summary
+                .last_crc
+                .map(|c| c as u64)
+                .unwrap_or_else(|| header.chain_seed()),
             frame_count: summary.frame_count,
             last_meta: None,
         };
@@ -523,6 +532,10 @@ impl SegWriter {
 
     pub fn seg_id(&self) -> u64 {
         self.header.seg_id
+    }
+
+    pub fn volume_id(&self) -> u64 {
+        self.header.volume_id
     }
 
     pub fn base_lsn(&self) -> u64 {
@@ -675,6 +688,21 @@ impl SegWriter {
     pub fn sync(&self) -> std::io::Result<()> {
         self.file.sync_data()
     }
+
+    /// fd 级 fdatasync：冲刷调用时点文件已有的脏页，不与并发追加互斥
+    /// （组提交 worker 解锁执行；记录先后关系由队列锁内快照建立，
+    /// append 先于 sync 调用的记录必然被冲刷覆盖）。
+    pub fn sync_fd(&self) -> std::io::Result<()> {
+        nix::unistd::fdatasync(self.file.as_raw_fd())?;
+        Ok(())
+    }
+
+    /// 复制底层文件描述符（与原 fd 共享同一文件描述对象）。供组提交
+    /// worker 在不持有追加锁的前提下执行 fsync；换段后须以新 writer 的
+    /// 克隆替换。
+    pub fn try_clone_file(&self) -> std::io::Result<File> {
+        self.file.try_clone()
+    }
 }
 
 fn read_header(file: &mut File, path: &Path) -> Result<SegmentHeader, SegmentError> {
@@ -699,7 +727,7 @@ fn fallocate_len(file: &File, len: u64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wal::manifest::{SegmentState, SegManifest};
+    use crate::wal::manifest::{SegManifest, SegmentState};
 
     /// 追加一条 Data 记录的辅助。
     fn append_data(w: &mut SegWriter, lsn: u64, payload: &[u8]) -> FrameMeta {
@@ -946,7 +974,10 @@ mod tests {
         assert_eq!(r.file_size(), 1 << 20, "fallocate preallocated");
         let f = r.next_frame().unwrap().unwrap();
         assert_eq!(f.payload, b"only");
-        assert!(r.next_frame().unwrap().is_none(), "unwritten extents read as zeros");
+        assert!(
+            r.next_frame().unwrap().is_none(),
+            "unwritten extents read as zeros"
+        );
     }
 
     #[test]
@@ -972,7 +1003,11 @@ mod tests {
         let mf = SegManifest::load(dir.path(), 4096).unwrap();
         assert_eq!(mf.segments().len(), 3);
         assert_eq!(mf.segments()[0].state, SegmentState::Sealed);
-        assert_eq!(mf.segments()[1].state, SegmentState::Sealed, "有后继段必须归一化为 Sealed");
+        assert_eq!(
+            mf.segments()[1].state,
+            SegmentState::Sealed,
+            "有后继段必须归一化为 Sealed"
+        );
         assert_eq!(mf.segments()[2].state, SegmentState::Active);
         assert_eq!(mf.active().unwrap().seg_id, 3);
         assert_eq!(mf.next_seg_id(), 4);
@@ -1016,4 +1051,3 @@ mod tests {
         assert_eq!(parse_seg_id("superblock.a"), None);
     }
 }
-
