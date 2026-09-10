@@ -2,7 +2,7 @@
 
 > 目的：在 [write-prediction-related-work.md](write-prediction-related-work.md) 的相关工作边界之上，结合 2026 年存储领域热点与 venue 时间窗口，确定可投方向、优先级与执行路线。
 >
-> 记录日期：2026-09-10。结论先行：**热点（AI 存储）与本项目资产（POSIX 透明内核客户端 + 学习型写门控 + RDMA）存在真实交叉，但必须先用极低成本的 go/no-go 测量验证 checkpoint 字节级冗余，再决定投入；KVCache 赛道明确不进。**
+> 记录日期：2026-09-10（阶段 A 结果同日填入第 7.1 节）。结论先行：**go/no-go 已判定——checkpoint 字节级去重 no-go（全同块 ≈0，压缩/CDC 同步失效），方向二否决；方向一转为"语义级冗余为何在 POSIX 字节层不可见"的能力边界测量论文，下一步做容器镜像/源码包正向对照。KVCache 赛道明确不进。**
 
 ## 1. Venue 时间窗口（2026-09 核实）
 
@@ -104,7 +104,10 @@ checkpoint 生命周期包含写（save）与读（load）两侧，读侧按加�
 
 - E1 大纲与卖点锁定（非对称损失 + 透明性测量 + 读侧分叉）；E2 实验图表；E3 8 页成文、内部评审、按截稿投稿。
 
-### 方向二（天花板高一档）：POSIX 透明 checkpoint 去重，打"通用性"缝隙
+### 方向二（~~天花板高一档~~ 已否决 2026-09-10）：POSIX 透明 checkpoint 去重
+
+> **状态：NO-GO。** 阶段 A 实测全同 chunk ≈0、shift/CDC 无效、bf16 与长间隔对照一致、zstd/XOR-delta ≤1.28×，详见第 7.1 节。下面的论述仅保留作决策记录。
+
 
 FAST'26 两篇的边界：**AdaCheck** 需张量级离线分析；**AITURBO** 需 grouped I/O 专用 API + XPU 卸载 BLAKE3 + job controller 集中判重；Kaiser (CLUSTER'16) 需改训练框架。共同隐含假设：应用愿意且能够配合。
 
@@ -131,9 +134,10 @@ FAST'26 两篇的边界：**AdaCheck** 需张量级离线分析；**AITURBO** �
 
 | 时间 | 事项 | 产出 / 决策点 |
 |---|---|---|
-| 2026-09 中旬（本周） | **写侧 go/no-go**：容器内 CPU 装 PyTorch，GPT-2 small 连存 20 个 checkpoint（torch.save + DCP 两格式），离线切 1MB chunk 算跨 step 重复率与偏移敏感度 | 1–2 天出结果；同时决定方向二死活、构成方向一核心数据 |
-| 2026-09 下旬 | **读侧最小验证**：复用同一批 checkpoint，全量加载 + 部分加载（model.* 子集）× readahead off/RULE:16/auto，cold cache 各 3 次；记录加载时延、读放大、volume IOPS | 确认"按加载意图自适应"分叉；量化 dedup 碎片对全量恢复的读侧代价 |
-| 2026-10 ~ 11 | 补容器层 + FIU trace 测量；实现指纹 hit/miss 真实标签回流，根治策略死穴；评估碎片感知并行 RDMA 预读原型 | 规则 vs NN 在陌生 trace 上的 precision/recall/FPR；碎片预读原型数据 |
+| 2026-09 中旬（本周） | **写侧 go/no-go**：容器内 CPU 装 PyTorch，GPT-2 small 连存 20 个 checkpoint（torch.save + DCP 两格式），离线切 1MB chunk 算跨 step 重复率与偏移敏感度 | **已完成 2026-09-10：NO-GO（全同块 0-0.37%、shift/CDC/压缩/bf16/长间隔对照全部失效，见 7.1）**；方向二否决，方向一改为能力边界测量 |
+| 2026-09 下旬 | **正向对照（提前，最高优先）**：字节级去重主场 workload——≥3 个共享 base 的容器镜像 `docker save` tar、同源码树多版本 tar（内核源码打包场景）、日志；跑同一分析器多档 chunk 重复率与跨版本距离 | 给出"字节级透明去重有效区间 vs 失效区间"完整边界图；短文核心表 |
+| 2026-09 下旬 | **读侧最小验证**：复用同一批 checkpoint，全量加载 + 部分加载（model.* 子集）× readahead off/RULE:16/auto，cold cache 各 3 次；记录加载时延、读放大、volume IOPS | 确认"按加载意图自适应"分叉（独立于去重结论） |
+| 2026-10 ~ 11 | FIU trace 测量；实现指纹 hit/miss 真实标签回流（checkpoint 作为负样本），根治策略死穴 | 规则 vs NN 在陌生 trace 上的 precision/recall/FPR |
 | 2026-12 ~ 2027-03 | 撰写 HotStorage'27 短文（8 页） | 投稿 |
 | 2027 春之后 | 补四基线（always-hash 客户端、服务端去重/SeaweedFS、规则门控、NN 门控）、lease/refcount 崩溃注入与多客户端测试、KML 标准的内核推理开销预算 | 扩展全文 → EuroSys'28 / FAST'28 |
 
@@ -149,8 +153,29 @@ FAST'26 两篇的边界：**AdaCheck** 需张量级离线分析；**AITURBO** �
 
 ## 7. 测量结果记录（按阶段追加）
 
-### 7.1 阶段 A：写侧 go/no-go（待测量）
+### 7.1 阶段 A：写侧 go/no-go —— 已完成（2026-09-10），结论：**对 checkpoint 字节级去重 no-go**
 
-- 夹具：模型配置 / 步数 / torch 版本：待测后填写。
-- 关键结果：1MB 全同 chunk 跨 step 比例、偏移滑窗命中率、仅-weights 对比。
-- 结论（go / no-go / CDC）：待定。
+**夹具**：GPT-2 small 124M（50257 vocab / 768 / 12 头 / 12 层，tied head），真实 AdamW（lr=1e-3, betas=(0.9,0.999), wd=0.01），seqlen=128×1×20 步；torch 2.4.1+cpu / py3.8；种子 20260910；torchsave 1493MB、weights 498MB、dcp 1494MB 每步（共 65GB）。脚本与原始结果：[experiments/checkpoint-dedup/](../experiments/checkpoint-dedup/)（`results_report.md` 可由脚本完整复现）。
+
+**核心数据（稳态 step5-19 均值，跨 step 全同 chunk 比例）**：
+
+| 格式 / 视角 | 4K | 64K | 1M | 4M |
+|---|---:|---:|---:|---:|
+| torchsave / file | 0.0037 | 0.0036 | **0.0014** | 0 |
+| torchsave / zipdata | 0.0037 | 0.0037 | 0.0029 | 0 |
+| weights / file | 0 | 0 | **0** | 0 |
+| dcp / file | 0.0037 | 0.0036 | 0.0028 | 0 |
+
+- 那 0.37% 的 4K 命中**全部是全零块**（`exact_4k == zero_4k`），不是内容重复；
+- **偏移敏感度为零**：shift ∈ {1,16,256,4096} 命中率不升反与对齐值相同 → 不存在"内容相同、起点漂移"，**CDC 也救不了**；
+- **鲁棒性对照**（`controls_overlap.csv`，同一训练跑 100 步）：fp32 weights 在间隔 1/50/100 步、所有档全为 **0**；bf16 weights 4K 仅 0.01%（60726 块中 6-11 块），64K/1M 为 0；间隔拉大不产生冗余；
+- **通用压缩也失效**（`delta_compression.csv`，zipdata 相邻步）：单文件 zstd-1 仅 1.08×；逐字节相同率仅 20-30%；XOR-delta 流 zstd-1 最高仅 1.28×（fp32 低位噪声）。
+
+**机制解释**：① tied lm-head 的反向给整个 embedding 矩阵 dense 梯度；embedding 反向对未采样行产生零（非 None）梯度，AdamW 的 decoupled weight_decay 仍逐元素衰减；② Adam m/v 每步对全参数衰减更新。→ 每个 fp32 字节每步都变，张量级语义冗余（AdaCheck 的并行/架构/迭代间相同张量、AITURBO 的 grouped I/O）在定长字节块视角不可见。
+
+**对路线的影响**：
+
+1. **方向二（POSIX 透明 checkpoint 去重）否决**：物理机制决定字节层无冗余可吃，继续投入是逆结论而行。
+2. **方向一反而更强**：论文卖点从"透明去重有效"改为**能力边界的实证划分**——"Why semantic checkpoint dedup (AdaCheck/AITURBO: 6-896×) is invisible at the POSIX byte layer: a measurement study"。HotStorage 风格的负面测量 + 立场，且非对称损失门控论点在 checkpoint 场景的正确行为是**学会不 hash**（NN 门控需要 checkpoint 作为负样本，反哺真实标签闭环）。
+3. **必须补正向对照**（下一步，原 C1 提前）：字节级去重在哪有效——容器镜像层 / 源码 tar 多版本 / 日志，形成完整边界图后短文证据链才闭环。
+4. 读侧实验（阶段 B）价值下降但不取消：checkpoint load 的 readahead 分叉仍独立成立（与去重无关）。

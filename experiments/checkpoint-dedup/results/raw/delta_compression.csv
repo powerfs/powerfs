@@ -1,0 +1,7 @@
+format,view,step_a,step_b,bytes,exact_4k_ratio,zero_4k_ratio,byte_equal_ratio,zstd_single_ratio,zstd_xor_ratio
+weights,zipdata,0,1,497759232,0.0,0.0,0.236498,1.081,1.186
+weights,zipdata,9,10,497759232,0.0,0.0,0.270197,1.08,1.25
+weights,zipdata,18,19,497759232,0.0,0.0,0.294114,1.08,1.278
+torchsave,zipdata,0,1,1493278288,0.003687,0.003687,0.198475,1.082,1.153
+torchsave,zipdata,9,10,1493278288,0.003687,0.003687,0.262838,1.085,1.223
+torchsave,zipdata,18,19,1493278288,0.003687,0.003687,0.302739,1.085,1.275

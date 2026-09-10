@@ -1,0 +1,74 @@
+[
+  {
+    "bytes": 497759232,
+    "exact_4k_ratio": 0.0,
+    "zero_4k_ratio": 0.0,
+    "byte_equal_ratio": 0.236498,
+    "zstd_single_ratio": 1.081,
+    "zstd_xor_ratio": 1.186,
+    "format": "weights",
+    "step_a": 0,
+    "step_b": 1,
+    "view": "zipdata"
+  },
+  {
+    "bytes": 497759232,
+    "exact_4k_ratio": 0.0,
+    "zero_4k_ratio": 0.0,
+    "byte_equal_ratio": 0.270197,
+    "zstd_single_ratio": 1.08,
+    "zstd_xor_ratio": 1.25,
+    "format": "weights",
+    "step_a": 9,
+    "step_b": 10,
+    "view": "zipdata"
+  },
+  {
+    "bytes": 497759232,
+    "exact_4k_ratio": 0.0,
+    "zero_4k_ratio": 0.0,
+    "byte_equal_ratio": 0.294114,
+    "zstd_single_ratio": 1.08,
+    "zstd_xor_ratio": 1.278,
+    "format": "weights",
+    "step_a": 18,
+    "step_b": 19,
+    "view": "zipdata"
+  },
+  {
+    "bytes": 1493278288,
+    "exact_4k_ratio": 0.003687,
+    "zero_4k_ratio": 0.003687,
+    "byte_equal_ratio": 0.198475,
+    "zstd_single_ratio": 1.082,
+    "zstd_xor_ratio": 1.153,
+    "format": "torchsave",
+    "step_a": 0,
+    "step_b": 1,
+    "view": "zipdata"
+  },
+  {
+    "bytes": 1493278288,
+    "exact_4k_ratio": 0.003687,
+    "zero_4k_ratio": 0.003687,
+    "byte_equal_ratio": 0.262838,
+    "zstd_single_ratio": 1.085,
+    "zstd_xor_ratio": 1.223,
+    "format": "torchsave",
+    "step_a": 9,
+    "step_b": 10,
+    "view": "zipdata"
+  },
+  {
+    "bytes": 1493278288,
+    "exact_4k_ratio": 0.003687,
+    "zero_4k_ratio": 0.003687,
+    "byte_equal_ratio": 0.302739,
+    "zstd_single_ratio": 1.085,
+    "zstd_xor_ratio": 1.275,
+    "format": "torchsave",
+    "step_a": 18,
+    "step_b": 19,
+    "view": "zipdata"
+  }
+]
