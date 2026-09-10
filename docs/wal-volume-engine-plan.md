@@ -666,7 +666,9 @@ P2 范围（§17）：checkpoint 文件（§4.4）+ superblock 双副本（§4.5
 
 | #  | 状态  | 完成内容   | 验证结果   | 提交     |
 | -- | --- | ------ | ------ | ------ |
-| T1 | 进行中 | （见 C.1 T1） | — | — |
+| T1 | 完成 | `wal/index.rs`：IndexStats 四分（used/staging/garbage/pinned 留位）——staging=tombstone 保留期物理字节、garbage=死副本账本字节；apply_delete 迁 staging、restore/revive 反向迁出、新增 purge_expired（过期 tombstone→死副本账本，staging→garbage）、load_from（checkpoint 装配，统计重算）；assert_consistent 重定义（garbage==死副本账本、staging==tombstone 逐字节核对） | delete/restore/revive/purge 统计迁移逐项断言 + I4 核对全绿；既有语义测试同步更新；wal 52 测试 + 故障模拟器 3000 场景回归绿 | 0ba5d8f5 |
+| T2 | 完成 | `wal/checkpoint.rs`：ckpt\_<seq\>.bin 全量编解码（128B header：seq/applied\_lsn/计数区 + header CRC；segments per-seg live/staging/dead 字节分桶；needles/tombstones/dead 账本/snapshots 留位/alloc_stats 四项统计；footer 全文件 CRC）；write 原子落盘（tmp→fsync→rename→fsync dir）；list\_ckpts/latest\_seq；build（索引+段清单→CkptData）、into\_index（恢复装配，统计从条目重建）；per\_seg\_bytes 分桶（GC 与段清单共用）；refcnt/checksum\_algo/gc\_pending 字段留位 P3 | 10 个单测全绿：全表 roundtrip（含 snapshot 表与死副本追加序）、CRC 破坏（payload/header 先后检出）、截断拒载、空表边界、多 seq 列举、分桶与索引统计一致、into\_index 终态一致 | 7f06f36d |
+| T3 | 完成 | `wal/superblock.rs`：superblock.a/b 双副本（128B：seq/volume\_id/latest\_ckpt\_seq/active\_seg\_id+size/volume\_size/state/时间戳/min\_live\_snapshot\_lsn 留位 + CRC）；barrier write（tmp→fsync→rename→fsync dir，目标=较旧副本/缺哪补哪，保证至少一份完好）；load 取合法最大 seq、区分"从未写过"（NotFound）与"写过全坏"（BothCorrupt 拒绝挂载） | 7 个单测全绿：roundtrip、轮换写（.a/.b 交替覆盖旧者）、单副本损坏回退旧 seq、双副本全损坏拒绝、撕裂副本视同损坏、tmp 清理 | 7f06f36d |
 
 ### C.3 执行约定
 
