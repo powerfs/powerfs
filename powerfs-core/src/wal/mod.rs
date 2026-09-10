@@ -8,9 +8,12 @@
 //! - 重放器（段序重放 + tolerate_tail）：[`replay`]。
 //! - 组提交与 fsync 屏障（方案 §5）：[`commit`]。
 //! - 引擎装配与恢复（方案 §5 / §6）：[`engine`]。
+//! - checkpoint 文件编解码（方案 §4.4）：[`checkpoint`]。
+//! - superblock 双副本（方案 §4.5）：[`superblock`]。
 //! - 本地面只读检查（admin stats/verify，方案 §19.3）：[`admin`]。
 
 pub mod admin;
+pub mod checkpoint;
 pub mod commit;
 pub mod engine;
 pub mod frame;
@@ -18,3 +21,4 @@ pub mod index;
 pub mod manifest;
 pub mod replay;
 pub mod segment;
+pub mod superblock;
