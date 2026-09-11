@@ -38,14 +38,17 @@ grows with model size and checkpoint frequency. Two FAST'26 systems attack
 the waste semantically: AdaCheck [1] classifies checkpoint tensors as
 replicated, architecturally shared, or temporally similar, and reports
 6–896× savings; AITURBO [2] batches tensor I/O into grouped operations and
-offloads BLAKE3 hashing to an XPU because content fingerprinting on the CPU
-cannot keep up with 100 Gbps networks. Kaiser [3] earlier required
-framework instrumentation to exploit inter-checkpoint redundancy. The
-common denominator is cooperation: the application must expose tensor
-identity or use a specialised API.
+computes BLAKE3 [3] fingerprints with optimised XPU kernels because CPU
+hashing cannot keep up with the storage fabric. The common denominator is
+cooperation: the application must expose tensor identity or use a
+specialised API. The closest byte-level predecessor, Kaiser et al. [4],
+characterised block-deduplication potential in *HPC* application
+checkpoints in 2016 and found application-dependent but real recurring
+savings—raising the question whether modern AI-training checkpoints behave
+the same; our answer is that they do not.
 
 Meanwhile, transparent block deduplication is a textbook POSIX-filesystem
-feature [4,5]: fingerprint content blocks, suppress redundant writes, and
+feature [5,6]: fingerprint content blocks, suppress redundant writes, and
 leave the application untouched. If semantic checkpoint redundancy were
 visible at the byte layer, *unmodified* PyTorch jobs would benefit simply
 by mounting the filesystem—no framework changes, no XPU. We asked exactly
@@ -88,17 +91,18 @@ code. Redundancy splits by **axis**, not by workload.
 uncompressed (STORED) zip container; tensor storage lands in numbered
 `data/N` entries. `torch.distributed.checkpoint` (DCP) writes one or more
 `.distcp` shard files plus metadata in the same zip-based format.
-safetensors [6] instead stores tensors as one contiguous little-endian byte
+safetensors [7] instead stores tensors as one contiguous little-endian byte
 region preceded by a JSON header. None of these formats compresses fp32
 state, because it does not compress (§4.3).
 
 **Byte-level deduplication.** A transparent client partitions write
 streams into fixed-size blocks, fingerprints each (we use BLAKE2b-128), and
 suppresses a block when the fingerprint already exists. Cost is dominated
-by hashing—exactly why AITURBO moves BLAKE3 to an XPU [2]—and by block
-alignment: fixed grids miss identical content that drifts in offset, which
-content-defined chunking [7,8] addresses at extra CPU cost. Block stores
-from Venti [5] to iDedup [4] operate on this model; iDedup also documented
+by hashing—exactly why AITURBO computes BLAKE3 [3] on XPU kernels [2]—and by
+block alignment: fixed grids miss identical content that drifts in offset,
+which content-defined chunking [8,9] addresses at extra CPU cost. Block
+stores from Venti [6] to iDedup [5] operate on this model; iDedup also
+documented
 that deduplication fragments physical layout and can hurt reads.
 
 **Three redundancy axes.** Semantic systems exploit three structurally
@@ -107,7 +111,7 @@ different sources of repeated bytes:
 | Axis | Example | Who benefits today |
 |---|---|---|
 | **A. Intra-job copies** | DDP replicates all parameters/optimizer state per rank; TP replicates embeddings | Any byte-identical copy mechanism |
-| **B. Inter-job similarity** | Same architecture, different data/seed; LoRA jobs share one frozen base | Tensor-keyed systems [1,3] |
+| **B. Inter-job similarity** | Same architecture, different data/seed; LoRA jobs share one frozen base | Tensor-keyed systems [1] |
 | **C. Inter-step similarity** | Consecutive checkpoints of one job | Tensor diff / grouped-I/O [1,2] |
 
 The crucial distinction is **copies versus similarities**. A copy is the
@@ -188,7 +192,10 @@ optimizer slots, no padding zero blocks—score exactly zero at every size.
 At 1 MB, all-pairs Jaccard across steps 0–19 is a flat 0.000351 regardless
 of step distance: the only overlap is the same persistent zero blocks,
 present in every checkpoint. Temporal similarity—what AdaCheck and AITURBO
-harvest step after step—simply does not exist as equal bytes.
+harvest step after step—simply does not exist as equal bytes. Notably,
+AITURBO's finest detection granularity is 4 MB [2]; at exactly that setting
+every format in our fixture yields zero cross-step hits—XPU-accelerated
+hashing would be spent on a stream containing nothing to find.
 
 ### 4.2 F2 — Not an alignment problem: boundary alignment is necessary but not sufficient
 
@@ -319,11 +326,13 @@ unique stream) wastes fingerprints; a false negative (skipped a redundant
 stream) loses one saving. Both errors affect performance only. Suppression
 still requires an exact fingerprint match, so the neural component can
 neither corrupt data nor lose a byte. This is the dividing line against
-prediction-in-the-data-path systems such as LinnOS [9] or KML-style learned
-storage operations [10]: prediction proposes, exact matching disposes.
+prediction-in-the-data-path systems such as LinnOS [10] or KML's learned
+kernel heuristics [11]: prediction proposes, exact matching disposes.
 Our measurements supply what such a gate previously lacked—labelled
-**negative** examples of production-shaped workloads; existing rule-based
-gates only ever saw overwrite-heavy positives.
+**negative** examples of production-shaped workloads; earlier write-side
+prediction work was tuned on traditional workloads (logs, overwrites,
+versioned files), where redundancy is the default rather than the
+exception.
 
 **A lower bound, not an obituary, for semantic systems.** The zero on the
 similarity axis quantifies the *necessity* of tensor cooperation: no amount
@@ -345,26 +354,31 @@ measurement in this paper determines *where it must not be switched on*.
 
 **Semantic checkpoint storage.** AdaCheck [1] classifies and rewrites
 tensors across parallelism, architecture, and temporal dimensions;
-AITURBO [2] contributes grouped I/O and XPU BLAKE3; Kaiser [3] instruments
-training frameworks for cross-checkpoint redundancy. We measure what
-remains of their savings after the semantic interface is removed, and
-conclude the interface is necessary precisely for their largest gains.
+AITURBO [2] contributes grouped I/O and XPU BLAKE3 fingerprinting. Kaiser
+et al. [4] is the closest predecessor: a byte-level measurement of
+deduplication potential across HPC application checkpoints, where static
+memory regions and repeated arrays produced application-dependent savings.
+We revisit the same question for modern AI-training state under AdamW,
+decompose redundancy into copy and similarity axes instead of a single
+ratio, and show the answer flips for the temporal axis while holding for
+the copy axis.
 
-**Block deduplication and chunking.** Venti [5] established
-content-addressed block storage; iDedup [4] studied inline deduplication
-and its fragmentation cost; LBFS [7] introduced and FastCDC [8] optimised
+**Block deduplication and chunking.** Venti [6] established
+content-addressed block storage; iDedup [5] studied inline deduplication
+and its fragmentation cost; LBFS [8] introduced and FastCDC [9] optimised
 content-defined chunking. Our shift experiment characterises whether CDC's
 precondition (offset-drifted identical content) holds for checkpoints—it
 does not—and our alignment control quantifies how badly fixed grids fare
 without file boundaries.
 
-**Learning in storage.** LinnOS [9] predicts I/O latency with learned
-models; KML [10] embeds ML inference in storage operation paths; learned
-prefetching and tuning form an active FAST topic. Our asymmetric-loss gate
-differs structurally: ML decides only whether an exact algorithm runs,
-never what data the algorithm returns.
+**Learning in storage.** LinnOS [10] infers per-I/O flash latency with a
+lightweight neural network and speculatively reroutes slow I/Os; KML [11]
+runs learned models inside the kernel to set storage heuristics such as
+readahead. In both, model output directly changes the I/O action. Our
+asymmetric-loss gate differs structurally: ML decides only whether an exact
+algorithm runs, never what data the algorithm returns.
 
-**AI storage workloads.** Mooncake [11] characterised and accelerated
+**AI storage workloads.** Mooncake [12] characterised and accelerated
 KVCache-centric serving traffic; checkpoint I/O studies and the FIU/MSR
 block traces provide the traditional-workload baselines we defer to the
 full-paper version. Serving KV caches are a separate, congested track we
@@ -394,14 +408,15 @@ where copies live.
 
 ## References
 
-1. AdaCheck: Efficient Checkpointing via Tensor-level Deduplication. FAST 2026.
-2. AITURBO: Accelerating AI Training Checkpointing with Grouped I/O and ... FAST 2026. (exact title to verify)
-3. Kaiser: ... Checkpoint deduplication with framework support. CLUSTER 2016. (exact title/authors to verify)
-4. Srinivasan et al., iDedup: Latency-aware, inline data deduplication. FAST 2012.
-5. Quinlan & Dorward, Venti: A New Approach to Archival Storage. FAST 2002.
-6. safetensors specification, Hugging Face.
-7. Muthitacharoen et al., A Low-Bandwidth Network File System (LBFS). SOSP 2001.
-8. Xia et al., The Design of Fast Content-Defined Chunking (FastCDC). USENIX ATC 2016.
-9. Khan et al., LinnOS: Predictability on Unpredictable Flash Storage with a Lightweight Neural Engine. EuroSys 2022. (venue to verify)
-10. KML: Learning Storage Operations ... (title/venue to verify).
-11. Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving. FAST 2025.
+1. W. Liu, S. Li, Z. Lai, K. Ge, Q. Chen, P. Sun, D. Li, K. Lu. AdaCheck: An Adaptive Checkpointing System for Efficient LLM Training with Redundancy Utilization. FAST 2026, pp. 271–289.
+2. Y. Hao, T. Yao, X. Wei, D. Zhang, T. Sun, Y. Zhang, Z. Fu, H. Wu, R. Chen. Fast Cloud Storage for AI Jobs via Grouped I/O API with Transparent Read/Write Optimizations (system name: AITURBO). FAST 2026.
+3. J. O'Connor, J.-P. Aumasson, S. Neves, Z. Wilcox-O'Hearn. BLAKE3: One Function, Fast Everywhere. Technical report, 2020. https://blake3.io
+4. J. Kaiser, R. Gad, T. Süß, F. Padua, L. Nagel, A. Brinkmann. Deduplication Potential of HPC Applications' Checkpoints. IEEE CLUSTER 2016, pp. 413–422.
+5. K. Srinivasan, T. Bisson, G. Goodson, K. Voruganti. iDedup: Latency-aware, Inline Data Deduplication for Primary Storage. FAST 2012.
+6. S. Quinlan, S. Dorward. Venti: A New Approach to Archival Storage. FAST 2002.
+7. Hugging Face. safetensors serialization format. https://huggingface.co/docs/safetensors (software; no archival paper).
+8. A. Muthitacharoen, B. Chen, D. Mazieres. A Low-Bandwidth Network File System (LBFS). SOSP 2001.
+9. W. Xia, Y. Zhou, H. Jiang, D. Feng, Y. Hua, Y. Hu, Q. Liu, Y. Zhang. The Design of Fast Content-Defined Chunking for Data Deduplication Based Storage Systems (FastCDC). IEEE TPDS 31(9):2017–2031, 2020.
+10. M. Hao, L. Toksoz, N. Li, E. E. Halim, H. Hoffmann, H. S. Gunawi. LinnOS: Predictability on Unpredictable Flash Storage with a Light Neural Network. OSDI 2020.
+11. I. U. Akgun, A. S. Aydin, A. Shaikh, L. Velikov, E. Zadok. A Machine Learning Framework to Improve Storage System Performance (KML). HotStorage 2021.
+12. R. Qin, Z. Li, W. He, J. Cui, F. Ren, M. Zhang, Y. Wu, W. Zheng, X. Xu. Mooncake: Trading More Storage for Less Computation — A KVCache-centric Architecture for Serving LLM Chatbot. FAST 2025, pp. 155–170 (Best Paper).
