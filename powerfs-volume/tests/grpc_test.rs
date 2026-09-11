@@ -10,7 +10,8 @@ use powerfs_core::storage::StorageManager;
 use powerfs_core::volume_engine::EngineKind;
 use powerfs_volume::proto::{
     CreateVolumeRequest, DeleteNeedleRequest, DeleteVolumeRequest, ReadNeedleBlobRequest,
-    ReadNeedleMetaRequest, ReadNeedleRequest, VolumeServiceClient, VolumeServiceServer,
+    ReadNeedleMetaRequest, ReadNeedleRequest, VolumeAdminCheckpointRequest, VolumeAdminGcRequest,
+    VolumeAdminStatsRequest, VolumeResizeRequest, VolumeServiceClient, VolumeServiceServer,
     WriteNeedleBlobRequest, WriteNeedleRequest,
 };
 use powerfs_volume::server::VolumeServer;
@@ -358,3 +359,194 @@ macro_rules! grpc_test_suite {
 grpc_test_suite!(needle_engine, EngineKind::Needle);
 // v2 WAL 引擎（S7 并行切换验收：同一测试集）。
 grpc_test_suite!(wal_engine, EngineKind::Wal);
+
+// ============================================================================
+// P2 T8：WAL 远程管理面 RPC（stats/gc/checkpoint/resize）
+// ============================================================================
+
+#[tokio::test]
+async fn wal_admin_rpcs_end_to_end() {
+    let (mut client, _temp_dir) = setup_server_and_client_with_engine(EngineKind::Wal).await;
+
+    client
+        .create_volume(CreateVolumeRequest {
+            volume_id: 71,
+            size: 10 * 1024 * 1024,
+            collection: String::new(),
+        })
+        .await
+        .unwrap();
+
+    client
+        .write_needle(WriteNeedleRequest {
+            volume_id: 71,
+            file_key: 7001,
+            data: b"wal-admin-rpc".to_vec(),
+            cookie: 0,
+            ttl: "".to_string(),
+        })
+        .await
+        .unwrap();
+
+    // stats：写入后 active needle=1、容量已限定、未满。
+    let stats = client
+        .volume_admin_stats(VolumeAdminStatsRequest { volume_id: 71 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stats.success, "stats failed: {}", stats.error);
+    assert_eq!(stats.active_count, 1);
+    assert_eq!(stats.volume_size, 10 * 1024 * 1024);
+    assert!(stats.free_bytes < stats.volume_size);
+    assert!(!stats.is_full);
+
+    // checkpoint：成功落盘并返回 seq。
+    let ckpt = client
+        .volume_admin_checkpoint(VolumeAdminCheckpointRequest { volume_id: 71 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ckpt.success, "checkpoint failed: {}", ckpt.error);
+    assert!(ckpt.ckpt_seq >= 1);
+    assert!(ckpt.applied_lsn >= 1);
+
+    // gc：成功执行一轮（无回收对象时各项为 0 也算通过）。
+    let gc = client
+        .volume_admin_gc(VolumeAdminGcRequest { volume_id: 71 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(gc.success, "gc failed: {}", gc.error);
+
+    // resize：shrink 到低于占用（13B 数据）必须拒绝。
+    let shrink = client
+        .volume_resize(VolumeResizeRequest {
+            volume_id: 71,
+            new_size: 1,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        !shrink.success,
+        "shrink below occupied bytes must be rejected"
+    );
+    assert!(
+        shrink.error.contains("shrink") || shrink.error.contains("rejected"),
+        "unexpected shrink error: {}",
+        shrink.error
+    );
+
+    // resize：grow 成功后 stats 反映新容量。
+    let grow = client
+        .volume_resize(VolumeResizeRequest {
+            volume_id: 71,
+            new_size: 64 * 1024 * 1024,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(grow.success, "grow failed: {}", grow.error);
+    let stats2 = client
+        .volume_admin_stats(VolumeAdminStatsRequest { volume_id: 71 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(stats2.success);
+    assert_eq!(stats2.volume_size, 64 * 1024 * 1024);
+    assert_eq!(stats2.active_count, 1);
+}
+
+#[tokio::test]
+async fn needle_admin_rpcs_rejected() {
+    let (mut client, _temp_dir) = setup_server_and_client_with_engine(EngineKind::Needle).await;
+
+    client
+        .create_volume(CreateVolumeRequest {
+            volume_id: 72,
+            size: 10 * 1024 * 1024,
+            collection: String::new(),
+        })
+        .await
+        .unwrap();
+
+    // v1 引擎：stats 明确报 WAL-only；其余管理 RPC 返回 InvalidRequest。
+    let stats = client
+        .volume_admin_stats(VolumeAdminStatsRequest { volume_id: 72 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stats.success);
+    assert!(
+        stats.error.contains("WAL-engine"),
+        "unexpected stats error: {}",
+        stats.error
+    );
+
+    let gc = client
+        .volume_admin_gc(VolumeAdminGcRequest { volume_id: 72 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!gc.success);
+    assert!(
+        gc.error.to_lowercase().contains("wal-engine"),
+        "unexpected gc error: {}",
+        gc.error
+    );
+
+    let ckpt = client
+        .volume_admin_checkpoint(VolumeAdminCheckpointRequest { volume_id: 72 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!ckpt.success);
+    assert!(
+        ckpt.error.to_lowercase().contains("wal-engine"),
+        "unexpected checkpoint error: {}",
+        ckpt.error
+    );
+
+    let resize = client
+        .volume_resize(VolumeResizeRequest {
+            volume_id: 72,
+            new_size: 4096,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!resize.success);
+    assert!(
+        resize.error.to_lowercase().contains("wal-engine"),
+        "unexpected resize error: {}",
+        resize.error
+    );
+}
+
+#[tokio::test]
+async fn admin_rpcs_unknown_volume_fail_gracefully() {
+    let (mut client, _temp_dir) = setup_server_and_client_with_engine(EngineKind::Wal).await;
+
+    let stats = client
+        .volume_admin_stats(VolumeAdminStatsRequest { volume_id: 4040 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!stats.success);
+    assert!(
+        stats.error.contains("not found"),
+        "unexpected error: {}",
+        stats.error
+    );
+
+    let resize = client
+        .volume_resize(VolumeResizeRequest {
+            volume_id: 4040,
+            new_size: 1024,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!resize.success);
+    assert!(resize.error.contains("not found"));
+}

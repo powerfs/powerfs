@@ -1,7 +1,8 @@
 use crate::volume_proto::powerfs::volume_service_client::VolumeServiceClient;
 use crate::volume_proto::powerfs::{
     CreateVolumeRequest, DeleteNeedleRequest, ListNeedlesRequest, ReadNeedleRequest,
-    RestoreNeedleRequest, WormLockRequest, WriteNeedleRequest,
+    RestoreNeedleRequest, VolumeAdminCheckpointRequest, VolumeAdminGcRequest,
+    VolumeAdminStatsRequest, VolumeResizeRequest, WormLockRequest, WriteNeedleRequest,
 };
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -325,6 +326,102 @@ impl VolumeClientPool {
             Err(e) => {
                 self.invalidate_channel(address).await;
                 Err(format!("list_needles failed: {}", e))
+            }
+        }
+    }
+
+    // ---- WAL engine remote admin (P2 T8) ----
+
+    /// Fetch WAL admin stats. Returns the volume server response verbatim so
+    /// success=false engine-level errors reach the CLI unchanged.
+    pub async fn admin_stats(
+        &self,
+        address: &str,
+        volume_id: u64,
+    ) -> Result<crate::volume_proto::powerfs::VolumeAdminStatsResponse, String> {
+        let channel = self.get_or_create_channel(address).await?;
+        let mut service = VolumeServiceClient::new(channel);
+        match service
+            .volume_admin_stats(tonic::Request::new(VolumeAdminStatsRequest { volume_id }))
+            .await
+        {
+            Ok(resp) => Ok(resp.into_inner()),
+            Err(e) => {
+                self.invalidate_channel(address).await;
+                Err(format!("volume admin stats failed: {}", e))
+            }
+        }
+    }
+
+    /// Trigger one GC cycle on the volume server.
+    pub async fn admin_gc(
+        &self,
+        address: &str,
+        volume_id: u64,
+    ) -> Result<crate::volume_proto::powerfs::VolumeAdminGcResponse, String> {
+        let channel = self.get_or_create_channel(address).await?;
+        let mut service = VolumeServiceClient::new(channel);
+        match service
+            .volume_admin_gc(tonic::Request::new(VolumeAdminGcRequest { volume_id }))
+            .await
+        {
+            Ok(resp) => Ok(resp.into_inner()),
+            Err(e) => {
+                self.invalidate_channel(address).await;
+                Err(format!("volume admin gc failed: {}", e))
+            }
+        }
+    }
+
+    /// Trigger a checkpoint on the volume server.
+    pub async fn admin_checkpoint(
+        &self,
+        address: &str,
+        volume_id: u64,
+    ) -> Result<crate::volume_proto::powerfs::VolumeAdminCheckpointResponse, String> {
+        let channel = self.get_or_create_channel(address).await?;
+        let mut service = VolumeServiceClient::new(channel);
+        match service
+            .volume_admin_checkpoint(tonic::Request::new(VolumeAdminCheckpointRequest {
+                volume_id,
+            }))
+            .await
+        {
+            Ok(resp) => Ok(resp.into_inner()),
+            Err(e) => {
+                self.invalidate_channel(address).await;
+                Err(format!("volume admin checkpoint failed: {}", e))
+            }
+        }
+    }
+
+    /// Resize the WAL volume capacity.
+    pub async fn resize_volume(
+        &self,
+        address: &str,
+        volume_id: u64,
+        new_size: u64,
+    ) -> Result<(), String> {
+        let channel = self.get_or_create_channel(address).await?;
+        let mut service = VolumeServiceClient::new(channel);
+        match service
+            .volume_resize(tonic::Request::new(VolumeResizeRequest {
+                volume_id,
+                new_size,
+            }))
+            .await
+        {
+            Ok(resp) => {
+                let inner = resp.into_inner();
+                if inner.success {
+                    Ok(())
+                } else {
+                    Err(inner.error)
+                }
+            }
+            Err(e) => {
+                self.invalidate_channel(address).await;
+                Err(format!("volume resize failed: {}", e))
             }
         }
     }

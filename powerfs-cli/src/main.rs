@@ -11,8 +11,8 @@ use commands::{
     AdminSubcommand, AssignArgs, CertSubcommand, ClusterAddArgs, ClusterRemoveArgs,
     ClusterStatusArgs, ClusterTransferArgs, CollectionArgs, CompactArgs, ConfigGenArgs,
     ConflictsArgs, DebugArgs, FilerStatsArgs, FsckArgs, FuseStatsArgs, GrowArgs, HeartbeatArgs,
-    KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs, StatusArgs, TopologyArgs, VolumeListArgs,
-    WriteArgs,
+    KvArgs, LookupArgs, ManageArgs, MountArgs, ReadArgs, StatusArgs, TopologyArgs,
+    VolumeAdminCommand, VolumeListArgs, WriteArgs,
 };
 
 /// `powerfs-cli config` subcommands.
@@ -54,6 +54,13 @@ enum Commands {
 
     /// List all volumes and nodes
     VolumeList(VolumeListArgs),
+
+    /// WAL volume remote administration (stats/resize/gc/checkpoint;
+    /// proxied by Master to the owning volume node)
+    Volume {
+        #[command(subcommand)]
+        command: VolumeAdminCommand,
+    },
 
     /// Send heartbeat to master (simulate volume server)
     Heartbeat(HeartbeatArgs),
@@ -187,6 +194,7 @@ async fn main() {
         Commands::Assign(args) => commands::assign(client, args).await,
         Commands::Lookup(args) => commands::lookup(client, args).await,
         Commands::VolumeList(args) => commands::volume_list(client, args).await,
+        Commands::Volume { command } => commands::volume_admin(client, command).await,
         Commands::Heartbeat(args) => commands::heartbeat(client, args).await,
         Commands::Grow(args) => commands::grow(client, args).await,
         Commands::Write(args) => commands::write(args).await,

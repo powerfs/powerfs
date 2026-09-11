@@ -33,6 +33,14 @@ service VolumeService {
 
     // List needles on a volume (for cold-data migration enumeration)
     rpc ListNeedles(ListNeedlesRequest) returns (ListNeedlesResponse);
+
+    // WAL engine remote admin face (P2 T8). Mutating RPCs are dispatched to
+    // the running engine; for the v1 needle engine they return success=false
+    // with an InvalidRequest-style error.
+    rpc VolumeAdminStats(VolumeAdminStatsRequest) returns (VolumeAdminStatsResponse);
+    rpc VolumeAdminGc(VolumeAdminGcRequest) returns (VolumeAdminGcResponse);
+    rpc VolumeAdminCheckpoint(VolumeAdminCheckpointRequest) returns (VolumeAdminCheckpointResponse);
+    rpc VolumeResize(VolumeResizeRequest) returns (VolumeResizeResponse);
 }
 
 message CreateVolumeRequest {
@@ -326,4 +334,67 @@ message ListNeedlesResponse {
     bool success = 1;
     repeated NeedleEntry needles = 2;
     string error = 3;
+}
+
+// ============================================================
+// WAL engine remote admin (P2 T8)
+// ============================================================
+
+message VolumeAdminStatsRequest {
+    uint64 volume_id = 1;
+}
+
+message VolumeAdminStatsResponse {
+    bool success = 1;
+    string error = 2;
+    // 0 means the volume has no capacity limit.
+    uint64 volume_size = 3;
+    // u64::MAX when the volume has no capacity limit.
+    uint64 free_bytes = 4;
+    uint64 used_bytes = 5;
+    uint64 staging_bytes = 6;
+    uint64 garbage_bytes = 7;
+    uint64 pinned_bytes = 8;
+    uint64 active_count = 9;
+    uint64 deleted_count = 10;
+    uint64 segments = 11;
+    uint64 last_ckpt_seq = 12;
+    uint64 last_ckpt_lsn = 13;
+    uint64 durable_lsn = 14;
+    bool is_full = 15;
+}
+
+message VolumeAdminGcRequest {
+    uint64 volume_id = 1;
+}
+
+message VolumeAdminGcResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 purged = 3;
+    uint64 segments_deleted = 4;
+    uint64 migrated_needles = 5;
+    uint64 migrated_bytes = 6;
+    uint64 reclaimed_bytes = 7;
+}
+
+message VolumeAdminCheckpointRequest {
+    uint64 volume_id = 1;
+}
+
+message VolumeAdminCheckpointResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 ckpt_seq = 3;
+    uint64 applied_lsn = 4;
+}
+
+message VolumeResizeRequest {
+    uint64 volume_id = 1;
+    uint64 new_size = 2;
+}
+
+message VolumeResizeResponse {
+    bool success = 1;
+    string error = 2;
 }

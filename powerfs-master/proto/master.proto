@@ -9,6 +9,14 @@ service MasterService {
     rpc Assign(AssignRequest) returns (AssignResponse);
     rpc VolumeList(VolumeListRequest) returns (VolumeListResponse);
     rpc VolumeGrow(VolumeGrowRequest) returns (VolumeGrowResponse);
+
+    // WAL engine remote admin (P2 T8). The Master locates the owning volume
+    // node via its volume table and proxies the call; the CLI never connects
+    // to a volume node directly.
+    rpc VolumeAdminStats(VolumeAdminStatsRequest) returns (VolumeAdminStatsResponse);
+    rpc VolumeAdminGc(VolumeAdminGcRequest) returns (VolumeAdminGcResponse);
+    rpc VolumeAdminCheckpoint(VolumeAdminCheckpointRequest) returns (VolumeAdminCheckpointResponse);
+    rpc VolumeResize(VolumeResizeRequest) returns (VolumeResizeResponse);
     rpc Ping(PingRequest) returns (PingResponse);
     
     // Collection management
@@ -1806,4 +1814,71 @@ message PinVolumeRequest {
 
 message SetPlacementStrategyRequest {
     string strategy = 1;  // "round_robin" | "least_loaded" | "anti_affinity"
+}
+// ============================================================
+// WAL volume remote admin (P2 T8, proxied to the owning volume node)
+// ============================================================
+
+message VolumeAdminStatsRequest {
+    uint64 volume_id = 1;
+}
+
+message VolumeAdminStatsResponse {
+    bool success = 1;
+    string error = 2;
+    // Address of the volume node that served the proxied call ("ip:port").
+    string node = 3;
+    // 0 means the volume has no capacity limit.
+    uint64 volume_size = 4;
+    // u64::MAX when the volume has no capacity limit.
+    uint64 free_bytes = 5;
+    uint64 used_bytes = 6;
+    uint64 staging_bytes = 7;
+    uint64 garbage_bytes = 8;
+    uint64 pinned_bytes = 9;
+    uint64 active_count = 10;
+    uint64 deleted_count = 11;
+    uint64 segments = 12;
+    uint64 last_ckpt_seq = 13;
+    uint64 last_ckpt_lsn = 14;
+    uint64 durable_lsn = 15;
+    bool is_full = 16;
+}
+
+message VolumeAdminGcRequest {
+    uint64 volume_id = 1;
+}
+
+message VolumeAdminGcResponse {
+    bool success = 1;
+    string error = 2;
+    string node = 3;
+    uint64 purged = 4;
+    uint64 segments_deleted = 5;
+    uint64 migrated_needles = 6;
+    uint64 migrated_bytes = 7;
+    uint64 reclaimed_bytes = 8;
+}
+
+message VolumeAdminCheckpointRequest {
+    uint64 volume_id = 1;
+}
+
+message VolumeAdminCheckpointResponse {
+    bool success = 1;
+    string error = 2;
+    string node = 3;
+    uint64 ckpt_seq = 4;
+    uint64 applied_lsn = 5;
+}
+
+message VolumeResizeRequest {
+    uint64 volume_id = 1;
+    uint64 new_size = 2;
+}
+
+message VolumeResizeResponse {
+    bool success = 1;
+    string error = 2;
+    string node = 3;
 }
