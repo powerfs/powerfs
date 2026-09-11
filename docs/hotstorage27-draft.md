@@ -1,11 +1,20 @@
 # Where Byte-Level Checkpoint Deduplication Dies: A Boundary Study of Semantic Redundancy in AI Training Checkpoints
 
-**Draft v0.1 — 2026-09-11 — target: HotStorage'27 (measurement + position, ~6 pp. + refs)**
+**Draft v0.1 — 2026-09-11 — target: HotStorage'27 (measurement + position)**
 
+> **Venue format note (2026-09):** HotStorage is now an **ACM** workshop
+> (18th edition, in cooperation with USENIX; proceedings in the ACM DL).
+> Per the HotStorage'26 CFP: acmart sigconf 10pt two-column, **5 content
+> pages excluding references**, double-blind, Position papers carry a
+> "Position:" title prefix and declare the type in HotCRP. Re-verify
+> against the HotStorage'27 CFP (spring 2027). Submission LaTeX lives in
+> `docs/hotstorage27/` (main.tex/refs.bib, compiled 6 pp. incl. refs);
+> this markdown file is the unabridged v0.1 text source.
+>
 > Drafting notes (delete before submission): all numbers are reproduced by
 > scripts and CSVs in `experiments/checkpoint-dedup/`; figure placeholders
-> [F1]…[F4] map to the outline figure list. References marked "(venue to
-> verify)" need a bibliography pass; do not guess venues.
+> [F1]…[F4] map to the outline figure list. References verified from
+> official proceedings pages 2026-09.
 
 ## Abstract
 
