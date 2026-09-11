@@ -10,6 +10,7 @@
 //! - 引擎装配与恢复（方案 §5 / §6）：[`engine`]。
 //! - checkpoint 文件编解码（方案 §4.4）：[`checkpoint`]。
 //! - superblock 双副本（方案 §4.5）：[`superblock`]。
+//! - 段 GC 与 tombstone purge（方案 §8）：[`gc`]。
 //! - 本地面只读检查（admin stats/verify，方案 §19.3）：[`admin`]。
 
 pub mod admin;
@@ -17,6 +18,7 @@ pub mod checkpoint;
 pub mod commit;
 pub mod engine;
 pub mod frame;
+pub mod gc;
 pub mod index;
 pub mod manifest;
 pub mod replay;

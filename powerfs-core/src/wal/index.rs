@@ -12,6 +12,11 @@ use std::collections::HashMap;
 
 use crate::wal::frame::FRAME_HEADER_SIZE;
 
+/// needle 条目 flags：条目指向 GC_MIGRATE 帧（payload 形态
+/// `needle_id|expect_version|data_len|data`，20B 头；读路径据此分派帧
+/// 解析与 CRC 校验种类，见 `WalEngine::read`）。
+pub const NEEDLE_FLAG_MIGRATED: u32 = 0x01;
+
 /// 活跃 needle 索引条目。
 ///
 /// `offset` 为 payload 区起点（帧起始 + 26B 帧头），`read(seg_id, offset,
@@ -90,6 +95,10 @@ pub struct WalIndex {
     max_needle_id: u64,
     /// 最近 CKPT_ANCHOR（P1 留位，仅记录）。
     last_ckpt_anchor: Option<(u64, u64)>,
+    /// tombstone purge 标记（needle_id → purge 记录 lsn）。重放/应用时
+    /// 压制该 needle 一切 lsn ≤ purge_lsn 的记录（孤儿副本防复活，§8
+    /// case C）；checkpoint 持久化，GC 在更老段全部回收后修剪。
+    purged: HashMap<u64, u64>,
 }
 
 impl WalIndex {
@@ -178,6 +187,16 @@ impl WalIndex {
         }
         if lsn > self.last_lsn {
             self.last_lsn = lsn;
+        }
+
+        // purge 压制：该 needle 已被持久化删除标记覆盖（lsn ≤ purge_lsn
+        // 的记录在重放时是无主孤儿，§8 case C）。更新的 DATA 是删除后
+        // 的全新写入——移除标记、正常建条目（新世代）。
+        if let Some(purge_lsn) = self.purged.get(&needle_id).copied() {
+            if lsn <= purge_lsn {
+                return Ok(());
+            }
+            self.purged.remove(&needle_id);
         }
 
         // 幂等防护：lsn 不高于当前版本时跳过。
@@ -302,6 +321,104 @@ impl WalIndex {
         Ok(())
     }
 
+    /// 应用一条 GC 搬移记录（GC_MIGRATE，条件应用）。
+    ///
+    /// payload = `needle_id u64 | expect_version u64 | data_len u32 | data`。
+    /// 仅当目标 needle 当前版本 lsn == expect_version 时应用（覆写路径，
+    /// 旧版本转死副本账本——原段物理副本自此只等 GC 回收）；否则跳过。
+    /// 无论应用与否都推进 last_lsn（重放游标单调）。返回是否应用。
+    pub fn apply_gc_migrate(
+        &mut self,
+        seg_id: u64,
+        frame_offset: u64,
+        frame_crc: u32,
+        lsn: u64,
+        payload: &[u8],
+        now: i64,
+    ) -> Result<bool, IndexError> {
+        if payload.len() < 20 {
+            return Err(IndexError::ShortPayload {
+                op: "GC_MIGRATE",
+                got: payload.len(),
+            });
+        }
+        let needle_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let expect_version = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+        let data_len = u32::from_le_bytes(payload[16..20].try_into().unwrap()) as u64;
+        if payload.len() != 20 + data_len as usize {
+            return Err(IndexError::ShortPayload {
+                op: "GC_MIGRATE",
+                got: payload.len(),
+            });
+        }
+
+        if lsn > self.last_lsn {
+            self.last_lsn = lsn;
+        }
+        if needle_id > self.max_needle_id {
+            self.max_needle_id = needle_id;
+        }
+
+        // 在线与重放共用同一套条件（记录自包含 expect_version，不依赖
+        // 应用时序）：
+        // - purge 标记覆盖（lsn ≤ purge_lsn）→ 压制（已删 needle 的孤儿
+        //   副本，重放防复活）；
+        // - 已有更新 tombstone（delete 晚于本搬移）→ 删除胜出，跳过；
+        // - 存在活跃条目且版本 == expect_version → 覆写为搬移副本；
+        // - 存在活跃条目但版本不符（已被并发覆写/二次搬移）→ 用户胜出；
+        // - 条目缺席且无 tombstone/purge → 应用：原段已被 case A 删除，
+        //   本记录是该 needle 唯一可重放副本，据此重建条目。
+        if self
+            .purged
+            .get(&needle_id)
+            .map(|p| lsn <= *p)
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        if self.tombstones.contains_key(&needle_id) {
+            return Ok(false);
+        }
+        let absent = match self.needles.get(&needle_id) {
+            Some(cur) if cur.version_lsn == expect_version => false,
+            Some(_) => return Ok(false),
+            None => true,
+        };
+
+        let entry = NeedleEntry {
+            needle_id,
+            seg_id,
+            offset: frame_offset + FRAME_HEADER_SIZE as u64,
+            data_len: data_len as u32,
+            crc: frame_crc,
+            version_lsn: lsn,
+            created_at: now,
+            flags: NEEDLE_FLAG_MIGRATED,
+        };
+        if absent {
+            // 重放重建：原段（含 DATA 历史与可能的覆写链）已物理回收。
+            self.stats.used_bytes += data_len;
+            self.stats.active_count += 1;
+            self.needles.insert(needle_id, entry);
+            return Ok(true);
+        }
+        let old = self.needles.insert(needle_id, entry).unwrap();
+        self.dead_copies.push(DeadCopy {
+            seg_id: old.seg_id,
+            offset: old.offset,
+            data_len: old.data_len,
+            crc: old.crc,
+            version_lsn: old.version_lsn,
+        });
+        self.stats.garbage_bytes += old.data_len as u64;
+        self.stats.used_bytes = self
+            .stats
+            .used_bytes
+            .saturating_sub(old.data_len as u64)
+            .saturating_add(data_len);
+        Ok(true)
+    }
+
     /// 记录 CKPT_ANCHOR（P1 留位）。
     pub fn apply_ckpt_anchor(&mut self, ckpt_seq: u64, applied_lsn: u64, frame_lsn: u64) {
         if frame_lsn > self.last_lsn {
@@ -350,8 +467,70 @@ impl WalIndex {
         Ok(())
     }
 
-    /// purge 已过保留期的 tombstone（case C）：物理副本迁入死副本账本
-    /// （staging → garbage），此后该副本只等 GC 按段回收。返回 purge 数。
+    /// 已过保留期的 tombstone 快照（GC case C 扫描用；实际 purge 经
+    /// 持久化 TOMB_PURGE 记录走 [`WalIndex::apply_tomb_purge`]）。
+    pub fn expired_tombstones(&self, now: i64) -> impl Iterator<Item = &TombstoneEntry> {
+        self.tombstones
+            .values()
+            .filter(move |tb| tb.retention_until <= now)
+    }
+
+    /// 应用 TOMB_PURGE 记录（§8 case C 持久化标记）。
+    ///
+    /// payload = `needle_id u64 | delete_lsn u64`；`frame_lsn` 为 purge
+    /// 记录自身 lsn（标记强度以它为准）。将对应 tombstone 的物理副本
+    /// 迁入死副本账本（staging → garbage）并登记 purge 标记；tombstone
+    /// 已不在（重复应用/重放旧标记）时仅维护标记的最大 lsn。
+    pub fn apply_tomb_purge(&mut self, frame_lsn: u64, payload: &[u8]) -> Result<(), IndexError> {
+        if payload.len() != 16 {
+            return Err(IndexError::ShortPayload {
+                op: "TOMB_PURGE",
+                got: payload.len(),
+            });
+        }
+        let needle_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let _delete_lsn = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+
+        if frame_lsn > self.last_lsn {
+            self.last_lsn = frame_lsn;
+        }
+
+        if let Some(tb) = self.tombstones.remove(&needle_id) {
+            self.dead_copies.push(DeadCopy {
+                seg_id: tb.seg_id,
+                offset: tb.offset,
+                data_len: tb.data_len,
+                crc: tb.crc,
+                version_lsn: tb.version_lsn,
+            });
+            self.stats.deleted_count -= 1;
+            self.stats.staging_bytes -= tb.data_len as u64;
+            self.stats.garbage_bytes += tb.data_len as u64;
+        }
+        // 标记取最大 lsn（同一 needle 重复世代的 purge/重放幂等）。
+        let slot = self.purged.entry(needle_id).or_insert(0);
+        if frame_lsn > *slot {
+            *slot = frame_lsn;
+        }
+        Ok(())
+    }
+
+    /// purge 标记表（checkpoint 持久化用）。
+    pub fn purged_markers(&self) -> &HashMap<u64, u64> {
+        &self.purged
+    }
+
+    /// 修剪失效 purge 标记：丢弃 `purge_lsn < min_surviving_base_lsn` 的
+    /// 标记（现存段不可能再含其压制对象）。返回移除数。
+    pub fn prune_purge_markers(&mut self, min_surviving_base_lsn: u64) -> usize {
+        let before = self.purged.len();
+        self.purged.retain(|_, lsn| *lsn >= min_surviving_base_lsn);
+        before - self.purged.len()
+    }
+
+    /// purge 已过保留期的 tombstone（case C 的纯内存形态）：物理副本迁入
+    /// 死副本账本（staging → garbage），不写持久化标记。仅供单元测试；
+    /// 在线 GC 路径必须走 [`WalIndex::apply_tomb_purge`]（标记防复活）。
     pub fn purge_expired(&mut self, now: i64) -> usize {
         let expired: Vec<u64> = self
             .tombstones
@@ -406,6 +585,7 @@ impl WalIndex {
         needles: impl Iterator<Item = NeedleEntry>,
         tombstones: impl Iterator<Item = TombstoneEntry>,
         dead: impl Iterator<Item = DeadCopy>,
+        purged: impl Iterator<Item = (u64, u64)>,
     ) {
         for n in needles {
             self.max_needle_id = self.max_needle_id.max(n.needle_id);
@@ -424,12 +604,35 @@ impl WalIndex {
             self.stats.garbage_bytes += d.data_len as u64;
             self.dead_copies.push(d);
         }
+        for (needle_id, purge_lsn) in purged {
+            self.last_lsn = self.last_lsn.max(purge_lsn);
+            let slot = self.purged.entry(needle_id).or_insert(0);
+            if purge_lsn > *slot {
+                *slot = purge_lsn;
+            }
+        }
+    }
+
+    /// 整段回收（GC case A）：清除该段全部死副本账本并扣减 garbage。
+    ///
+    /// 段文件删除后，段内记录从盘面消失，恢复重放不再产生这些 dead
+    /// 条目；内存账本同步清除使统计与恢复后重放终态一致（I4）。返回
+    /// 回收字节数。
+    pub fn remove_seg_garbage(&mut self, seg_id: u64) -> u64 {
+        let mut reclaimed = 0u64;
+        self.dead_copies.retain(|d| {
+            if d.seg_id == seg_id {
+                reclaimed += d.data_len as u64;
+                false
+            } else {
+                true
+            }
+        });
+        self.stats.garbage_bytes = self.stats.garbage_bytes.saturating_sub(reclaimed);
+        reclaimed
     }
 
     /// 冻结索引快照（checkpoint 写入用；P2 简化为锁内克隆）。
-    ///
-    /// 返回 (needles, tombstones, dead 账本, 统计)。统计由调用方按过滤
-    /// 后的条目重算时忽略本统计（checkpoint 路径）。
     pub fn clone_state(&self) -> (Vec<NeedleEntry>, Vec<TombstoneEntry>, Vec<DeadCopy>) {
         (
             self.needles.values().cloned().collect(),
@@ -588,12 +791,13 @@ mod tests {
     fn purge_expired_moves_staging_to_garbage() {
         let mut idx = WalIndex::new();
         // needle 1：deleted_at=100，保留到 100+86400；needle 2：已过期。
-        idx.apply_data(1, 68, 1, 1, &data_payload(1, 100), 0).unwrap();
-        idx.apply_data(1, 68, 2, 2, &data_payload(2, 50), 0).unwrap();
+        idx.apply_data(1, 68, 1, 1, &data_payload(1, 100), 0)
+            .unwrap();
+        idx.apply_data(1, 68, 2, 2, &data_payload(2, 50), 0)
+            .unwrap();
         idx.apply_delete(3, &delete_payload(1, 100, 100 + 86400))
             .unwrap();
-        idx.apply_delete(4, &delete_payload(2, 100, 50))
-            .unwrap();
+        idx.apply_delete(4, &delete_payload(2, 100, 50)).unwrap();
         assert_eq!(idx.stats().staging_bytes, 150);
         assert_eq!(idx.stats().garbage_bytes, 0);
 
@@ -693,5 +897,125 @@ mod tests {
             .unwrap();
         assert_eq!(idx.max_needle_id(), 100);
         assert_eq!(idx.last_lsn(), 7);
+    }
+
+    fn migrate_payload(needle_id: u64, expect_version: u64, data_len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(20 + data_len);
+        v.extend_from_slice(&needle_id.to_le_bytes());
+        v.extend_from_slice(&expect_version.to_le_bytes());
+        v.extend_from_slice(&(data_len as u32).to_le_bytes());
+        v.extend_from_slice(&vec![0xcc; data_len]);
+        v
+    }
+
+    /// 重放缺席应用：原段已回收，GC_MIGRATE 是 needle 唯一可重放副本。
+    #[test]
+    fn gc_migrate_absent_rebuilds_entry() {
+        let mut idx = WalIndex::new();
+        let applied = idx
+            .apply_gc_migrate(3, 100, 0x1234, 11, &migrate_payload(7, 5, 40), 1000)
+            .unwrap();
+        assert!(applied);
+        let e = idx.lookup(7).unwrap();
+        assert_eq!(e.seg_id, 3);
+        assert_eq!(e.data_len, 40);
+        assert_eq!(e.version_lsn, 11);
+        assert_eq!(e.flags, NEEDLE_FLAG_MIGRATED);
+        assert_eq!(idx.stats().used_bytes, 40);
+        assert_eq!(idx.stats().active_count, 1);
+        idx.assert_consistent();
+    }
+
+    /// 版本不符（用户并发覆写胜出）→ 跳过，不产生账本条变。
+    #[test]
+    fn gc_migrate_version_mismatch_skips() {
+        let mut idx = WalIndex::new();
+        idx.apply_data(1, 0, 0, 5, &data_payload(7, 40), 0).unwrap();
+        idx.apply_data(1, 0, 0, 9, &data_payload(7, 40), 0).unwrap(); // 用户覆写 lsn9
+        let applied = idx
+            .apply_gc_migrate(2, 0, 0, 11, &migrate_payload(7, 5, 40), 0)
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(idx.lookup(7).unwrap().version_lsn, 9);
+        assert_eq!(idx.stats().garbage_bytes, 40); // 仅用户覆写产生一条死副本
+        idx.assert_consistent();
+    }
+
+    /// tombstone 晚于搬移 → 删除胜出，跳过（在线并发删除窗口）。
+    #[test]
+    fn gc_migrate_after_tombstone_skips() {
+        let mut idx = WalIndex::new();
+        idx.apply_data(1, 0, 0, 5, &data_payload(7, 40), 0).unwrap();
+        idx.apply_delete(6, &delete_payload(7, 0, 86400)).unwrap();
+        let applied = idx
+            .apply_gc_migrate(2, 0, 0, 7, &migrate_payload(7, 5, 40), 0)
+            .unwrap();
+        assert!(!applied);
+        assert!(idx.lookup(7).is_none());
+        assert!(idx.tombstone_of(7).is_some());
+        idx.assert_consistent();
+    }
+
+    /// purge 标记压制更老孤儿副本；标记之后的新写入是新世代（清除标记）。
+    #[test]
+    fn purge_marker_suppresses_orphans_and_allows_new_generation() {
+        let mut idx = WalIndex::new();
+        idx.load_from(
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::once((7u64, 20u64)),
+        );
+
+        // lsn11 的孤儿 GC_MIGRATE / DATA 被压制（重放防复活）。
+        assert!(!idx
+            .apply_gc_migrate(3, 0, 0, 11, &migrate_payload(7, 5, 40), 0)
+            .unwrap());
+        idx.apply_data(3, 0, 0, 12, &data_payload(7, 40), 0)
+            .unwrap();
+        assert!(idx.lookup(7).is_none(), "被压制的孤儿不得复活");
+
+        // lsn21 的删除后新写入允许建立，且清除旧标记。
+        idx.apply_data(3, 0, 0, 21, &data_payload(7, 30), 0)
+            .unwrap();
+        assert_eq!(idx.lookup(7).unwrap().data_len, 30);
+        assert!(!idx.purged_markers().contains_key(&7));
+        idx.assert_consistent();
+    }
+
+    /// TOMB_PURGE 应用：tombstone 转死副本账本 + 登记标记，幂等取最大。
+    #[test]
+    fn tomb_purge_applies_and_is_idempotent() {
+        let mut idx = WalIndex::new();
+        idx.apply_data(1, 0, 0, 5, &data_payload(7, 40), 0).unwrap();
+        idx.apply_delete(6, &delete_payload(7, 0, 0)).unwrap();
+        let mut p = Vec::new();
+        p.extend_from_slice(&7u64.to_le_bytes());
+        p.extend_from_slice(&6u64.to_le_bytes());
+        idx.apply_tomb_purge(10, &p).unwrap();
+        assert!(idx.tombstone_of(7).is_none());
+        assert_eq!(idx.purged_markers().get(&7), Some(&10));
+        assert_eq!(idx.stats().staging_bytes, 0);
+        assert_eq!(idx.stats().garbage_bytes, 40);
+
+        // 重放旧标记不回退强度。
+        idx.apply_tomb_purge(8, &p).unwrap();
+        assert_eq!(idx.purged_markers().get(&7), Some(&10));
+        idx.assert_consistent();
+    }
+
+    /// 标记修剪：purge_lsn < 现存最老段 base_lsn 时丢弃。
+    #[test]
+    fn purge_markers_pruned_by_min_base_lsn() {
+        let mut idx = WalIndex::new();
+        idx.load_from(
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            [(1u64, 10u64), (2u64, 20u64)].into_iter(),
+        );
+        assert_eq!(idx.prune_purge_markers(15), 1);
+        assert!(!idx.purged_markers().contains_key(&1));
+        assert_eq!(idx.purged_markers().get(&2), Some(&20));
     }
 }
