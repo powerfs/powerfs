@@ -550,6 +550,9 @@ impl CkptAnchorPayload {
     }
 }
 
+/// VOLUME_META（0x07）field_mask：volume_size（u64 LE，8B values）。
+pub const VOLUME_META_FIELD_VOLUME_SIZE: u32 = 0x01;
+
 /// VOLUME_META（0x07）payload：`field_mask u32 | values`。
 /// `values` 为按 mask 解释的字节（collection、state 等），编码层不透明。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -559,6 +562,17 @@ pub struct VolumeMetaPayload {
 }
 
 impl VolumeMetaPayload {
+    /// 构造仅携带 new_volume_size 的 VOLUME_META（§11.1 容量伸缩）。
+    pub fn volume_size(new_size: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12);
+        Self {
+            field_mask: VOLUME_META_FIELD_VOLUME_SIZE,
+            values: Bytes::copy_from_slice(&new_size.to_le_bytes()),
+        }
+        .encode(&mut buf);
+        buf
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.field_mask.to_le_bytes());
         out.extend_from_slice(&self.values);
@@ -575,6 +589,16 @@ impl VolumeMetaPayload {
             field_mask: read_u32(buf, 0)?,
             values: Bytes::copy_from_slice(&buf[4..]),
         })
+    }
+
+    /// 按 mask 解释 new_volume_size；未知 mask 位或缺字节返回 None（由
+    /// 索引层按 payload 损坏处理）。
+    pub fn take_volume_size(&self) -> Option<u64> {
+        if self.field_mask & VOLUME_META_FIELD_VOLUME_SIZE != 0 && self.values.len() >= 8 {
+            Some(u64::from_le_bytes(self.values[0..8].try_into().unwrap()))
+        } else {
+            None
+        }
     }
 }
 
@@ -1020,5 +1044,23 @@ mod tests {
         let scanned = scan_all(&buf);
         assert_eq!(scanned[0].0.lsn, u64::MAX);
         assert!(scanned[0].0.is_sync_barrier());
+    }
+
+    #[test]
+    fn volume_meta_payload_roundtrip() {
+        let buf = VolumeMetaPayload::volume_size(0x1122_3344_5566_7788);
+        assert_eq!(buf.len(), 12);
+        let p = VolumeMetaPayload::decode(&buf).unwrap();
+        assert_eq!(p.take_volume_size(), Some(0x1122_3344_5566_7788));
+
+        // 缺字节 / mask 未置位：按损坏 payload 处理。
+        let short = VolumeMetaPayload::decode(&[1, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(short.take_volume_size(), None);
+        let zero_mask = VolumeMetaPayload {
+            field_mask: 0,
+            values: Bytes::copy_from_slice(&0u64.to_le_bytes()),
+        };
+        assert_eq!(zero_mask.take_volume_size(), None);
+        assert!(VolumeMetaPayload::decode(&[0, 0]).is_err());
     }
 }

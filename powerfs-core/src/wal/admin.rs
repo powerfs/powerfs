@@ -36,9 +36,15 @@ pub struct WalInspectReport {
 fn inspect_impl(dir: &Path, seg_size: u64) -> Result<WalInspectReport, String> {
     let manifest = SegManifest::load(dir, seg_size).map_err(|e| e.to_string())?;
     // 只读检查全量重放（不装载 checkpoint：与 server 并发时 ckpt 可能
-    // 正被写出；全量重放只依赖不可变的 sealed 段 + tolerate_tail）。
-    let replay = replay_all(dir, &manifest, crate::wal::index::WalIndex::new(), true, 0)
-        .map_err(|e| e.to_string())?;
+    // 正被写出；全量重放只依赖不可变的 sealed 段 + TolerateTail）。
+    let replay = replay_all(
+        dir,
+        &manifest,
+        crate::wal::index::WalIndex::new(),
+        crate::wal::replay::RecoveryMode::TolerateTail,
+        0,
+    )
+    .map_err(|e| e.to_string())?;
 
     let segments = manifest
         .segments()

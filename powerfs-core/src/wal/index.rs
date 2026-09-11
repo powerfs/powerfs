@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::wal::frame::FRAME_HEADER_SIZE;
+use crate::wal::frame::{VolumeMetaPayload, FRAME_HEADER_SIZE};
 
 /// needle 条目 flags：条目指向 GC_MIGRATE 帧（payload 形态
 /// `needle_id|expect_version|data_len|data`，20B 头；读路径据此分派帧
@@ -99,6 +99,9 @@ pub struct WalIndex {
     /// 压制该 needle 一切 lsn ≤ purge_lsn 的记录（孤儿副本防复活，§8
     /// case C）；checkpoint 持久化，GC 在更老段全部回收后修剪。
     purged: HashMap<u64, u64>,
+    /// 卷逻辑容量（字节，§11；由 VOLUME_META 记录推进，checkpoint
+    /// 持久化；0 = 未设置，引擎启动时回退 superblock/config 基线）。
+    volume_size: u64,
 }
 
 impl WalIndex {
@@ -431,6 +434,36 @@ impl WalIndex {
         {
             self.last_ckpt_anchor = Some((ckpt_seq, applied_lsn));
         }
+    }
+
+    /// 当前卷逻辑容量（0 = 尚无 VOLUME_META/checkpoint 基线）。
+    pub fn volume_size(&self) -> u64 {
+        self.volume_size
+    }
+
+    /// 启动基线注入（无 VOLUME_META 记录时取 superblock/config）。
+    pub fn set_volume_size(&mut self, size: u64) {
+        self.volume_size = size;
+    }
+
+    /// 应用 VOLUME_META（§11.1 容量伸缩）：推进卷容量并消费 LSN。
+    /// 返回生效后的 volume_size。mask/values 无法解释 → payload 损坏。
+    pub fn apply_volume_meta(&mut self, frame_lsn: u64, payload: &[u8]) -> Result<u64, IndexError> {
+        let parsed = VolumeMetaPayload::decode(payload).map_err(|_| IndexError::ShortPayload {
+            op: "volume_meta",
+            got: payload.len(),
+        })?;
+        let Some(new_size) = parsed.take_volume_size() else {
+            return Err(IndexError::ShortPayload {
+                op: "volume_meta.size",
+                got: payload.len(),
+            });
+        };
+        self.volume_size = new_size;
+        if frame_lsn > self.last_lsn {
+            self.last_lsn = frame_lsn;
+        }
+        Ok(new_size)
     }
 
     /// 推进重放游标到 checkpoint 的 applied_lsn（恢复路径装配）。
@@ -1017,5 +1050,38 @@ mod tests {
         assert_eq!(idx.prune_purge_markers(15), 1);
         assert!(!idx.purged_markers().contains_key(&1));
         assert_eq!(idx.purged_markers().get(&2), Some(&20));
+    }
+
+    #[test]
+    fn volume_meta_apply_and_malformed_reject() {
+        use crate::wal::frame::VolumeMetaPayload;
+        let mut idx = WalIndex::new();
+        assert_eq!(idx.volume_size(), 0);
+
+        let buf = VolumeMetaPayload::volume_size(4096);
+        assert_eq!(idx.apply_volume_meta(3, &buf).unwrap(), 4096);
+        assert_eq!(idx.volume_size(), 4096);
+        assert_eq!(idx.last_lsn(), 3);
+
+        // 旧 LSN 重放不回退容量字段以外的游标，但容量以记录内容为准。
+        assert_eq!(
+            idx.apply_volume_meta(2, &VolumeMetaPayload::volume_size(2048))
+                .unwrap(),
+            2048
+        );
+        assert_eq!(idx.volume_size(), 2048);
+        assert_eq!(idx.last_lsn(), 3);
+
+        // 损坏 payload：拒绝且不改动容量。
+        let bad = VolumeMetaPayload {
+            field_mask: 0,
+            values: bytes::Bytes::new(),
+        };
+        let mut bad_buf = Vec::new();
+        bad.encode(&mut bad_buf);
+        assert!(idx.apply_volume_meta(4, &bad_buf).is_err());
+        assert!(idx.apply_volume_meta(4, &[1, 0, 0, 0, 0]).is_err());
+        assert_eq!(idx.volume_size(), 2048);
+        assert_eq!(idx.last_lsn(), 3);
     }
 }

@@ -39,6 +39,13 @@ fn engine_err(e: EngineError) -> PowerFsError {
         EngineError::Locked(_) => {
             PowerFsError::Internal(format!("wal volume locked by another writer: {e}"))
         }
+        EngineError::VolumeFull { .. } => PowerFsError::OutOfSpace,
+        EngineError::ResizeTooSmall {
+            requested,
+            required,
+        } => PowerFsError::InvalidRequest(format!(
+            "shrink below occupied bytes: requested {requested}, used+staging+pinned {required}"
+        )),
         other => PowerFsError::Internal(format!("wal engine: {other}")),
     }
 }
@@ -70,18 +77,26 @@ impl WalVolume {
         wal_config.volume_size = size;
         let engine = WalEngine::open(&volume_path, wal_config).map_err(engine_err)?;
 
+        // 容量以引擎持久状态为准（VOLUME_META 记录 / checkpoint /
+        // superblock 基线），构造参数仅在从未 resize 时生效。
+        let effective_size = engine.volume_size();
+
         // 重放终态恢复 info：used 取索引统计，next_file_key 接续 max+1。
         let stats = engine.stats().index;
         let info = VolumeInfo {
             id,
             node_id: powerfs_common::types::NodeId(node_id.to_string()),
             collection: Collection::default(),
-            size,
+            size: effective_size,
             used: stats.used_bytes,
             replica_count: 3,
             ttl: Ttl::default(),
             disk_type: DiskType::default(),
-            state: VolumeState::Available,
+            state: if engine.is_full() {
+                VolumeState::Full
+            } else {
+                VolumeState::Available
+            },
             created_at: Utc::now(),
             modified_at: Utc::now(),
             next_file_key: engine.next_needle_id(),
@@ -104,13 +119,29 @@ impl WalVolume {
         }
     }
 
-    /// 从索引统计刷新 info.used，并在释放空间后恢复 Full → Available。
+    /// 从引擎统计刷新 info.used，并按 free ≤ 0 规则切换
+    /// Available ↔ Full（§11；删除经 purge/GC 释放后恢复）。
     fn refresh_used(&self, guard: &mut VolumeInfo) {
-        let stats = self.engine.stats().index;
-        guard.used = stats.used_bytes;
-        if guard.state == VolumeState::Full && guard.size > stats.used_bytes {
-            guard.state = VolumeState::Available;
+        let stats = self.engine.stats();
+        guard.used = stats.index.used_bytes;
+        guard.size = stats.volume_size;
+        match guard.state {
+            VolumeState::Full if stats.free_bytes > 0 => guard.state = VolumeState::Available,
+            VolumeState::Available if stats.free_bytes == 0 => guard.state = VolumeState::Full,
+            _ => {}
         }
+    }
+
+    /// 引擎返回 VolumeFull 时把卷状态置 Full，再转成服务层错误。
+    fn mark_full_on_oom(&self, e: EngineError) -> PowerFsError {
+        if matches!(e, EngineError::VolumeFull { .. }) {
+            let mut guard = self.info.write().unwrap();
+            if guard.state == VolumeState::Available {
+                guard.state = VolumeState::Full;
+                guard.modified_at = Utc::now();
+            }
+        }
+        engine_err(e)
     }
 
     fn needle_info_from(&self, id: VolumeId, e: &crate::wal::index::NeedleEntry) -> NeedleInfo {
@@ -167,8 +198,29 @@ impl WalVolume {
     }
 
     pub fn free_space(&self) -> u64 {
-        let info = self.info.read().unwrap();
-        info.size.saturating_sub(info.used)
+        let free = self.engine.free_bytes();
+        if free == u64::MAX {
+            // 未限定容量：沿用 size − used 的展示口径。
+            let info = self.info.read().unwrap();
+            info.size.saturating_sub(info.used)
+        } else {
+            free
+        }
+    }
+
+    /// 容量伸缩（§11.1 VOLUME_META）：grow 直接生效；shrink 低于
+    /// used+staging+pinned 返回 InvalidRequest。落盘并同步 superblock。
+    pub fn resize(&self, new_size: u64) -> Result<()> {
+        self.engine.resize(new_size).map_err(engine_err)?;
+        let mut guard = self.info.write().unwrap();
+        guard.size = new_size;
+        guard.modified_at = Utc::now();
+        match guard.state {
+            VolumeState::Full if !self.engine.is_full() => guard.state = VolumeState::Available,
+            VolumeState::Available if self.engine.is_full() => guard.state = VolumeState::Full,
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn write_needle(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
@@ -187,8 +239,11 @@ impl WalVolume {
             file_key
         };
 
-        // 容量检查（逻辑字节口径：活跃 needle 数据之和）。
-        if info_guard.used + data.len() as u64 > info_guard.size {
+        // 容量准入（与引擎同口径：used+staging+pinned；引擎侧为最终
+        // 权威，这里避免无谓的 needle id 分配与入队）。
+        let s = self.engine.stats();
+        let occupied = s.index.used_bytes + s.index.staging_bytes + s.index.pinned_bytes;
+        if s.volume_size > 0 && occupied + data.len() as u64 > s.volume_size {
             info_guard.state = VolumeState::Full;
             return Err(PowerFsError::OutOfSpace);
         }
@@ -196,7 +251,12 @@ impl WalVolume {
         let receipt = self
             .engine
             .write(actual_key, &data, self.mode())
-            .map_err(engine_err)?;
+            .map_err(|e| {
+                if matches!(e, EngineError::VolumeFull { .. }) {
+                    info_guard.state = VolumeState::Full;
+                }
+                engine_err(e)
+            })?;
 
         let needle_info = NeedleInfo {
             id: NeedleId(actual_key),
@@ -343,7 +403,7 @@ impl WalVolume {
         if data_offset == 0 && data_size >= data.len() {
             self.engine
                 .write(file_key, &data[..data_size], self.mode())
-                .map_err(engine_err)?;
+                .map_err(|e| self.mark_full_on_oom(e))?;
         } else {
             // 部分写：读旧版本 RMW 合并（needle 不存在 → 稀疏写，0 填充）。
             let old = self.engine.read(file_key).unwrap_or_default();
@@ -353,7 +413,7 @@ impl WalVolume {
             buf[data_offset..end].copy_from_slice(&data[..data_size]);
             self.engine
                 .write(file_key, &buf, self.mode())
-                .map_err(engine_err)?;
+                .map_err(|e| self.mark_full_on_oom(e))?;
         }
 
         let mut info_guard = self.info.write().unwrap();
