@@ -789,6 +789,9 @@ fn build_config(
             transport: None,
             rdma_device: None,
             require_rdma: false,
+            volume_engine: None,
+            wal_segment_size: None,
+            wal_idle_sync_secs: 30,
         },
         filer: FilerConfig {
             port: cfg.filer_port,

@@ -54,6 +54,26 @@ impl MasterGrpcServer {
     }
 }
 
+impl MasterGrpcServer {
+    /// Locate the gRPC endpoint ("ip:port") of the volume node currently
+    /// owning `volume_id`. Used by the WAL admin proxy RPCs.
+    #[allow(clippy::result_large_err)]
+    fn locate_volume_grpc(&self, volume_id: u64) -> Result<String, Status> {
+        let vid = VolumeId(volume_id);
+        let info = self
+            .master
+            .get_volume_info(&vid)
+            .ok_or_else(|| Status::not_found(format!("volume {} is not registered", volume_id)))?;
+        let node = self.master.get_node_info(&info.node_id).ok_or_else(|| {
+            Status::unavailable(format!(
+                "owning node {} for volume {} is not reachable",
+                info.node_id.0, volume_id
+            ))
+        })?;
+        Ok(format!("{}:{}", node.address, node.grpc_port))
+    }
+}
+
 // ========================================================================
 // proto <-> Rust conversion helpers for the Collection P0 attribute model
 // ========================================================================
@@ -1177,6 +1197,169 @@ impl MasterService for MasterGrpcServer {
                 success: false,
                 error: e.to_string(),
             })),
+        }
+    }
+
+    async fn volume_admin_stats(
+        &self,
+        request: Request<VolumeAdminStatsRequest>,
+    ) -> Result<Response<VolumeAdminStatsResponse>, Status> {
+        let req = request.into_inner();
+        let address = self.locate_volume_grpc(req.volume_id)?;
+        info!(
+            "volume_admin_stats proxy: volume_id={} -> {}",
+            req.volume_id, address
+        );
+        match self
+            .master
+            .volume_client_pool
+            .admin_stats(&address, req.volume_id)
+            .await
+        {
+            Ok(r) => Ok(Response::new(VolumeAdminStatsResponse {
+                success: r.success,
+                error: r.error,
+                node: address,
+                volume_size: r.volume_size,
+                free_bytes: r.free_bytes,
+                used_bytes: r.used_bytes,
+                staging_bytes: r.staging_bytes,
+                garbage_bytes: r.garbage_bytes,
+                pinned_bytes: r.pinned_bytes,
+                active_count: r.active_count,
+                deleted_count: r.deleted_count,
+                segments: r.segments,
+                last_ckpt_seq: r.last_ckpt_seq,
+                last_ckpt_lsn: r.last_ckpt_lsn,
+                durable_lsn: r.durable_lsn,
+                is_full: r.is_full,
+            })),
+            Err(e) => {
+                warn!(
+                    "volume_admin_stats proxy failed for {} via {}: {}",
+                    req.volume_id, address, e
+                );
+                Ok(Response::new(VolumeAdminStatsResponse {
+                    success: false,
+                    error: e,
+                    node: address,
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+
+    async fn volume_admin_gc(
+        &self,
+        request: Request<VolumeAdminGcRequest>,
+    ) -> Result<Response<VolumeAdminGcResponse>, Status> {
+        let req = request.into_inner();
+        let address = self.locate_volume_grpc(req.volume_id)?;
+        info!(
+            "volume_admin_gc proxy: volume_id={} -> {}",
+            req.volume_id, address
+        );
+        match self
+            .master
+            .volume_client_pool
+            .admin_gc(&address, req.volume_id)
+            .await
+        {
+            Ok(r) => Ok(Response::new(VolumeAdminGcResponse {
+                success: r.success,
+                error: r.error,
+                node: address,
+                purged: r.purged,
+                segments_deleted: r.segments_deleted,
+                migrated_needles: r.migrated_needles,
+                migrated_bytes: r.migrated_bytes,
+                reclaimed_bytes: r.reclaimed_bytes,
+            })),
+            Err(e) => {
+                warn!(
+                    "volume_admin_gc proxy failed for {} via {}: {}",
+                    req.volume_id, address, e
+                );
+                Ok(Response::new(VolumeAdminGcResponse {
+                    success: false,
+                    error: e,
+                    node: address,
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+
+    async fn volume_admin_checkpoint(
+        &self,
+        request: Request<VolumeAdminCheckpointRequest>,
+    ) -> Result<Response<VolumeAdminCheckpointResponse>, Status> {
+        let req = request.into_inner();
+        let address = self.locate_volume_grpc(req.volume_id)?;
+        info!(
+            "volume_admin_checkpoint proxy: volume_id={} -> {}",
+            req.volume_id, address
+        );
+        match self
+            .master
+            .volume_client_pool
+            .admin_checkpoint(&address, req.volume_id)
+            .await
+        {
+            Ok(r) => Ok(Response::new(VolumeAdminCheckpointResponse {
+                success: r.success,
+                error: r.error,
+                node: address,
+                ckpt_seq: r.ckpt_seq,
+                applied_lsn: r.applied_lsn,
+            })),
+            Err(e) => {
+                warn!(
+                    "volume_admin_checkpoint proxy failed for {} via {}: {}",
+                    req.volume_id, address, e
+                );
+                Ok(Response::new(VolumeAdminCheckpointResponse {
+                    success: false,
+                    error: e,
+                    node: address,
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+
+    async fn volume_resize(
+        &self,
+        request: Request<VolumeResizeRequest>,
+    ) -> Result<Response<VolumeResizeResponse>, Status> {
+        let req = request.into_inner();
+        let address = self.locate_volume_grpc(req.volume_id)?;
+        info!(
+            "volume_resize proxy: volume_id={} new_size={} -> {}",
+            req.volume_id, req.new_size, address
+        );
+        match self
+            .master
+            .volume_client_pool
+            .resize_volume(&address, req.volume_id, req.new_size)
+            .await
+        {
+            Ok(()) => Ok(Response::new(VolumeResizeResponse {
+                success: true,
+                error: String::new(),
+                node: address,
+            })),
+            Err(e) => {
+                warn!(
+                    "volume_resize proxy failed for {} to {} via {}: {}",
+                    req.volume_id, req.new_size, address, e
+                );
+                Ok(Response::new(VolumeResizeResponse {
+                    success: false,
+                    error: e,
+                    node: address,
+                }))
+            }
         }
     }
 

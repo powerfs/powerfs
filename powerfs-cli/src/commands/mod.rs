@@ -22,6 +22,7 @@ mod mount;
 mod read;
 mod status;
 mod topology;
+mod volume_admin;
 mod volume_list;
 mod write;
 
@@ -49,6 +50,7 @@ pub use mount::{mount, MountArgs};
 pub use read::{read, ReadArgs};
 pub use status::{status, StatusArgs};
 pub use topology::{topology, TopologyArgs};
+pub use volume_admin::{volume_admin, VolumeAdminCommand};
 pub use volume_list::{volume_list, VolumeListArgs};
 pub use write::{write, WriteArgs};
 

@@ -1490,4 +1490,202 @@ impl VolumeService for VolumeServer {
             }
         }
     }
+
+    async fn volume_admin_stats(
+        &self,
+        request: Request<crate::proto::VolumeAdminStatsRequest>,
+    ) -> std::result::Result<Response<crate::proto::VolumeAdminStatsResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+
+        debug!("volume_admin_stats: volume_id={}", volume_id.0);
+
+        let storage_manager = self.storage_manager.clone();
+        match tokio::task::spawn_blocking(move || {
+            let volume = storage_manager
+                .get_volume(&volume_id)
+                .ok_or_else(|| PowerFsError::VolumeNotFound(volume_id))?;
+            volume.wal_admin_stats().ok_or_else(|| {
+                PowerFsError::InvalidRequest(
+                    "admin stats are only available on WAL-engine volumes".to_string(),
+                )
+            })
+        })
+        .await
+        {
+            Ok(Ok(s)) => Ok(Response::new(crate::proto::VolumeAdminStatsResponse {
+                success: true,
+                error: String::new(),
+                volume_size: s.volume_size,
+                free_bytes: s.free_bytes,
+                used_bytes: s.used_bytes,
+                staging_bytes: s.staging_bytes,
+                garbage_bytes: s.garbage_bytes,
+                pinned_bytes: s.pinned_bytes,
+                active_count: s.active_count,
+                deleted_count: s.deleted_count,
+                segments: s.segments as u64,
+                last_ckpt_seq: s.last_ckpt_seq,
+                last_ckpt_lsn: s.last_ckpt_lsn,
+                durable_lsn: s.durable_lsn,
+                is_full: s.is_full,
+            })),
+            Ok(Err(e)) => {
+                warn!("volume_admin_stats {} failed: {}", volume_id.0, e);
+                Ok(Response::new(crate::proto::VolumeAdminStatsResponse {
+                    success: false,
+                    error: e.to_string(),
+                    ..Default::default()
+                }))
+            }
+            Err(e) => {
+                error!("volume_admin_stats task join failed: {}", e);
+                Err(Status::internal(format!("task join failed: {}", e)))
+            }
+        }
+    }
+
+    async fn volume_admin_gc(
+        &self,
+        request: Request<crate::proto::VolumeAdminGcRequest>,
+    ) -> std::result::Result<Response<crate::proto::VolumeAdminGcResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+
+        info!("volume_admin_gc: volume_id={}", volume_id.0);
+
+        let storage_manager = self.storage_manager.clone();
+        match tokio::task::spawn_blocking(move || {
+            let volume = storage_manager
+                .get_volume(&volume_id)
+                .ok_or_else(|| PowerFsError::VolumeNotFound(volume_id))?;
+            volume.wal_gc()
+        })
+        .await
+        {
+            Ok(Ok(out)) => {
+                info!(
+                    "Manual GC volume {}: purged={}, segments_deleted={}, migrated={} needles/{} bytes, reclaimed={} bytes",
+                    volume_id.0,
+                    out.purged,
+                    out.segments_deleted,
+                    out.migrated_needles,
+                    out.migrated_bytes,
+                    out.reclaimed_bytes
+                );
+                Ok(Response::new(crate::proto::VolumeAdminGcResponse {
+                    success: true,
+                    error: String::new(),
+                    purged: out.purged as u64,
+                    segments_deleted: out.segments_deleted as u64,
+                    migrated_needles: out.migrated_needles as u64,
+                    migrated_bytes: out.migrated_bytes,
+                    reclaimed_bytes: out.reclaimed_bytes,
+                }))
+            }
+            Ok(Err(e)) => {
+                warn!("volume_admin_gc {} failed: {}", volume_id.0, e);
+                Ok(Response::new(crate::proto::VolumeAdminGcResponse {
+                    success: false,
+                    error: e.to_string(),
+                    ..Default::default()
+                }))
+            }
+            Err(e) => {
+                error!("volume_admin_gc task join failed: {}", e);
+                Err(Status::internal(format!("task join failed: {}", e)))
+            }
+        }
+    }
+
+    async fn volume_admin_checkpoint(
+        &self,
+        request: Request<crate::proto::VolumeAdminCheckpointRequest>,
+    ) -> std::result::Result<Response<crate::proto::VolumeAdminCheckpointResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+
+        info!("volume_admin_checkpoint: volume_id={}", volume_id.0);
+
+        let storage_manager = self.storage_manager.clone();
+        match tokio::task::spawn_blocking(move || {
+            let volume = storage_manager
+                .get_volume(&volume_id)
+                .ok_or_else(|| PowerFsError::VolumeNotFound(volume_id))?;
+            volume.wal_checkpoint()
+        })
+        .await
+        {
+            Ok(Ok(out)) => {
+                info!(
+                    "Manual checkpoint volume {}: seq={}, applied_lsn={}",
+                    volume_id.0, out.ckpt_seq, out.applied_lsn
+                );
+                Ok(Response::new(crate::proto::VolumeAdminCheckpointResponse {
+                    success: true,
+                    error: String::new(),
+                    ckpt_seq: out.ckpt_seq,
+                    applied_lsn: out.applied_lsn,
+                }))
+            }
+            Ok(Err(e)) => {
+                warn!("volume_admin_checkpoint {} failed: {}", volume_id.0, e);
+                Ok(Response::new(crate::proto::VolumeAdminCheckpointResponse {
+                    success: false,
+                    error: e.to_string(),
+                    ..Default::default()
+                }))
+            }
+            Err(e) => {
+                error!("volume_admin_checkpoint task join failed: {}", e);
+                Err(Status::internal(format!("task join failed: {}", e)))
+            }
+        }
+    }
+
+    async fn volume_resize(
+        &self,
+        request: Request<crate::proto::VolumeResizeRequest>,
+    ) -> std::result::Result<Response<crate::proto::VolumeResizeResponse>, Status> {
+        let req = request.into_inner();
+        let volume_id = VolumeId(req.volume_id);
+        let new_size = req.new_size;
+
+        info!(
+            "volume_resize: volume_id={}, new_size={}",
+            volume_id.0, new_size
+        );
+
+        let storage_manager = self.storage_manager.clone();
+        match tokio::task::spawn_blocking(move || {
+            let volume = storage_manager
+                .get_volume(&volume_id)
+                .ok_or_else(|| PowerFsError::VolumeNotFound(volume_id))?;
+            volume.wal_resize(new_size)
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                info!("Resized volume {} to {} bytes", volume_id.0, new_size);
+                Ok(Response::new(crate::proto::VolumeResizeResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "volume_resize {} to {} failed: {}",
+                    volume_id.0, new_size, e
+                );
+                Ok(Response::new(crate::proto::VolumeResizeResponse {
+                    success: false,
+                    error: e.to_string(),
+                }))
+            }
+            Err(e) => {
+                error!("volume_resize task join failed: {}", e);
+                Err(Status::internal(format!("task join failed: {}", e)))
+            }
+        }
+    }
 }
