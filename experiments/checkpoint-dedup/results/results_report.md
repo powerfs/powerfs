@@ -136,7 +136,46 @@ hit-any = fraction of chunks already present in ANY earlier version.
 OCI layer blobs (v3 image): 2; 1 shared across all 3 versions (75 of 272 MB, content-addressable, zero transfer/storage). Shared digests:
 - `470b66ea5123c93b0d5…` in v1, v2, v3
 
-## 6. Go/no-go (decision rules)
+## 6. R1 — redundancy axes: byte layer sees COPIES, not SIMILARS
+
+Same GPT-2 small trained states; each compared object chunked
+with per-file alignment.
+
+| axis | pair | view | 4K | 64K | 1M |
+|---|---|---|---:|---:|---:|
+| ddp_torch | rank1 vs rank0..0 | file | 1.0000 | 1.0000 | 1.0000 |
+| ddp_torch | rank2 vs rank0..1 | file | 1.0000 | 1.0000 | 1.0000 |
+| ddp_torch | rank3 vs rank0..2 | file | 1.0000 | 1.0000 | 1.0000 |
+| ddp_st | rank1 vs rank0..0 | file | 1.0000 | 1.0000 | 1.0000 |
+| ddp_st | rank2 vs rank0..1 | file | 1.0000 | 1.0000 | 1.0000 |
+| ddp_st | rank3 vs rank0..2 | file | 1.0000 | 1.0000 | 1.0000 |
+| shard | rank1 vs rank0..0 | file | 0.0000 | 0.0000 | 0.0000 |
+| shard | rank2 vs rank0..1 | file | 0.0000 | 0.0000 | 0.0000 |
+| shard | rank3 vs rank0..2 | file | 0.0000 | 0.0000 | 0.0000 |
+| inter-job | job_b vs job_a (full.pt) | file | 0.0000 | 0.0000 | 0.0007 |
+| inter-job | job_b vs job_a (weights.safetensors) | file | 0.0000 | 0.0000 | 0.0000 |
+| lora | base.safetensors: job2 vs job1 | file | 1.0000 | 1.0000 | 1.0000 |
+| lora | adapter.safetensors: job2 vs job1 | file | 0.0000 | 0.0000 | 0.0000 |
+| lora | job2 dir vs job1 dir | file | 0.9988 | 0.9988 | 1.0000 |
+
+zipdata-view rows for .pt artifacts are in axes_overlap.csv
+(DDP replicas 1.0 there too). DDP replicas are md5-identical
+files; shards are disjoint parameter sets; inter-job compares
+two same-architecture independent-seed runs; LoRA jobs share
+one base file and have tiny distinct adapters.
+
+## 7. R2 — safetensors slot (exact same 20-step run)
+
+Steady-state (steps 5-19) cross-step hit ratio, file view:
+
+| chunk | hit-any | hit-prev |
+|---:|---:|---:|
+| 4K | 0.000025 | 0.000025 |
+| 64K | 0.000000 | 0.000000 |
+| 1M | 0.000000 | 0.000000 |
+| 4M | 0.000000 | 0.000000 |
+
+## 8. Go/no-go (decision rules)
 
 - torchsave @1M file view, hit-any = 0.001404 (go >0.30, no-go <0.05)
 - weights @1M file view, hit-any = 0.0 (go >0.30, no-go <0.05)

@@ -1,0 +1,64 @@
+axis,pair,view,chunk_size,n_chunks,hit,hit_ratio
+ddp_torch,rank1 vs rank0..0,file,4096,363259,363259,1.0
+ddp_torch,rank1 vs rank0..0,file,65536,22704,22704,1.0
+ddp_torch,rank1 vs rank0..0,file,1048576,1423,1423,1.0
+ddp_torch,rank1 vs rank0..0,zipdata,4096,363049,363049,1.0
+ddp_torch,rank1 vs rank0..0,zipdata,65536,22678,22678,1.0
+ddp_torch,rank1 vs rank0..0,zipdata,1048576,1383,1383,1.0
+ddp_torch,rank2 vs rank0..1,file,4096,363259,363259,1.0
+ddp_torch,rank2 vs rank0..1,file,65536,22704,22704,1.0
+ddp_torch,rank2 vs rank0..1,file,1048576,1423,1423,1.0
+ddp_torch,rank2 vs rank0..1,zipdata,4096,363049,363049,1.0
+ddp_torch,rank2 vs rank0..1,zipdata,65536,22678,22678,1.0
+ddp_torch,rank2 vs rank0..1,zipdata,1048576,1383,1383,1.0
+ddp_torch,rank3 vs rank0..2,file,4096,363259,363259,1.0
+ddp_torch,rank3 vs rank0..2,file,65536,22704,22704,1.0
+ddp_torch,rank3 vs rank0..2,file,1048576,1423,1423,1.0
+ddp_torch,rank3 vs rank0..2,zipdata,4096,363049,363049,1.0
+ddp_torch,rank3 vs rank0..2,zipdata,65536,22678,22678,1.0
+ddp_torch,rank3 vs rank0..2,zipdata,1048576,1383,1383,1.0
+ddp_st,rank1 vs rank0..0,file,4096,121526,121526,1.0
+ddp_st,rank1 vs rank0..0,file,65536,7595,7595,1.0
+ddp_st,rank1 vs rank0..0,file,1048576,474,474,1.0
+ddp_st,rank2 vs rank0..1,file,4096,121526,121526,1.0
+ddp_st,rank2 vs rank0..1,file,65536,7595,7595,1.0
+ddp_st,rank2 vs rank0..1,file,1048576,474,474,1.0
+ddp_st,rank3 vs rank0..2,file,4096,121526,121526,1.0
+ddp_st,rank3 vs rank0..2,file,65536,7595,7595,1.0
+ddp_st,rank3 vs rank0..2,file,1048576,474,474,1.0
+shard,rank1 vs rank0..0,file,4096,48395,0,0.0
+shard,rank1 vs rank0..0,file,65536,3024,0,0.0
+shard,rank1 vs rank0..0,file,1048576,189,0,0.0
+shard,rank1 vs rank0..0,zipdata,4096,48384,0,0.0
+shard,rank1 vs rank0..0,zipdata,65536,3024,0,0.0
+shard,rank1 vs rank0..0,zipdata,1048576,180,0,0.0
+shard,rank2 vs rank0..1,file,4096,797,0,0.0
+shard,rank2 vs rank0..1,file,65536,49,0,0.0
+shard,rank2 vs rank0..1,file,1048576,3,0,0.0
+shard,rank2 vs rank0..1,zipdata,4096,768,0,0.0
+shard,rank2 vs rank0..1,zipdata,65536,48,0,0.0
+shard,rank2 vs rank0..1,zipdata,1048576,3,0,0.0
+shard,rank3 vs rank0..2,file,4096,72263,0,0.0
+shard,rank3 vs rank0..2,file,65536,4516,0,0.0
+shard,rank3 vs rank0..2,file,1048576,282,0,0.0
+shard,rank3 vs rank0..2,zipdata,4096,72252,0,0.0
+shard,rank3 vs rank0..2,zipdata,65536,4515,0,0.0
+shard,rank3 vs rank0..2,zipdata,1048576,279,0,0.0
+inter-job,job_b vs job_a (full.pt),file,4096,363259,13,3.6e-05
+inter-job,job_b vs job_a (full.pt),file,65536,22704,1,4.4e-05
+inter-job,job_b vs job_a (full.pt),file,1048576,1423,1,0.000703
+inter-job,job_b vs job_a (full.pt),zipdata,4096,363049,1,3e-06
+inter-job,job_b vs job_a (full.pt),zipdata,65536,22678,1,4.4e-05
+inter-job,job_b vs job_a (full.pt),zipdata,1048576,1383,1,0.000723
+inter-job,job_b vs job_a (weights.safetensors),file,4096,121526,3,2.5e-05
+inter-job,job_b vs job_a (weights.safetensors),file,65536,7595,0,0.0
+inter-job,job_b vs job_a (weights.safetensors),file,1048576,474,0,0.0
+lora,base.safetensors: job2 vs job1,file,4096,121526,121526,1.0
+lora,base.safetensors: job2 vs job1,file,65536,7595,7595,1.0
+lora,base.safetensors: job2 vs job1,file,1048576,474,474,1.0
+lora,adapter.safetensors: job2 vs job1,file,4096,144,0,0.0
+lora,adapter.safetensors: job2 vs job1,file,65536,9,0,0.0
+lora,adapter.safetensors: job2 vs job1,file,1048576,0,0,0.0
+lora,job2 dir vs job1 dir,file,4096,121670,121526,0.998816
+lora,job2 dir vs job1 dir,file,65536,7604,7595,0.998816
+lora,job2 dir vs job1 dir,file,1048576,474,474,1.0

@@ -168,8 +168,54 @@ def main():
             for d, vs in sorted(shared.items()):
                 lines.append(f"- `{d}…` in {', '.join(vs)}")
 
+    # R1: redundancy axes (paper F6 / Table 2)
+    apath = os.path.join(raw, "axes_overlap.csv")
+    if os.path.exists(apath):
+        axes = read_csv(apath)
+        lines += ["",
+                  "## 6. R1 — redundancy axes: byte layer sees COPIES, not SIMILARS",
+                  "",
+                  "Same GPT-2 small trained states; each compared object chunked",
+                  "with per-file alignment.", "",
+                  "| axis | pair | view | 4K | 64K | 1M |",
+                  "|---|---|---|---:|---:|---:|"]
+        cells = {}
+        order = []
+        for r in axes:
+            k = (r["axis"], r["pair"], r["view"])
+            if k not in order:
+                order.append(k)
+            cells[k + (int(r["chunk_size"]),)] = float(r["hit_ratio"])
+        for k in order:
+            if k[2] != "file":
+                continue  # table shows file view; zipdata rows remain in CSV
+            vals = [cells.get(k + (s,)) for s in (4096, 65536, 1048576)]
+            lines.append(f"| {k[0]} | {k[1]} | {k[2]} | " +
+                         " | ".join("—" if x is None else f"{x:.4f}"
+                                    for x in vals) + " |")
+        lines += ["",
+                  "zipdata-view rows for .pt artifacts are in axes_overlap.csv",
+                  "(DDP replicas 1.0 there too). DDP replicas are md5-identical",
+                  "files; shards are disjoint parameter sets; inter-job compares",
+                  "two same-architecture independent-seed runs; LoRA jobs share",
+                  "one base file and have tiny distinct adapters."]
+
+    # R2: safetensors slot
+    spath = os.path.join(raw, "safetensors_metrics.csv")
+    if os.path.exists(spath):
+        st = [r for r in read_csv(spath) if int(r["step"]) >= 5]
+        lines += ["", "## 7. R2 — safetensors slot (exact same 20-step run)",
+                  "", "Steady-state (steps 5-19) cross-step hit ratio, file view:",
+                  "", "| chunk | hit-any | hit-prev |", "|---:|---:|---:|"]
+        for s in (4096, 65536, 1048576, 4194304):
+            rows = [r for r in st if int(r["chunk_size"]) == s]
+            ha = mean([float(r["hit_any_ratio"]) for r in rows])
+            hp = mean([float(r["hit_adj_ratio"]) for r in rows])
+            label = f"{s//1024}K" if s < 1048576 else f"{s//1048576}M"
+            lines.append(f"| {label} | {ha:.6f} | {hp:.6f} |")
+
     # go/no-go: 1M file-view torchsave + weights
-    lines += ["", "## 6. Go/no-go (decision rules)", ""]
+    lines += ["", "## 8. Go/no-go (decision rules)", ""]
     for fmt in ("torchsave", "weights", "dcp"):
         v1m = key["steady_state_step5plus"].get(f"{fmt}/file/{1048576}", {}).get("hit_any")
         lines.append(f"- {fmt} @1M file view, hit-any = {v1m} "

@@ -2,7 +2,7 @@
 
 > 目的：在 [write-prediction-related-work.md](write-prediction-related-work.md) 的相关工作边界之上，结合 2026 年存储领域热点与 venue 时间窗口，确定可投方向、优先级与执行路线。
 >
-> 记录日期：2026-09-10；阶段 A（7.1）与正向对照（7.2）分别于 09-10 / 09-11 完成。结论先行：**checkpoint 字节级去重 no-go（全同块 ≈0，压缩/CDC/bf16/长间隔对照全部失效），方向二否决；正向对照证明同一方法在容器镜像层/源码多版本上命中 59–98%，能力边界图成立，方向一定位为"语义级冗余为何在 POSIX 字节层不可见"的测量论文。KVCache 赛道明确不进。**
+> 记录日期：2026-09-10；7.1/7.2/7.3 三组测量均于 09-10/11 完成。结论先行：**checkpoint 字节级去重按冗余轴分裂——复制轴（DDP 副本、LoRA 共享 base）命中 100%，相似轴（跨 step、同构异作业、分片间）≈0（压缩/CDC/bf16/长间隔/safetensors 全部对照失效）；同方法在镜像层/源码多版本上命中 59–98%。方向二否决，方向一定位为"语义级冗余为何在 POSIX 字节层不可见"的测量论文，outline 已锁定（[hotstorage27-short-paper-outline.md](hotstorage27-short-paper-outline.md)）。KVCache 赛道明确不进。**
 
 ## 1. Venue 时间窗口（2026-09 核实）
 
@@ -202,3 +202,25 @@ FAST'26 两篇的边界：**AdaCheck** 需张量级离线分析；**AITURBO** �
 - **边界对齐的必要性（附带发现）**：若不按文件边界、直接对 tar 字节流切块，镜像/源码命中率也塌到 0.3–19%（tar 成员顺序与头错位）；checkpoint 的 zipdata 视图已按 entry 边界对齐却仍为 0 → 证明 checkpoint 失败不是边界问题，而是**边界内的 fp32 训练状态版本间不具字节稳定性**。
 
 **边界图结论（短文核心表）**：字节级透明去重在"版本间保持字节稳定的文件单元"（系统二进制、库、源码、镜像层）上命中 59–98%；在"每步全参数浮点更新"的训练 checkpoint 上 ≈0。NN 门控的价值正是在接触字节前区分这两类工作负载。
+
+### 7.3 R1/R2：冗余轴地图与 safetensors 槽位 —— 已完成（2026-09-11）
+
+回应 outline 定稿后识别的两个 reviewer 必打点（脚本 `gen_axes.py`/`analyze_axes.py`/`gen_safetensors.py`/`analyze_safetensors.py`，数据 `axes_overlap.csv`、`safetensors_metrics.csv`）。
+
+**R1 冗余轴（F6 / Table 2，同一 GPT-2 small 训练状态，per-file 对齐）**：
+
+| 轴 | 对比 | 4K | 64K | 1M |
+|---|---|---:|---:|---:|
+| intra-job 复制（DDP rank 副本，torch.save） | rank r vs 早期 ranks | **1.0000** | **1.0000** | **1.0000** |
+| intra-job 复制（safetensors 副本） | 同上 | **1.0000** | **1.0000** | **1.0000** |
+| FSDP/TP 不相交参数分片 | rank r vs 早期 ranks | 0 | 0 | 0 |
+| inter-job 同构异种子（完整 ckpt） | job B vs A | 0.0000 | 0.0000 | 0.0007（1/1423，噪声） |
+| inter-job 同构异种子（weights safetensors） | job B vs A | 0 | 0 | 0 |
+| LoRA 共享 base 文件 | job2 vs job1 base | **1.0000** | **1.0000** | **1.0000** |
+| LoRA 独立 adapter | job2 vs job1 adapter | 0 | 0 | — |
+| LoRA 作业目录整体 | 目录对目录 | 0.9988 | 0.9988 | 1.0000 |
+
+- DDP 四副本 md5 完全相同（`a139b0b9…` torch、`c39187fe…` safetensors），zipdata 视图同为 1.0。
+- **F6 结论**：字节层吃得到的是**复制轴**（整体文件/张量副本：DP 副本、LoRA base 共享），吃不到**相似轴**（逐步时序 7.1、同构异作业、分片间）；AdaCheck/AITURBO 收益的大头在相似轴，这量化了"为什么必须语义化"的下限，也说明透明层在 DDP 多副本保存场景仍有合法收益（门控应放行）。
+
+**R2 safetensors**：与主夹具**完全相同的 20 步训练序列**（前 5 步 loss 逐位一致 10.989/10.916/10.968/11.021/10.935），仅换容器格式。稳态跨 step 命中：4K 0.000025（极少量巧合块），64K/1M/4M 全 **0**——结论与 zip 格式无关。
