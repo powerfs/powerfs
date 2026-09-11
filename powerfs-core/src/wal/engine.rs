@@ -42,16 +42,17 @@ use crate::wal::commit::{
     CommitConfig, CommitError, CommitMode, CommitQueue, CommitReceipt, CommitRequest,
 };
 use crate::wal::frame::{
-    compute_frame_crc, DataPayload, DeletePayload, RecordType, FRAME_HEADER_SIZE, RT_DATA,
+    compute_frame_crc, DataPayload, DeletePayload, GcMigratePayload, RecordType, FRAME_HEADER_SIZE,
 };
-use crate::wal::index::{IndexError, IndexStats, WalIndex};
+use crate::wal::gc::{spawn_gc_worker, GcConfig, GcOutcome};
+use crate::wal::index::{IndexError, IndexStats, WalIndex, NEEDLE_FLAG_MIGRATED};
 use crate::wal::manifest::{SegManifest, SegmentState};
 use crate::wal::replay::{replay_all, ReplayError};
 use crate::wal::segment::{seg_file_name, SegWriter, SegmentError, SEG_HEADER_SIZE};
-use crate::wal::superblock::{self, Superblock, SbError};
+use crate::wal::superblock::{self, SbError, Superblock};
 
 /// DELETE tombstone 默认保留期（方案 §5.3：7 天，保留期内可 restore）。
-const TOMBSTONE_RETENTION_SECS: i64 = 7 * 24 * 3600;
+pub const DEFAULT_TOMBSTONE_RETENTION_SECS: i64 = 7 * 24 * 3600;
 
 /// 引擎配置。
 #[derive(Debug, Clone)]
@@ -78,6 +79,10 @@ pub struct WalEngineConfig {
     pub ckpt_on_close: bool,
     /// 卷大小（写入 superblock，容量伸缩 T7 的持久化基线）。
     pub volume_size: u64,
+    /// 段 GC 配置（§8；T6）。
+    pub gc: GcConfig,
+    /// DELETE tombstone 保留期（秒；§5.3 默认 7 天，测试/管理可调短）。
+    pub tombstone_retention_secs: i64,
 }
 
 impl Default for WalEngineConfig {
@@ -93,6 +98,8 @@ impl Default for WalEngineConfig {
             ckpt_lsn_distance: 262_144,
             ckpt_on_close: true,
             volume_size: 0,
+            gc: GcConfig::default(),
+            tombstone_retention_secs: DEFAULT_TOMBSTONE_RETENTION_SECS,
         }
     }
 }
@@ -170,7 +177,7 @@ fn acquire_volume_lock(dir: &Path) -> Result<VolumeLock, EngineError> {
 }
 
 /// fsync 目录项（新建段文件后调用，保证崩溃后目录项可见）。
-fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+pub(super) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
@@ -186,12 +193,13 @@ fn unix_millis() -> u64 {
 /// 追加经 `Mutex<SegWriter>` 串行化（与队列锁共同保证单写者语义）；
 /// sync 通过独立克隆的 fd 执行，不阻塞追加（两阶段流水）。换段时先
 /// seal 旧段（数据 fsync + sealed 位回写），再开新段并 fsync 目录项。
-struct SegSink {
+pub(super) struct SegSink {
     writer: Mutex<SegWriter>,
     /// 当前 writer 底层 fd 的克隆（换段时同步替换）；sync 持读锁执行，
     /// 与追加互斥解耦。
     sync_file: RwLock<File>,
-    manifest: Mutex<SegManifest>,
+    /// 段清单（GC 候选扫描/整段回收共用；锁序约定 manifest → index）。
+    pub(super) manifest: Mutex<SegManifest>,
     dir: PathBuf,
     volume_id: u64,
     seg_size: u64,
@@ -327,13 +335,16 @@ fn build_seg_entries(manifest: &SegManifest, index: &WalIndex) -> Vec<CkptSegEnt
         .collect()
 }
 
-/// 引擎共享核心。调度线程持有 `Arc` 克隆，`WalEngine` Drop 时先停线程。
-struct EngineCore {
-    dir: PathBuf,
-    config: WalEngineConfig,
-    sink: Arc<SegSink>,
-    commit: CommitQueue,
-    index: RwLock<WalIndex>,
+/// 引擎共享核心。调度线程（ckpt / GC）持有 `Arc` 克隆，`WalEngine` Drop
+/// 时先停线程。字段对 wal 模块内子模块（gc.rs）可见；锁序全局约定：
+/// commit 队列锁 → sink.writer → sink.manifest → index，任何嵌套获取都
+/// 不得逆序（checkpoint/GC 的临界区按此方向取锁）。
+pub(super) struct EngineCore {
+    pub(super) dir: PathBuf,
+    pub(super) config: WalEngineConfig,
+    pub(super) sink: Arc<SegSink>,
+    pub(super) commit: CommitQueue,
+    pub(super) index: RwLock<WalIndex>,
     next_needle_id: AtomicU64,
     /// 下一个 checkpoint seq（open 时从既有文件接续）。
     next_ckpt_seq: AtomicU64,
@@ -347,8 +358,8 @@ struct EngineCore {
     last_ckpt_seq: AtomicU64,
     /// 最近 checkpoint 时间（unix ms，调度 interval 基线）。
     last_ckpt_ms: AtomicU64,
-    /// 调度线程停止标志。
-    stop: AtomicBool,
+    /// 后台线程停止标志（ckpt / GC 共用）。
+    pub(super) stop: AtomicBool,
     /// Drop 顺序约定：最后释放——commit 排空 + 最终 fsync 后 flock 才
     /// 释放。
     _volume_lock: VolumeLock,
@@ -385,11 +396,13 @@ impl EngineCore {
         };
         let ckpt_seq = self.next_ckpt_seq.fetch_add(1, Ordering::SeqCst);
 
-        // 1. 短临界区：冻结索引快照 + 段清单分桶 + 重放边界。
+        // 1. 短临界区：冻结索引快照 + 段清单分桶 + 重放边界（锁序
+        //    manifest → index，与全局约定一致）。
         let (data, apply_lsn) = {
+            let manifest = self.sink.manifest.lock().unwrap();
             let idx = self.index.read().unwrap();
             let apply_lsn = idx.last_lsn();
-            let segs = build_seg_entries(&self.sink.manifest.lock().unwrap(), &idx);
+            let segs = build_seg_entries(&manifest, &idx);
             let header = CkptHeader {
                 ckpt_seq,
                 applied_lsn: apply_lsn,
@@ -434,16 +447,89 @@ impl EngineCore {
             applied_lsn: apply_lsn,
         })
     }
+
+    /// GC 搬移条件写（§8 case B）：向活跃段写入一条 GC_MIGRATE 记录，
+    /// 在线索引仅当 needle 当前版本 == expect_version 且无更新的
+    /// tombstone/purge 标记时应用。
+    ///
+    /// 并发正确性：搬移「读条目 → 重写」之间存在用户覆写/删除窗口。
+    /// 普通 DATA 记录无法承载条件（其 lsn 一定更晚，会以旧数据覆盖新
+    /// 用户更新），故搬移使用独立记录类型自包含 expect_version：
+    /// - 在线 apply：版本不符/已有更新 tombstone → 跳过（用户胜出），
+    ///   盘面记录成为无主副本随段 GC 回收；
+    /// - 重放 apply（[`WalIndex::apply_gc_migrate`]）：needle 缺席且无
+    ///   tombstone/purge 时应用——原段被 case A 删除后，本记录是该
+    ///   needle 唯一可重放副本，据此重建条目，重放终态与在线一致。
+    pub(super) fn migrate_write(
+        &self,
+        needle_id: u64,
+        expect_version: u64,
+        data: &[u8],
+    ) -> Result<(CommitReceipt, bool), EngineError> {
+        let need = FRAME_HEADER_SIZE + GcMigratePayload::FIXED + data.len();
+        if need as u64 > self.config.seg_size - SEG_HEADER_SIZE as u64 {
+            return Err(EngineError::RecordTooLarge {
+                need,
+                seg_size: self.config.seg_size,
+            });
+        }
+        let payload = GcMigratePayload {
+            needle_id,
+            expect_version,
+            data: bytes::Bytes::copy_from_slice(data),
+        };
+        let mut buf = Vec::with_capacity(GcMigratePayload::FIXED + data.len());
+        payload.encode(&mut buf);
+
+        let receipt = self
+            .commit
+            .enqueue(CommitRequest::new(RecordType::GcMigrate, &buf))?;
+        let now = chrono::Utc::now().timestamp();
+        let applied = self.index.write().unwrap().apply_gc_migrate(
+            receipt.placement.seg_id,
+            receipt.placement.offset,
+            receipt.placement.crc,
+            receipt.lsn,
+            &buf,
+            now,
+        )?;
+        Ok((receipt, applied))
+    }
+
+    /// tombstone 过期 purge 持久化（§8 case C）：向活跃段写入
+    /// TOMB_PURGE 标记（durable 后旧副本所在段方可安全回收）。
+    ///
+    /// 标记必要性：DELETE 记录所在段可能先于含更早 DATA/GC_MIGRATE 副本
+    /// 的段被 case A 回收；重放失去 DELETE 后孤儿副本会让已删 needle
+    /// 复活。purge 标记以更大 lsn 驻留日志并由 checkpoint 持久化，重放
+    /// 时压制该 needle 一切更早记录；当所有 base_lsn ≤ purge_lsn 的段都
+    /// 已回收（不可能再有更老孤儿），标记可由 GC 清除。
+    pub(super) fn purge_write(
+        &self,
+        needle_id: u64,
+        delete_lsn: u64,
+    ) -> Result<CommitReceipt, EngineError> {
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&needle_id.to_le_bytes());
+        buf.extend_from_slice(&delete_lsn.to_le_bytes());
+        let receipt = self
+            .commit
+            .enqueue(CommitRequest::new(RecordType::TombPurge, &buf).strict())?;
+        self.index
+            .write()
+            .unwrap()
+            .apply_tomb_purge(receipt.lsn, &buf)?;
+        Ok(receipt)
+    }
 }
 
 /// checkpoint 后台调度（§7 条件 1/2）：轮询 distance 与 interval，满足
 /// 任一且有未 checkpoint 的写入即执行。失败仅告警，不影响在线写路径。
 fn spawn_ckpt_worker(core: Arc<EngineCore>) -> std::thread::JoinHandle<()> {
-    let interval = core
-        .config
-        .ckpt_interval
-        .unwrap_or(Duration::from_secs(60));
-    let poll = interval.min(Duration::from_secs(1)).max(Duration::from_millis(10));
+    let interval = core.config.ckpt_interval.unwrap_or(Duration::from_secs(60));
+    let poll = interval
+        .min(Duration::from_secs(1))
+        .max(Duration::from_millis(10));
     std::thread::Builder::new()
         .name("wal-ckpt".into())
         .spawn(move || {
@@ -474,7 +560,8 @@ fn spawn_ckpt_worker(core: Arc<EngineCore>) -> std::thread::JoinHandle<()> {
 /// WAL 引擎（v2）。单卷单实例；卷级 flock 保证同一时刻至多一个写者。
 pub struct WalEngine {
     core: Arc<EngineCore>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 后台线程（ckpt 调度 / GC 扫描），Drop 时统一停止并 join。
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl WalEngine {
@@ -561,7 +648,13 @@ impl WalEngine {
 
         // ---- 段清单 + 重放（§10 步骤 4：前缀由 ckpt 承载）----
         let mut manifest = SegManifest::load(dir, config.seg_size)?;
-        let replay = replay_all(dir, &manifest, index, config.tolerate_tail, ckpt_applied_lsn)?;
+        let replay = replay_all(
+            dir,
+            &manifest,
+            index,
+            config.tolerate_tail,
+            ckpt_applied_lsn,
+        )?;
         let index = replay.index;
 
         // 活跃段：重开既有段（哈希链从扫描摘要恢复）；无活跃段则开新段。
@@ -615,18 +708,30 @@ impl WalEngine {
         //      齐实际装载的 ckpt；新卷写首份）----
         core.store_superblock(loaded_ckpt_seq)?;
 
-        // ---- 后台调度（§7 条件 1/2；None 则仅手动触发）----
-        let worker = core.config.ckpt_interval.map(|_| spawn_ckpt_worker(core.clone()));
+        // ---- 后台调度（ckpt §7 条件 1/2；GC §8；None 则仅手动触发）----
+        let mut workers = Vec::new();
+        if core.config.ckpt_interval.is_some() {
+            workers.push(spawn_ckpt_worker(core.clone()));
+        }
+        if core.config.gc.interval.is_some() {
+            workers.push(spawn_gc_worker(core.clone()));
+        }
 
         Ok(WalEngine {
             core,
-            worker: Mutex::new(worker),
+            workers: Mutex::new(workers),
         })
     }
 
     /// 手动触发一次 checkpoint（§7 条件 3）。
     pub fn checkpoint(&self) -> Result<CkptOutcome, EngineError> {
         self.core.checkpoint_impl()
+    }
+
+    /// 手动执行一轮 GC（§8：purge + 搬移 + 整段回收）。与后台调度共用
+    /// 同一实现；失败返回错误由调用方处置。
+    pub fn gc(&self) -> Result<GcOutcome, EngineError> {
+        crate::wal::gc::run_gc_cycle(&self.core, &self.core.config.gc)
     }
 
     /// 单个 needle 的索引条目（适配层 read_needle_meta 用）。
@@ -637,6 +742,11 @@ impl WalEngine {
     /// 全部活跃 needle 的索引条目（适配层 list/scrub 用）。
     pub fn needle_entries(&self) -> Vec<crate::wal::index::NeedleEntry> {
         self.core.index.read().unwrap().needles().cloned().collect()
+    }
+
+    /// I4 断言：索引统计与内容严格一致（GC/测试/scrub 校验用）。
+    pub fn assert_index_consistent(&self) {
+        self.core.index.read().unwrap().assert_consistent()
     }
 
     pub fn dir(&self) -> &Path {
@@ -707,7 +817,7 @@ impl WalEngine {
         let payload = DeletePayload {
             needle_id,
             deleted_at: now,
-            retention_until: now + TOMBSTONE_RETENTION_SECS,
+            retention_until: now + self.core.config.tombstone_retention_secs,
         };
         let mut buf = Vec::with_capacity(DeletePayload::SIZE);
         payload.encode(&mut buf);
@@ -726,30 +836,68 @@ impl WalEngine {
     }
 
     /// 读取一个 needle 的数据（索引定位 → pread → 帧 CRC 校验）。
+    ///
+    /// ENOENT 重试：GC 删段与读并发时，「索引快照后、打开文件前」原段可
+    /// 能被整段回收。此时重查索引重试一次——条目已被搬移更新则读新位置
+    /// 成功；条目未变却 ENOENT 意味着索引与盘面不一致，按错误返回。
     pub fn read(&self, needle_id: u64) -> Result<Vec<u8>, EngineError> {
-        let entry = {
-            let index = self.core.index.read().unwrap();
-            match index.lookup(needle_id) {
-                Some(e) => (e.seg_id, e.offset, e.data_len, e.crc, e.version_lsn),
-                None => return Err(EngineError::NotFound(needle_id)),
-            }
-        };
-        let (seg_id, offset, data_len, crc, version_lsn) = entry;
-        let path = self.core.dir.join(seg_file_name(seg_id));
-        let mut f = File::open(&path).map_err(EngineError::Io)?;
-        f.seek(SeekFrom::Start(offset)).map_err(EngineError::Io)?;
+        for attempt in 0..2 {
+            let entry = {
+                let index = self.core.index.read().unwrap();
+                match index.lookup(needle_id) {
+                    Some(e) => (
+                        e.seg_id,
+                        e.offset,
+                        e.data_len,
+                        e.crc,
+                        e.version_lsn,
+                        e.flags,
+                    ),
+                    None => return Err(EngineError::NotFound(needle_id)),
+                }
+            };
+            let (seg_id, offset, data_len, crc, version_lsn, flags) = entry;
+            let path = self.core.dir.join(seg_file_name(seg_id));
+            let mut f = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt == 0 => {
+                    continue; // GC 删段窗口：重查索引重试
+                }
+                Err(e) => return Err(EngineError::Io(e)),
+            };
+            f.seek(SeekFrom::Start(offset)).map_err(EngineError::Io)?;
 
-        let payload_len = 12 + data_len as usize;
-        let mut payload = vec![0u8; payload_len];
-        f.read_exact(&mut payload).map_err(EngineError::Io)?;
+            // 帧形态分派：DATA 帧 payload 为 needle_id|data_len|data（12B
+            // 头）；GC_MIGRATE 帧 payload 为
+            // needle_id|expect_version|data_len|data（20B 头）。CRC 按各
+            // 自 rtype 重算比对（盘面即真相）。
+            let migrated = flags & NEEDLE_FLAG_MIGRATED != 0;
+            let header_len = if migrated { 20usize } else { 12usize };
+            let rt = if migrated {
+                RecordType::GcMigrate
+            } else {
+                RecordType::Data
+            };
 
-        if self.core.config.verify_on_read {
-            let got = compute_frame_crc(RT_DATA, 0, version_lsn, &payload);
-            if got != crc {
-                return Err(EngineError::ReadCorrupt { needle_id });
+            let payload_len = header_len + data_len as usize;
+            let mut payload = vec![0u8; payload_len];
+            match f.read_exact(&mut payload) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && attempt == 0 => {
+                    continue; // 段被截断/删除窗口：重查索引重试
+                }
+                Err(e) => return Err(EngineError::Io(e)),
             }
+
+            if self.core.config.verify_on_read {
+                let got = compute_frame_crc(rt.to_u8(), 0, version_lsn, &payload);
+                if got != crc {
+                    return Err(EngineError::ReadCorrupt { needle_id });
+                }
+            }
+            return Ok(payload[header_len..].to_vec());
         }
-        Ok(payload[12..].to_vec())
+        Err(EngineError::NotFound(needle_id))
     }
 
     /// 持久化屏障：等待 `durable_lsn >= min_lsn`（FlushNeedles 语义锚点）。
@@ -794,9 +942,9 @@ impl WalEngine {
 
 impl Drop for WalEngine {
     fn drop(&mut self) {
-        // 1. 停调度线程并等待其在途 checkpoint 完成。
+        // 1. 停后台线程（ckpt / GC）并等待其在途工作完成。
         self.core.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.worker.lock().unwrap().take() {
+        for h in self.workers.lock().unwrap().drain(..) {
             let _ = h.join();
         }
         // 2. 优雅停机前强制一次（§7 条件 4，best-effort）：失败仅损失
@@ -1203,10 +1351,7 @@ mod tests {
             let out = eng.checkpoint().unwrap();
             assert_eq!(out.ckpt_seq, 1);
             assert_eq!(out.applied_lsn, 11); // 10 write + 1 delete
-            assert!(dir
-                .path()
-                .join(checkpoint::ckpt_file_name(1))
-                .exists());
+            assert!(dir.path().join(checkpoint::ckpt_file_name(1)).exists());
             let st = eng.stats();
             assert_eq!(st.last_ckpt_seq, 1);
             assert_eq!(st.last_ckpt_lsn, 11);
@@ -1397,7 +1542,10 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected VolumeIdMismatch, got Ok"),
         };
-        assert!(matches!(err, EngineError::VolumeIdMismatch { sb: 1, got: 2 }));
+        assert!(matches!(
+            err,
+            EngineError::VolumeIdMismatch { sb: 1, got: 2 }
+        ));
     }
 
     /// 停机 checkpoint（§7 条件 4）：close 后 ckpt 文件与 superblock 轮换

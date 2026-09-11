@@ -146,6 +146,14 @@ impl SegManifest {
             e.state = SegmentState::Sealed;
         }
     }
+
+    /// 段文件删除后从内存清单移除（GC 整段回收；磁盘事实源是目录扫描，
+    /// 重启后清单自然与盘面一致）。返回是否实际移除。
+    pub fn remove(&mut self, seg_id: u64) -> bool {
+        let len = self.entries.len();
+        self.entries.retain(|e| e.seg_id != seg_id);
+        self.entries.len() != len
+    }
 }
 
 fn read_segment_header(path: &Path) -> Result<SegmentHeader, SegmentError> {

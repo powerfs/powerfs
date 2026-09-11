@@ -14,7 +14,7 @@
 //! ```text
 //! [header 128B] magic|ver|header_len|ckpt_seq|applied_lsn|volume_id
 //!               |active_seg_id|next_seg_id|next_needle_id|next_snapshot_id
-//!               |created_ts|counts(seg/needle/tomb/dead/snap)|reserved
+//!               |created_ts|counts(seg/needle/tomb/dead/snap/purged)|reserved
 //!               |header_crc(crc32c over [0..124))
 //! [segments]    per seg 49B: seg_id|state|live_bytes|staging_bytes
 //!               |dead_bytes|base_lsn|last_lsn
@@ -25,6 +25,7 @@
 //! [dead]        per entry 32B: seg_id|offset|data_len|crc|version_lsn
 //! [snapshots]   per entry 26+nB: snapshot_id|root_lsn|created_ts|name_len
 //!               |name（P2 空表）
+//! [purged]      per entry 16B: needle_id|purge_lsn（§8 case C 防复活标记）
 //! [alloc_stats] 48B: used|staging|garbage|pinned|active_count|deleted_count
 //! [footer 4B]   crc32c(whole file up to footer)
 //! ```
@@ -125,6 +126,8 @@ pub struct CkptData {
     pub tombstones: Vec<TombstoneEntry>,
     pub dead: Vec<DeadCopy>,
     pub snapshots: Vec<CkptSnapshotEntry>,
+    /// tombstone purge 标记（needle_id → purge_lsn，§8 case C）。
+    pub purged: Vec<(u64, u64)>,
     pub alloc_stats: CkptAllocStats,
 }
 
@@ -211,6 +214,11 @@ pub fn build(header: CkptHeader, seg_entries: Vec<CkptSegEntry>, index: &WalInde
         tombstones: index.tombstones().cloned().collect(),
         dead: index.dead_copies().to_vec(),
         snapshots: Vec::new(),
+        purged: index
+            .purged_markers()
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect(),
         alloc_stats: CkptAllocStats {
             used: st.used_bytes,
             staging: st.staging_bytes,
@@ -224,9 +232,9 @@ pub fn build(header: CkptHeader, seg_entries: Vec<CkptSegEntry>, index: &WalInde
 
 /// 原子写入 checkpoint：tmp → fsync → rename → fsync 目录项。
 pub fn write(dir: &Path, data: &CkptData) -> Result<PathBuf, CkptError> {
-    let hdr = data
-        .header
-        .ok_or(CkptError::CountsMismatch { path: dir.to_path_buf() })?;
+    let hdr = data.header.ok_or(CkptError::CountsMismatch {
+        path: dir.to_path_buf(),
+    })?;
     let body = encode(data);
 
     let final_path = dir.join(ckpt_file_name(hdr.ckpt_seq));
@@ -247,9 +255,8 @@ pub fn write(dir: &Path, data: &CkptData) -> Result<PathBuf, CkptError> {
 /// 编码完整文件体（含 footer CRC）。
 pub fn encode(data: &CkptData) -> Vec<u8> {
     let hdr = data.header.expect("checkpoint header");
-    let mut buf = Vec::with_capacity(
-        CKPT_HEADER_SIZE + data.segments.len() * 49 + data.needles.len() * 61,
-    );
+    let mut buf =
+        Vec::with_capacity(CKPT_HEADER_SIZE + data.segments.len() * 49 + data.needles.len() * 61);
 
     // ---- header [0..124) + crc [124..128) ----
     buf.extend_from_slice(&CKPT_MAGIC);
@@ -268,6 +275,7 @@ pub fn encode(data: &CkptData) -> Vec<u8> {
     buf.extend_from_slice(&(data.tombstones.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(data.dead.len() as u64).to_le_bytes());
     buf.extend_from_slice(&(data.snapshots.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&(data.purged.len() as u64).to_le_bytes());
     buf.resize(CKPT_HEADER_CRC_OFF, 0); // 保留区零填充
     let hcrc = crc32c::crc32c(&buf);
     buf.extend_from_slice(&hcrc.to_le_bytes());
@@ -326,6 +334,12 @@ pub fn encode(data: &CkptData) -> Vec<u8> {
         buf.extend_from_slice(&s.created_ts.to_le_bytes());
         buf.extend_from_slice(&(s.name.len() as u16).to_le_bytes());
         buf.extend_from_slice(s.name.as_bytes());
+    }
+
+    // ---- purged markers（16B each）----
+    for (needle_id, purge_lsn) in &data.purged {
+        buf.extend_from_slice(&needle_id.to_le_bytes());
+        buf.extend_from_slice(&purge_lsn.to_le_bytes());
     }
 
     // ---- alloc_stats（48B）----
@@ -389,8 +403,11 @@ pub fn decode(path: &Path, raw: &[u8]) -> Result<CkptData, CkptError> {
             got: header_len as u16,
         });
     }
-    let expect_hcrc =
-        u32::from_le_bytes(raw[CKPT_HEADER_CRC_OFF..CKPT_HEADER_SIZE].try_into().unwrap());
+    let expect_hcrc = u32::from_le_bytes(
+        raw[CKPT_HEADER_CRC_OFF..CKPT_HEADER_SIZE]
+            .try_into()
+            .unwrap(),
+    );
     let got_hcrc = crc32c::crc32c(&raw[..CKPT_HEADER_CRC_OFF]);
     if expect_hcrc != got_hcrc {
         return Err(CkptError::HeaderCrc {
@@ -416,6 +433,7 @@ pub fn decode(path: &Path, raw: &[u8]) -> Result<CkptData, CkptError> {
     let tomb_count = u64at(92) as usize;
     let dead_count = u64at(100) as usize;
     let snap_count = u64at(108) as usize;
+    let purged_count = u64at(116) as usize;
 
     let mut off = CKPT_HEADER_SIZE;
     let mut need = |n: usize| -> Result<&[u8], CkptError> {
@@ -508,6 +526,13 @@ pub fn decode(path: &Path, raw: &[u8]) -> Result<CkptData, CkptError> {
         });
     }
 
+    // ---- purged markers ----
+    let mut purged = Vec::with_capacity(purged_count);
+    for _ in 0..purged_count {
+        let s = need(16)?;
+        purged.push((g64(s, 0), g64(s, 8)));
+    }
+
     // ---- alloc_stats ----
     let st = need(48)?;
     let alloc_stats = CkptAllocStats {
@@ -532,6 +557,7 @@ pub fn decode(path: &Path, raw: &[u8]) -> Result<CkptData, CkptError> {
         tombstones,
         dead,
         snapshots,
+        purged,
         alloc_stats,
     })
 }
@@ -546,6 +572,7 @@ pub fn into_index(data: &CkptData) -> WalIndex {
         data.needles.iter().cloned(),
         data.tombstones.iter().cloned(),
         data.dead.iter().cloned(),
+        data.purged.iter().copied(),
     );
     idx
 }
@@ -575,10 +602,13 @@ mod tests {
     fn sample_index() -> WalIndex {
         let mut idx = WalIndex::new();
         // 段 1：needle 1 (100B) 覆写 150B → 死副本 100 进账本
-        idx.apply_data(1, 64, 0x11, 1, &make_data(1, 100), 100).unwrap();
-        idx.apply_data(1, 300, 0x22, 2, &make_data(1, 150), 101).unwrap();
+        idx.apply_data(1, 64, 0x11, 1, &make_data(1, 100), 100)
+            .unwrap();
+        idx.apply_data(1, 300, 0x22, 2, &make_data(1, 150), 101)
+            .unwrap();
         // 段 2：needle 2 (60B) + tombstone (60B)
-        idx.apply_data(2, 64, 0x33, 3, &make_data(2, 60), 102).unwrap();
+        idx.apply_data(2, 64, 0x33, 3, &make_data(2, 60), 102)
+            .unwrap();
         idx.apply_delete(4, &make_delete(9)).unwrap(); // 无活跃条目 → 忽略
         idx.apply_delete(5, &make_delete(2)).unwrap();
         idx

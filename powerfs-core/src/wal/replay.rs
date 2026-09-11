@@ -198,6 +198,29 @@ fn apply_frame(
                 })
             }
         }
+        RecordType::GcMigrate => {
+            // 条件应用（缺席重建 / 版本匹配覆写 / 其余跳过；purge 压制），
+            // 与在线路径同语义，见 WalIndex::apply_gc_migrate。
+            let now = chrono::Utc::now().timestamp();
+            index
+                .apply_gc_migrate(seg_id, meta.offset, meta.crc, meta.lsn, payload, now)
+                .map_err(|_| ReplayError::MalformedPayload {
+                    seg_id,
+                    lsn: meta.lsn,
+                    rtype: meta.rtype.to_u8(),
+                })
+                .map(|_| ())
+        }
+        RecordType::TombPurge => {
+            // 持久化 purge 标记：搬账本 + 登记压制（防孤儿副本复活）。
+            index
+                .apply_tomb_purge(meta.lsn, payload)
+                .map_err(|_| ReplayError::MalformedPayload {
+                    seg_id,
+                    lsn: meta.lsn,
+                    rtype: meta.rtype.to_u8(),
+                })
+        }
         // ATTR / SNAP_TAKE / SNAP_DROP / VOLUME_META：payload 语义在 P2+
         // 接入快照与属性功能时消费；P1 仅要求帧级完整性（CRC/链已校验）。
         RecordType::Attr | RecordType::SnapTake | RecordType::SnapDrop | RecordType::VolumeMeta => {

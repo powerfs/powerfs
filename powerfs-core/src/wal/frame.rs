@@ -37,6 +37,8 @@ pub const RT_SNAP_TAKE: u8 = 0x04;
 pub const RT_SNAP_DROP: u8 = 0x05;
 pub const RT_CKPT_ANCHOR: u8 = 0x06;
 pub const RT_VOLUME_META: u8 = 0x07;
+pub const RT_GC_MIGRATE: u8 = 0x08;
+pub const RT_TOMB_PURGE: u8 = 0x09;
 pub const RT_PAD: u8 = 0x7F;
 
 /// 帧级错误。
@@ -72,6 +74,17 @@ pub enum RecordType {
     CkptAnchor,
     /// volume 级元数据（collection、state 变更等）。
     VolumeMeta,
+    /// GC 搬移（§8 case B）：把存活 needle 重写入新段。条件应用——仅当
+    /// 当前版本 lsn == expect_version 时生效，否则跳过（盘面保留为无主
+    /// 记录，随原段/目标段的 GC 收敛回收），保证与并发覆写不发生 LSN
+    /// 倒挂覆盖（用户更新胜出）。
+    GcMigrate,
+    /// tombstone 过期 purge 标记（§8 case C）：payload
+    /// `needle_id u64 | delete_lsn u64`。GC purge 时写入活跃段并由
+    /// checkpoint 持久化；重放时压制该 needle 一切 lsn ≤ 本记录的孤儿
+    /// 副本，避免 DELETE 物理副本先于旧数据段回收后已删 needle 复活。
+    /// 当所有更老段回收后标记可由 GC 清除。
+    TombPurge,
     /// 段尾填充，保证记录永不跨段。
     Pad,
 }
@@ -86,6 +99,8 @@ impl RecordType {
             RecordType::SnapDrop => RT_SNAP_DROP,
             RecordType::CkptAnchor => RT_CKPT_ANCHOR,
             RecordType::VolumeMeta => RT_VOLUME_META,
+            RecordType::GcMigrate => RT_GC_MIGRATE,
+            RecordType::TombPurge => RT_TOMB_PURGE,
             RecordType::Pad => RT_PAD,
         }
     }
@@ -99,6 +114,8 @@ impl RecordType {
             RT_SNAP_DROP => Some(RecordType::SnapDrop),
             RT_CKPT_ANCHOR => Some(RecordType::CkptAnchor),
             RT_VOLUME_META => Some(RecordType::VolumeMeta),
+            RT_GC_MIGRATE => Some(RecordType::GcMigrate),
+            RT_TOMB_PURGE => Some(RecordType::TombPurge),
             RT_PAD => Some(RecordType::Pad),
             _ => None,
         }
@@ -557,6 +574,58 @@ impl VolumeMetaPayload {
         Ok(VolumeMetaPayload {
             field_mask: read_u32(buf, 0)?,
             values: Bytes::copy_from_slice(&buf[4..]),
+        })
+    }
+}
+
+/// GC_MIGRATE（0x08）payload：
+/// `needle_id u64 | expect_version u64 | data_len u32 | data`。
+///
+/// `expect_version` 为搬移决策时原条目的 version_lsn。应用侧（在线索引与
+/// 重放共用同一逻辑）仅当目标 needle 当前版本 lsn == expect_version 时才
+/// 应用本记录，否则跳过——并发覆写/删除/搬移之后到达的搬移记录自然失
+/// 效，避免旧数据以更大 lsn 覆盖用户更新（记录自包含，重放与在线语义
+/// 一致，无需依赖应用时序）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcMigratePayload {
+    pub needle_id: u64,
+    pub expect_version: u64,
+    pub data: Bytes,
+}
+
+impl GcMigratePayload {
+    pub const FIXED: usize = 20;
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.needle_id.to_le_bytes());
+        out.extend_from_slice(&self.expect_version.to_le_bytes());
+        out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.data);
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, FrameError> {
+        if buf.len() < Self::FIXED {
+            return Err(payload_err(
+                RT_GC_MIGRATE,
+                format!("need >= {} bytes, got {}", Self::FIXED, buf.len()),
+            ));
+        }
+        let needle_id = read_u64(buf, 0)?;
+        let expect_version = read_u64(buf, 8)?;
+        let data_len = read_u32(buf, 16)? as usize;
+        if buf.len() != Self::FIXED + data_len {
+            return Err(payload_err(
+                RT_GC_MIGRATE,
+                format!(
+                    "data_len {data_len} != remaining {}",
+                    buf.len() - Self::FIXED
+                ),
+            ));
+        }
+        Ok(GcMigratePayload {
+            needle_id,
+            expect_version,
+            data: Bytes::copy_from_slice(&buf[Self::FIXED..]),
         })
     }
 }
