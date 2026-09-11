@@ -59,6 +59,25 @@ pub struct WalVolume {
     compacting: AtomicBool,
 }
 
+/// WAL 卷管理面详细统计（远程面 admin stats；free_bytes 未限定容量时
+/// 为 u64::MAX，与 [`crate::wal::engine::EngineStats`] 同口径）。
+#[derive(Debug, Clone, Copy)]
+pub struct WalAdminStats {
+    pub volume_size: u64,
+    pub free_bytes: u64,
+    pub used_bytes: u64,
+    pub staging_bytes: u64,
+    pub garbage_bytes: u64,
+    pub pinned_bytes: u64,
+    pub active_count: u64,
+    pub deleted_count: u64,
+    pub segments: usize,
+    pub last_ckpt_seq: u64,
+    pub last_ckpt_lsn: u64,
+    pub durable_lsn: u64,
+    pub is_full: bool,
+}
+
 #[allow(clippy::result_large_err)]
 impl WalVolume {
     pub fn new(
@@ -223,6 +242,36 @@ impl WalVolume {
         Ok(())
     }
 
+    /// WAL 专有：手动触发一轮段 GC（远程面 admin gc；§8）。
+    pub fn wal_gc(&self) -> Result<crate::wal::gc::GcOutcome> {
+        self.engine.gc().map_err(engine_err)
+    }
+
+    /// WAL 专有：手动触发一次 checkpoint（远程面 admin checkpoint；§7）。
+    pub fn wal_checkpoint(&self) -> Result<crate::wal::engine::CkptOutcome> {
+        self.engine.checkpoint().map_err(engine_err)
+    }
+
+    /// WAL 专有：管理面详细统计（四项空间账 + ckpt/段概览，§9.3/§19.2）。
+    pub fn wal_admin_stats(&self) -> WalAdminStats {
+        let s = self.engine.stats();
+        WalAdminStats {
+            volume_size: s.volume_size,
+            free_bytes: s.free_bytes,
+            used_bytes: s.index.used_bytes,
+            staging_bytes: s.index.staging_bytes,
+            garbage_bytes: s.index.garbage_bytes,
+            pinned_bytes: s.index.pinned_bytes,
+            active_count: s.index.active_count,
+            deleted_count: s.index.deleted_count,
+            segments: s.segments,
+            last_ckpt_seq: s.last_ckpt_seq,
+            last_ckpt_lsn: s.last_ckpt_lsn,
+            durable_lsn: s.durable_lsn,
+            is_full: self.engine.is_full(),
+        }
+    }
+
     pub fn write_needle(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
         let mut info_guard = self.info.write().unwrap();
         if info_guard.state != VolumeState::Available {
@@ -366,9 +415,10 @@ impl WalVolume {
     }
 
     pub fn compact(&self) -> Result<(u64, u64)> {
-        // 搬移式 GC 属 P2（方案 §8）：P1 无回收动作，返回零值保持接口兼容。
-        log::debug!("compact: wal engine gc not active (P2), no-op");
-        Ok((0, 0))
+        // 映射到段 GC 一轮（§8：purge + 搬移 + 整段回收），返回
+        // (整段回收字节, 搬移 needle 数) 与 v1 compact 回执同形。
+        let out = self.engine.gc().map_err(engine_err)?;
+        Ok((out.reclaimed_bytes, out.migrated_needles as u64))
     }
 
     pub fn is_compacting(&self) -> bool {

@@ -680,7 +680,7 @@ mod tests {
             let max_lsn = r.index.last_lsn();
             assert!(max_lsn < 40);
             assert_eq!(
-                r.index.needle_count() as u64,
+                r.index.needle_count(),
                 max_lsn,
                 "only contiguous prefix needles present"
             );

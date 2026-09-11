@@ -293,6 +293,44 @@ impl VolumeEngine {
         }
     }
 
+    /// WAL 专有：管理面段 GC（v1 引擎返回 InvalidRequest）。
+    pub fn wal_gc(&self) -> Result<crate::wal::gc::GcOutcome> {
+        match self {
+            VolumeEngine::Wal(v) => v.wal_gc(),
+            VolumeEngine::Needle(_) => Err(PowerFsError::InvalidRequest(
+                "gc is a WAL-engine admin operation".to_string(),
+            )),
+        }
+    }
+
+    /// WAL 专有：管理面 checkpoint（v1 引擎返回 InvalidRequest）。
+    pub fn wal_checkpoint(&self) -> Result<crate::wal::engine::CkptOutcome> {
+        match self {
+            VolumeEngine::Wal(v) => v.wal_checkpoint(),
+            VolumeEngine::Needle(_) => Err(PowerFsError::InvalidRequest(
+                "checkpoint is a WAL-engine admin operation".to_string(),
+            )),
+        }
+    }
+
+    /// WAL 专有：容量伸缩（v1 引擎返回 InvalidRequest）。
+    pub fn wal_resize(&self, new_size: u64) -> Result<()> {
+        match self {
+            VolumeEngine::Wal(v) => v.resize(new_size),
+            VolumeEngine::Needle(_) => Err(PowerFsError::InvalidRequest(
+                "resize is a WAL-engine admin operation".to_string(),
+            )),
+        }
+    }
+
+    /// WAL 专有：管理面详细统计；v1 引擎返回 None（调用方回退通用 stats）。
+    pub fn wal_admin_stats(&self) -> Option<crate::wal_volume::WalAdminStats> {
+        match self {
+            VolumeEngine::Wal(v) => Some(v.wal_admin_stats()),
+            VolumeEngine::Needle(_) => None,
+        }
+    }
+
     pub fn is_compacting(&self) -> bool {
         match self {
             VolumeEngine::Needle(v) => v.is_compacting(),

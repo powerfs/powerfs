@@ -72,7 +72,7 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum AdminCmd {
-    /// 段清单 + 索引统计 + LSN 概览
+    /// 段清单 + 索引统计 + LSN 概览（只读，不取锁）
     Stats {
         /// WAL 卷目录（如 /data/volume_123）
         volume_dir: String,
@@ -80,10 +80,55 @@ enum AdminCmd {
         #[arg(long, default_value_t = 64 << 20)]
         segment_size: u64,
     },
-    /// 全量重放校验（逐帧 CRC + 哈希链）
+    /// 全量重放校验（逐帧 CRC + 哈希链；只读，不取锁）
     Verify {
         /// WAL 卷目录（如 /data/volume_123）
         volume_dir: String,
+        /// 段大小（需与 server 配置 wal_segment_size 一致）
+        #[arg(long, default_value_t = 64 << 20)]
+        segment_size: u64,
+    },
+    /// 枚举活跃 needle（只读，不取锁；与运行中的 server 并发安全）
+    ListNeedles {
+        /// WAL 卷目录（如 /data/volume_123）
+        volume_dir: String,
+        /// 段大小（需与 server 配置 wal_segment_size 一致）
+        #[arg(long, default_value_t = 64 << 20)]
+        segment_size: u64,
+        /// 仅列出 needle_id >= PREFIX 的条目
+        #[arg(long)]
+        prefix: Option<u64>,
+        /// 最多列出 N 条
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// 离线触发一轮段 GC（tombstone purge + 搬移 + 整段回收；取锁）
+    Gc {
+        /// WAL 卷目录（如 /data/volume_123）
+        volume_dir: String,
+        /// 段大小（需与 server 配置 wal_segment_size 一致）
+        #[arg(long, default_value_t = 64 << 20)]
+        segment_size: u64,
+        /// 覆盖 tombstone 保留期秒数（维护窗口可传 0 立即 purge；
+        /// 缺省用引擎默认 7 天）
+        #[arg(long)]
+        retention_secs: Option<i64>,
+    },
+    /// 离线触发一次 checkpoint（取锁）
+    Checkpoint {
+        /// WAL 卷目录（如 /data/volume_123）
+        volume_dir: String,
+        /// 段大小（需与 server 配置 wal_segment_size 一致）
+        #[arg(long, default_value_t = 64 << 20)]
+        segment_size: u64,
+    },
+    /// 离线容量伸缩（VOLUME_META strict 落盘 + superblock 同步；取锁）
+    Resize {
+        /// WAL 卷目录（如 /data/volume_123）
+        volume_dir: String,
+        /// 新卷容量（字节）；shrink 不得小于 used+staging+pinned
+        #[arg(long)]
+        size: u64,
         /// 段大小（需与 server 配置 wal_segment_size 一致）
         #[arg(long, default_value_t = 64 << 20)]
         segment_size: u64,
@@ -120,16 +165,69 @@ fn run_admin(cmd: &AdminCmd) -> std::result::Result<(), Box<dyn std::error::Erro
         | AdminCmd::Verify {
             volume_dir,
             segment_size,
+        }
+        | AdminCmd::ListNeedles {
+            volume_dir,
+            segment_size,
+            ..
+        }
+        | AdminCmd::Gc {
+            volume_dir,
+            segment_size,
+            ..
+        }
+        | AdminCmd::Checkpoint {
+            volume_dir,
+            segment_size,
+        }
+        | AdminCmd::Resize {
+            volume_dir,
+            segment_size,
+            ..
         } => (volume_dir.as_str(), *segment_size),
     };
     let path = std::path::Path::new(dir);
     if !path.is_dir() {
         return Err(format!("volume dir not found: {dir}").into());
     }
-    let report = wal_admin::inspect(path, seg_size)?;
-    print!("{}", wal_admin::format_report(&report));
-    if let AdminCmd::Verify { .. } = cmd {
-        println!("verify: OK (full replay passed)");
+
+    match cmd {
+        AdminCmd::Stats { .. } => {
+            let report = wal_admin::inspect(path, seg_size)?;
+            print!("{}", wal_admin::format_report(&report));
+        }
+        AdminCmd::Verify { .. } => {
+            let report = wal_admin::verify(path, seg_size)?;
+            print!("{}", wal_admin::format_report(&report));
+            println!("verify: OK (full replay passed)");
+        }
+        AdminCmd::ListNeedles { prefix, limit, .. } => {
+            let rows = wal_admin::list_needles(path, seg_size, prefix.unwrap_or(0), *limit)?;
+            print!("{}", wal_admin::format_needles(&rows));
+        }
+        AdminCmd::Gc { retention_secs, .. } => {
+            let out = wal_admin::run_gc(path, seg_size, *retention_secs)?;
+            println!(
+                "gc: purged={} migrated_needles={} migrated_bytes={} \
+                 segments_deleted={} reclaimed_bytes={}",
+                out.purged,
+                out.migrated_needles,
+                out.migrated_bytes,
+                out.segments_deleted,
+                out.reclaimed_bytes
+            );
+        }
+        AdminCmd::Checkpoint { .. } => {
+            let out = wal_admin::run_checkpoint(path, seg_size)?;
+            println!(
+                "checkpoint: seq={} applied_lsn={}",
+                out.ckpt_seq, out.applied_lsn
+            );
+        }
+        AdminCmd::Resize { size, .. } => {
+            let lsn = wal_admin::run_resize(path, seg_size, *size)?;
+            println!("resize: volume_size={size} committed at lsn={lsn}");
+        }
     }
     Ok(())
 }
@@ -265,7 +363,7 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
                     _ = flush_interval.tick() => {
                         let n = sm.flush_all_expired();
                         flush_tick_count += 1;
-                        if n > 0 && flush_tick_count % 20 == 0 {
+                        if n > 0 && flush_tick_count.is_multiple_of(20) {
                             // 每 1 秒（20×50ms）输出一次 flush 统计
                             debug!("BG_FLUSH: flushed {} needles", n);
                         }
