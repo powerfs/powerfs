@@ -26,7 +26,7 @@
 //! [snapshots]   per entry 26+nB: snapshot_id|root_lsn|created_ts|name_len
 //!               |name（P2 空表）
 //! [purged]      per entry 16B: needle_id|purge_lsn（§8 case C 防复活标记）
-//! [alloc_stats] 48B: used|staging|garbage|pinned|active_count|deleted_count
+//! [alloc_stats] 56B: used|staging|garbage|pinned|active_count|deleted_count|volume_size
 //! [footer 4B]   crc32c(whole file up to footer)
 //! ```
 
@@ -92,7 +92,7 @@ pub struct CkptHeader {
     pub created_ts: i64,
 }
 
-/// 空间分配统计（§9.3 四项）。
+/// 空间分配统计（§9.3 四项 + 容量）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CkptAllocStats {
     pub used: u64,
@@ -101,6 +101,8 @@ pub struct CkptAllocStats {
     pub pinned: u64,
     pub active_count: u64,
     pub deleted_count: u64,
+    /// 卷逻辑容量（§11 VOLUME_META 推进值；0 = 未设置）。
+    pub volume_size: u64,
 }
 
 impl CkptAllocStats {
@@ -204,6 +206,25 @@ pub fn latest_seq(dir: &Path) -> Option<u64> {
     list_ckpts(dir).pop()
 }
 
+/// 删除 applied_lsn > `max_lsn` 的 checkpoint 文件（中部断链恢复点回退用：
+/// 恢复点之前的 ckpt 锚点引用了已弃置段，必须失效，否则下次启动会装载
+/// 超前状态）。返回被删除的 ckpt 序号（升序）。损坏/不可读的 ckpt 不动。
+pub fn remove_future_ckpts(dir: &Path, max_lsn: u64) -> Vec<u64> {
+    let mut removed = Vec::new();
+    for seq in list_ckpts(dir) {
+        match load(dir, seq) {
+            Ok(data) if data.header.map(|h| h.applied_lsn).unwrap_or(0) > max_lsn => {
+                let path = dir.join(ckpt_file_name(seq));
+                if std::fs::remove_file(&path).is_ok() {
+                    removed.push(seq);
+                }
+            }
+            _ => {}
+        }
+    }
+    removed
+}
+
 /// 从索引与段清单构造 CkptData（engine 侧调用）。
 pub fn build(header: CkptHeader, seg_entries: Vec<CkptSegEntry>, index: &WalIndex) -> CkptData {
     let st = index.stats();
@@ -226,6 +247,7 @@ pub fn build(header: CkptHeader, seg_entries: Vec<CkptSegEntry>, index: &WalInde
             pinned: st.pinned_bytes,
             active_count: st.active_count,
             deleted_count: st.deleted_count,
+            volume_size: index.volume_size(),
         },
     }
 }
@@ -350,6 +372,7 @@ pub fn encode(data: &CkptData) -> Vec<u8> {
     buf.extend_from_slice(&a.pinned.to_le_bytes());
     buf.extend_from_slice(&a.active_count.to_le_bytes());
     buf.extend_from_slice(&a.deleted_count.to_le_bytes());
+    buf.extend_from_slice(&a.volume_size.to_le_bytes());
 
     // ---- footer: whole-file crc ----
     let fcrc = crc32c::crc32c(&buf);
@@ -533,8 +556,8 @@ pub fn decode(path: &Path, raw: &[u8]) -> Result<CkptData, CkptError> {
         purged.push((g64(s, 0), g64(s, 8)));
     }
 
-    // ---- alloc_stats ----
-    let st = need(48)?;
+    // ---- alloc_stats（56B）----
+    let st = need(56)?;
     let alloc_stats = CkptAllocStats {
         used: g64(st, 0),
         staging: g64(st, 8),
@@ -542,6 +565,7 @@ pub fn decode(path: &Path, raw: &[u8]) -> Result<CkptData, CkptError> {
         pinned: g64(st, 24),
         active_count: g64(st, 32),
         deleted_count: g64(st, 40),
+        volume_size: g64(st, 48),
     };
 
     if off != raw.len() - 4 {
@@ -574,6 +598,7 @@ pub fn into_index(data: &CkptData) -> WalIndex {
         data.dead.iter().cloned(),
         data.purged.iter().copied(),
     );
+    idx.set_volume_size(data.alloc_stats.volume_size);
     idx
 }
 

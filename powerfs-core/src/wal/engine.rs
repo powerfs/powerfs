@@ -42,17 +42,27 @@ use crate::wal::commit::{
     CommitConfig, CommitError, CommitMode, CommitQueue, CommitReceipt, CommitRequest,
 };
 use crate::wal::frame::{
-    compute_frame_crc, DataPayload, DeletePayload, GcMigratePayload, RecordType, FRAME_HEADER_SIZE,
+    compute_frame_crc, DataPayload, DeletePayload, GcMigratePayload, RecordType, VolumeMetaPayload,
+    FRAME_HEADER_SIZE,
 };
 use crate::wal::gc::{spawn_gc_worker, GcConfig, GcOutcome};
 use crate::wal::index::{IndexError, IndexStats, WalIndex, NEEDLE_FLAG_MIGRATED};
 use crate::wal::manifest::{SegManifest, SegmentState};
-use crate::wal::replay::{replay_all, ReplayError};
+use crate::wal::replay::{replay_all, replay_with, RecoveryMode, ReplayError};
 use crate::wal::segment::{seg_file_name, SegWriter, SegmentError, SEG_HEADER_SIZE};
 use crate::wal::superblock::{self, SbError, Superblock};
 
 /// DELETE tombstone 默认保留期（方案 §5.3：7 天，保留期内可 restore）。
 pub const DEFAULT_TOMBSTONE_RETENTION_SECS: i64 = 7 * 24 * 3600;
+
+/// superblock state：卷满（free ≤ 0，§11 OutOfSpace）；0 = 正常。
+pub const VOLUME_STATE_FULL: u8 = 1;
+
+/// 逻辑占用字节（§9.3）：used + staging + pinned。garbage 不计入——
+/// 它是可由 GC 回收的死空间；free = volume_size − occupied。
+fn occupied_bytes(st: &IndexStats) -> u64 {
+    st.used_bytes + st.staging_bytes + st.pinned_bytes
+}
 
 /// 引擎配置。
 #[derive(Debug, Clone)]
@@ -63,8 +73,8 @@ pub struct WalEngineConfig {
     pub volume_id: u64,
     /// 段创建时是否 fallocate 预分配。
     pub preallocate: bool,
-    /// 恢复时是否容忍最后段撕裂尾（截断到最后完整帧）。
-    pub tolerate_tail: bool,
+    /// 恢复模式（方案 §10；尾撕裂三档均截断，中部断链按档位处理）。
+    pub recovery_mode: RecoveryMode,
     /// 读路径是否重算帧 CRC 校验。
     pub verify_on_read: bool,
     /// 组提交配置。
@@ -91,7 +101,7 @@ impl Default for WalEngineConfig {
             seg_size: 64 << 20,
             volume_id: 0,
             preallocate: true,
-            tolerate_tail: true,
+            recovery_mode: RecoveryMode::TolerateTail,
             verify_on_read: true,
             commit: CommitConfig::default(),
             ckpt_interval: Some(Duration::from_secs(60)),
@@ -131,12 +141,24 @@ pub enum EngineError {
     ReadCorrupt { needle_id: u64 },
     #[error("record too large for segment: need {need} bytes, seg_size {seg_size}")]
     RecordTooLarge { need: usize, seg_size: u64 },
+    #[error("shrink rejected: requested {requested} < used+staging+pinned {required}")]
+    ResizeTooSmall { requested: u64, required: u64 },
+    #[error("volume full: capacity {volume_size}, occupied {occupied}, write needs {need} bytes")]
+    VolumeFull {
+        volume_size: u64,
+        occupied: u64,
+        need: u64,
+    },
 }
 
 /// 引擎统计。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EngineStats {
     pub index: IndexStats,
+    /// 卷逻辑容量（0 = 未限定）。
+    pub volume_size: u64,
+    /// 逻辑可用字节（未限定时为 u64::MAX）。
+    pub free_bytes: u64,
     pub durable_lsn: u64,
     pub flushed_lsn: u64,
     pub segments: usize,
@@ -369,14 +391,20 @@ impl EngineCore {
     /// superblock 轮换写入（seq 单调 +1，active_seg_id 取当前活跃段）。
     fn store_superblock(&self, latest_ckpt_seq: u64) -> Result<(), EngineError> {
         let seq = self.sb_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let (volume_size, state) = {
+            let idx = self.index.read().unwrap();
+            let cap = idx.volume_size();
+            let full = cap > 0 && occupied_bytes(&idx.stats()) >= cap;
+            (cap, if full { VOLUME_STATE_FULL } else { 0 })
+        };
         let sb = Superblock {
             seq,
             volume_id: self.config.volume_id,
             latest_ckpt_seq,
             active_seg_id: self.sink.writer.lock().unwrap().seg_id(),
             active_seg_size: self.config.seg_size,
-            volume_size: self.config.volume_size,
-            state: 0,
+            volume_size,
+            state,
             created_ts: self.sb_created_ts,
             last_mount_ts: chrono::Utc::now().timestamp(),
             min_live_snapshot_lsn: 0, // P3 快照接入
@@ -521,6 +549,35 @@ impl EngineCore {
             .apply_tomb_purge(receipt.lsn, &buf)?;
         Ok(receipt)
     }
+
+    /// 容量伸缩（§11.1 VOLUME_META）：
+    /// - shrink 前置校验 new_size ≥ used+staging+pinned（pinned 计入，
+    ///   否则快照钉住的旧版本会被挤出盘）；不足返回 ResizeTooSmall。
+    /// - grow 直接生效。VOLUME_META strict 组提交并 apply 后立即轮换
+    ///   superblock（容量是 GC 回收 META 记录段时的持久化基线，不能只等
+    ///   下次 ckpt 轮换）。
+    pub fn resize_impl(&self, new_size: u64) -> Result<CommitReceipt, EngineError> {
+        let required = occupied_bytes(&self.index.read().unwrap().stats());
+        if new_size < required {
+            return Err(EngineError::ResizeTooSmall {
+                requested: new_size,
+                required,
+            });
+        }
+        let buf = VolumeMetaPayload::volume_size(new_size);
+        let receipt = self
+            .commit
+            .enqueue(CommitRequest::new(RecordType::VolumeMeta, &buf).strict())?;
+        let applied = self
+            .index
+            .write()
+            .unwrap()
+            .apply_volume_meta(receipt.lsn, &buf)?;
+        debug_assert_eq!(applied, new_size);
+        // superblock 立即同步容量与 Full 状态。
+        self.store_superblock(self.last_ckpt_seq.load(Ordering::SeqCst))?;
+        Ok(receipt)
+    }
 }
 
 /// checkpoint 后台调度（§7 条件 1/2）：轮询 distance 与 interval，满足
@@ -648,37 +705,141 @@ impl WalEngine {
 
         // ---- 段清单 + 重放（§10 步骤 4：前缀由 ckpt 承载）----
         let mut manifest = SegManifest::load(dir, config.seg_size)?;
-        let replay = replay_all(
+        let mut replay = replay_all(
             dir,
             &manifest,
             index,
-            config.tolerate_tail,
+            config.recovery_mode,
             ckpt_applied_lsn,
         )?;
-        let index = replay.index;
 
-        // 活跃段：重开既有段（哈希链从扫描摘要恢复）；无活跃段则开新段。
-        let writer = match manifest.active() {
-            Some(entry) => {
-                let (w, _summary) =
-                    SegWriter::reopen(&manifest.seg_path(entry.seg_id), config.seg_size)?;
-                w
+        // 中部断链且已装载的 ckpt 锚点超前于恢复点：ckpt 索引引用了将被
+        // 弃置的段，必须丢弃 ckpt 全量重放，并物理失效超前 ckpt 文件
+        // （否则下次启动会重新装载超前状态）。
+        let mut ckpt_seq_floor = 0u64;
+        if replay.stop.is_some() && ckpt_applied_lsn > 0 {
+            let forced = replay.stop;
+            log::warn!(
+                "wal: checkpoint {} anchored beyond mid-chain recovery point; \
+                 discarding and falling back to full replay",
+                loaded_ckpt_seq
+            );
+            // 首轮已物理截断损坏段：把停点传入全量重放，否则损坏证据消失，
+            // 全量扫描会越过恢复点继续重放后继段。
+            replay = replay_with(
+                dir,
+                &manifest,
+                WalIndex::new(),
+                config.recovery_mode,
+                0,
+                forced,
+            )?;
+            for seq in checkpoint::remove_future_ckpts(dir, replay.index.last_lsn()) {
+                log::warn!("wal: removed post-recovery checkpoint seq {seq}");
+                ckpt_seq_floor = ckpt_seq_floor.max(seq);
             }
-            None => {
-                let seg_id = manifest.next_seg_id();
-                let base_lsn = index.last_lsn() + 1;
-                let w = SegWriter::create(
-                    &dir.join(seg_file_name(seg_id)),
-                    seg_id,
-                    config.volume_id,
-                    base_lsn,
-                    config.seg_size,
-                    config.preallocate,
-                )?;
-                fsync_dir(dir)?;
-                // 新段登记进清单：后续换段依赖 next_seg_id() 接续。
-                manifest.register(seg_id, base_lsn, config.volume_id);
-                w
+            ckpt_applied_lsn = 0;
+            loaded_ckpt_seq = checkpoint::latest_seq(dir).unwrap_or(0);
+        }
+
+        // 尾撕裂告警（三档均截断恢复，仅告警级别不同；中部停点段除外，
+        // 由下方统一报告）。
+        let stop_seg = replay.stop.map(|s| s.seg_id);
+        for (&seg_id, &offset) in &replay.truncated {
+            if Some(seg_id) == stop_seg {
+                continue;
+            }
+            match config.recovery_mode {
+                RecoveryMode::TolerateTail => {
+                    log::info!("wal: torn tail truncated on seg {seg_id} at offset {offset}")
+                }
+                RecoveryMode::PointInTime => {
+                    log::warn!("wal: torn tail truncated on seg {seg_id} at offset {offset}")
+                }
+                RecoveryMode::Absolute => log::error!(
+                    "wal: torn tail truncated on seg {seg_id} at offset {offset} \
+                     (absolute mode: incomplete write tolerated, any mid-log \
+                     failure would reject mount)"
+                ),
+            }
+        }
+
+        // 中部断链：报告停点 → 弃置后继段（删文件 + fsync 目录 + 清单移除）
+        // → 停点段物理封段（reopen+seal 幂等）。
+        if let Some(sp) = replay.stop {
+            log::error!(
+                "wal: replay stopped at last complete record: seg {} offset {} \
+                 reason {:?}; {} subsequent segment(s) abandoned",
+                sp.seg_id,
+                sp.offset,
+                sp.reason,
+                replay.abandoned.len()
+            );
+            for &seg_id in &replay.abandoned {
+                let path = dir.join(seg_file_name(seg_id));
+                if let Err(e) = std::fs::remove_file(&path) {
+                    log::warn!("wal: failed to remove abandoned seg {seg_id}: {e}");
+                }
+                manifest.remove(seg_id);
+            }
+            fsync_dir(dir)?;
+            let (mut sealer, _) =
+                SegWriter::reopen(&manifest.seg_path(sp.seg_id), config.seg_size)?;
+            sealer.seal()?;
+            manifest.mark_sealed(sp.seg_id);
+        }
+
+        // 卷容量基线：VOLUME_META 记录 > checkpoint/superblock 装载值；
+        // 均未设置（0）时回退本次挂载 config.volume_size。
+        let mut index = replay.index;
+        if index.volume_size() == 0 {
+            let baseline = if sb.volume_size != 0 {
+                sb.volume_size
+            } else {
+                config.volume_size
+            };
+            index.set_volume_size(baseline);
+        }
+
+        // 活跃段：中部停点后按 §10 步骤 5 封旧开新；否则重开既有活跃段
+        // （哈希链从扫描摘要恢复）；无活跃段则开新段。
+        let writer = if replay.stop.is_some() {
+            let seg_id = manifest.next_seg_id();
+            let base_lsn = index.last_lsn() + 1;
+            let w = SegWriter::create(
+                &dir.join(seg_file_name(seg_id)),
+                seg_id,
+                config.volume_id,
+                base_lsn,
+                config.seg_size,
+                config.preallocate,
+            )?;
+            fsync_dir(dir)?;
+            manifest.register(seg_id, base_lsn, config.volume_id);
+            w
+        } else {
+            match manifest.active() {
+                Some(entry) => {
+                    let (w, _summary) =
+                        SegWriter::reopen(&manifest.seg_path(entry.seg_id), config.seg_size)?;
+                    w
+                }
+                None => {
+                    let seg_id = manifest.next_seg_id();
+                    let base_lsn = index.last_lsn() + 1;
+                    let w = SegWriter::create(
+                        &dir.join(seg_file_name(seg_id)),
+                        seg_id,
+                        config.volume_id,
+                        base_lsn,
+                        config.seg_size,
+                        config.preallocate,
+                    )?;
+                    fsync_dir(dir)?;
+                    // 新段登记进清单：后续换段依赖 next_seg_id() 接续。
+                    manifest.register(seg_id, base_lsn, config.volume_id);
+                    w
+                }
             }
         };
 
@@ -694,7 +855,7 @@ impl WalEngine {
             commit,
             index: RwLock::new(index),
             next_needle_id: AtomicU64::new(next_needle),
-            next_ckpt_seq: AtomicU64::new(loaded_ckpt_seq + 1),
+            next_ckpt_seq: AtomicU64::new(loaded_ckpt_seq.max(ckpt_seq_floor) + 1),
             sb_seq: AtomicU64::new(sb.seq),
             sb_created_ts: sb.created_ts,
             last_ckpt_lsn: AtomicU64::new(ckpt_applied_lsn),
@@ -732,6 +893,35 @@ impl WalEngine {
     /// 同一实现；失败返回错误由调用方处置。
     pub fn gc(&self) -> Result<GcOutcome, EngineError> {
         crate::wal::gc::run_gc_cycle(&self.core, &self.core.config.gc)
+    }
+
+    /// 容量伸缩（§11.1）：grow 直接生效；shrink 不满足
+    /// new_size ≥ used+staging+pinned 时返回 ResizeTooSmall。
+    /// VOLUME_META strict 落盘并同步 superblock 后返回。
+    pub fn resize(&self, new_size: u64) -> Result<CommitReceipt, EngineError> {
+        self.core.resize_impl(new_size)
+    }
+
+    /// 当前卷逻辑容量（字节；0 = 未限定）。
+    pub fn volume_size(&self) -> u64 {
+        self.core.index.read().unwrap().volume_size()
+    }
+
+    /// 逻辑可用字节：volume_size − (used+staging+pinned)；未限定容量
+    /// （0）返回 u64::MAX。
+    pub fn free_bytes(&self) -> u64 {
+        let idx = self.core.index.read().unwrap();
+        match idx.volume_size() {
+            0 => u64::MAX,
+            cap => cap.saturating_sub(occupied_bytes(&idx.stats())),
+        }
+    }
+
+    /// 卷是否处于 Full 状态（free ≤ 0；删除经 purge/GC 释放后恢复）。
+    pub fn is_full(&self) -> bool {
+        let idx = self.core.index.read().unwrap();
+        let cap = idx.volume_size();
+        cap > 0 && occupied_bytes(&idx.stats()) >= cap
     }
 
     /// 单个 needle 的索引条目（适配层 read_needle_meta 用）。
@@ -779,6 +969,23 @@ impl WalEngine {
                 need,
                 seg_size: self.core.config.seg_size,
             });
+        }
+        // 容量准入（§11 free ≤ 0 → Full）：cap=0 表示未限定。逻辑占用按
+        // used+staging+pinned（garbage 由 GC 回收，不占用逻辑额度）；
+        // 物理超卖由段分配器兜底。
+        {
+            let idx = self.core.index.read().unwrap();
+            let cap = idx.volume_size();
+            if cap > 0 {
+                let occupied = occupied_bytes(&idx.stats());
+                if occupied + data.len() as u64 > cap {
+                    return Err(EngineError::VolumeFull {
+                        volume_size: cap,
+                        occupied,
+                        need: data.len() as u64,
+                    });
+                }
+            }
         }
         let payload = DataPayload {
             needle_id,
@@ -922,8 +1129,15 @@ impl WalEngine {
     pub fn stats(&self) -> EngineStats {
         let index = self.core.index.read().unwrap();
         let cs = self.core.commit.stats();
+        let cap = index.volume_size();
+        let free = match cap {
+            0 => u64::MAX,
+            c => c.saturating_sub(occupied_bytes(&index.stats())),
+        };
         EngineStats {
             index: index.stats(),
+            volume_size: cap,
+            free_bytes: free,
             durable_lsn: self.core.commit.durable_lsn(),
             flushed_lsn: self.core.commit.flushed_lsn(),
             segments: self.core.sink.manifest.lock().unwrap().segments().len(),
@@ -1575,7 +1789,7 @@ mod tests {
     }
 
     /// ckpt 前缀跳过不弱化完整性：装载后继续校验 ckpt 覆盖段的帧 CRC/链
-    /// （损坏段即使全部落在 skip 区间也拒绝挂载）。
+    /// （损坏段即使全部落在 skip 区间，Absolute 档也拒绝挂载）。
     #[test]
     fn skipped_prefix_still_integrity_checked() {
         let dir = tempfile::tempdir().unwrap();
@@ -1604,10 +1818,310 @@ mod tests {
         file.write_all(&b).unwrap();
         drop(file);
 
-        // 段损坏 → 重放拒绝（不影响 ckpt 前缀本身的有效性）。
+        // Absolute：段损坏 → 重放拒绝（不影响 ckpt 前缀本身的有效性）。
+        let cfg = WalEngineConfig {
+            recovery_mode: RecoveryMode::Absolute,
+            ..manual_ckpt_cfg()
+        };
         assert!(matches!(
-            WalEngine::open(dir.path(), manual_ckpt_cfg()),
+            WalEngine::open(dir.path(), cfg),
             Err(EngineError::Replay(ReplayError::Corrupt { .. }))
         ));
+    }
+
+    /// 中段损坏恢复矩阵：512B 段 6 条 100B 写入跨 2 段；损坏 seg1 的第 3
+    /// 帧后，Absolute 拒载，TolerateTail/PointInTime 停在损坏前，seg2
+    /// 弃置删除，停点段封段开新段，续写与再次重开均正常。
+    #[test]
+    fn mid_chain_corruption_recovery_matrix() {
+        for mode in [RecoveryMode::TolerateTail, RecoveryMode::PointInTime] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = WalEngineConfig {
+                seg_size: 512,
+                preallocate: false,
+                recovery_mode: mode,
+                ckpt_interval: None,
+                ckpt_on_close: false,
+                gc: GcConfig {
+                    interval: None,
+                    ..GcConfig::default()
+                },
+                ..Default::default()
+            };
+            {
+                let eng = WalEngine::open(dir.path(), cfg.clone()).unwrap();
+                for i in 1..=6u64 {
+                    eng.write(i, &[0xa0 + i as u8; 100], CommitMode::Strict)
+                        .unwrap();
+                }
+            }
+            // 至少两个段，损坏点在非尾段。
+            let mf = SegManifest::load(dir.path(), cfg.seg_size).unwrap();
+            assert!(mf.segments().len() >= 2, "{}", mf.segments().len());
+            assert!(dir.path().join(seg_file_name(2)).exists());
+            corrupt_frame_payload(dir.path(), 1, 3);
+
+            // 同一盘面 Absolute 必须拒载（只读，不改动文件）。
+            let abs_cfg = WalEngineConfig {
+                recovery_mode: RecoveryMode::Absolute,
+                ..cfg.clone()
+            };
+            assert!(matches!(
+                WalEngine::open(dir.path(), abs_cfg),
+                Err(EngineError::Replay(ReplayError::Corrupt { .. }))
+            ));
+
+            // 容忍档：停点前缀可见，后继段记录全部消失。
+            let eng = WalEngine::open(dir.path(), cfg.clone()).unwrap();
+            assert_eq!(eng.read(1).unwrap(), vec![0xa1; 100]);
+            assert_eq!(eng.read(2).unwrap(), vec![0xa2; 100]);
+            for i in 3..=6u64 {
+                assert!(
+                    matches!(eng.read(i), Err(EngineError::NotFound(_))),
+                    "needle {i} must be abandoned in mode {mode:?}"
+                );
+            }
+            assert_eq!(eng.stats().index.active_count, 2);
+            // 旧 seg2（w4-6）已弃置；manifest 只余停点段 seg1（sealed）+
+            // 恢复后新挂的活跃段（复用 seg_id 2，base_lsn 接续 = 3）。
+            let mf_after = SegManifest::load(dir.path(), cfg.seg_size).unwrap();
+            let segs = mf_after.segments();
+            assert_eq!(segs.len(), 2);
+            assert_eq!(segs[0].seg_id, 1);
+            assert_eq!(segs[0].state, SegmentState::Sealed);
+            assert_eq!(segs[1].seg_id, 2);
+            assert_eq!(segs[1].state, SegmentState::Active);
+            assert_eq!(segs[1].base_lsn, 3);
+
+            // 续写落在新段，LSN 接续单调。
+            let nid = eng.alloc_needle_id();
+            eng.write(nid, b"post-recovery", CommitMode::Strict)
+                .unwrap();
+            assert_eq!(eng.read(nid).unwrap(), b"post-recovery");
+            let lsn_after = eng.flushed_lsn();
+            drop(eng);
+
+            // 再次重开：盘面干净、无停点、续写持久。
+            let eng2 = WalEngine::open(dir.path(), cfg).unwrap();
+            assert_eq!(eng2.read(1).unwrap(), vec![0xa1; 100]);
+            assert_eq!(eng2.read(2).unwrap(), vec![0xa2; 100]);
+            assert_eq!(eng2.read(nid).unwrap(), b"post-recovery");
+            assert_eq!(eng2.flushed_lsn(), lsn_after);
+        }
+    }
+
+    /// 中部损坏且已有 checkpoint 锚点超前于恢复点：装载的 ckpt 状态被
+    /// 丢弃（全量重放），超前 ckpt 文件物理失效，后续重启不会复活。
+    #[test]
+    fn mid_chain_corruption_invalidates_future_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = || WalEngineConfig {
+            seg_size: 512,
+            preallocate: false,
+            ckpt_interval: None,
+            ckpt_on_close: false,
+            gc: GcConfig {
+                interval: None,
+                ..GcConfig::default()
+            },
+            ..Default::default()
+        };
+        {
+            let eng = WalEngine::open(dir.path(), cfg()).unwrap();
+            for i in 1..=3u64 {
+                eng.write(i, &[i as u8; 100], CommitMode::Strict).unwrap();
+            }
+            let out = eng.checkpoint().unwrap();
+            assert_eq!(out.applied_lsn, 3);
+            for i in 4..=6u64 {
+                eng.write(i, &[i as u8; 100], CommitMode::Strict).unwrap();
+            }
+        }
+        assert!(!checkpoint::list_ckpts(dir.path()).is_empty());
+        corrupt_frame_payload(dir.path(), 1, 3);
+
+        let eng = WalEngine::open(dir.path(), cfg()).unwrap();
+        // 全量重放恢复点 = lsn 2：needle3（损坏帧）与后继段 4..6 全部丢弃。
+        assert_eq!(eng.read(1).unwrap(), vec![1u8; 100]);
+        assert_eq!(eng.read(2).unwrap(), vec![2u8; 100]);
+        for i in 3..=6u64 {
+            assert!(matches!(eng.read(i), Err(EngineError::NotFound(_))));
+        }
+        assert!(
+            checkpoint::list_ckpts(dir.path()).is_empty(),
+            "checkpoints anchored beyond recovery point must be removed"
+        );
+        assert_eq!(eng.stats().last_ckpt_seq, 0);
+        drop(eng);
+
+        // 再开：不会重新装载已失效的超前状态。
+        let eng2 = WalEngine::open(dir.path(), cfg()).unwrap();
+        assert!(matches!(eng2.read(3), Err(EngineError::NotFound(_))));
+        // 新 checkpoint 可正常落盘（已删除文件的序号复用是安全的：
+        // 写路径 tmp + 原子 rename，且删除已 fsync 目录）。
+        let seq = eng2.checkpoint().unwrap().ckpt_seq;
+        assert!(seq >= 1);
+        drop(eng2);
+
+        // 第三次重开：ckpt 装载 + 重放后状态仍是恢复点终态。
+        let eng3 = WalEngine::open(dir.path(), cfg()).unwrap();
+        assert!(matches!(eng3.read(3), Err(EngineError::NotFound(_))));
+        assert_eq!(eng3.read(1).unwrap(), vec![1u8; 100]);
+        assert_eq!(eng3.read(2).unwrap(), vec![2u8; 100]);
+        assert!(eng3.stats().last_ckpt_seq >= 1);
+    }
+
+    /// 翻转指定段内指定 lsn 帧的 payload 一个字节（造成帧 CRC 失败，
+    /// 哈希链前缀保持完整）。
+    fn corrupt_frame_payload(dir: &Path, seg_id: u64, lsn: u64) {
+        let path = dir.join(seg_file_name(seg_id));
+        let mut r = crate::wal::segment::SegReader::open(&path).unwrap();
+        let target = loop {
+            match r.next_frame().unwrap() {
+                Some(f) if f.meta.lsn == lsn => break f.meta.offset,
+                Some(_) => continue,
+                None => panic!("frame lsn {lsn} not found in seg {seg_id}"),
+            }
+        };
+        drop(r);
+        let at = target + FRAME_HEADER_SIZE as u64 + 16;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start(at)).unwrap();
+        let mut b = [0u8; 1];
+        file.read_exact(&mut b).unwrap();
+        file.seek(SeekFrom::Start(at)).unwrap();
+        b[0] ^= 0x01;
+        file.write_all(&b).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn resize_cfg(seg: u64) -> WalEngineConfig {
+        WalEngineConfig {
+            seg_size: seg,
+            preallocate: false,
+            ckpt_interval: None,
+            ckpt_on_close: false,
+            tombstone_retention_secs: 0,
+            gc: GcConfig {
+                interval: None,
+                ..GcConfig::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resize_enforces_capacity_full_state_and_gc_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let eng = WalEngine::open(dir.path(), resize_cfg(4096)).unwrap();
+
+        // 未限定容量：free 以 u64::MAX 表达，非 Full。
+        assert_eq!(eng.volume_size(), 0);
+        assert_eq!(eng.free_bytes(), u64::MAX);
+        assert!(!eng.is_full());
+
+        eng.resize(300).unwrap();
+        assert_eq!(eng.volume_size(), 300);
+        for i in 1..=3u64 {
+            eng.write(i, &[i as u8; 100], CommitMode::Strict).unwrap();
+        }
+        let st = eng.stats();
+        assert_eq!(st.volume_size, 300);
+        assert_eq!(st.free_bytes, 0);
+        assert_eq!(st.index.used_bytes, 300);
+        assert!(eng.is_full());
+        // superblock 轮换点（checkpoint；resize 本身也是轮换点）同步
+        // 容量与 Full 标记。
+        eng.checkpoint().unwrap();
+        let sb = superblock::load(dir.path()).unwrap();
+        assert_eq!(sb.volume_size, 300);
+        assert_eq!(sb.state, VOLUME_STATE_FULL);
+
+        // 超出容量：写拒绝。
+        assert!(matches!(
+            eng.write(4, &[4u8; 100], CommitMode::Strict),
+            Err(EngineError::VolumeFull {
+                volume_size: 300,
+                occupied: 300,
+                need: 100,
+            })
+        ));
+
+        // shrink 到占用以下：拒绝并带缺口信息；恰好等于占用允许。
+        assert!(matches!(
+            eng.resize(200),
+            Err(EngineError::ResizeTooSmall {
+                requested: 200,
+                required: 300,
+            })
+        ));
+        eng.resize(300).unwrap();
+
+        // 删除后字节转入 staging（保留期占额度）：仍 Full；
+        // purge/GC 把 staging 转成可回收 garbage 后逻辑空间释放。
+        eng.delete(1, CommitMode::Strict).unwrap();
+        assert!(eng.is_full());
+        assert!(matches!(
+            eng.write(4, &[4u8; 100], CommitMode::Strict),
+            Err(EngineError::VolumeFull { .. })
+        ));
+        let out = eng.gc().unwrap();
+        assert!(out.purged >= 1, "purged tombstones: {:?}", out);
+        assert!(!eng.is_full());
+        assert_eq!(eng.free_bytes(), 100);
+        eng.write(4, &[4u8; 100], CommitMode::Strict).unwrap();
+        assert!(eng.is_full());
+
+        // grow 立即解除 Full，并同步 superblock state。
+        eng.resize(1000).unwrap();
+        assert_eq!(eng.volume_size(), 1000);
+        assert_eq!(eng.free_bytes(), 700);
+        assert!(!eng.is_full());
+        let sb = superblock::load(dir.path()).unwrap();
+        assert_eq!(sb.volume_size, 1000);
+        assert_eq!(sb.state, 0);
+    }
+
+    #[test]
+    fn resize_persists_via_record_replay_and_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = || resize_cfg(4096);
+
+        // 路径 1：无 checkpoint，VOLUME_META 记录经全量重放恢复。
+        {
+            let eng = WalEngine::open(dir.path(), cfg()).unwrap();
+            eng.resize(4321).unwrap();
+            eng.write(1, &[1u8; 100], CommitMode::Strict).unwrap();
+        }
+        let eng = WalEngine::open(dir.path(), cfg()).unwrap();
+        assert_eq!(eng.volume_size(), 4321);
+        assert_eq!(eng.free_bytes(), 4221);
+
+        // 路径 2：checkpoint alloc_stats 携带 volume_size。
+        eng.resize(8888).unwrap();
+        eng.checkpoint().unwrap();
+        drop(eng);
+        let eng = WalEngine::open(dir.path(), cfg()).unwrap();
+        assert_eq!(eng.volume_size(), 8888);
+        assert_eq!(eng.stats().last_ckpt_seq, 1);
+
+        // 路径 3：从未 resize 时以 superblock/config 容量为基线。
+        let dir2 = tempfile::tempdir().unwrap();
+        let base = WalEngineConfig {
+            volume_size: 111,
+            ..resize_cfg(4096)
+        };
+        {
+            let eng = WalEngine::open(dir2.path(), base.clone()).unwrap();
+            assert_eq!(eng.volume_size(), 111);
+            eng.write(1, &[1u8; 10], CommitMode::Strict).unwrap();
+        }
+        let eng = WalEngine::open(dir2.path(), base).unwrap();
+        assert_eq!(eng.volume_size(), 111);
+        assert_eq!(eng.free_bytes(), 101);
     }
 }

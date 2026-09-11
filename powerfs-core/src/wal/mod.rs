@@ -5,7 +5,7 @@
 //! - 段文件读写（段头、SegWriter、SegReader，方案 §4.1）：[`segment`]。
 //! - 段清单（目录内段文件的内存索引）：[`manifest`]。
 //! - 内存索引（needle/tombstone/统计）：[`index`]。
-//! - 重放器（段序重放 + tolerate_tail）：[`replay`]。
+//! - 重放器（段序重放 + 三档恢复模式，方案 §10）：[`replay`]。
 //! - 组提交与 fsync 屏障（方案 §5）：[`commit`]。
 //! - 引擎装配与恢复（方案 §5 / §6）：[`engine`]。
 //! - checkpoint 文件编解码（方案 §4.4）：[`checkpoint`]。
