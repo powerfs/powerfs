@@ -8,7 +8,7 @@ log_level = "info"
 redis_url = "redis://172.30.0.50:6379"
 
 [master]
-# master 注册用 TCP (内核客户端 register_client 走 TCP); volume/filer 用 RDMA
+# master 注册走 TCP 9334 (内核客户端 register_client 固定 TCP); volume/filer 数据面用 RDMA
 transport = "tcp"
 port = 9333
 raft_port = 9335
@@ -16,9 +16,9 @@ metrics_port = 9300
 net_port = 9334
 dir = "/data/master"
 ip = "0.0.0.0"
-advertise_addr = "192.168.100.3:9333"
+advertise_addr = "192.168.100.4:9333"
 raft_id = 1
-raft_peers = ["192.168.100.3:9335"]
+raft_peers = ["192.168.100.4:9335"]
 admin_token = "powerfs-admin-test"
 # ca_dir 启用: master 作为集群 CA, 首次启动自动生成自签名 CA 到此目录.
 # 容器内路径 /data/master/ca 在 docker-compose 中挂载自 ./docker/certs-default

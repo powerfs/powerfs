@@ -1,5 +1,5 @@
 # PowerFS Volume 节点配置 - 硬件 RDMA host-network 单节点测试
-# 使用 192.168.100.3 (IPoIB ibp160s0f1) 作为 RDMA 服务地址
+# 使用 192.168.100.4 (IPoIB ibp160s0f1) 作为 RDMA 服务地址
 
 [global]
 log_level = "info"
@@ -7,16 +7,17 @@ redis_url = "redis://172.30.0.50:6379"
 
 [volume]
 transport = "rdma"
+volume_engine = "wal"   # 新建卷使用 WAL 统一日志引擎 (needle=v1)
 grpc_port = 8080
 http_port = 8091
 net_port = 8901
 data_dir = "/data"
-master_addresses = ["192.168.100.3:9333"]
+master_addresses = ["192.168.100.4:9333"]
 master_net_port = 9334
 node_id = "volume-server-1"
 max_volume_size = 107374182400
 initial_volume_count = 4
-advertise_addr = "192.168.100.3"
+advertise_addr = "192.168.100.4"
 lease_enabled = false
 force_sync_on_write = false      # 持久化策略: false=内存ack(NVMe-oF盘阵保证持久化); true=每次写强制fsync
 wal_idle_sync_secs = 30   # 后台空闲 WAL fsync 间隔(秒): 0=禁用, >0 空闲时检查并 fsync 有新写入的 WAL
