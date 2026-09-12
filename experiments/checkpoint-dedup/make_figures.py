@@ -160,8 +160,9 @@ def f3(pairs, pos):
     fig, (a, b) = plt.subplots(1, 2, figsize=(7.0, 2.7),
                                gridspec_kw={"width_ratios": [1.05, 1]})
     # left: checkpoint hit ratio vs step gap (4K file view)
-    for fmt, c, lab in [("torchsave", C_SIM, "torch.save"),
-                        ("weights", "#e67e22", "weights")]:
+    # distinct markers per series: both lines read as one in grayscale otherwise
+    for fmt, c, lab, style in [("torchsave", C_SIM, "torch.save", "o-"),
+                               ("weights", "#e67e22", "weights", "^-")]:
         by_gap = {}
         for r in pairs:
             if (r["format"] == fmt and r["view"] == "file"
@@ -170,7 +171,8 @@ def f3(pairs, pos):
                 by_gap.setdefault(g, []).append(float(r["inter_over_b"]))
         gaps = sorted(by_gap)
         ys = [sum(by_gap[g]) / len(by_gap[g]) for g in gaps]
-        a.plot(gaps, [max(v, FLOOR) for v in ys], "o-", ms=3, color=c, label=lab)
+        a.plot(gaps, [max(v, FLOOR) for v in ys], style, ms=4, color=c,
+               label=lab)
         if ys and ys[-1] == 0:
             a.text(gaps[-1] + 0.25, FLOOR * 1.3, "0", ha="left",
                    fontsize=7, color=c)
