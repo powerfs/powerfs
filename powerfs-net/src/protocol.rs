@@ -1445,6 +1445,10 @@ pub enum FieldId {
     /// inspects the first-write content (magic number / printable ratio) and
     /// requests Stripe for binary data, Flat for text. Absent → Flat (legacy).
     DesiredMode = 0xD6,
+    /// Volume server 管理面 gRPC 端口 (u64, 如 8080)。心跳携带,
+    /// 供 Master 代理 WAL admin RPC (stats/checkpoint/gc/resize) 使用。
+    /// 区别于 NetPort(0x9D, 数据面 powerfs-net 端口 890x)。
+    AdminGrpcPort = 0xD7,
 }
 
 impl FieldId {
@@ -1576,6 +1580,7 @@ impl FieldId {
             0xD4 => Some(Self::ClientCert),
             0xD5 => Some(Self::ClientCertSignature),
             0xD6 => Some(Self::DesiredMode),
+            0xD7 => Some(Self::AdminGrpcPort),
             _ => None,
         }
     }

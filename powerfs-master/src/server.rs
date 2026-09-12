@@ -70,7 +70,15 @@ impl MasterGrpcServer {
                 info.node_id.0, volume_id
             ))
         })?;
-        Ok(format!("{}:{}", node.address, node.grpc_port))
+        // grpc_port 在 RDMA/数据面部署中被复用为 powerfs-net 数据端口
+        // (890x); admin gRPC(8080) 优先取心跳上报的 admin_grpc_port,
+        // 0(旧节点) 时回退 grpc_port。
+        let admin_port = if node.admin_grpc_port > 0 {
+            node.admin_grpc_port
+        } else {
+            node.grpc_port
+        };
+        Ok(format!("{}:{}", node.address, admin_port))
     }
 }
 

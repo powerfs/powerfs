@@ -711,6 +711,7 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         node_id: node_id.clone(),
         http_port: http_port as u32,
         net_port: net_port as u32,
+        admin_grpc_port: grpc_port as u32,
         ip: &ip,
         registration_token: volume_cfg.registration_token.as_deref(),
         client_cert_pem: &client_cert_pem,

@@ -22,6 +22,8 @@ pub struct MasterClient {
     node_id: NodeId,
     http_port: u32,
     net_port: u32,
+    /// 管理面 gRPC 端口 (8080), 供 Master 代理 admin RPC。
+    admin_grpc_port: u32,
     ip: String,
     /// Registration token for node authentication. Sent in every Heartbeat
     /// TLV body (FieldId::RegistrationToken) so the master can verify the
@@ -43,6 +45,8 @@ pub struct NewMasterClientParams<'a> {
     pub node_id: NodeId,
     pub http_port: u32,
     pub net_port: u32,
+    /// 管理面 gRPC 端口 (8080); Master 用它代理 WAL admin RPC。
+    pub admin_grpc_port: u32,
     pub ip: &'a str,
     /// Registration token for master authentication. None = dev mode.
     pub registration_token: Option<&'a str>,
@@ -86,6 +90,7 @@ impl MasterClient {
             node_id: params.node_id,
             http_port: params.http_port,
             net_port: params.net_port,
+            admin_grpc_port: params.admin_grpc_port,
             ip: params.ip.to_string(),
             registration_token: params.registration_token.map(|s| s.to_string()),
             client_cert_pem: params.client_cert_pem.to_string(),
@@ -123,6 +128,7 @@ impl MasterClient {
         let _ = enc.add_string(FieldId::Owner, &self.ip);
         let _ = enc.add_u64(FieldId::Blksize, self.http_port as u64);
         let _ = enc.add_u64(FieldId::NetPort, self.net_port as u64);
+        let _ = enc.add_u64(FieldId::AdminGrpcPort, self.admin_grpc_port as u64);
         let _ = enc.add_u64(FieldId::Entries, volumes.len() as u64);
 
         // P5: Node load metrics — scaled to basis points (0-10000 = 0.00%-100.00%).
