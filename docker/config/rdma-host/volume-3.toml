@@ -1,5 +1,5 @@
 # PowerFS Volume 节点配置 - 硬件 RDMA host-network (volume-3)
-# 与 volume-1/2 共享 host IP 192.168.100.3, 端口必须独立
+# 与 volume-1/2 共享 host IP 192.168.100.4, 端口必须独立
 
 [global]
 log_level = "info"
@@ -7,16 +7,17 @@ redis_url = "redis://172.30.0.50:6379"
 
 [volume]
 transport = "rdma"
+volume_engine = "wal"   # 新建卷使用 WAL 统一日志引擎 (needle=v1)
 grpc_port = 8082
 http_port = 8093
 net_port = 8903
 data_dir = "/data"
-master_addresses = ["192.168.100.3:9333"]
+master_addresses = ["192.168.100.4:9333"]
 master_net_port = 9334
 node_id = "volume-server-3"
 max_volume_size = 107374182400
 initial_volume_count = 4
-advertise_addr = "192.168.100.3"
+advertise_addr = "192.168.100.4"
 lease_enabled = false
 registration_token = "powerfs-cluster-test"
 ca_crt = "/etc/powerfs/certs/ca.crt"
