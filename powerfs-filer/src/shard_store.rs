@@ -1867,14 +1867,19 @@ impl ShardStore {
         self.inodes.read().unwrap().get(&inode).cloned()
     }
 
-    /// 遍历所有 inode, 收集 chunk 映射 (needle_id, volume_id).
+    /// 遍历所有 inode, 收集 chunk 映射 (volume_id, needle_id).
     /// 用于 Filer 重启时恢复 Zone counter (P2.5).
     pub fn list_all_chunks(&self) -> Vec<(u64, u64)> {
         let inodes = self.inodes.read().unwrap();
         let mut result = Vec::new();
         for info in inodes.values() {
             for chunk in &info.chunks {
-                result.push((chunk.needle_id, chunk.volume_id));
+                // 顺序必须是 (volume_id, needle_id): zone_client::recover_counter
+                // 按 (_, needle_id) 解构第二个元素提取 counter. 旧实现顺序
+                // 相反导致恢复时把 volume_id 当 needle_id, zone 过滤永不命中,
+                // filer 每次重启 zone counter 都复位到 FILE_KEY_STRIDE,
+                // 重复发号 → 新写入跨文件覆盖旧 needle.
+                result.push((chunk.volume_id, chunk.needle_id));
             }
         }
         result
@@ -3344,6 +3349,11 @@ impl ShardStore {
         info.reliability_state = reliability_state;
         info.chunks = ec_chunks;
         info.replica_chunks = Vec::new(); // EC 不使用 replica_chunks
+        // EC 转换后必须切换 storage_mode: Stripe/Flat 的 GETATTR 编码只发
+        // sparse anchor / 平铺 chunk, 而 EC 读路径 (内核 powerfs_net_data)
+        // 需要按 [group][shard] 排列的全量 shard 列表; StorageMode::Ec
+        // 分支才会编码全量 chunks + Placement::Flat + Reliability::EC.
+        info.storage_mode = powerfs_layout::StorageMode::Ec;
         info.mtime = Self::current_time();
         if let Ok(data) = serde_json::to_vec(&info) {
             let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);

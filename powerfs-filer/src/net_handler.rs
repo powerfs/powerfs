@@ -251,17 +251,27 @@ fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
 
     // Stripe 参数推断 (dense chunks: 每个 chunk 1MB, offset 连续):
     //
-    // stripe_size = 首个 volume 切换点的 offset. 同一 stripe unit 内的所有
-    // chunk 落在同一 volume, 连续排布; 当 chunk 的 volume_id 与前一个不同时,
-    // 说明进入下一个 stripe unit, 该 chunk 的 offset 就是 stripe_size.
-    //   例: chunks[0..63] 全在 vol0 (offset 0..64MB), chunks[64] 在 vol1
-    //       (offset 64MB) → stripe_size = 64MB.
-    // 旧逻辑用 chunks[1].offset - chunks[0].offset = 1MB (chunk 间距),
-    // 把 stripe_size 误判成 1MB.
-    let stripe_size = chunks
-        .windows(2)
-        .find(|w| w[0].volume_id != w[1].volume_id)
-        .map(|w| w[1].offset)
+    // stripe_size 推断 (抗锚点交错):
+    //
+    // chunks 里除真实数据 chunk 外还可能含每卷 base needle 的 sparse anchor
+    // (offset = round*stripe_size, 持久化重载后顺序可能与写入时不同, 例如
+    // [vol0@0, vol1@1M, vol2@2M, vol3@3M, vol4@0, vol5@0, vol0@4M, ...])。
+    // 直接取 "首个卷切换点 offset" 会命中 anchor 得到 stripe_size=0, 内核
+    // RAID0 寻址整体错位。稳妥做法: 按 (offset, vid) 去重排序后, 取 offset=0
+    // 上出现的任一卷再次出现的最小正偏移 —— 即一个完整条带周期的长度。
+    let mut sorted: Vec<&ChunkRef> = chunks.iter().collect();
+    sorted.sort_by_key(|c| (c.offset, c.volume_id));
+    sorted.dedup_by_key(|c| (c.offset, c.volume_id));
+
+    let zero_vids: std::collections::HashSet<u64> = sorted
+        .iter()
+        .take_while(|c| c.offset == 0)
+        .map(|c| c.volume_id)
+        .collect();
+    let stripe_size = sorted
+        .iter()
+        .find(|c| c.offset > 0 && zero_vids.contains(&c.volume_id))
+        .map(|c| c.offset)
         .unwrap_or(1024 * 1024);
 
     // volume_ids = 去重后的卷序列 (按首次出现顺序). 这是 stripe unit → volume
@@ -1454,6 +1464,31 @@ impl FilerNetHandler {
                     })
                     .collect();
 
+                // Heal: 已被 scrubber 转成 EC 的旧 Stripe/WideStripe inode
+                // (早期 update_to_ec 未同步切换 storage_mode 的持久化状态).
+                // EC 读路径需要按 [group][shard] 排列的全量 shard 列表, 不能
+                // 走 sparse anchor 编码 — 否则内核只拿到 group0 的 6 个
+                // anchor, 越过第一个 group (offset>=4MiB) 即 -EINVAL.
+                let is_ec_converted =
+                    matches!(info.reliability, Reliability::EC { .. });
+                if is_ec_converted {
+                    let layout = FileLayout {
+                        placement: Placement::Flat,
+                        reliability: info.reliability.clone(),
+                        reliability_state: info.reliability_state.clone(),
+                        compression: info.compression_state.clone(),
+                        encoding: ChunkEncoding::PerChunk {
+                            chunks: chunks.clone(),
+                        },
+                    };
+                    encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
+                        .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+
+                    if let Some(first) = chunks.first() {
+                        enc.add_u64(FieldId::VolumeId, first.volume_id);
+                        enc.add_u64(FieldId::FileKey, first.needle_id);
+                    }
+                } else {
                 let placement = detect_placement_from_chunks(&chunks);
 
                 // 只发 sparse anchors (每个卷的 base needle), 而非全部 dense
@@ -1491,6 +1526,7 @@ impl FilerNetHandler {
                 if let Some(first) = chunks.first() {
                     enc.add_u64(FieldId::VolumeId, first.volume_id);
                     enc.add_u64(FieldId::FileKey, first.needle_id);
+                }
                 }
             }
             powerfs_layout::StorageMode::Ec => {
