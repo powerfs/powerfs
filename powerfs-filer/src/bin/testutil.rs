@@ -67,11 +67,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    // 构造 TLV Volume 客户端 (与 Filer scrubber 共用同一协议)
-    let pool = Arc::new(ClientConnPool::new(
+    // 构造 TLV Volume 客户端 (与 Filer scrubber 共用同一协议).
+    // POWERFS_TEST_TRANSPORT=rdma 时走 RDMA 数据面 (生产/硬件 RDMA 环境下
+    // Volume 的 890x 端口不监听 TCP, 默认 TCP 会连接被拒).
+    let transport: Option<Arc<dyn powerfs_net::Transport>> =
+        if std::env::var("POWERFS_TEST_TRANSPORT").as_deref() == Ok("rdma") {
+            let cfg = powerfs_net::TransportConfig {
+                transport: "rdma".to_string(),
+                ..Default::default()
+            };
+            Some(powerfs_net::create_transport(&cfg)?)
+        } else {
+            None
+        };
+    let pool = Arc::new(ClientConnPool::new_with_transport(
         0, // client_id (测试工具无需正式注册)
         ClientPoolConfig::default(),
         None,
+        transport,
     ));
     let client = TlvVolumeClient::new(pool);
 
