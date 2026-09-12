@@ -48,7 +48,7 @@ A Boundary Study of Semantic Redundancy in AI Training Checkpoints}
 
 \begin{abstract}
 Semantic checkpoint-deduplication systems report 6--896$\times$ storage
-savings by reasoning about \emph{tensors}---identifying replicated,
+savings by reasoning about \emph{tensors}: identifying replicated,
 architecturally shared, or slowly changing parameters across ranks, jobs,
 and training steps. All of them require framework cooperation: offline
 tensor analysis, specialised grouped-I/O APIs, or accelerator-offloaded
@@ -63,7 +63,8 @@ archives. The boundary is sharp: the byte layer sees the \textbf{copy
 axis} (DDP rank replicas, shared LoRA base files) at 100\% hit ratio, but
 sees essentially \textbf{nothing} on the \textbf{similarity
 axis}---cross-step temporal redundancy ($\le$0.29\% of 1\,MB chunks, all
-zero blocks), same-architecture different-seed jobs ($\sim$0\%), and
+zero blocks), same-architecture jobs ($\sim$0\%; even from a shared
+byte-identical pretrained init, divergence takes one step), and
 disjoint parameter shards (0\%)---even though a general compressor fares
 no better (zstd 1.08$\times$; XOR-delta $\le$1.28$\times$). The same code
 path scores 59--98\% on image layers and source trees. We argue the right
@@ -84,45 +85,40 @@ performance, never correctness.
 \section{Introduction}
 \label{sec:intro}
 
-Checkpoints already dominate AI-cluster storage traffic, and the problem
-grows with model size and checkpoint frequency. Two FAST'26 systems attack
+Checkpoints already dominate AI-cluster storage traffic. Two FAST'26
+systems attack
 the waste semantically: AdaCheck~\cite{adacheck} classifies checkpoint
-tensors as replicated, architecturally shared, or temporally similar, and
-reports 6--896$\times$ savings; AITURBO~\cite{aiturbo} batches tensor I/O
+tensors as replicated, architecturally shared, or temporally similar,
+and reports 6--896$\times$ savings; AITURBO~\cite{aiturbo} batches tensor I/O
 into grouped operations and computes BLAKE3~\cite{blake3} fingerprints
-with optimised XPU kernels because CPU hashing cannot keep up with the
-storage fabric. The common denominator is cooperation: the application
+on XPU kernels because CPU hashing cannot keep up with the
+storage fabric. Both require cooperation: the application
 must expose tensor identity or use a specialised API. The closest
 byte-level predecessor, Kaiser et al.~\cite{kaiser2016}, characterised
-block-deduplication potential in \emph{HPC} application checkpoints in
-2016 and found application-dependent but real recurring savings---raising
-the question whether modern AI-training checkpoints behave the same; our
-answer is that they do not.
+block-deduplication potential in \emph{HPC} checkpoints and found
+application-dependent but real recurring savings. Ours
+do not behave the same.
 
-Meanwhile, transparent block deduplication is a textbook
+Transparent block deduplication is a textbook
 POSIX-filesystem feature~\cite{idedup,venti}: fingerprint content blocks,
 suppress redundant writes, and leave the application untouched. If
 semantic checkpoint redundancy were visible at the byte layer,
 \emph{unmodified} PyTorch jobs would benefit simply by mounting the
 filesystem---no framework changes, no XPU. We asked exactly one question:
-
-\begin{quote}
-\textbf{Of the redundancy that tensor-level systems exploit, how much
+\emph{of the redundancy that tensor-level systems exploit, how much
 reaches an unmodified POSIX byte layer?}
-\end{quote}
 
 We answer with a controlled measurement on a self-contained, reproducible
 GPT-2 small (124\,M parameter) training fixture---real forward/backward
 and AdamW updates, not synthesised tensors---plus axis-specific fixtures
-and two workload families where byte deduplication is \emph{expected} to
-win.
+and control workloads where byte deduplication is \emph{expected} to win.
 
 \smallskip
 \noindent\textbf{Findings.}
 Cross-step identical 1\,MB blocks are 0.14--0.28\% for full checkpoints
 and \textbf{0\%} for weights-only files; every hit is a zero block.
-Alignment sweeps, bf16 precision, and long save gaps do not help; neither
-zstd nor XOR-delta exploits the data. Yet identical DDP rank replicas and
+Alignment sweeps, precision, save gaps, zstd, and XOR-delta do not help.
+Yet identical DDP rank replicas and
 shared LoRA bases match at 100\%, and image layers/source archives score
 59--98\% under the same code. Redundancy splits by \textbf{axis}, not by
 workload.
@@ -203,12 +199,12 @@ layers; tied input/output embeddings; pre-LayerNorm; HF-compatible tensor
 naming) and train it with AdamW (lr $10^{-3}$; betas $(0.9, 0.999)$;
 eps $10^{-8}$; weight decay 0.01) on random token streams (batch 1,
 sequence 128) for 20 steps, saving every step in three layouts: full
-\texttt{torch.save} (model+optimizer+step+loss; 1,493\,MB), weights-only
-(498\,MB), and DCP (1,494\,MB)---about 65\,GB total. A 100-step run
-provides long-gap and precision controls (torch 2.4.1+cpu, Python 3.8,
-seed 20260910; every script is checked in and re-runnable). We use a
-small CPU model because the mechanism under test (element-wise optimizer
-updates) is independent of parameter count.
+\texttt{torch.save} (1,493\,MB), weights-only (498\,MB), and DCP
+(1,494\,MB)---about 65\,GB total. A 100-step run provides long-gap and
+precision controls (torch 2.4.1+cpu, seed 20260910; every script is
+checked in and re-runnable). We use a small CPU model because the
+mechanism under test (element-wise optimizer updates) is independent of
+parameter count.
 
 \textbf{Analyzer.} For every checkpoint we fingerprint fixed blocks of
 \{4\,KB, 64\,KB, 1\,MB, 4\,MB\} using BLAKE2b-128, in a raw \emph{file}
@@ -217,15 +213,17 @@ chunked independently. We measure hit ratio against the previous version
 (\emph{hit-prev}) and the union of all earlier versions (\emph{hit-any}),
 all-pairs Jaccard, and offset-shift sweeps that re-chunk the reference
 after skipping \{1, 16, 256, 4096\} bytes---our detector for ``identical
-content, drifted offset'', the condition CDC would rescue. A synthetic
-fixture of known random/zero/pattern segments validates exact instance
-counts.
+content, drifted offset'', the condition CDC would rescue; a synthetic
+fixture validates exact instance counts.
 
 \textbf{Axis fixtures (A and B).} From two independent 3-step runs we
 materialise four byte-identical full-checkpoint \emph{rank replicas} per
 format (md5-verified), four disjoint 1/4 parameter \emph{shards},
 same-architecture cross-job pairs, and two LoRA-style jobs sharing one
-identical 498\,MB base file with distinct 0.6\,MB adapters.
+identical 498\,MB base file with distinct 0.6\,MB adapters. A third run
+reuses job A's byte-identical init (determinism-asserted) with a
+different data stream for 6 weights-only steps, modelling a fine-tuning
+fleet that shares one pretrained base.
 
 \textbf{Positive controls.} Three images built sequentially on
 ubuntu:20.04, exported as flat rootfs tarballs and \texttt{docker save}
@@ -237,12 +235,11 @@ incremental chain. For archives we measure both a \emph{per-file} view
 tar-stream view.
 
 \textbf{Scope.} This is a controlled microbenchmark, not field-trace
-analysis; absolute ratios at hyperscale and non-AdamW optimisers are out
-of scope (\S\ref{sec:limitations}).
+analysis (\S\ref{sec:limitations}).
 
 \begin{figure*}[t]
 \centering
-\includegraphics[width=0.66\textwidth]{f1_teaser.pdf}
+\includegraphics[width=0.48\textwidth]{f1_teaser.pdf}
 \caption{Cross-step hit-any ratio per checkpoint format and chunk size
 (log scale). The byte layer finds only zero blocks on training
 checkpoints (red), versus 59--98\% hits for container image layers and
@@ -256,10 +253,11 @@ source archives.}
 \subsection{Temporal redundancy is invisible at the byte layer}
 
 \begin{table}[t]
-\caption{Steady-state (steps 5--19) cross-step hit-any ratios. Every hit
-is a zero block.}
+\caption{Steady-state hit-any ratios over steps 5--19. Every hit is a
+zero block.}
 \label{tab:f1}
-\small
+\footnotesize
+\setlength{\tabcolsep}{5pt}
 \begin{tabular}{lrrrr}
 \toprule
 \textbf{Layout / view} & \textbf{4\,KB} & \textbf{64\,KB} &
@@ -284,21 +282,14 @@ detection granularity is 4\,MB~\cite{aiturbo}; at exactly that setting
 every format yields zero cross-step hits---XPU hashing would be spent on
 a stream containing nothing to find.
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=0.82\columnwidth]{f2_chunksizes.pdf}
-\caption{Hit-any ratio vs.\ chunk size: no size recovers cross-step
-redundancy.}
-\label{fig:chunksizes}
-\end{figure}
-
 \noindent\textbf{Not an alignment problem.}
 Two complementary tests. \emph{Within} checkpoints, shifting the previous
 checkpoint's chunk grid by 1, 16, or 256 bytes leaves the hit ratio
 unchanged (e.g.\ 0.001404 at 1\,MB for every shift; a 4096 shift removes
 the prefix chunk and nothing else). Identical-but-drifting content, the
-failure mode content-defined chunking fixes, is absent: there is no hidden
-redundancy for CDC to uncover (Figure~\ref{fig:chunksizes}).
+failure mode content-defined chunking fixes, is absent: the hit-any
+ratio is flat across all four chunk sizes (Table~\ref{tab:f1}), leaving
+no hidden redundancy for CDC to uncover.
 
 \emph{Across} workload families, alignment matters sharply. Chunking
 archive byte streams naively (raw tar view) collapses even our positive
@@ -309,14 +300,6 @@ raw-stream pair is zero, as tar reordering and headers destroy grid
 alignment. Checkpoint zipdata entries, in contrast, \emph{are} chunked
 from independent aligned boundaries---and still score zero. Alignment is
 necessary (wrong boundaries read zero) but not sufficient.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=0.88\columnwidth]{f4_delta.pdf}
-\caption{Adjacent-step byte equality is only 19.8--30.3\%; zstd and
-XOR-delta zstd find almost no redundancy either.}
-\label{fig:delta}
-\end{figure}
 
 \noindent\textbf{Not precision, age, or compressibility.}
 \emph{Precision control.} bf16 weights across 100 steps yield 6--11
@@ -331,11 +314,11 @@ scores 0.0025\% hits at 4\,KB and zero above---the result is a property
 of the bytes, not the zip container.
 
 \emph{Compression control.} Perhaps redundancy exists in a form blocks
-cannot express (Figure~\ref{fig:delta}). zstd-1 on one checkpoint
-compresses 1.08$\times$; an XOR-delta stream between adjacent steps
-compresses only 1.15--1.28$\times$; byte-wise equality between adjacent
-steps is just 19.8--30.3\%. fp32 training state in motion carries almost
-no extractable redundancy by any measure.
+cannot express. zstd-1 on one checkpoint compresses 1.08$\times$; an
+XOR-delta stream between adjacent steps compresses only
+1.15--1.28$\times$ under zstd; byte-wise equality between adjacent steps
+is just 19.8--30.3\%. fp32 training state in motion carries almost no
+extractable redundancy by any measure.
 
 \noindent\textbf{Mechanism: every byte is touched every step.}
 The zero result has a precise mechanism. (1)~AdamW applies decoupled
@@ -347,10 +330,31 @@ bytes. (2)~Adam momentum slots decay and accumulate per element.
 gradient through the whole embedding matrix, and the embedding backward
 materialises \textbf{zero (not \texttt{None}) gradients} for unsampled
 rows, so weight decay touches those rows too---we verified that rows
-unused by the current batch still change bytes every step. At fp32,
-essentially every parameter byte changes each step, while tensor
-\emph{keys} (names, shapes, identity) stay constant: the whole axis
-boundary in one sentence.
+unused by the current batch still change bytes every step; and
+(4)~\emph{the churn survives learning-rate decay}: an element's
+per-step relative change is $\mathit{lr}\cdot\mathit{wd}$ (weight decay)
+or $\mathit{lr}\cdot|\hat m|/\sqrt{\hat v}\,/\,|p|$ (Adam step), whose
+ratio $|\hat m|/\sqrt{\hat v}$ is scale-free; for $|p|\!\sim\!10^{-2}$
+the Adam term is $10$--$50\times\mathit{lr}$, and fp32's unit roundoff
+$6\times10^{-8}$ keeps bytes flipping while $\mathit{lr}>10^{-9}$---far
+below any decay tail. Weight decay
+alone would freeze at $\mathit{lr}<6\times10^{-6}$; the gradient step is
+the load-bearing term, so freezing requires gradients to vanish or
+become \texttt{None}. At fp32 essentially every
+parameter byte changes each step, while tensor
+\emph{keys} (names, shapes, identity) stay constant: the axis boundary
+in one sentence.
+
+\noindent\textbf{Gradient density sets the boundary.}
+The mechanism assumes every parameter receives a gradient each
+step---true for dense-update training like our fixture, and the reason
+its bytes churn. PyTorch-style optimisers apply \emph{no} update to a
+parameter whose gradient is \texttt{None}, skipping even decoupled
+weight decay, so such bytes stay exactly stable. Sparsely-updated
+regimes---routed-out MoE experts, frozen stages, sparse schedules---sit
+closer to the copy axis and are byte-deduplicable, exactly the labelled
+positives a skip gate must not lose. Gradient-density proxies are
+observable from the I/O stream alone, making them natural gate features.
 
 \noindent\textbf{Redundancy-axis map: copies visible, similarities invisible.}
 \label{sec:axismap}
@@ -367,6 +371,7 @@ boundary in one sentence.
 A copies & DDP rank replicas (\texttt{torch.save}/safetensors) & 1.000 & 1.000 & 1.000 \\
 A divides & Disjoint FSDP/TP shards vs earlier shards & 0 & 0 & 0 \\
 B cross-job & full ckpt / weights safetensors, diff.\ seed & 0.000 & 0.000 & 0.0007 \\
+B co-init & shared init, 1 step apart (weights) & 0.006 & 0.005 & 0.004 \\
 B LoRA & shared base file, job2 vs job1 & 1.000 & 1.000 & 1.000 \\
 B LoRA & distinct adapter files & 0 & 0 & --- \\
 B LoRA & whole-job directories & 0.9988 & 0.9988 & 1.000 \\
@@ -376,7 +381,9 @@ C temporal & consecutive steps (Table~\ref{tab:f1}) & 0.0037$^*$ & 0.0036$^*$ & 
 
 \vspace{2pt}
 \footnotesize $^*$hits are zero blocks. The single 1\,MB inter-job hit
-(1 of 1,423 blocks) is zero content, not structure.
+(1 of 1,423 blocks) is zero content, not structure. The co-init
+residual is the zero-gradient positional-embedding region, where both
+jobs trace byte-identical weight-decay-only trajectories.
 \end{table}
 
 Whole-object copies---rank replicas and shared base files---collapse to
@@ -387,15 +394,11 @@ recognition of ``the same parameter in another version''---consecutive
 steps, independent jobs, disjoint shards---is invisible. The
 6--896$\times$ headline savings of semantic systems live on this
 invisible side; their framework requirements are forced by where the
-redundancy is.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=0.88\columnwidth]{f3_distance.pdf}
-\caption{Hit ratio vs.\ version distance (log x): checkpoints stay at
-the zero-block floor; source/rootfs overlaps stay high.}
-\label{fig:distance}
-\end{figure}
+redundancy is. Sharing a pretrained base does not change the verdict:
+starting two jobs from a byte-identical init, a single step on different
+data collapses block identity to a 0.4--0.6\% residual (the zero-gradient
+positional-embedding region, Table~\ref{tab:axismap}). The divergence
+horizon of the dominant fine-tuning fleet pattern is \emph{one step}.
 
 \noindent\textbf{Positive controls: the same instrument scores 59--98\%.}
 
@@ -422,7 +425,8 @@ The 75\,MB ubuntu base blob is shared verbatim across all three images;
 even the 191/197\,MB sibling application layers---full reinstalls---
 contain 59\% and 98\% of blocks seen earlier, because dpkg overwrites the
 same library and binary files with identical content
-(Table~\ref{tab:controls}, Figure~\ref{fig:distance}). System files are
+(Table~\ref{tab:controls}); the same holds at all block sizes, while
+source archives decay smoothly with commit distance. System files are
 byte-stable across versions; optimizer state is byte-stable for exactly
 one step. With the same code scoring 98\% and 0\%, the zero cannot be
 blamed on the instrument.
@@ -434,11 +438,10 @@ blamed on the instrument.
 (AITURBO's XPU is the admission~\cite{aiturbo}) and temporal checkpoints
 never hit, a transparent client should not be smarter about \emph{how} it
 hashes checkpoint streams---it should decide \emph{whether to hash at
-all}, from signals available before touching bytes: write pattern
-(periodic large sequential file from a training job), file size/age,
-directory topology (rank replicas), and cheap prefix probes. Copy-heavy
-paths (rank replicas, base models, image pulls, log/tar bundles) always
-hash; churn-heavy training state skips to write-through.
+all} from signals available before touching bytes: write pattern, file
+size/age, directory topology (rank replicas), and cheap prefix probes.
+Copy-heavy paths always hash; churn-heavy training state skips to
+write-through.
 
 \textbf{Asymmetric loss keeps ML off the correctness path.} A gating
 classifier makes one mistake in each direction: a false positive (hashed
@@ -449,24 +452,37 @@ corrupt data nor lose a byte---unlike prediction-in-the-data-path
 systems such as LinnOS~\cite{linnos} or KML's learned kernel
 heuristics~\cite{kml}: prediction proposes, exact matching disposes. Our
 measurements supply the labelled \textbf{negative} workloads such a gate
-previously lacked; earlier write-side prediction only knew workloads
-where redundancy is the default.
+previously lacked.
 
-\textbf{A lower bound, not an obituary, for semantic systems.} The zero
+\textbf{Why learned rather than rule-based.} The negative class we
+measure is simple---periodic multi-GB rewrites of one path---and a
+three-rule gate (size, period, cadence) would classify today's fixtures.
+The rule set, however, is format-relative: sharded DCP layouts,
+weights-only saves, quantised optimizer states, and sparse-update MoE
+training (\S\ref{sec:findings}) shift the boundary in ways a fixed rule
+cannot anticipate. A gate retrained on labelled positives and negatives
+tracks that drift, and the asymmetric loss makes its mistakes cheap.
+Placement: per file, in the dedup client, before the first
+fingerprint---late enough that exact matching owns correctness, early
+enough that no hash cost is paid.
+
+\textbf{A lower bound for semantic systems.} The zero
 on the similarity axis quantifies the \emph{necessity} of tensor
 cooperation: no transparent cleverness---CDC, larger blocks,
 compression---can intercept savings whose identical units are tensor
-keys, not bytes. The 100\% on the copy axis, conversely, shows
-transparent dedup remains right for replicated saves and shared bases; a
-deployed system should compose both.
+keys, not bytes. The 100\% on the copy axis shows transparent dedup
+remains right for replicated saves and shared bases; a deployed system
+should compose both.
 
-\textbf{Existence proof.} In our research POSIX filesystem, an inline
-kernel content-hash fast path with a gated write needle cuts dedup
-metadata RPCs from 1,024 to 258 per 256\,MB write round and improves
-steady-state write bandwidth by 50\% across four rounds, with
-md5-identical output. The gated path is cheap and safe; this paper
-determines \emph{where it must not be switched on}. (System name
-withheld for blind review.)
+\textbf{Existence proof.} In our research filesystem---a log-structured,
+needle-based object store with an inline kernel dedup hot path---the
+write path consults the dedup index only when a cheap client-side gate
+deems a write likely-unique, and appends directly otherwise. Replaying
+four 256\,MB sequential write rounds, per-round WriteNeedle (dedup
+metadata) RPCs drop from 1,020 to 258 and steady-state write bandwidth
+rises 50\%, with md5-identical stored layout. The gated path is cheap
+and safe; this paper determines \emph{where it must not be switched on}.
+(System name withheld for blind review.)
 
 \section{Related Work}
 \label{sec:related}
@@ -474,12 +490,23 @@ withheld for blind review.)
 \textbf{Semantic checkpoint storage.} AdaCheck~\cite{adacheck} rewrites
 tensors across parallelism, architecture, and temporal dimensions;
 AITURBO~\cite{aiturbo} adds grouped I/O and XPU BLAKE3 fingerprinting.
-Kaiser et al.~\cite{kaiser2016}, the closest predecessor, measured
-byte-level deduplication potential across HPC checkpoints, where static
-memory regions produced application-dependent savings. We revisit the
-question for AI-training state under AdamW, splitting redundancy into
-copy and similarity axes: the answer flips for temporal similarity but
-holds for copies.
+Multilevel checkpointing systems for HPC (Moody et al.~\cite{moody2010},
+FTI~\cite{fti2011}) optimise snapshot tiering and recovery interval, not
+cross-run byte sharing. Kaiser et al.~\cite{kaiser2016}, the closest
+predecessor, measured byte-level deduplication potential across HPC
+checkpoints, where static memory regions produced savings that vary by
+application. We revisit the question for AI-training state under AdamW,
+splitting redundancy into copy and similarity axes: the answer flips for
+temporal similarity but holds for copies.
+
+\textbf{Writing less instead of deduplicating.} Checkpoint bytes can be
+shrunk at the source: tiered multilevel snapshotting~\cite{moody2010,
+fti2011}, differential checkpointing (Check-N-Run~\cite{checknrun}),
+quantised optimizer state (8-bit blockwise Adam~\cite{dettmers8bit};
+ZeRO partitioning/offload~\cite{zero}), and PyTorch DCP~\cite{dcp},
+whose per-rank disjoint shards remove axis~A outright. All are
+framework-visible changes; our question is what remains for the layer
+that changes nothing.
 
 \textbf{Block deduplication and chunking.} Venti~\cite{venti}
 established content-addressed blocks; iDedup~\cite{idedup} studied inline
@@ -492,31 +519,29 @@ and finds it absent.
 learned latency model; KML~\cite{kml} sets kernel heuristics such as
 readahead with learned models. In both, model output directly changes the
 I/O action. Our gate differs structurally: ML decides only whether an
-exact algorithm runs, never what data it returns.
-
-\textbf{AI storage workloads.} Mooncake~\cite{mooncake} accelerated
-KVCache-centric serving traffic, a separate track we do not enter.
-Traditional-workload baselines (FIU/MSR traces) are deferred to the
-full-paper version.
+exact algorithm runs, never what data it returns. Mooncake~\cite{mooncake}
+targets KVCache-centric serving traffic, a separate track we do not
+enter; traditional-workload baselines are deferred to the full-paper
+version.
 
 \section{Limitations and Conclusion}
 \label{sec:limitations}
 
 \textbf{Limitations.} One architecture (124\,M GPT-2), one optimiser
-family (AdamW), random-token training, CPU, and single-process fixtures:
-absolute numbers will move at scale, but the mechanism (per-element
-updates flip fp32 bytes; similarity keys are tensor names) is
-architecture-independent, and our controls isolate it directly.
-Multi-node traces, non-AdamW optimisers, and a full CDC implementation
-(we give strong precondition evidence rather than an implementation) are
-clear extensions, as are read-side fragmentation effects on restore.
+family (AdamW), random-token CPU training, single-process fixtures:
+absolute numbers will move at scale, but the mechanism---per-element
+updates flip fp32 bytes; similarity keys are tensor names---is
+architecture-independent. Long-horizon lr-schedule runs are argued
+analytically; multi-node traces, sparse-update and non-AdamW regimes, a
+full CDC implementation, and restore-side fragmentation are clear
+extensions.
 
-\textbf{Conclusion.} Redundancy splits sharply at the POSIX boundary: the
-byte layer sees every \emph{copy} (100\%) and nearly none of the
-\emph{similarity} ($\approx$0\%) semantic systems monetise, while the
-same code scores 59--98\% on images and sources. Transparent storage
-cannot earn that 6--896$\times$; it should learn to skip churn and
-reserve exact fingerprinting for where copies live.
+\textbf{Conclusion.} The
+byte layer sees every \emph{copy} (100\%) and none of the \emph{similarity}
+semantic systems monetise, while the same code scores 59--98\% on images
+and sources. Transparent storage cannot earn that 6--896$\times$; it
+should learn to skip churn and reserve exact fingerprinting for where
+copies live.
 
 % Acknowledgments: camera-ready only (double-blind submission).
 
