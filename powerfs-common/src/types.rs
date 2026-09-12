@@ -468,6 +468,12 @@ pub struct DataNodeInfo {
     pub grpc_port: u32,
     pub http_port: u32,
     pub public_url: String,
+    /// 管理面 gRPC 端口 (volume server 8080), 由心跳 TLV AdminGrpcPort 上报。
+    /// `grpc_port` 在 RDMA/数据面部署中被故意复用为 powerfs-net 数据端口
+    /// (890x, 见 master net_handler); admin RPC 代理必须使用本字段。
+    /// 0 表示旧节点未上报, 回退使用 grpc_port。本地(非 Raft)易失字段。
+    #[serde(default)]
+    pub admin_grpc_port: u32,
     pub maintenance_mode: bool,
     /// When `state == SoftError`, the specific soft-error sub-type. `None`
     /// otherwise. Set by the node itself in its heartbeat and propagated
@@ -545,6 +551,7 @@ impl DataNodeInfo {
             grpc_port,
             http_port,
             public_url,
+            admin_grpc_port: 0,
             maintenance_mode: false,
             soft_error_type: None,
             degrade_type: None,

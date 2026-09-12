@@ -282,6 +282,9 @@ impl MasterNetHandler {
         let ip = dec.next_string(FieldId::Owner).unwrap_or_default();
         let port = dec.next_u64(FieldId::Blksize).unwrap_or(0) as u32;
         let net_port = dec.next_u64(FieldId::NetPort).unwrap_or(0) as u32;
+        // 管理面 gRPC 端口 (volume 8080)。旧 volume 不上报时为 0,
+        // 代理回退到 grpc_port(数据端口)——仅在同端口双协议时可用。
+        let admin_grpc_port = dec.next_u64(FieldId::AdminGrpcPort).unwrap_or(0) as u32;
         let volume_count = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
 
         // P5: Parse node load metrics (basis points 0-10000 → ratio 0.0-1.0).
@@ -474,6 +477,8 @@ impl MasterNetHandler {
         // in the leader's in-memory topology.
         self.master
             .update_node_load_metrics(&node_id, cpu_usage, memory_usage);
+        self.master
+            .update_node_admin_grpc_port(&node_id, admin_grpc_port);
 
         let leader = self.master.get_leader().await;
         let default_volume_size = powerfs_common::constants::DEFAULT_VOLUME_SIZE;

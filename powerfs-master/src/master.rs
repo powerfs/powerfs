@@ -2410,6 +2410,18 @@ impl MasterNode {
         }
     }
 
+    /// 更新节点的管理面 gRPC 端口 (心跳 TLV AdminGrpcPort)。
+    /// 本地(非 Raft)易失更新, 与 load metrics 同性质; 节点重启后心跳重报。
+    pub fn update_node_admin_grpc_port(&self, node_id: &NodeId, admin_grpc_port: u32) {
+        if admin_grpc_port == 0 {
+            return;
+        }
+        let mut topology = self.topology.write().unwrap();
+        if let Some(node) = topology.get_node_mut(node_id) {
+            node.admin_grpc_port = admin_grpc_port;
+        }
+    }
+
     pub async fn update_node_volumes(&self, params: UpdateNodeVolumesParams) -> Result<()> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);

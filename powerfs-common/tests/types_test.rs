@@ -486,6 +486,7 @@ fn test_data_node_info_url() {
         grpc_port: 8080,
         http_port: 8081,
         public_url: "".to_string(),
+        admin_grpc_port: 0,
         maintenance_mode: false,
         soft_error_type: None,
         degrade_type: None,
