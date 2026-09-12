@@ -25,6 +25,11 @@ C_COP = "#27ae60"   # copy axis (good)
 C_TRAD = "#2c6fbb"  # traditional versioned workloads
 C_GREY = "#7f8c8d"
 
+# grayscale-safe textures (HotStorage CFP: many readers print in gray);
+# hatch strokes take the bar edgecolor
+HATCH = {C_SIM: "//", C_COP: "xx", C_TRAD: ".."}
+EDGE = {C_SIM: "#87251a", C_COP: "#1d7a44", C_TRAD: "#1d4e8f"}
+
 
 def rows(name):
     with open(os.path.join(RAW, name), newline="") as f:
@@ -91,7 +96,9 @@ def f1(metrics, st_metrics, axes, pos):
     fig.subplots_adjust(bottom=0.30, top=0.88)
     x = np.arange(len(labels))
     plot_vals = [max(v, FLOOR) for v in vals]
-    bars = ax.bar(x, plot_vals, color=colors, width=0.72)
+    bars = ax.bar(x, plot_vals, color=colors, width=0.72,
+                  edgecolor=[EDGE[c] for c in colors], linewidth=0.4,
+                  hatch=[HATCH[c] for c in colors])
     for xi, v in zip(x, vals):
         if v == 0:
             ax.text(xi, FLOOR * 1.25, "0", ha="center", va="bottom",
