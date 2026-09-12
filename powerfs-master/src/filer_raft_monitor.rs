@@ -208,7 +208,10 @@ pub fn spawn_filer_raft_monitor(master: Arc<MasterNode>, pool: Arc<ClientConnPoo
                 if filer.net_port == 0 {
                     continue;
                 }
-                let addr_port = format!("{}:{}", filer.address, filer.net_port);
+                // filer.address 注册时可能已含端口 ("ip:9336");
+                // 只取 host, 再拼 net_port, 避免出现 "ip:9336:9336"。
+                let host = filer.address.split(':').next().unwrap_or(&filer.address);
+                let addr_port = format!("{}:{}", host, filer.net_port);
 
                 let status_result = query_filer_raft_status(&pool, &addr_port).await;
 
