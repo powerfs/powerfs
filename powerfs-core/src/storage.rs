@@ -36,8 +36,14 @@ impl StorageManager {
         force_sync: bool,
     ) -> Result<Self> {
         let backend = Arc::new(
-            LocalFsBackend::new_with_sync(&data_path, &node_id.0, "default", device_capacity, force_sync)
-                .map_err(backend_err)?,
+            LocalFsBackend::new_with_sync(
+                &data_path,
+                &node_id.0,
+                "default",
+                device_capacity,
+                force_sync,
+            )
+            .map_err(backend_err)?,
         );
         Ok(StorageManager {
             volumes: RwLock::new(HashMap::new()),
@@ -232,8 +238,11 @@ impl StorageManager {
                 Ok(true) => synced += 1,
                 Ok(false) => {} // 无新写入，跳过
                 Err(e) => {
-                    log::warn!("sync_all_wals_if_dirty: volume {} fsync WAL failed: {}",
-                        volume.id().0, e);
+                    log::warn!(
+                        "sync_all_wals_if_dirty: volume {} fsync WAL failed: {}",
+                        volume.id().0,
+                        e
+                    );
                 }
             }
         }

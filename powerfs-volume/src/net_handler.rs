@@ -683,7 +683,9 @@ impl VolumeNetHandler {
                 .ok_or_else(|| format!("volume not found: {}", volume_id))?;
             let ids: Vec<NeedleId> = file_keys.into_iter().map(NeedleId).collect();
             // flush_specific 只物化数据到后端文件，不 fsync WAL
-            volume.flush_specific_needles(&ids).map_err(|e| format!("{}", e))
+            volume
+                .flush_specific_needles(&ids)
+                .map_err(|e| format!("{}", e))
         })
         .await
         {

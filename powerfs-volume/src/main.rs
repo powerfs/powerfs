@@ -161,13 +161,14 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
             // 高频 flush：50ms 一次
             let mut flush_interval = tokio::time::interval(Duration::from_millis(50));
             flush_interval.tick().await; // 跳过首次立即触发
-            // 低频 WAL fsync：仅在 force_sync_on_write=false 时启用
-            let mut wal_interval_opt =
-                if wal_interval_secs > 0 {
-                    Some(tokio::time::interval(Duration::from_secs(wal_interval_secs)))
-                } else {
-                    None
-                };
+                                         // 低频 WAL fsync：仅在 force_sync_on_write=false 时启用
+            let mut wal_interval_opt = if wal_interval_secs > 0 {
+                Some(tokio::time::interval(Duration::from_secs(
+                    wal_interval_secs,
+                )))
+            } else {
+                None
+            };
             if let Some(ref mut iv) = wal_interval_opt {
                 iv.tick().await; // 跳过首次立即触发
             }
