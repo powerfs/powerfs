@@ -782,6 +782,7 @@ fn build_config(
             advertise_addr: Some(ip.to_string()),
             lease_enabled: true,
             force_sync_on_write: false,
+            wal_idle_sync_secs: 30,
             registration_token: None,
             ca_crt: None,
             client_crt: None,
