@@ -1953,11 +1953,11 @@ impl Transport for RdmaTransport {
                 send_cq.as_ptr(),
                 recv_cq.as_ptr(),
                 ptr::null_mut(),
-                64,    // max_send_wr
-                64,    // max_recv_wr
-                2,     // max_send_sge
-                2,     // max_recv_sge
-                256,   // max_inline_data
+                64,  // max_send_wr
+                64,  // max_recv_wr
+                2,   // max_send_sge
+                2,   // max_recv_sge
+                256, // max_inline_data
                 ffi::IBV_QPT_RC,
                 1,
             )
@@ -2776,11 +2776,11 @@ impl TransportListener for RdmaListenerAdapter {
                             send_cq.as_ptr(),
                             recv_cq.as_ptr(),
                             ptr::null_mut(),
-                            64,    // max_send_wr
-                            64,    // max_recv_wr
-                            2,     // max_send_sge
-                            2,     // max_recv_sge
-                            256,   // max_inline_data
+                            64,  // max_send_wr
+                            64,  // max_recv_wr
+                            2,   // max_send_sge
+                            2,   // max_recv_sge
+                            256, // max_inline_data
                             ffi::IBV_QPT_RC,
                             1,
                         )
