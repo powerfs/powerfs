@@ -1,0 +1,35 @@
+{
+  "fingerprint": "blake2b-128",
+  "chunk_sizes": [
+    4096,
+    65536,
+    1048576,
+    4194304
+  ],
+  "shifts": [
+    1,
+    16,
+    256,
+    4096
+  ],
+  "formats": {
+    "torchsave": {
+      "n_steps": 20,
+      "disk_bytes": 29868875000,
+      "zip_payload_bytes": 29865565760,
+      "container_overhead_ratio": 0.000111
+    },
+    "weights": {
+      "n_steps": 20,
+      "disk_bytes": 9956095400,
+      "zip_payload_bytes": 9955184640,
+      "container_overhead_ratio": 9.1e-05
+    },
+    "dcp": {
+      "n_steps": 20,
+      "data_bytes": 29879720320,
+      "metadata_bytes": 2785500,
+      "metadata_overhead_ratio": 9.3e-05
+    }
+  }
+}
