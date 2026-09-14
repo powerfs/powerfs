@@ -57,6 +57,18 @@ use crate::protobuf::raft_service_client::RaftServiceClient;
 use crate::BasicNode;
 use crate::SnapshotData;
 
+/// 构造 raft gRPC client 并放宽收发消息尺寸限制。
+///
+/// tonic 默认 4MiB 上限会让超大 raft entry（批量元数据写）无法复制：
+/// 持有该条目的节点日志最新必为 leader，却凑不齐多数派，其余节点也
+/// 因日志落后无法夺权，对应 raft 组进入永久性写死锁。统一放宽到
+/// [`crate::RAFT_GRPC_MAX_MSG_SIZE`]（server 侧需一致配置）。
+fn new_raft_client(channel: Channel) -> RaftServiceClient<Channel> {
+    RaftServiceClient::new(channel)
+        .max_decoding_message_size(crate::RAFT_GRPC_MAX_MSG_SIZE)
+        .max_encoding_message_size(crate::RAFT_GRPC_MAX_MSG_SIZE)
+}
+
 /// 多 Raft 组共享路由器。
 ///
 /// 持有节点地址表和共享 gRPC 连接池，实现 `GroupRouter<C, String>`。
@@ -153,7 +165,7 @@ impl MultiGroupRouter {
             .get_channel(target_node_id)
             .await
             .map_err(|e| format!("failed to get channel to '{}': {}", target_node_id, e))?;
-        let mut client = RaftServiceClient::new(channel);
+        let mut client = new_raft_client(channel);
 
         let pb_req = pb::ProposeRequest {
             group_id: group_id.to_string(),
@@ -210,7 +222,7 @@ where
                 .get_channel(&node_id)
                 .await
                 .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-            let mut client = RaftServiceClient::new(channel);
+            let mut client = new_raft_client(channel);
 
             let mut pb_req = append_entries_request_to_pb::<C>(rpc)
                 .map_err(|e| RPCError::Network(NetworkError::new(&AnyError::error(e))))?;
@@ -239,7 +251,7 @@ where
                 .get_channel(&node_id)
                 .await
                 .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-            let mut client = RaftServiceClient::new(channel);
+            let mut client = new_raft_client(channel);
 
             let mut pb_req: pb::VoteRequest = rpc.into();
             pb_req.group_id = group_id;
@@ -269,7 +281,7 @@ where
                 .get_channel(&node_id)
                 .await
                 .map_err(|e| StreamingError::Unreachable(Unreachable::new(&e)))?;
-            let mut client = RaftServiceClient::new(channel);
+            let mut client = new_raft_client(channel);
 
             let (mut tx, rx) = mpsc::channel(1024);
             let response = client

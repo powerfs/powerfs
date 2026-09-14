@@ -251,29 +251,6 @@ fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
 
     // Stripe 参数推断 (dense chunks: 每个 chunk 1MB, offset 连续):
     //
-    // stripe_size 推断 (抗锚点交错):
-    //
-    // chunks 里除真实数据 chunk 外还可能含每卷 base needle 的 sparse anchor
-    // (offset = round*stripe_size, 持久化重载后顺序可能与写入时不同, 例如
-    // [vol0@0, vol1@1M, vol2@2M, vol3@3M, vol4@0, vol5@0, vol0@4M, ...])。
-    // 直接取 "首个卷切换点 offset" 会命中 anchor 得到 stripe_size=0, 内核
-    // RAID0 寻址整体错位。稳妥做法: 按 (offset, vid) 去重排序后, 取 offset=0
-    // 上出现的任一卷再次出现的最小正偏移 —— 即一个完整条带周期的长度。
-    let mut sorted: Vec<&ChunkRef> = chunks.iter().collect();
-    sorted.sort_by_key(|c| (c.offset, c.volume_id));
-    sorted.dedup_by_key(|c| (c.offset, c.volume_id));
-
-    let zero_vids: std::collections::HashSet<u64> = sorted
-        .iter()
-        .take_while(|c| c.offset == 0)
-        .map(|c| c.volume_id)
-        .collect();
-    let stripe_size = sorted
-        .iter()
-        .find(|c| c.offset > 0 && zero_vids.contains(&c.volume_id))
-        .map(|c| c.offset)
-        .unwrap_or(1024 * 1024);
-
     // volume_ids = 去重后的卷序列 (按首次出现顺序). 这是 stripe unit → volume
     // 的映射表, 长度 = stripe_count. 旧逻辑为每个 chunk 放一个 vid (长度=
     // chunk 数=100), 把 stripe_count 误判成 100 而非实际卷数 (如 3).
@@ -282,6 +259,48 @@ fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
         if !volume_ids.contains(&c.volume_id) {
             volume_ids.push(c.volume_id);
         }
+    }
+
+    // chunk_size: dense chunks 的最小正间距 (通常 1MB).
+    let mut all_offsets: Vec<u64> = chunks.iter().map(|c| c.offset).collect();
+    all_offsets.sort_unstable();
+    all_offsets.dedup();
+    let chunk_size = all_offsets
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0)
+        .min()
+        .unwrap_or(1024 * 1024);
+
+    // stripe_size 推断: 每个卷在一个 stripe unit 内持有一段 offset 连续、
+    // 步进 chunk_size 的 dense run, 取所有卷上最长 run 的长度.
+    //   - 80MB/count=4: [v0 0..63M(run64), v1 64..79M(run16)] → 64MB
+    //   - 完整多轮: 每个卷每轮 run=stripe_size, 最长即 stripe_size
+    //   - 持久化重载混入的单-offset sparse anchor (run=1) 不会抬高结果
+    //
+    // 旧实现取 "offset=0 上某卷再次出现的最小正偏移": 当文件不足一个完整
+    // stripe_count 轮次时 (如 80MB=64+16, 卷0 在文件内不再出现), 会误得
+    // chunk_size (1MB) — 内核按 1MB 条带 RAID0 寻址, 数据整体错位且未写
+    // 区域读零 (实测单次写 >64MB 文件 100% 复现).
+    let mut stripe_size = chunk_size;
+    for vid in &volume_ids {
+        let mut ofs: Vec<u64> = chunks
+            .iter()
+            .filter(|c| c.volume_id == *vid)
+            .map(|c| c.offset)
+            .collect();
+        ofs.sort_unstable();
+        ofs.dedup();
+        let mut run = chunk_size;
+        for pair in ofs.windows(2) {
+            if pair[1] - pair[0] == chunk_size {
+                run += chunk_size;
+                stripe_size = stripe_size.max(run);
+            } else {
+                run = chunk_size;
+            }
+        }
+        stripe_size = stripe_size.max(run);
     }
 
     Placement::Stripe {
@@ -2250,7 +2269,7 @@ impl FilerNetHandler {
             )
             .await
         {
-            Ok(ino) => {
+            Ok((ino, storage_mode)) => {
                 // P3.1: SetAttr propose for mode/uid/gid is ELIMINATED.
                 // The values are already baked into the CreateInode Raft log
                 // entry via InodeInfo { mode, uid, gid }. This saves ~40ms of
@@ -2269,7 +2288,32 @@ impl FilerNetHandler {
                 // 客户端缓存后直接用于后续 setattr/getattr 等路由
                 enc.add_u64(FieldId::ShardId, setattr_shard.0);
 
-                if let Some(max_size) = inline_max {
+                if !is_special_file
+                    && matches!(storage_mode, powerfs_layout::StorageMode::Flat)
+                {
+                    // === Flat (权威布局来自 LayoutPredictor, 如 .bin 规则) ===
+                    // 落盘 inode 已是 Flat (chunks 为空), 响应必须回 Flat 布局.
+                    // 旧实现无视实际 storage_mode 一律按 inline_max 回 Inline,
+                    // 客户端据此盲发 inline_data 命中 STALE_INLINE_REJECT,
+                    // 重试耗尽后静默丢数据. 空文件不带 chunks, 客户端首写时
+                    // 自行完成 inline-staging → volume 的迁移/分配.
+                    info!(
+                        "FILER_NET_CREATE: flat mode (predictor) inode={} (empty chunks, first write allocates)",
+                        ino
+                    );
+                    let layout = FileLayout {
+                        placement: Placement::Flat,
+                        reliability: Reliability::SingleReplica,
+                        reliability_state: ReliabilityState::default(),
+                        compression: CompressionState::default(),
+                        encoding: ChunkEncoding::PerChunk {
+                            chunks: Vec::new(),
+                        },
+                    };
+                    encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(
+                        |e| NetError::Protocol(format!("encode_file_layout failed: {}", e)),
+                    )?;
+                } else if let Some(max_size) = inline_max {
                     // === P2.5 Inline 模式 ===
                     // 不分配 volume/needle, 不持久化 chunk 映射. 客户端 CLOSE 时
                     // 把 inline_data 发 Filer (handle_update_inode_size_chunks),

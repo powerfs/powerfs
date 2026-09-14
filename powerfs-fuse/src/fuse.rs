@@ -801,6 +801,12 @@ fn filer_error_to_errno(e: &str) -> i32 {
         libc::ENOSPC
     } else if lower.contains("invalid argument") || lower.contains("bad request") {
         libc::EINVAL
+    } else if lower.contains("stale_layout") || lower.contains("stale layout") {
+        // Local inline cache disagrees with the Filer's authoritative
+        // layout (#106). Reported by UpdateInodeSizeChunks as
+        // STATUS_ERR_STALE_LAYOUT; the TLV error body carries the
+        // "stale_layout" prefix when present.
+        libc::ESTALE
     } else {
         libc::EIO
     }
@@ -820,6 +826,11 @@ fn status_to_errno(status: u16) -> i32 {
         powerfs_net::STATUS_ERR_BAD_FD => libc::EBADF,
         powerfs_net::STATUS_ERR_SERVER_ERROR => libc::EIO,
         powerfs_net::STATUS_ERR_BAD_REQUEST => libc::EINVAL,
+        // Filer rejected inline_data because its authoritative layout is
+        // already Flat/Stripe (e.g. another client migrated the file while
+        // our inline cache was stale). ESTALE tells the caller the local
+        // view is stale — same mapping as the kernel client (#106 step 2).
+        powerfs_net::STATUS_ERR_STALE_LAYOUT => libc::ESTALE,
         _ => libc::EIO,
     }
 }
@@ -2700,11 +2711,27 @@ impl PowerFsFs {
                         );
                     }
                     Err(e) => {
+                        // STATUS_ERR_STALE_LAYOUT (#106): the Filer's
+                        // authoritative layout is already Flat/Stripe but we
+                        // submitted inline_data. This is a *deterministic*
+                        // mismatch — the identical retry is rejected again,
+                        // so break immediately instead of burning the full
+                        // backoff budget (~7.5s). The round_ok=false path
+                        // below keeps the buffer dirty and surfaces ESTALE.
+                        let stale = e.to_lowercase().contains("stale_layout")
+                            || e.contains("server status 13");
                         last_err = e;
                         warn!(
                             "{} inode={} round {} attempt {} error: {}",
                             log_prefix, inode, sync_round, attempt, last_err
                         );
+                        if stale {
+                            warn!(
+                                "{} inode={} stale layout reject from Filer — aborting inline sync retries",
+                                log_prefix, inode
+                            );
+                            break;
+                        }
                     }
                 }
                 if attempt < max_retries {

@@ -174,7 +174,7 @@ impl FilerMetaService for FilerMetaServiceImpl {
             .create_file_with_shard(parent_inode, &name, shard_id, mode, uid, gid)
             .await
         {
-            Ok(ino) => ino,
+            Ok((ino, _storage_mode)) => ino,
             Err(e) => {
                 return Ok(Response::new(CreateEntryResponse {
                     success: false,
