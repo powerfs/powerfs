@@ -3027,7 +3027,14 @@ impl MetaShardManager {
         // returned after submitting to RaftCore (fire-and-forget). Apply
         // happens asynchronously; readers use retry logic in net_handler
         // (handle_lookup/handle_getattr) to absorb the visibility gap.
-        if !self.is_async_meta_persist()
+        //
+        // EXCEPTION: mode/uid/gid are security-sensitive — chmod/chown must
+        // be durable before the RPC returns. Otherwise, a dentry cache drop
+        // (drop_caches/remount) triggers a lookup that reads the stale
+        // pre-chmod mode from RocksDB (Raft command not yet applied).
+        // Always wait synchronously for these fields regardless of async flag.
+        let security_sensitive = mode.is_some() || uid.is_some() || gid.is_some();
+        if (security_sensitive || !self.is_async_meta_persist())
             && (mode.is_some()
                 || uid.is_some()
                 || gid.is_some()
