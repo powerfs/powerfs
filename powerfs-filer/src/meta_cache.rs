@@ -580,13 +580,13 @@ impl MetaCache {
         chunks: Vec<crate::shard_store::StoredFileChunk>,
         inline_data: Option<Vec<u8>>,
         is_append: bool,
-    ) {
+    ) -> Result<(), String> {
         let mut tbl = self.inode_table.write().unwrap();
         let Some(existing) = tbl.get_mut(&inode) else {
-            return;
+            return Ok(());
         };
         match existing.state {
-            CacheState::Deleted | CacheState::Trimming => return,
+            CacheState::Deleted | CacheState::Trimming => return Ok(()),
             CacheState::Staging | CacheState::Clean | CacheState::Dirty => {}
         }
         let old_bytes = estimate_inode_bytes(&existing.info);
@@ -646,6 +646,12 @@ impl MetaCache {
                         data.len(),
                     );
                     // Keep existing FLAT state intact.
+                    // Return error so update_inode_size_chunks_atomic can
+                    // propagate STATUS_ERR_STALE_LAYOUT to the client.
+                    return Err(format!(
+                        "stale_layout: inode {} has chunks/storage_mode={:?}, reject inline",
+                        inode, existing.info.storage_mode
+                    ));
                 } else {
                     // Inline overwrite (explicit): caller wants full replacement.
                     existing.info.size = size;
@@ -744,6 +750,7 @@ impl MetaCache {
             self.trim.release(old_bytes - new_bytes);
         }
         existing.touch();
+        Ok(())
     }
 
     /// Project setattr_meta (CRDT-merged) into MetaCache ( MDS projected state model).

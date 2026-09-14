@@ -3349,10 +3349,10 @@ impl ShardStore {
         info.reliability_state = reliability_state;
         info.chunks = ec_chunks;
         info.replica_chunks = Vec::new(); // EC 不使用 replica_chunks
-        // EC 转换后必须切换 storage_mode: Stripe/Flat 的 GETATTR 编码只发
-        // sparse anchor / 平铺 chunk, 而 EC 读路径 (内核 powerfs_net_data)
-        // 需要按 [group][shard] 排列的全量 shard 列表; StorageMode::Ec
-        // 分支才会编码全量 chunks + Placement::Flat + Reliability::EC.
+                                          // EC 转换后必须切换 storage_mode: Stripe/Flat 的 GETATTR 编码只发
+                                          // sparse anchor / 平铺 chunk, 而 EC 读路径 (内核 powerfs_net_data)
+                                          // 需要按 [group][shard] 排列的全量 shard 列表; StorageMode::Ec
+                                          // 分支才会编码全量 chunks + Placement::Flat + Reliability::EC.
         info.storage_mode = powerfs_layout::StorageMode::Ec;
         info.mtime = Self::current_time();
         if let Ok(data) = serde_json::to_vec(&info) {

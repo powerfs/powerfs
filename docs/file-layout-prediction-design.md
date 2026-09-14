@@ -533,6 +533,213 @@ curl http://<filer_ip>:<metrics_port>/admin/layout-migration-stats
 
 Empty 状态作为兜底: 规则未命中时, 客户端首次写入走 `auto_promote`, 根据写入大小决定布局。
 
+### 3.6.6 静默数据丢失修复方案 (#106)
+
+> **创建**: 2026-09-14
+> **更新**: 2026-09-14
+> **状态**: 三层修复 + 步骤 4 清理已实施 (步骤 0-4), 待完整回归验证
+
+#### 问题根因
+
+乐观 fast-create 在内核本地把新 inode 置为 `INLINE` (`powerfs_dir.c:973`),
+但 Filer 的 LayoutPredictor 在 CREATE 时可能已按文件名预测为 `Flat`
+(如 `.bin`→executables 规则→Flat)。BatchCreate 响应只回 COUNT、不回传
+每 entry 的 storage_mode, 造成**客户端与服务端布局不一致**:
+
+```
+kernel fast-create:  inode placement = INLINE (盲猜)
+filer CREATE:        inode storage_mode = Flat (LayoutPredictor 决定)
+                     (BatchCreate 响应不回传该决定)
+
+fsync/close 提交 inline_data → Filer 命中 STALE_INLINE_REJECT
+  → shard_store.rs:3012: 只 warn、不改状态、返回 STATUS_OK
+  → kernel 误以为成功, 清除 inline_dirty
+  → 文件 size=0, 静默数据丢失
+```
+
+#### 枚举值不一致 (已确认)
+
+| 位置 | Empty | Inline | Flat | Stripe | WideStripe | Ec |
+|------|-------|--------|------|--------|-----------|-----|
+| **服务端** (placement.rs:73) | **0** (default) | 1 | 2 | 3 | 4 | 5 |
+| **kernel** (powerfs.h:378) | —(无 Empty) | **0** | 1 | 2 | 3 | — |
+
+kernel 缺少 Empty 枚举值, 且 Inline=0 与服务端 Empty=0 冲突。
+两侧通过 TLV 字段 case 映射传递, 非裸整数, 但语义错位导致解析易错。
+
+#### 设计原则 (确认)
+
+1. **Inline 是少数明确规则的优化特例** (.txt/.c/.conf/.md 等确定小文本),
+   不是缺省行为。不确定的文件缺省 Flat。
+2. **Empty=0, Inline=1, Flat=2, ...** 枚举值与服务端对齐。
+3. **fast-create 不应盲猜 Inline**, 应从 BatchCreate 响应获取权威布局,
+   或缺省 Flat (Flat 提交不会命中 STALE_INLINE_REJECT)。
+
+#### 三层修复方案
+
+##### 第一层: STALE_INLINE_REJECT 返回非 OK (兜底, 最高 ROI)
+
+> **架构约束**: STALE_INLINE_REJECT 发生在 Raft apply 路径 (shard_store.rs),
+> 而 async 模式下客户端在 propose 后就返回 STATUS_OK, 无法直接回传错误。
+> 修正方案: 在 `meta_cache.project_update_size_chunks` (同步, propose 后、
+> RPC 返回前) 做检查并返回错误, 让 `update_inode_size_chunks_atomic` 透传,
+> 使 `handle_update_inode_size_chunks` 返回非 OK status。
+
+**改动**: 让 `meta_cache.project_update_size_chunks` 返回 `Result<(), String>`,
+STALE_INLINE_REJECT 分支返回 Err, `update_inode_size_chunks_atomic` 透传,
+`handle_update_inode_size_chunks` 返回 STATUS_ERR_STALE_LAYOUT (新增 status=13)。
+kernel `net_status_to_errno` 映射为 -ESTALE, cap_flush/fsync 返回错误、
+保留 inline_dirty、触发重试。
+
+**效果**:
+- 正常路径 (Inline/Empty 文件) **0 影响 0 额外 RPC**
+- 仅 Flat/Stripe 预测命中的文件首次提交失败一次, 重试时 GETATTR→migrate 纠正
+- 兜底所有未来类似场景 (旧 kernel, FUSE, 跨客户端 stale 提交)
+- 独立于上层方案, 可独立部署
+
+**服务端改动**:
+- `powerfs-net/src/protocol.rs`: 新增 STATUS_ERR_STALE_LAYOUT = 13
+- `meta_cache.rs:576`: project 返回 Result, STALE_INLINE_REJECT 返 Err
+- `meta_shard_manager.rs:4264`: 透传 project 错误
+- `net_handler.rs:3349`: 匹配 STALE_LAYOUT 返回对应 status
+**kernel 改动**:
+- `powerfs_net.h`: 新增 POWERFS_NET_STATUS_ERR_STALE_LAYOUT = 13
+- `powerfs_transport.c`: net_status_to_errno 映射 → -ESTALE
+
+##### 第二层: BatchCreate 响应回填 + fast-create 缺省 Flat (架构优化)
+
+**改动 A**: BatchCreate 响应为每个 entry 携带 `storage_mode` (1 字节),
+Flat/Stripe 的 entry 还带上预分配的 `volume_id` + `file_key`。
+
+**改动 B**: fast-create 用 BatchCreate 响应值设 placement, 不再盲猜 Inline。
+若 BatchCreate 尚未回填 (兼容旧 Filer), 缺省 Flat 而非 Inline。
+
+**效果**:
+- .bin (Flat): kernel 直接走 Flat 写, **0 REJECT 0 额外 RPC**
+- .dat (Inline): kernel 走 Inline, **0 额外 RPC**
+- Empty (未决定): kernel 按 Inline 写 (与现在 GETATTR effective=Inline 一致),
+  auto_promote 首次 sync 决定, **0 额外 RPC**
+- 消除 STALE_INLINE_REJECT 场景而非事后纠正
+- 数据路径不依赖 Filer leader (Volume Server 直写)
+
+**已移除** (步骤 4): GETATTR-align 修复中的 GETATTR RPC 调用块。
+**保留**: layout_aligned 字段 (改为 BatchCreate Inline 确认标记)、
+powerfs_align_inline_before_commit (改为 BatchCreate 回填驱动的迁移入口)、
+powerfs_migrate_inline_out (inline 溢出升级是合法运行时转换),
+apply_layout 的 K2 防护 (refresh_work getattr 与 close 竞态仍需)。
+
+**服务端改动**: `net_handler.rs` BatchCreate handler, 响应 encode per-entry
+storage_mode + Flat/Stripe 的 volume_id/file_key。
+**kernel 改动**: `powerfs_net_inode.c` batch_create 响应解析 per-entry,
+`powerfs_dir.c` fast-create 用响应值, `powerfs_inode.c` init_inode 缺省 Flat。
+
+##### 第三层: 枚举对齐 + Empty 语义清晰化
+
+**改动 A**: kernel 新增 `POWERFS_PLACEMENT_EMPTY = 0`, 后续值对齐服务端:
+```c
+enum powerfs_placement {
+    POWERFS_PLACEMENT_EMPTY      = 0,  /* 布局未决定 (服务端 Empty) */
+    POWERFS_PLACEMENT_INLINE     = 1,
+    POWERFS_PLACEMENT_FLAT       = 2,
+    POWERFS_PLACEMENT_STRIPE     = 3,
+    POWERFS_PLACEMENT_WIDESTRIPE = 4,
+    POWERFS_PLACEMENT_EC         = 5,
+};
+```
+
+**改动 B**: init_inode 缺省 `EMPTY` (非 FLAT), fast-create 也设 `EMPTY`,
+GETATTR 时 Empty 映射成 Inline 写路径 (现有行为)。
+
+**改动 C**: 确认 auto_promote 对 Empty→Flat 升级路径完整
+(超 inline 阈值时 Empty/Inline → Flat, 避免大文件卡 Inline)。
+
+#### 实施顺序
+
+| 步骤 | 方案层 | 改动面 | 风险 | 依赖 | 状态 |
+|------|--------|--------|------|------|------|
+| 0 | GETATTR-align | kernel 5 处 | 已验证 | — | ✅ 已验证 |
+| 1 | 第一层 (STALE_INLINE_REJECT 返非 OK) | 服务端 4 处 + kernel 2 处 | 低 | 独立 | ✅ 已实施 |
+| 2 | 第三层 (状态码枚举对齐) | 服务端 2 处 + kernel 2 处 | 低 (值对齐) | 独立 | ✅ 已实施 |
+| 3 | 第二层 (BatchCreate 响应回填) | 服务端 3 处 + kernel 5 处 | 中 | 步骤 2 | ✅ 已实施 |
+| 4 | 清理 (移除 GETATTR-align) | kernel | 低 | 步骤 3 验证后 | ✅ 已实施 |
+
+#### 实施记录
+
+##### 步骤 0: GETATTR-align 即时修复 (已验证)
+
+在 cap_flush Step4 提交 inline_data 前, 调 `powerfs_align_inline_before_commit`
+用 GETATTR 取权威布局, Flat/Stripe 则 `powerfs_migrate_inline_out` 迁移到卷。
+验证结果: `.bin/.dat/.txt` 4KB fsync/close 均 size=4096 md5=620f0b67,
+drop_caches 重读一致, 服务端 ENCODE Flat size=4096 chunks=1。
+
+##### 步骤 1: STALE_INLINE_REJECT 返非 OK (已实施)
+
+**服务端**:
+- `powerfs-net/src/protocol.rs`: 新增 `STATUS_ERR_STALE_LAYOUT = 13`, 加入 `is_client_error` 列表
+- `powerfs-filer/src/meta_cache.rs`: `project_update_size_chunks` 返回类型从 `()` 改为 `Result<(), String>`, STALE_INLINE_REJECT 分支返回 `Err("stale_layout: ...")`
+- `powerfs-filer/src/meta_shard_manager.rs`: `update_inode_size_chunks_atomic` 将 `project_update_size_chunks` 调用移至 `propose_meta` 之前, 用 `?` 透传错误, 跳过 Raft propose
+- `powerfs-filer/src/net_handler.rs`: `handle_update_inode_size_chunks` 匹配 `"stale_layout"` 错误, 返回 `STATUS_ERR_STALE_LAYOUT` 响应
+
+**kernel**:
+- `powerfs_mod/powerfs_net.h`: 新增 `POWERFS_NET_STATUS_ERR_STALE_LAYOUT = 13`
+- `powerfs_mod/powerfs_net_req.c` + `powerfs_mod/powerfs_transport.c`: `net_status_to_errno` 映射 `STALE_LAYOUT → -ESTALE`
+
+**效果**: 正常路径 (Inline/Empty 文件) 0 影响 0 额外 RPC; 仅 Flat/Stripe 预测命中的
+文件首次提交失败一次, 返回 -ESTALE, cap_flush 保留 dirty, 客户端重试时
+GETATTR→migrate 纠正布局。
+
+##### 步骤 2: 状态码枚举对齐 (已实施)
+
+**设计调整**: 原方案计划在 kernel 新增 `POWERFS_PLACEMENT_EMPTY = 0` 并后移
+Inline 值。实施时发现 **wire protocol 已天然对齐**: 服务端 codec.rs 的
+`placement_tag` 常量 (INLINE=0, FLAT=1, STRIPE=2, WIDE_STRIPE=3) 与
+kernel `powerfs.h` 的 placement 枚举值完全一致。服务端 `StorageMode::Empty`
+通过 `storage_mode_to_placement_tag` 映射为 0 (INLINE) 上线, 无需 kernel 侧
+新增 EMPTY 枚举。
+
+**实际改动**: 对齐的是 **status code 枚举** (非 placement 枚举):
+- `powerfs-net/src/protocol.rs`: 新增 `STATUS_ERR_BAD_REQUEST = 12`, `STATUS_ERR_STALE_LAYOUT = 13`
+- `powerfs_mod/powerfs_net.h`: 新增 `POWERFS_NET_STATUS_ERR_BAD_REQUEST = 12`, `POWERFS_NET_STATUS_ERR_STALE_LAYOUT = 13`
+
+##### 步骤 3: BatchCreate 响应回填 + fast-create 缺省 Flat (已实施)
+
+**服务端**:
+- `powerfs-net/src/serialize.rs`: `encode_batch_create_resp` 接收 `placements: &[(u64, u8)]`, 每 entry 编码 `(Ino u64 + Placement u8)`; `decode_batch_create_resp` 返回 `(flushed_count, Vec<(ino, tag)>)`
+- `powerfs-filer/src/meta_shard_manager.rs`: `batch_create_file` 返回 `Vec<Result<Option<u8>, String>>` (Some(tag)=新建, None=幂等重试); 新增 `storage_mode_to_placement_tag` 映射函数 (Empty/Inline→0, Flat/Ec→1, Stripe→2, WideStripe→3)
+- `powerfs-filer/src/net_handler.rs`: BatchCreate handler 收集 `placements: Vec<(u64, u8)>`, 调用 `encode_batch_create_resp(flushed, &placements)` 回填响应
+
+**kernel**:
+- `powerfs_mod/powerfs.h`: `powerfs_dirty_create` 新增 `placement_out: u8` 字段; `powerfs_inode_info` 新增 `layout_aligned: bool` 字段
+- `powerfs_mod/powerfs_net_inode.c`: `powerfs_net_batch_create` 签名改为 `entries: *mut` (非 const), 分配 `resp_cap` 缓冲, 解析响应中每 entry 的 `(Ino + Placement)`, 按 ino 匹配回填 `entries[j].placement_out`
+- `powerfs_mod/powerfs_dir.c`: `powerfs_flush_dirty_creates` BatchCreate 成功后将 `entries[i].placement_out` 拷回 `tmp_list` 原始节点; ilookup 循环中根据 `placement_out` 更新 inode: Inline(0)→`layout_aligned=true`, Flat/Stripe→设 placement 但 `layout_aligned=false` (需迁移 inline_data→Volume); fast-create 初始 `layout_aligned=false`
+- `powerfs_mod/powerfs_addr.c`: `powerfs_align_inline_before_commit` 新增 Step 3 fast path — 若 `placement != INLINE && volume_id == 0` (BatchCreate 回填了 FLAT/Stripe 但尚未迁移), 直接调 `powerfs_migrate_inline_out` 迁移, 跳过 GETATTR; `writepages` 对 `volume_id == 0` 的 FLAT/Stripe 文件跳过 Volume Server writeback (清脏页标记避免 -EIO)
+
+**关键实现决策**:
+1. **layout_aligned=false for FLAT/Stripe**: BatchCreate 回填 FLAT 后, inline_data 仍在 inode 本地缓冲, 必须迁移到 Volume。设 `layout_aligned=false` 确保 align 函数执行迁移, 而非跳过。
+2. **writepages volume_id==0 跳过**: BatchCreate 回填 FLAT 但迁移前, writepage WQ 可能运行, 因 `volume_id=0` 导致 `locate_chunk` 失败返回 -EIO。对 `volume_id==0` 的 FLAT/Stripe 文件跳过 Volume Server writeback, 清脏页标记, 让数据通过 close/release 路径提交。
+3. **dirty flush 重试 150 次**: `POWERFS_DIRTY_FLUSH_MAX_RETRIES` 从 10 改为 150 (30s), 覆盖 Filer shard leader 选举窗口 (~5s), 避免创建在 failover 期间丢失。
+
+##### 步骤 4: 移除 GETATTR-align workaround (已实施)
+
+步骤 3 的 BatchCreate 响应回填已让 kernel 在 `powerfs_flush_dirty_creates` 的
+ilookup 循环中获得 Filer 权威 placement。`powerfs_align_inline_before_commit`
+不再需要 GETATTR RPC 来发现布局, 改为直接信任 BatchCreate 回填值:
+
+- **移除**: `struct powerfs_file_layout layout` 局部变量、`bool need_getattr`
+  标志、`powerfs_net_getattr()` RPC 调用块 (~40 行)
+- **保留**: `powerfs_flush_pending_create` 调用 (幂等, 确保 BatchCreate 已提交)
+- **新逻辑**: flush 后重检 placement —
+  - `layout_aligned` → Inline 确认, return 0
+  - `placement != INLINE && volume_id != 0` → 已迁移, return 0
+  - `placement != INLINE && volume_id == 0` → BatchCreate 回填 FLAT/Stripe, 直接迁移
+  - `placement == INLINE && !layout_aligned` → BatchCreate 未成功, return `-EAGAIN` 保留 dirty
+
+**保留**: `layout_aligned` 字段 (BatchCreate Inline 确认标记)、
+`powerfs_align_inline_before_commit` 函数 (迁移调度入口)、
+`powerfs_migrate_inline_out` (inline→Volume 迁移实现)。
+**保留**: `writepages` 对 `volume_id == 0` 的 FLAT/Stripe 文件跳过 Volume Server
+writeback (迁移前 writepage WQ 竞态仍需防护)。
+
 ### 3.7 文件迁移监控与可观测性
 
 > **设计目标**: 监控布局预测效果, 区分真实迁移 (Inline→Flat/Stripe) 与首次分配 (预测命中), 为运维和前端展示提供数据。

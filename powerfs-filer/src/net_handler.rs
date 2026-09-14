@@ -1469,8 +1469,7 @@ impl FilerNetHandler {
                 // EC 读路径需要按 [group][shard] 排列的全量 shard 列表, 不能
                 // 走 sparse anchor 编码 — 否则内核只拿到 group0 的 6 个
                 // anchor, 越过第一个 group (offset>=4MiB) 即 -EINVAL.
-                let is_ec_converted =
-                    matches!(info.reliability, Reliability::EC { .. });
+                let is_ec_converted = matches!(info.reliability, Reliability::EC { .. });
                 if is_ec_converted {
                     let layout = FileLayout {
                         placement: Placement::Flat,
@@ -1481,52 +1480,54 @@ impl FilerNetHandler {
                             chunks: chunks.clone(),
                         },
                     };
-                    encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
-                        .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+                    encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(|e| {
+                        NetError::Protocol(format!("encode_file_layout failed: {}", e))
+                    })?;
 
                     if let Some(first) = chunks.first() {
                         enc.add_u64(FieldId::VolumeId, first.volume_id);
                         enc.add_u64(FieldId::FileKey, first.needle_id);
                     }
                 } else {
-                let placement = detect_placement_from_chunks(&chunks);
+                    let placement = detect_placement_from_chunks(&chunks);
 
-                // 只发 sparse anchors (每个卷的 base needle), 而非全部 dense
-                // chunks. Stripe 客户端用 Placement::Stripe 的 stripe_size /
-                // stripe_count / volume_ids 做 RAID0 数学寻址 (卷回绕 + 卷内
-                // 偏移推进, 见 powerfs-layout placement.rs locate 与内核
-                // locate_chunk), 不需要 per-chunk ChunkRef.
-                //
-                // 这样 GETATTR/LOOKUP 响应大小与文件大小无关 (≈ stripe_count
-                // × 44B), 避免大文件 dense chunks 撑爆客户端接收缓冲
-                // (RX_TRUNCATE → E2BIG, 200MB=200 chunks×44B > 8.7KB cap).
-                // anchor 取每个 volume_id 第一次出现的 chunk (即该卷 round 0
-                // 的起始 chunk): offset = vol_rank * stripe_size, needle = base.
-                let mut anchors: Vec<ChunkRef> = Vec::new();
-                let mut seen_vids: std::collections::HashSet<u64> =
-                    std::collections::HashSet::new();
-                for c in &chunks {
-                    if seen_vids.insert(c.volume_id) {
-                        anchors.push(c.clone());
+                    // 只发 sparse anchors (每个卷的 base needle), 而非全部 dense
+                    // chunks. Stripe 客户端用 Placement::Stripe 的 stripe_size /
+                    // stripe_count / volume_ids 做 RAID0 数学寻址 (卷回绕 + 卷内
+                    // 偏移推进, 见 powerfs-layout placement.rs locate 与内核
+                    // locate_chunk), 不需要 per-chunk ChunkRef.
+                    //
+                    // 这样 GETATTR/LOOKUP 响应大小与文件大小无关 (≈ stripe_count
+                    // × 44B), 避免大文件 dense chunks 撑爆客户端接收缓冲
+                    // (RX_TRUNCATE → E2BIG, 200MB=200 chunks×44B > 8.7KB cap).
+                    // anchor 取每个 volume_id 第一次出现的 chunk (即该卷 round 0
+                    // 的起始 chunk): offset = vol_rank * stripe_size, needle = base.
+                    let mut anchors: Vec<ChunkRef> = Vec::new();
+                    let mut seen_vids: std::collections::HashSet<u64> =
+                        std::collections::HashSet::new();
+                    for c in &chunks {
+                        if seen_vids.insert(c.volume_id) {
+                            anchors.push(c.clone());
+                        }
                     }
-                }
 
-                let layout = FileLayout {
-                    placement: placement.clone(),
-                    reliability: info.reliability.clone(),
-                    reliability_state: info.reliability_state.clone(),
-                    compression: info.compression_state.clone(),
-                    encoding: ChunkEncoding::PerChunk {
-                        chunks: anchors.clone(),
-                    },
-                };
-                encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2)
-                    .map_err(|e| NetError::Protocol(format!("encode_file_layout failed: {}", e)))?;
+                    let layout = FileLayout {
+                        placement: placement.clone(),
+                        reliability: info.reliability.clone(),
+                        reliability_state: info.reliability_state.clone(),
+                        compression: info.compression_state.clone(),
+                        encoding: ChunkEncoding::PerChunk {
+                            chunks: anchors.clone(),
+                        },
+                    };
+                    encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(|e| {
+                        NetError::Protocol(format!("encode_file_layout failed: {}", e))
+                    })?;
 
-                if let Some(first) = chunks.first() {
-                    enc.add_u64(FieldId::VolumeId, first.volume_id);
-                    enc.add_u64(FieldId::FileKey, first.needle_id);
-                }
+                    if let Some(first) = chunks.first() {
+                        enc.add_u64(FieldId::VolumeId, first.volume_id);
+                        enc.add_u64(FieldId::FileKey, first.needle_id);
+                    }
                 }
             }
             powerfs_layout::StorageMode::Ec => {
@@ -2817,14 +2818,27 @@ impl FilerNetHandler {
 
         let mut flushed: u32 = 0;
         let mut any_ok = false;
+        // Per-entry (ino, placement_tag) for the response. Idempotent-retry
+        // entries (Ok(None)) are counted as flushed but carry no tag — the
+        // kernel already holds their layout from the prior create/GETATTR.
+        let mut placements: Vec<(u64, u8)> = Vec::with_capacity(entries.len());
         for (i, result) in results.iter().enumerate() {
             let (ino, parent_ino, name, _, _, _, _, _) = &entries[i];
             match result {
-                Ok(_) => {
+                Ok(Some(tag)) => {
+                    flushed += 1;
+                    any_ok = true;
+                    placements.push((*ino, *tag));
+                    debug!(
+                        "FILER_NET_BATCH_CREATE: created ino={} parent={} name={} placement_tag={}",
+                        ino, parent_ino, name, tag
+                    );
+                }
+                Ok(None) => {
                     flushed += 1;
                     any_ok = true;
                     debug!(
-                        "FILER_NET_BATCH_CREATE: created ino={} parent={} name={}",
+                        "FILER_NET_BATCH_CREATE: idempotent retry ino={} parent={} name={}",
                         ino, parent_ino, name
                     );
                 }
@@ -2856,8 +2870,8 @@ impl FilerNetHandler {
             }
         }
 
-        let resp_body =
-            powerfs_net::serialize::encode_batch_create_resp(flushed).unwrap_or_default();
+        let resp_body = powerfs_net::serialize::encode_batch_create_resp(flushed, &placements)
+            .unwrap_or_default();
         let overall_status = if any_ok {
             STATUS_OK
         } else {
@@ -3406,6 +3420,17 @@ impl FilerNetHandler {
                 warn!("FILER_NET_UPDATE_SIZE_CHUNKS failed: {}", e);
                 if e.contains("not_leader") || e.contains("redirect") {
                     Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
+                } else if e.contains("stale_layout") {
+                    // STALE_INLINE_REJECT: client submitted inline_data for an
+                    // inode already migrated to Flat/Stripe. Return distinct
+                    // status so the client can re-fetch layout and retry.
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, &e);
+                    Ok(Self::build_response(
+                        msg,
+                        powerfs_net::STATUS_ERR_STALE_LAYOUT,
+                        enc.into_bytes(),
+                    ))
                 } else {
                     // 失败: STATUS_ERR + FieldId::Name = error string
                     let mut enc = TlvEncoder::new();

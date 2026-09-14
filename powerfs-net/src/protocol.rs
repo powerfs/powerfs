@@ -1097,6 +1097,11 @@ pub const STATUS_ERR_REDIRECT: u16 = 11;
 /// Used by RegisterFiler when shard_count mismatches the cluster's
 /// established value (unless the client passes Force=1).
 pub const STATUS_ERR_BAD_REQUEST: u16 = 12;
+/// Stale layout — the client submitted inline_data for an inode that has
+/// already been migrated to Flat/Stripe on the Filer. The client must
+/// re-fetch the authoritative layout (GETATTR) and retry with the correct
+/// placement. Distinct from SERVER_ERROR to avoid tripping CircuitBreaker.
+pub const STATUS_ERR_STALE_LAYOUT: u16 = 13;
 
 /// Returns `true` if the status code represents a **client-level error**
 /// (e.g., ENOENT, EEXIST, EACCES) rather than a server failure.
@@ -1126,6 +1131,7 @@ pub fn is_client_error(status: u16) -> bool {
             | STATUS_ERR_IS_DIR
             | STATUS_ERR_BAD_FD
             | STATUS_ERR_BAD_REQUEST
+            | STATUS_ERR_STALE_LAYOUT
     )
 }
 
