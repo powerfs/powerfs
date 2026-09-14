@@ -57,8 +57,8 @@ fi
 # host RDMA 拓扑: 所有存储节点共享 host IP 192.168.100.3
 HOST_NODE_IP="${HOST_NODE_IP:-192.168.100.3}"
 # VM kernel-client 源 IP (ib0 IPoIB 优先, eth0 docker-net 兜底)
-HOST_VM1_IPS=(192.168.100.100 172.30.0.100)
-HOST_VM2_IPS=(192.168.100.101 172.30.0.101)
+HOST_VM1_IPS=(192.168.100.51 172.30.0.100)
+HOST_VM2_IPS=(192.168.100.52 172.30.0.101)
 
 # 三节点 HA: 各服务独立 IP (bridge 172.30.0.x)
 # IP 必须与 docker-compose.yml 的 ipv4_address 一致, 否则 master 证书验证拒绝.
