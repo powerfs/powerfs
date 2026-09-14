@@ -869,6 +869,26 @@ impl MetaShardManager {
         mode
     }
 
+    /// Map server-side `StorageMode` to the TLV `placement_tag` wire value
+    /// (powerfs-layout/src/codec.rs: INLINE=0, FLAT=1, STRIPE=2, WIDE_STRIPE=3).
+    ///
+    /// Used by `batch_create_file` to backfill the per-entry placement tag in
+    /// the BatchCreate response so the kernel client can set its inode
+    /// placement from the response instead of blind-guessing Inline.
+    ///
+    /// Empty → INLINE: an undetermined layout starts on the inline write path
+    /// (cheapest, auto_promotes on overflow), matching the existing GETATTR
+    /// effective-placement behavior.
+    fn storage_mode_to_placement_tag(mode: powerfs_layout::StorageMode) -> u8 {
+        use powerfs_layout::StorageMode;
+        match mode {
+            StorageMode::Inline | StorageMode::Empty => 0, // INLINE
+            StorageMode::Flat | StorageMode::Ec => 1,      // FLAT
+            StorageMode::Stripe => 2,                      // STRIPE
+            StorageMode::WideStripe => 3,                  // WIDE_STRIPE
+        }
+    }
+
     /// Two-phase create used by `create_file`, `create_directory`,
     /// `create_file_with_shard`, `put_object_entry`, and `create_symlink`.
     ///
@@ -1319,12 +1339,18 @@ impl MetaShardManager {
     ///
     /// Each entry: (ino, parent_ino, name, mode, uid, gid, mtime, atime),
     /// mtime/atime in unix seconds (0 = server assigns current time).
+    /// Returns per-entry `Result<Option<u8>, String>`.
+    /// - `Ok(Some(tag))`: created, tag = TLV placement_tag (INLINE=0, FLAT=1,
+    ///   STRIPE=2, WIDE_STRIPE=3) from the predicted StorageMode.
+    /// - `Ok(None)`: idempotent retry (inode already existed, no new placement
+    ///   to report — the kernel already knows the layout from the prior create).
+    /// - `Err`: propose failed.
     pub async fn batch_create_file(
         &self,
         entries: &[(u64, u64, String, u32, u32, u32, u64, u64)],
-    ) -> Vec<Result<(), String>> {
+    ) -> Vec<Result<Option<u8>, String>> {
         let n = entries.len();
-        let mut results = vec![Ok(()); n];
+        let mut results: Vec<Result<Option<u8>, String>> = vec![Ok(None); n];
 
         if entries.is_empty() {
             return results;
@@ -1345,7 +1371,9 @@ impl MetaShardManager {
 
         // Build InodeInfo + stage each create in MetaCache (immediate
         // visibility for reads before Raft apply).
-        let mut infos: Vec<InodeInfo> = Vec::with_capacity(n);
+        // Each entry carries its original index so we can backfill the
+        // per-entry placement tag into `results` after the Raft commit.
+        let mut infos: Vec<(usize, InodeInfo)> = Vec::with_capacity(n);
         for (idx, (ino, parent_ino, name, mode, uid, gid, mtime, atime)) in
             entries.iter().enumerate()
         {
@@ -1363,7 +1391,9 @@ impl MetaShardManager {
                             && existing.file_type == FileType::File
                         {
                             // Idempotent retry — same file, skip silently.
-                            results[idx] = Ok(());
+                            // No placement to report: the kernel already holds
+                            // the layout from the prior create/GETATTR.
+                            results[idx] = Ok(None);
                             continue;
                         }
                         results[idx] = Err(format!(
@@ -1413,7 +1443,7 @@ impl MetaShardManager {
 
             self.meta_cache
                 .stage_create(info.clone(), *parent_ino, name);
-            infos.push(info);
+            infos.push((idx, info));
         }
 
         if infos.is_empty() {
@@ -1423,7 +1453,7 @@ impl MetaShardManager {
         // Build [CreateInode, AddDirEntry] * N commands and propose_many
         // in a single Raft replication cycle.
         let mut cmds: Vec<Vec<u8>> = Vec::with_capacity(infos.len() * 2);
-        for info in &infos {
+        for (_, info) in &infos {
             cmds.push(
                 ShardCommand::CreateInode {
                     info: Box::new(info.clone()),
@@ -1442,17 +1472,22 @@ impl MetaShardManager {
 
         match self.raft_group_manager.propose_many(shard_dir, cmds).await {
             Ok(_) => {
-                for info in &infos {
+                for (idx, info) in &infos {
+                    // Backfill the predicted placement tag so the kernel
+                    // client can set its inode placement from the BatchCreate
+                    // response instead of blind-guessing Inline.
+                    let tag = Self::storage_mode_to_placement_tag(info.storage_mode);
+                    results[*idx] = Ok(Some(tag));
                     info!(
-                        "batch_create: committed inode={} parent={} name={} to shard {}",
-                        info.inode, info.parent_inode, info.name, shard_dir.0
+                        "batch_create: committed inode={} parent={} name={} to shard {} placement_tag={}",
+                        info.inode, info.parent_inode, info.name, shard_dir.0, tag
                     );
                 }
             }
             Err(e) => {
                 // Propose failed (lost leadership, network error, etc.)
                 // Invalidate staging and mark all entries as failed.
-                for info in &infos {
+                for (_, info) in &infos {
                     self.meta_cache
                         .invalidate_staging(info.inode, info.parent_inode, &info.name);
                 }
@@ -1460,7 +1495,7 @@ impl MetaShardManager {
                 for (idx, (_, parent_ino, name, _, _, _, _, _)) in entries.iter().enumerate() {
                     if infos
                         .iter()
-                        .any(|i| i.parent_inode == *parent_ino && i.name == *name)
+                        .any(|(_, i)| i.parent_inode == *parent_ino && i.name == *name)
                     {
                         results[idx] = Err(e.clone());
                     }
@@ -4249,6 +4284,23 @@ impl MetaShardManager {
         let chunks_for_projection = chunks.clone();
         let inline_for_projection = inline_data.clone();
 
+        // STALE_INLINE_REJECT pre-check (#106 step 1): project BEFORE
+        // propose_meta. If the client submitted inline_data for an inode
+        // already migrated to Flat/Stripe, project returns Err and we skip
+        // the Raft propose entirely — returning STATUS_ERR_STALE_LAYOUT to
+        // the client so it can re-fetch layout and retry.
+        // Previously the propose happened first, so the stale inline_data
+        // was committed to the Raft log and shard_store.rs logged
+        // STALE_INLINE_REJECT on apply, but the client still got STATUS_OK
+        // (async mode returns after propose, not after apply).
+        self.meta_cache.project_update_size_chunks(
+            inode,
+            size,
+            chunks_for_projection,
+            inline_for_projection,
+            is_append,
+        )?;
+
         let cmd = ShardCommand::UpdateInodeSizeChunks {
             inode,
             size,
@@ -4257,17 +4309,6 @@ impl MetaShardManager {
             is_append,
         };
         self.propose_meta(shard_id, cmd.serialize()).await?;
-
-        // Project the update into MetaCache so subsequent get_inode calls
-        // (e.g., from cross-client getattr) return the new size/chunks
-        // immediately, without waiting for Raft apply.
-        self.meta_cache.project_update_size_chunks(
-            inode,
-            size,
-            chunks_for_projection,
-            inline_for_projection,
-            is_append,
-        );
 
         // Strict mode only: Wait for the apply to complete on this (leader)
         // node so that notify_inode_change and subsequent reads see the
