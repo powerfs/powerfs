@@ -21,7 +21,9 @@ use tokio::sync::mpsc;
 use crate::client_conn::{ClientConn, ConnState};
 use crate::flow_control::FlowController;
 use crate::flow_policy::AdmissionDecision;
-use crate::protocol::{FrameFlags, FrameHeader, NetMessage, STATUS_ERR_SERVER_ERROR};
+use crate::protocol::{
+    FrameFlags, FrameHeader, NetMessage, STATUS_ERR_BUSY, STATUS_ERR_SERVER_ERROR,
+};
 use crate::server_connection::{NetHandler, ServerConnectionManager};
 use crate::work::Work;
 
@@ -112,7 +114,10 @@ impl Worker {
                         msg_type,
                         reason.as_str()
                     );
-                    let resp = Self::build_error_response(&work.msg);
+                    // Transient flow-control rejection: respond STATUS_ERR_BUSY
+                    // so the client backs off and retries instead of treating
+                    // overload as a hard server error / tripping the breaker.
+                    let resp = Self::build_busy_response(&work.msg);
                     self.send_with_flow(conn, resp);
                     return; // 未处理, 不调 on_request_complete
                 }
@@ -184,6 +189,18 @@ impl Worker {
 
         // 更新活动时间
         conn.touch().await;
+    }
+
+    /// 构造 BUSY 响应 (准入控制拒绝时使用, 客户端应退避重试)
+    fn build_busy_response(req: &NetMessage) -> NetMessage {
+        let header = FrameHeader::new(
+            req.header.msg_type,
+            FrameFlags::new(FrameFlags::RESPONSE),
+            req.header.seq,
+            0,
+        )
+        .with_status(STATUS_ERR_BUSY);
+        NetMessage::new(header)
     }
 
     /// 构造错误响应 (handler 返回 Err 时使用)

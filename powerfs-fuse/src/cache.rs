@@ -190,6 +190,14 @@ impl CachedEntry {
         let allowed = match (self.state, target) {
             (New, Clean) | (New, Dirty) | (New, Stale) | (New, Tombstone) => true,
             (Clean, Dirty) | (Clean, Stale) | (Clean, Tombstone) => true,
+            // Clean→Flushing is permitted: the write path records a chunk in
+            // dirty_shards before it transitions the entry Clean→Dirty (two
+            // independent locks, cannot be made atomic). A flusher that drains
+            // in that window sees dirty chunks but a Clean entry. Flushing such
+            // an entry is a valid no-op-style request; success returns it to
+            // Clean, failure to Dirty. It does NOT weaken the core invariant —
+            // transitions out of Dirty/Flushing to Stale stay forbidden below.
+            (Clean, Flushing) => true,
             (Dirty, Flushing) | (Dirty, Tombstone) => true,
             (Flushing, Clean) | (Flushing, Dirty) => true,
             (Stale, Clean) | (Stale, Dirty) | (Stale, Tombstone) => true,
@@ -2733,6 +2741,15 @@ pub struct ChunkData {
     pub mtime: u64,
     pub crc32: u32,
     pub dirty: bool,
+    /// Monotonic per-chunk write generation, bumped on every local content
+    /// replacement (`put`) or in-place mutation (`modify`).
+    ///
+    /// The flush path snapshots this value when it drains a chunk and only
+    /// clears `dirty` after a successful RPC when the generation is still the
+    /// same. A concurrent overwrite during the RPC advances `write_seq`, so
+    /// the flusher leaves `dirty=true`; otherwise evict_if_needed could drop
+    /// the new (unflushed) data before the background flusher re-flushes it.
+    pub write_seq: u64,
 }
 
 const NUM_SHARDS: usize = 16;
@@ -2814,6 +2831,9 @@ impl ChunkCache {
             // chunk that was previously flushed (dirty=false) and then modified
             // via modify() could be evicted with unflushed data.
             chunk.dirty = true;
+            // Advance the write generation so an in-flight flush that snapshotted
+            // the old generation does not clear dirty for this new content.
+            chunk.write_seq = chunk.write_seq.wrapping_add(1);
             let new_len = chunk.data.len() as u64;
             if new_len != old_len {
                 // Update current_bytes to reflect the size change caused by
@@ -2845,10 +2865,17 @@ impl ChunkCache {
         {
             let mut cache = self.shards[shard].write().unwrap();
 
-            if let Some(old) = cache.get(&key) {
-                let old_len = old.data.len() as u64;
-                self.current_bytes.fetch_sub(old_len, Ordering::SeqCst);
-            }
+            // Inherit the generation of the chunk being replaced and advance
+            // it (fresh chunk starts at 1). A flush that snapshotted the old
+            // generation must not clear dirty for this replacement content.
+            let next_write_seq = match cache.get(&key) {
+                Some(old) => {
+                    let old_len = old.data.len() as u64;
+                    self.current_bytes.fetch_sub(old_len, Ordering::SeqCst);
+                    old.write_seq.wrapping_add(1)
+                }
+                None => 1,
+            };
 
             cache.insert(
                 key,
@@ -2859,6 +2886,7 @@ impl ChunkCache {
                     mtime,
                     crc32,
                     dirty: true,
+                    write_seq: next_write_seq,
                 },
             );
             self.current_bytes
@@ -3119,19 +3147,41 @@ impl ChunkCache {
         }
     }
 
-    /// 清除指定 inode 中特定 chunk 的脏标记。
-    /// 在 flush_dirty_chunks_impl 成功写入 volume server 后调用，
-    /// 使这些 chunk 可被 evict_if_needed 驱逐。
-    /// 只清除传入的 chunk_idx 对应的 chunk，不影响同 inode 的其他 chunk。
-    pub fn clear_dirty_for_chunks(&self, inode: u64, chunk_indices: &[u64]) {
+    /// Clear the dirty flag of flushed chunks, but only for chunks whose
+    /// content generation still matches the snapshot the flusher took.
+    ///
+    /// Called after `flush_dirty_chunks_impl` has successfully written a
+    /// batch to the volume server. Each entry is `(chunk_idx, snap_write_seq)`
+    /// where `snap_write_seq` came from the `ChunkData` used to build the
+    /// flush request.
+    ///
+    /// RACE GUARD: if a concurrent `put`/`modify` replaced the chunk while the
+    /// flush RPC was in flight, `write_seq` advanced and the chunk still holds
+    /// unflushed data — leave `dirty=true` so evict_if_needed cannot drop it
+    /// and the background flusher runs another round. Returns the number of
+    /// chunks actually marked clean.
+    pub fn clear_dirty_if_unchanged(&self, inode: u64, flushed: &[(u64, u64)]) -> usize {
+        if flushed.is_empty() {
+            return 0;
+        }
+        let mut cleared = 0usize;
         for shard in self.shards.iter() {
             let mut cache = shard.write().unwrap();
             for ((ino, idx), chunk) in cache.iter_mut() {
-                if *ino == inode && chunk_indices.contains(idx) {
-                    chunk.dirty = false;
+                if *ino != inode {
+                    continue;
+                }
+                if let Some((_, snap_seq)) = flushed.iter().find(|(i, _)| i == idx) {
+                    if chunk.write_seq == *snap_seq {
+                        chunk.dirty = false;
+                        cleared += 1;
+                    }
+                    // write_seq advanced → concurrent overwrite during the
+                    // flush RPC; keep dirty=true to protect the new data.
                 }
             }
         }
+        cleared
     }
 
     pub fn dirty_chunks(&self) -> u64 {
@@ -3779,6 +3829,61 @@ mod chunk_cache_tests {
         assert_eq!(missing.len(), 2);
         assert_eq!(missing[0], (1024, 1024));
         assert_eq!(missing[1], (2048, 1024));
+    }
+
+    #[test]
+    fn test_clear_dirty_if_unchanged_guards_concurrent_overwrite() {
+        let cache = ChunkCache::new(1024, 10);
+        let inode = 100;
+
+        // Fresh write: generation 1, dirty.
+        cache.put(inode, 0, vec![0u8; 1024].into(), 1, 0);
+        assert_eq!(cache.get(inode, 0).unwrap().write_seq, 1);
+        assert!(cache.has_dirty_chunks(inode));
+
+        // Flush snapshots generation 1 and succeeds → clears dirty.
+        let cleared = cache.clear_dirty_if_unchanged(inode, &[(0, 1)]);
+        assert_eq!(cleared, 1);
+        assert!(!cache.has_dirty_chunks(inode));
+
+        // Next write round: generation advances to 2.
+        cache.put(inode, 0, vec![1u8; 1024].into(), 2, 0);
+        assert_eq!(cache.get(inode, 0).unwrap().write_seq, 2);
+        let snap = cache.get(inode, 0).unwrap().write_seq; // flush snapshot = 2
+
+        // Concurrent write lands while the flush RPC is in flight: gen → 3.
+        cache.put(inode, 0, vec![2u8; 1024].into(), 3, 0);
+        assert_eq!(cache.get(inode, 0).unwrap().write_seq, 3);
+
+        // Stale snapshot must NOT clear dirty (would allow evicting new data).
+        let cleared = cache.clear_dirty_if_unchanged(inode, &[(0, snap)]);
+        assert_eq!(cleared, 0);
+        assert!(
+            cache.has_dirty_chunks(inode),
+            "concurrently overwritten chunk must stay dirty/evict-protected"
+        );
+
+        // Next flush round snapshots generation 3 and clears it.
+        let cleared = cache.clear_dirty_if_unchanged(inode, &[(0, 3)]);
+        assert_eq!(cleared, 1);
+        assert!(!cache.has_dirty_chunks(inode));
+    }
+
+    #[test]
+    fn test_modify_advances_write_seq() {
+        let cache = ChunkCache::new(1024, 10);
+        let inode = 200;
+        cache.put(inode, 0, vec![0u8; 1024].into(), 1, 0);
+        assert_eq!(cache.get(inode, 0).unwrap().write_seq, 1);
+
+        assert!(cache.modify(inode, 0, |c| c.data = vec![9u8; 512].into()));
+        assert_eq!(cache.get(inode, 0).unwrap().write_seq, 2);
+        assert!(cache.has_dirty_chunks(inode));
+
+        // A flush that snapshotted gen 1 cannot clear the modified chunk.
+        let cleared = cache.clear_dirty_if_unchanged(inode, &[(0, 1)]);
+        assert_eq!(cleared, 0);
+        assert!(cache.has_dirty_chunks(inode));
     }
 
     #[test]
