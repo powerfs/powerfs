@@ -1618,30 +1618,56 @@ impl MetaShardClient {
             .send_coherence_msg(powerfs_net::MsgType::MigrateInlineAlloc, shard_id, body)
             .await?;
 
-        let mut dec = TlvDecoder::new(&resp_body);
+        // Detect response variant by peeking the FIRST field with a throwaway
+        // decoder. A Stripe response starts with StripeCount; a Flat response
+        // starts with VolumeId.
+        //
+        // IMPORTANT: next_u32(StripeCount) on a Flat body would consume the
+        // leading VolumeId header/value while probing, so the Flat parse below
+        // must use its OWN fresh decoder (reusing the probe leaves the cursor
+        // past VolumeId → spurious "response missing VolumeId" → EFBIG on
+        // every text/Flat Inline→Flat migration).
+        let is_stripe = {
+            let mut probe = TlvDecoder::new(&resp_body);
+            matches!(probe.next_field(), Some((FieldId::StripeCount, _)))
+        };
 
-        // Check for Stripe response: presence of StripeCount field.
-        if let Ok(stripe_count) = dec.next_u32(FieldId::StripeCount) {
-            let stripe_size = dec
+        if is_stripe {
+            let mut meta_dec = TlvDecoder::new(&resp_body);
+            let stripe_count = meta_dec.next_u32(FieldId::StripeCount).unwrap_or_default();
+            let stripe_size = meta_dec
                 .next_u64(FieldId::StripeSize)
                 .unwrap_or(powerfs_layout::policy::PlacementPolicy::default().default_stripe_size);
-            // Collect N (volume_id, needle_id) pairs from repeated VolumeId/FileKey fields.
+            // Collect N (volume_id, needle_id) pairs from repeated
+            // VolumeId/FileKey fields. Re-decode the whole body sequentially.
+            //
+            // CRITICAL: next_field() only consumes the 5-byte TLV header, NOT
+            // the value. Every field's value must be consumed via read_X() or
+            // skip() before the next next_field(); otherwise the decoder
+            // interprets the previous value's bytes as the next TLV header,
+            // desyncing the stream and silently dropping every VolumeId
+            // (symptom: server allocates N stripes, client sees
+            // "Stripe response has no allocations" → EFBIG on every Inline
+            // file grown past the threshold).
             let mut allocations = Vec::with_capacity(stripe_count as usize);
-            // Re-decode from the start to iterate fields in order.
             let mut pair_dec = TlvDecoder::new(&resp_body);
-            // Skip StripeCount and StripeSize fields already consumed conceptually;
-            // iterate all fields collecting VolumeId/FileKey pairs.
+            let mut pending_vid: Option<u64> = None;
             while let Some((fid, length)) = pair_dec.next_field() {
-                if fid == FieldId::VolumeId {
-                    if let Ok(vid) = pair_dec.read_u64(length) {
-                        // Peek the next FileKey
-                        if let Some((fid2, len2)) = pair_dec.next_field() {
-                            if fid2 == FieldId::FileKey {
-                                if let Ok(nid) = pair_dec.read_u64(len2) {
-                                    allocations.push((vid, nid));
-                                }
+                match fid {
+                    FieldId::VolumeId => match pair_dec.read_u64(length) {
+                        Ok(vid) => pending_vid = Some(vid),
+                        Err(_) => pending_vid = None,
+                    },
+                    FieldId::FileKey => {
+                        if let Ok(nid) = pair_dec.read_u64(length) {
+                            if let Some(vid) = pending_vid.take() {
+                                allocations.push((vid, nid));
                             }
                         }
+                    }
+                    // StripeCount / StripeSize / any other field: consume value.
+                    _ => {
+                        let _ = pair_dec.skip(length);
                     }
                 }
             }
@@ -1655,11 +1681,13 @@ impl MetaShardClient {
             });
         }
 
-        // Flat response: single (volume_id, needle_id)
-        let volume_id = dec
+        // Flat response: single (volume_id, needle_id). Fresh decoder — the
+        // Stripe probe above must not have advanced this stream.
+        let mut flat_dec = TlvDecoder::new(&resp_body);
+        let volume_id = flat_dec
             .next_u64(FieldId::VolumeId)
             .map_err(|_| "migrate_inline_alloc: response missing VolumeId".to_string())?;
-        let needle_id = dec
+        let needle_id = flat_dec
             .next_u64(FieldId::FileKey)
             .map_err(|_| "migrate_inline_alloc: response missing FileKey".to_string())?;
         Ok(MigrateAllocResult::Flat {

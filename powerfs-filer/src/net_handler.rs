@@ -2292,27 +2292,70 @@ impl FilerNetHandler {
                     && matches!(storage_mode, powerfs_layout::StorageMode::Flat)
                 {
                     // === Flat (权威布局来自 LayoutPredictor, 如 .bin 规则) ===
-                    // 落盘 inode 已是 Flat (chunks 为空), 响应必须回 Flat 布局.
-                    // 旧实现无视实际 storage_mode 一律按 inline_max 回 Inline,
-                    // 客户端据此盲发 inline_data 命中 STALE_INLINE_REJECT,
-                    // 重试耗尽后静默丢数据. 空文件不带 chunks, 客户端首写时
-                    // 自行完成 inline-staging → volume 的迁移/分配.
+                    // 分配 volume_id/needle_id 并持久化 chunk 映射, 与传统 Flat
+                    // 路径一致. flat_alloc 可能为 None (inline_max 已配置但
+                    // predictor 覆盖为 Flat), 此时在此处补充分配, 确保客户端
+                    // 拿到权威 volume_id 直连 volume 写入. 旧实现返回空 chunks 且
+                    // 不含 VolumeId/FileKey, 客户端 Flat 路径取 attr.volume_id
+                    // 得到 None → EIO (1M+ 文件写入必复现).
+                    let (volume_id, needle_id) = match flat_alloc {
+                        Some(v) => v,
+                        None => match self.alloc_for_new_file() {
+                            Some(v) => v,
+                            None => {
+                                warn!(
+                                    "FILER_NET_CREATE: zone not registered, cannot allocate needle_id for flat (predictor) inode {}",
+                                    ino
+                                );
+                                return Ok(Self::build_response(
+                                    msg,
+                                    STATUS_ERR_SERVER_ERROR,
+                                    Vec::new(),
+                                ));
+                            }
+                        },
+                    };
+                    // 持久化 chunk 映射 via Raft, 客户端写入和后续 lookup 都依赖此映射.
+                    let fid_str = format!("{},0,{}", volume_id, needle_id);
+                    let setchunks_shard = self.shard_strategy.calculate_shard(ino);
+                    if let Err(e) = self
+                        .meta_shard_manager
+                        .set_chunks(ino, setchunks_shard, fid_str, volume_id, 0, 0, 0)
+                        .await
+                    {
+                        warn!(
+                            "FILER_NET_CREATE: set_chunks failed for flat (predictor) inode {} (needle_id={:#x}): {}",
+                            ino, needle_id, e
+                        );
+                    }
                     info!(
-                        "FILER_NET_CREATE: flat mode (predictor) inode={} (empty chunks, first write allocates)",
-                        ino
+                        "FILER_NET_CREATE: flat mode (predictor) inode={} volume_id={} needle_id={:#x}",
+                        ino, volume_id, needle_id
                     );
+                    // 响应携带 Flat 布局 + chunk 映射 + 顶层 VolumeId/FileKey.
+                    // 客户端 Flat 路径从 volume_id/file_key 构造 fid;
+                    // chunks 供 lookup/getattr 一致性读取.
                     let layout = FileLayout {
                         placement: Placement::Flat,
                         reliability: Reliability::SingleReplica,
                         reliability_state: ReliabilityState::default(),
                         compression: CompressionState::default(),
                         encoding: ChunkEncoding::PerChunk {
-                            chunks: Vec::new(),
+                            chunks: vec![ChunkRef {
+                                offset: 0,
+                                size: 0,
+                                needle_id,
+                                volume_id,
+                                crc32: 0,
+                                mtime: 0,
+                            }],
                         },
                     };
                     encode_file_layout(&mut enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(
                         |e| NetError::Protocol(format!("encode_file_layout failed: {}", e)),
                     )?;
+                    enc.add_u64(FieldId::VolumeId, volume_id);
+                    enc.add_u64(FieldId::FileKey, needle_id);
                 } else if let Some(max_size) = inline_max {
                     // === P2.5 Inline 模式 ===
                     // 不分配 volume/needle, 不持久化 chunk 映射. 客户端 CLOSE 时
