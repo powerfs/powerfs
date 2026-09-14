@@ -1102,6 +1102,13 @@ pub const STATUS_ERR_BAD_REQUEST: u16 = 12;
 /// re-fetch the authoritative layout (GETATTR) and retry with the correct
 /// placement. Distinct from SERVER_ERROR to avoid tripping CircuitBreaker.
 pub const STATUS_ERR_STALE_LAYOUT: u16 = 13;
+/// Server temporarily overloaded — the admission-control layer rejected the
+/// request because the connection (or the server globally) already has the
+/// maximum number of in-flight requests. The server did NOT process the
+/// request, so the client should back off briefly and retry. This is a
+/// transient flow-control signal, not a server fault: it must NOT be counted
+/// toward the CircuitBreaker failure counter.
+pub const STATUS_ERR_BUSY: u16 = 14;
 
 /// Returns `true` if the status code represents a **client-level error**
 /// (e.g., ENOENT, EEXIST, EACCES) rather than a server failure.
@@ -1132,6 +1139,7 @@ pub fn is_client_error(status: u16) -> bool {
             | STATUS_ERR_BAD_FD
             | STATUS_ERR_BAD_REQUEST
             | STATUS_ERR_STALE_LAYOUT
+            | STATUS_ERR_BUSY
     )
 }
 

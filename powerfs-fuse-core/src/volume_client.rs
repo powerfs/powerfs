@@ -15,7 +15,9 @@ use crate::request_state::{RequestContext, RequestKind};
 use crate::topology::{ClusterTopologyManager, VolumeInfo};
 use powerfs_net::protocol::{CHANNEL_DATA, CHANNEL_META};
 use powerfs_net::serialize::TlvDecoder;
-use powerfs_net::{FieldId, PowerFsNetClient, STATUS_ERR_NOT_FOUND, STATUS_ERR_NO_SPACE};
+use powerfs_net::{
+    FieldId, PowerFsNetClient, STATUS_ERR_BUSY, STATUS_ERR_NOT_FOUND, STATUS_ERR_NO_SPACE,
+};
 
 /// 请求等待者类型别名
 type VolumeResponseWaiters =
@@ -1266,9 +1268,46 @@ impl VolumeClient {
             .get_or_create_volume_client_channel(&volume.addr, CHANNEL_DATA)
             .await?;
 
-        let result = vol_client
-            .send_request(powerfs_net::MsgType::WriteNeedle, &payload, data)
-            .await;
+        // The volume server's admission control may answer STATUS_ERR_BUSY
+        // when the data connection already carries the maximum number of
+        // in-flight writes — common for Stripe files, whose chunks within a
+        // single stripe unit all target the same volume. BUSY means the server
+        // never processed the request, so retry with bounded exponential
+        // backoff. It is transient overload and must not trip the breaker.
+        // The write targets one fixed needle/offset, so re-sending the same
+        // request is an idempotent overwrite.
+        const MAX_BUSY_RETRIES: u32 = 20;
+        let mut busy_attempts: u32 = 0;
+        let result = loop {
+            let attempt = vol_client
+                .send_request(powerfs_net::MsgType::WriteNeedle, &payload, data)
+                .await;
+            match attempt {
+                Ok(ref resp) if resp.header.status == STATUS_ERR_BUSY => {
+                    if busy_attempts >= MAX_BUSY_RETRIES {
+                        break attempt;
+                    }
+                    // 2ms, 4ms, 8ms, ... capped at 200ms (total < ~3s).
+                    let shift = busy_attempts.min(7);
+                    let delay_ms = std::cmp::min(200, 2u64 * (1u64 << shift));
+                    busy_attempts += 1;
+                    if busy_attempts <= 3 || busy_attempts % 5 == 0 {
+                        log::warn!(
+                            "send_write_needle_direct: volume={} addr={} BUSY (admission \
+                             reject), retry {}/{} after {}ms",
+                            volume_id,
+                            volume.addr,
+                            busy_attempts,
+                            MAX_BUSY_RETRIES,
+                            delay_ms
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                _ => break attempt,
+            }
+        };
 
         match result {
             Ok(resp) if resp.is_ok() => {

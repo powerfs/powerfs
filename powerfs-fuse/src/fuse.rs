@@ -1420,6 +1420,60 @@ impl PowerFsFs {
         false
     }
 
+    /// Resolve the EntryState after a successful flush RPC.
+    ///
+    /// The inode entered the flush as Flushing. Normally it transitions
+    /// Flushing→Clean. But if a concurrent write landed while the RPC was in
+    /// flight (`re_dirtied`), the chunk(s) are legitimately dirty again and
+    /// the state must go Flushing→Dirty so the background flusher runs another
+    /// round. Forcing Flushing→Clean is rejected by the state machine and
+    /// would hide the new dirty data.
+    fn finish_flush_state(&self, inode: u64, re_dirtied: bool) {
+        if re_dirtied {
+            self.cache.mark_dirty(inode);
+            debug!(
+                "flush_dirty_chunks_impl: inode={} re-dirtied during flush, \
+                 staying Dirty for next flush round",
+                inode
+            );
+        } else {
+            // EntryState: Flushing→Clean after a successful flush RPC.
+            self.cache.mark_clean(inode);
+        }
+    }
+
+    /// Store a reconstructed file buffer into ChunkCache split at the chunk
+    /// boundary and mark every covered chunk dirty.
+    ///
+    /// Used by the Inline→Flat/Stripe migration paths, which rebuild the
+    /// whole file content (inline buffer plus the new write — or a fully
+    /// reconstructed buffer when the inline buffer was previously evicted).
+    /// Putting the whole buffer into chunk 0 was wrong for two reasons:
+    /// 1. The flush path emits one WriteNeedle per dirty chunk, so a >4MB
+    ///    chunk produced a frame whose data_len exceeded the volume server's
+    ///    MAX_FRAME_SIZE (4MB) → "invalid frame header: data_len >
+    ///    MAX_FRAME_SIZE" + connection drop + EIO under high concurrency.
+    /// 2. Flat keys data by per-chunk needle offsets and Stripe routes each
+    ///    chunk to its stripe unit, so one giant chunk also produced an
+    ///    incorrect on-volume layout.
+    fn store_reconstructed_data_as_chunks(&self, inode: u64, data: Vec<u8>, mtime: u64) {
+        let chunk_size = self.chunk_cache.chunk_size();
+        let bytes = bytes::Bytes::from(data);
+        if bytes.is_empty() {
+            return;
+        }
+        let chunk_count = (bytes.len() as u64 + chunk_size - 1) / chunk_size;
+        for chunk_idx in 0..chunk_count {
+            let start = (chunk_idx * chunk_size) as usize;
+            let end = std::cmp::min(start + chunk_size as usize, bytes.len());
+            // Bytes::slice is an O(1) ref-counted view.
+            let piece = bytes.slice(start..end);
+            self.chunk_cache
+                .put(inode, chunk_idx * chunk_size, piece, mtime, 0);
+            self.mark_dirty(inode, chunk_idx);
+        }
+    }
+
     /// Flush dirty chunks for an inode. Acquires per-inode flush lock to
     /// serialize with release callback's lease release.
     fn flush_dirty_chunks(&self, inode: u64, lease_token: Option<&str>) -> std::io::Result<()> {
@@ -1537,7 +1591,10 @@ impl PowerFsFs {
             let batch_size = 32;
             let mut had_error = false;
 
-            let chunks_to_flush: Vec<(u64, powerfs_fuse_core::WriteBlobRequest)> = dirty
+            // Each tuple carries (chunk_idx, snap_write_seq, request). The
+            // write_seq snapshot lets the post-RPC clear skip chunks that a
+            // concurrent write replaced while the RPC was in flight.
+            let chunks_to_flush: Vec<(u64, u64, powerfs_fuse_core::WriteBlobRequest)> = dirty
                 .iter()
                 .filter_map(|(_, chunk_idx)| {
                     if *chunk_idx >= powerfs_common::constants::FILE_KEY_BLOCK_SIZE {
@@ -1551,11 +1608,13 @@ impl PowerFsFs {
                     }
                     let chunk_offset = chunk_idx * chunk_size;
                     let chunk_data = self.chunk_cache.get(inode, chunk_offset)?;
+                    let snap_seq = chunk_data.write_seq;
                     let data_len = chunk_data.data.len();
                     let (vol_id, needle_id) =
                         resolve_stripe_chunk(placement, &stripe_chunks, chunk_offset, chunk_size)?;
                     Some((
                         *chunk_idx,
+                        snap_seq,
                         powerfs_fuse_core::WriteBlobRequest {
                             volume_id: vol_id,
                             file_key: needle_id,
@@ -1568,14 +1627,15 @@ impl PowerFsFs {
                 })
                 .collect();
 
-            let mut flushed_indices: Vec<u64> = Vec::new();
+            // (chunk_idx, snap_write_seq) for chunks whose RPC succeeded.
+            let mut flushed_indices: Vec<(u64, u64)> = Vec::new();
             for batch in chunks_to_flush.chunks(batch_size) {
-                let requests: Vec<_> = batch.iter().map(|(_, req)| req.clone()).collect();
+                let requests: Vec<_> = batch.iter().map(|(_, _, req)| req.clone()).collect();
                 let results = self
                     .client
                     .write_blob_batch_with_lease(requests, lease_token);
 
-                for ((chunk_idx, req), result) in batch.iter().zip(results.iter()) {
+                for ((chunk_idx, snap_seq, req), result) in batch.iter().zip(results.iter()) {
                     if let Err(e) = result {
                         self.mark_dirty(inode, *chunk_idx);
                         error!(
@@ -1588,40 +1648,31 @@ impl PowerFsFs {
                         let crc = crc32fast::hash(&req.data);
                         let chunk_offset = *chunk_idx * chunk_size;
                         self.cache.update_chunk_crc32(inode, chunk_offset, crc);
-                        flushed_indices.push(*chunk_idx);
+                        flushed_indices.push((*chunk_idx, *snap_seq));
                     }
                 }
             }
 
             if !flushed_indices.is_empty() {
                 self.chunk_cache
-                    .clear_dirty_for_chunks(inode, &flushed_indices);
+                    .clear_dirty_if_unchanged(inode, &flushed_indices);
             }
 
-            // ISSUE-001 diagnostic: log post-flush dirty state for stripe path
+            // Post-flush dirty state: a non-empty dirty set here means a
+            // concurrent write re-marked a chunk during the RPC, not a failed
+            // clear. The inode must stay Dirty so the flusher runs another
+            // round (see finish_flush_state below).
             let has_dirty_shards = self.has_dirty_for_inode(inode);
             let has_dirty_cache = self.chunk_cache.has_dirty_chunks(inode);
-            if flushed_indices.len() == dirty.len() && (has_dirty_shards || has_dirty_cache) {
-                warn!(
-                    "flush_dirty_chunks_impl(stripe): inode={} post-flush dirty NOT cleared! \
-                     flushed={}/{} has_dirty_shards={} has_dirty_cache={}",
-                    inode,
-                    flushed_indices.len(),
-                    dirty.len(),
-                    has_dirty_shards,
-                    has_dirty_cache
-                );
-            } else {
-                debug!(
-                    "flush_dirty_chunks_impl(stripe): inode={} post-flush OK flushed={}/{} \
-                     has_dirty_shards={} has_dirty_cache={}",
-                    inode,
-                    flushed_indices.len(),
-                    dirty.len(),
-                    has_dirty_shards,
-                    has_dirty_cache
-                );
-            }
+            debug!(
+                "flush_dirty_chunks_impl(stripe): inode={} flushed={}/{} \
+                 has_dirty_shards={} has_dirty_cache={}",
+                inode,
+                flushed_indices.len(),
+                dirty.len(),
+                has_dirty_shards,
+                has_dirty_cache
+            );
 
             if had_error {
                 // EntryState: Flushing→Dirty on failure (Phase 4). Chunks
@@ -1630,8 +1681,7 @@ impl PowerFsFs {
                 self.cache.mark_dirty(inode);
                 return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
-            // EntryState: Flushing→Clean after successful stripe flush RPC.
-            self.cache.mark_clean(inode);
+            self.finish_flush_state(inode, has_dirty_shards || has_dirty_cache);
             return Ok(());
         }
 
@@ -1672,8 +1722,10 @@ impl PowerFsFs {
         let batch_size = 32; // high concurrency for better throughput (2GB container)
         let mut had_error = false;
 
-        // Collect chunk data for all dirty chunks
-        let chunks_to_flush: Vec<(u64, powerfs_fuse_core::WriteBlobRequest)> = dirty
+        // Collect chunk data for all dirty chunks. Tuples carry
+        // (chunk_idx, snap_write_seq, request); the generation snapshot guards
+        // the post-RPC dirty clear against a concurrent overwrite.
+        let chunks_to_flush: Vec<(u64, u64, powerfs_fuse_core::WriteBlobRequest)> = dirty
             .iter()
             .filter_map(|(_, chunk_idx)| {
                 // Safety: chunk_idx must fit within FILE_KEY_BLOCK_SIZE to avoid
@@ -1689,9 +1741,11 @@ impl PowerFsFs {
                 }
                 let chunk_offset = chunk_idx * chunk_size;
                 let chunk_data = self.chunk_cache.get(inode, chunk_offset)?;
+                let snap_seq = chunk_data.write_seq;
                 let data_len = chunk_data.data.len();
                 Some((
                     *chunk_idx,
+                    snap_seq,
                     powerfs_fuse_core::WriteBlobRequest {
                         volume_id: fid.volume_id.0,
                         file_key: fid.file_key.saturating_add(*chunk_idx),
@@ -1717,46 +1771,54 @@ impl PowerFsFs {
         let shard_id = self.routing_shard(inode);
         let policy_threshold = self.write_predict_threshold(inode);
 
-        let mut deduped_indices: Vec<u64> = Vec::new();
-        let chunks_to_write: Vec<(u64, powerfs_fuse_core::WriteBlobRequest)> = if policy_threshold
-            > 0.0
-        {
-            let mut to_write = Vec::with_capacity(chunks_to_flush.len());
-            for (chunk_idx, req) in chunks_to_flush {
-                let chunk_offset = chunk_idx * chunk_size;
-                let data_size = req.data.len() as u64;
-                let fp = powerfs_core::fingerprint::Fingerprint::compute(&req.data);
-                let prefix = powerfs_core::fingerprint::Fingerprint::extract_prefix(&req.data);
+        // (chunk_idx, snap_write_seq) for chunks satisfied by a fingerprint
+        // reference rather than a data write — they are still "flushed".
+        let mut deduped_indices: Vec<(u64, u64)> = Vec::new();
+        let chunks_to_write: Vec<(u64, u64, powerfs_fuse_core::WriteBlobRequest)> =
+            if policy_threshold > 0.0 {
+                let mut to_write = Vec::with_capacity(chunks_to_flush.len());
+                for (chunk_idx, snap_seq, req) in chunks_to_flush {
+                    let chunk_offset = chunk_idx * chunk_size;
+                    let data_size = req.data.len() as u64;
+                    let fp = powerfs_core::fingerprint::Fingerprint::compute(&req.data);
+                    let prefix = powerfs_core::fingerprint::Fingerprint::extract_prefix(&req.data);
 
-                let meta_client = self.client.facade().meta_shard_client().clone();
-                let lookup_result = self.client.block_on(async move {
-                    meta_client
-                        .fingerprint_lookup(shard_id, inode, chunk_offset, &fp, data_size, &prefix)
-                        .await
-                });
+                    let meta_client = self.client.facade().meta_shard_client().clone();
+                    let lookup_result = self.client.block_on(async move {
+                        meta_client
+                            .fingerprint_lookup(
+                                shard_id,
+                                inode,
+                                chunk_offset,
+                                &fp,
+                                data_size,
+                                &prefix,
+                            )
+                            .await
+                    });
 
-                match lookup_result {
-                    Ok(powerfs_core::fingerprint::LookupResult::Match {
-                        needle_id,
-                        volume_id,
-                        crc32,
-                        ..
-                    })
-                    | Ok(powerfs_core::fingerprint::LookupResult::Recoverable {
-                        needle_id,
-                        volume_id,
-                        crc32,
-                        ..
-                    }) => {
-                        self.cache.update_chunk_needle_ref(
-                            inode,
-                            chunk_offset,
+                    match lookup_result {
+                        Ok(powerfs_core::fingerprint::LookupResult::Match {
                             needle_id,
                             volume_id,
                             crc32,
-                        );
-                        deduped_indices.push(chunk_idx);
-                        info!(
+                            ..
+                        })
+                        | Ok(powerfs_core::fingerprint::LookupResult::Recoverable {
+                            needle_id,
+                            volume_id,
+                            crc32,
+                            ..
+                        }) => {
+                            self.cache.update_chunk_needle_ref(
+                                inode,
+                                chunk_offset,
+                                needle_id,
+                                volume_id,
+                                crc32,
+                            );
+                            deduped_indices.push((chunk_idx, snap_seq));
+                            info!(
                             "FUSE_WRITE_DEDUP: inode={} chunk_idx={} fp={} → ref needle={} vol={}",
                             inode,
                             chunk_idx,
@@ -1764,35 +1826,36 @@ impl PowerFsFs {
                             needle_id,
                             volume_id
                         );
-                    }
-                    Ok(powerfs_core::fingerprint::LookupResult::NoMatch) => {
-                        to_write.push((chunk_idx, req));
-                    }
-                    Err(e) => {
-                        warn!(
+                        }
+                        Ok(powerfs_core::fingerprint::LookupResult::NoMatch) => {
+                            to_write.push((chunk_idx, snap_seq, req));
+                        }
+                        Err(e) => {
+                            warn!(
                                 "FUSE_WRITE_DEDUP: lookup failed inode={} chunk_idx={}: {} — normal write",
                                 inode,
                                 chunk_idx,
                                 e
                             );
-                        to_write.push((chunk_idx, req));
+                            to_write.push((chunk_idx, snap_seq, req));
+                        }
                     }
                 }
-            }
-            to_write
-        } else {
-            chunks_to_flush
-        };
+                to_write
+            } else {
+                chunks_to_flush
+            };
 
-        // Flush non-deduped chunks in parallel batches
-        let mut flushed_indices: Vec<u64> = Vec::new();
+        // Flush non-deduped chunks in parallel batches.
+        // (chunk_idx, snap_write_seq) for chunks whose RPC succeeded.
+        let mut flushed_indices: Vec<(u64, u64)> = Vec::new();
         for batch in chunks_to_write.chunks(batch_size) {
-            let requests: Vec<_> = batch.iter().map(|(_, req)| req.clone()).collect();
+            let requests: Vec<_> = batch.iter().map(|(_, _, req)| req.clone()).collect();
             let results = self
                 .client
                 .write_blob_batch_with_lease(requests, lease_token);
 
-            for ((chunk_idx, req), result) in batch.iter().zip(results.iter()) {
+            for ((chunk_idx, snap_seq, req), result) in batch.iter().zip(results.iter()) {
                 if let Err(e) = result {
                     self.mark_dirty(inode, *chunk_idx);
                     error!(
@@ -1825,47 +1888,36 @@ impl PowerFsFs {
                                 .await
                         });
                     }
-                    flushed_indices.push(*chunk_idx);
+                    flushed_indices.push((*chunk_idx, *snap_seq));
                 }
             }
         }
 
-        // Deduped chunks are also "flushed" — they reference existing data
-        flushed_indices.extend(deduped_indices.iter());
+        // Deduped chunks are also "flushed" — they reference existing data.
+        flushed_indices.extend(deduped_indices);
 
-        // Clear dirty flag for successfully flushed chunks so they can be evicted.
+        // Clear dirty only for chunks whose content generation is unchanged
+        // since the flush snapshot. A concurrent overwrite leaves those
+        // chunks dirty (evict-protected) for the next flush round.
         if !flushed_indices.is_empty() {
             self.chunk_cache
-                .clear_dirty_for_chunks(inode, &flushed_indices);
+                .clear_dirty_if_unchanged(inode, &flushed_indices);
         }
 
-        // ISSUE-001 diagnostic: log post-flush dirty state to verify clearing.
-        // has_dirty_for_inode checks dirty_shards; has_dirty_chunks checks
-        // chunk_cache internal dirty flag. Both should be false after a
-        // successful flush with all chunks flushed.
+        // Post-flush dirty state: a non-empty dirty set means a concurrent
+        // write re-marked a chunk during the RPC (expected under high
+        // concurrency), not a failed clear.
         let has_dirty_shards = self.has_dirty_for_inode(inode);
         let has_dirty_cache = self.chunk_cache.has_dirty_chunks(inode);
-        if flushed_indices.len() == dirty.len() && (has_dirty_shards || has_dirty_cache) {
-            warn!(
-                "flush_dirty_chunks_impl: inode={} post-flush dirty NOT cleared! \
-                 flushed={}/{} has_dirty_shards={} has_dirty_cache={} — possible re-mark race",
-                inode,
-                flushed_indices.len(),
-                dirty.len(),
-                has_dirty_shards,
-                has_dirty_cache
-            );
-        } else {
-            debug!(
-                "flush_dirty_chunks_impl: inode={} post-flush OK flushed={}/{} \
-                 has_dirty_shards={} has_dirty_cache={}",
-                inode,
-                flushed_indices.len(),
-                dirty.len(),
-                has_dirty_shards,
-                has_dirty_cache
-            );
-        }
+        debug!(
+            "flush_dirty_chunks_impl: inode={} flushed={}/{} \
+             has_dirty_shards={} has_dirty_cache={}",
+            inode,
+            flushed_indices.len(),
+            dirty.len(),
+            has_dirty_shards,
+            has_dirty_cache
+        );
 
         if had_error {
             // EntryState: Flushing→Dirty on failure (Phase 4). Chunks
@@ -1875,8 +1927,8 @@ impl PowerFsFs {
             return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
-        // EntryState: Flushing→Clean after successful flat flush RPC.
-        self.cache.mark_clean(inode);
+        // Flushing→Clean, or stay Dirty if a concurrent write landed.
+        self.finish_flush_state(inode, has_dirty_shards || has_dirty_cache);
 
         // Phase 3.4: size/chunks 元数据同步移至 release()（close 时强一致 sync），
         // flush_dirty_chunks 只负责将数据持久化到 volume server。
@@ -7338,9 +7390,7 @@ impl FileSystem for PowerFsFs {
                     // P4 fix: 必须调用 mark_dirty, 否则 release/flusher 不会将
                     // 迁移数据 flush 到 Volume Server, 导致数据只在内存中.
                     let mtime = chrono::Utc::now().timestamp() as u64;
-                    self.chunk_cache
-                        .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
-                    self.mark_dirty(inode, 0);
+                    self.store_reconstructed_data_as_chunks(inode, merged_data, mtime);
 
                     // 切换 cache 到 Flat 模式
                     let fid = Fid {
@@ -7388,13 +7438,12 @@ impl FileSystem for PowerFsFs {
                     let mtime = chrono::Utc::now().timestamp() as u64;
                     let new_size = new_end;
 
-                    // Put the full migrated data into chunk_cache at offset 0.
-                    // The Stripe write/flush path uses placement.locate() to
-                    // route each byte range to the correct volume, so we do
-                    // not need to split the data here.
-                    self.chunk_cache
-                        .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
-                    self.mark_dirty(inode, 0);
+                    // Split the migrated data into chunk-sized pieces. The
+                    // Stripe flush path emits one WriteNeedle per dirty chunk
+                    // and routes each chunk offset to its stripe unit via
+                    // resolve_stripe_chunk, so a single oversized chunk would
+                    // both exceed the frame limit and land in the wrong unit.
+                    self.store_reconstructed_data_as_chunks(inode, merged_data, mtime);
 
                     // Build Stripe placement + per-stripe chunks.
                     let volume_ids: Vec<u64> = allocations.iter().map(|(v, _)| *v).collect();
@@ -7948,9 +7997,7 @@ impl FileSystem for PowerFsFs {
                             inode, new_end, migrate_threshold, volume_id, needle_id
                         );
                         let mtime = chrono::Utc::now().timestamp() as u64;
-                        self.chunk_cache
-                            .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
-                        self.mark_dirty(inode, 0);
+                        self.store_reconstructed_data_as_chunks(inode, merged_data, mtime);
                         let fid = Fid {
                             volume_id: VolumeId(volume_id),
                             cookie: 0,
@@ -7990,9 +8037,7 @@ impl FileSystem for PowerFsFs {
                         );
                         let mtime = chrono::Utc::now().timestamp() as u64;
                         let new_size = new_end;
-                        self.chunk_cache
-                            .put(inode, 0, bytes::Bytes::from(merged_data), mtime, 0);
-                        self.mark_dirty(inode, 0);
+                        self.store_reconstructed_data_as_chunks(inode, merged_data, mtime);
                         let volume_ids: Vec<u64> = allocations.iter().map(|(v, _)| *v).collect();
                         let placement = powerfs_layout::Placement::Stripe {
                             stripe_size,
