@@ -2799,7 +2799,7 @@ impl MetaShardManager {
         mode: u32,
         uid: u32,
         gid: u32,
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, powerfs_layout::StorageMode), String> {
         let t0 = std::time::Instant::now();
 
         // Phase 3: Allocate inode within the parent directory's shard range
@@ -2856,7 +2856,10 @@ impl MetaShardManager {
             gid,
             info.storage_mode
         );
-        Ok(inode)
+        // 返回权威 storage_mode: 调用方 (net/gRPC create 响应) 必须按落盘
+        // 布局构造响应, 否则客户端盲信响应布局会与实际布局分叉 (例如文件名
+        // 规则预测为 Flat, 响应却回 Inline → 客户端 inline 提交被拒, 静默丢数).
+        Ok((inode, info.storage_mode))
     }
 
     pub async fn delete_file_by_inode(

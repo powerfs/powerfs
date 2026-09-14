@@ -37,6 +37,16 @@ pub use openraft::BasicNode;
 pub use openraft::Raft;
 pub use openraft::SnapshotPolicy;
 
+/// Raft gRPC 收发消息的最大尺寸（64 MiB）。
+///
+/// tonic/h2 默认上限为 4 MiB。Raft AppendEntries 单个日志条目可能超过
+/// 该值（批量元数据写、大 inline 载荷）；一旦某条未提交大 entry 落到
+/// 日志最新的节点上，它会赢得选举成为 leader，却永远无法把该条目复制
+/// 给受 4 MiB 限制的 follower，凑不齐多数派，其余节点也因日志落后无法
+/// 夺权 —— 整个 Raft 组进入不可恢复的写死锁。server 与所有 client
+/// channel 必须统一使用此限制。
+pub const RAFT_GRPC_MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
+
 // =============================================================================
 // TypeConfig
 // =============================================================================

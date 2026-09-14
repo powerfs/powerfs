@@ -233,7 +233,7 @@ impl PosixMetaService for PosixMetaServiceImpl {
                 )
                 .await
             {
-                Ok(ino) => ino,
+                Ok((ino, _storage_mode)) => ino,
                 Err(e) => {
                     return Ok(Response::new(CreateEntryResponse {
                         success: false,

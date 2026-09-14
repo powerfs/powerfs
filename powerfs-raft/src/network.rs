@@ -145,7 +145,11 @@ where
             .connect()
             .await
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        Ok(RaftServiceClient::new(endpoint))
+        // 放宽到 64MiB，避免大 raft entry 复制被 tonic 默认 4MiB 帧限
+        // 拒死（详见 RAFT_GRPC_MAX_MSG_SIZE 文档）。
+        Ok(RaftServiceClient::new(endpoint)
+            .max_decoding_message_size(crate::RAFT_GRPC_MAX_MSG_SIZE)
+            .max_encoding_message_size(crate::RAFT_GRPC_MAX_MSG_SIZE))
     }
 
     /// 把 `pb::AppendEntriesResponse` 转成 `StreamAppendResult`。

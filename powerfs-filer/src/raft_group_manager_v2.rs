@@ -416,7 +416,11 @@ impl RaftGroupManagerV2 {
 
     /// 返回 Raft gRPC service，供调用者合并到共享 gRPC server。
     pub fn raft_service(&self) -> RaftServiceServer<MultiRaftServiceImpl<FilerTypeConfig>> {
+        // 放宽收消息上限：默认 4MiB 会让超大 raft entry 无法被 follower
+        // 接收，导致对应 raft 组陷入不可恢复的选举死锁；须与出站
+        // client 侧（RAFT_GRPC_MAX_MSG_SIZE）保持一致。
         RaftServiceServer::new(MultiRaftServiceImpl::new(self.router.clone()))
+            .max_decoding_message_size(powerfs_raft::RAFT_GRPC_MAX_MSG_SIZE)
     }
 
     /// 获取本节点 gRPC 地址。
