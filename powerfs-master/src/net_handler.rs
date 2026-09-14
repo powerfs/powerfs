@@ -1371,6 +1371,16 @@ impl MasterNetHandler {
         msg: &NetMessage,
     ) -> powerfs_net::NetResult<NetMessage> {
         let _ = ctx;
+        // Volume capacity/used/file_count live in the in-memory volume_routes
+        // table, which is only updated on the Raft leader by volume heartbeats
+        // (apply_update_node_volumes). A follower's table is empty/stale, so
+        // answering here produced STATUS_OK with total=0, which made the
+        // kernel report a 0-block filesystem (busybox `df` hides it and users
+        // saw no powerfs mount). Redirect to the leader; the kernel statfs
+        // path iterates all configured masters and retries non-OK responses.
+        if let Err(resp) = self.check_raft_available(msg, "NET_STATFS").await {
+            return resp;
+        }
         let volumes = self.master.list_volume_routes();
 
         let total_size: u64 = volumes.iter().map(|v| v.size).sum();
