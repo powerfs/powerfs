@@ -25,8 +25,8 @@
 #   - 单节点 master (9333/9334) + 单节点 filer (8888/8900/9336)
 #   - **三 volume** (8080/8081/8082 + 8901/8902/8903) — 单 master + 单 filer + 3 volume, 共 12 initial volumes
 #   - Redis 复用 bridge 网络 (172.30.0.50), host 网络可直接访问
-#   - 硬件 RDMA: mlx5_1, IPoIB ibp160s0f1 192.168.100.3/24
-#   - VM VF: mlx5_1 virtfn0/virtfn1 → VM ib0 192.168.100.100/101
+#   - 硬件 RDMA: mlx5_1, IPoIB ibp160s0f1 192.168.100.4/24
+#   - VM VF: mlx5_1 virtfn0/virtfn1 → VM ib0 192.168.100.51/52
 #
 # host 网络端口规划 (必须全部唯一):
 #   master-1 :  9333 (TCP), 9334 (net), 9335 (raft), 9300 (metrics)
