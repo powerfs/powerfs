@@ -1482,7 +1482,7 @@ impl PowerFsFs {
         if bytes.is_empty() {
             return;
         }
-        let chunk_count = (bytes.len() as u64 + chunk_size - 1) / chunk_size;
+        let chunk_count = (bytes.len() as u64).div_ceil(chunk_size);
         for chunk_idx in 0..chunk_count {
             let start = (chunk_idx * chunk_size) as usize;
             let end = std::cmp::min(start + chunk_size as usize, bytes.len());

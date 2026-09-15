@@ -3,7 +3,6 @@ use bytes::Bytes;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
@@ -49,7 +48,7 @@ struct VolumeMeta {
 impl VolumeMeta {
     /// 获取或打开缓存的文件句柄（read+write 模式）。
     /// 首次调用时打开文件并缓存，后续调用直接复用。
-    fn get_or_open_file(&self) -> StorageResult<std::sync::MutexGuard<Option<File>>> {
+    fn get_or_open_file(&self) -> StorageResult<std::sync::MutexGuard<'_, Option<File>>> {
         let mut guard = self.data_file_handle.lock().map_err(|e| {
             StorageBackendError::BackendError(format!("data_file_handle mutex poisoned: {}", e))
         })?;

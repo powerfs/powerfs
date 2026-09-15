@@ -374,7 +374,7 @@ mod tests {
         let cfg = TransportConfig::default();
         assert_eq!(cfg.transport, "auto");
         assert!(cfg.tcp_fallback);
-        assert_eq!(cfg.rdma_buf_num, 32);
+        assert_eq!(cfg.rdma_buf_num, 128);
         assert_eq!(cfg.rdma_buf_size, 2 * 1024 * 1024);
         assert_eq!(cfg.conn_per_node, 1);
         assert!(!cfg.require_rdma);

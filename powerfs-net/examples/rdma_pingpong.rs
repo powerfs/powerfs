@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use clap::Parser;
-use powerfs_net::{create_transport, Transport, TransportConfig, TransportStream};
+use powerfs_net::{create_transport, TransportConfig, TransportStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser, Debug)]
@@ -31,13 +31,14 @@ struct Args {
 }
 
 fn make_cfg(args: &Args) -> TransportConfig {
-    let mut cfg = TransportConfig::default();
-    cfg.transport = args.transport.clone();
-    cfg.rdma_device = args.device.clone();
-    cfg.rdma_buf_num = 4;
-    cfg.rdma_buf_size = 65536;
-    cfg.tcp_fallback = false;
-    cfg
+    TransportConfig {
+        transport: args.transport.clone(),
+        rdma_device: args.device.clone(),
+        rdma_buf_num: 4,
+        rdma_buf_size: 65536,
+        tcp_fallback: false,
+        ..Default::default()
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -100,9 +101,7 @@ async fn server_loop(
         }
         w.write_all(&buf).await?;
         w.flush().await?;
-        if (i + 1) % 1 == 0 {
-            eprintln!("[srv] round {}/{} OK", i + 1, iters);
-        }
+        eprintln!("[srv] round {}/{} OK", i + 1, iters);
     }
     let elapsed = t0.elapsed();
     eprintln!(
@@ -120,7 +119,7 @@ async fn client_loop(
     n: usize,
 ) -> anyhow::Result<()> {
     let (mut r, mut w) = stream.split();
-    let mut send = vec![0xABu8; n];
+    let send = vec![0xABu8; n];
     let mut recv = vec![0u8; n];
     let t0 = Instant::now();
     for i in 0..iters {

@@ -39,7 +39,7 @@ impl BloomFilter {
             (-(expected_items as f64) * fpr.ln() / (ln2 * ln2)).ceil() as usize
         };
         let num_bits = m.max(64);
-        let num_words = (num_bits + 63) / 64;
+        let num_words = num_bits.div_ceil(64);
         let num_hashes = ((num_bits as f64 / expected_items as f64) * std::f64::consts::LN_2)
             .ceil()
             .max(1.0) as usize;

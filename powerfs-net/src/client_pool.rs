@@ -304,9 +304,7 @@ impl ClientConnPool {
         // transport (no new TCP socket / RDMA MR-pool + QP). This is the
         // primary guard against reconnect storms when topology points at a
         // dead/unreachable node (see #77).
-        if let Err(e) = self.check_backoff(&key) {
-            return Err(e);
-        }
+        self.check_backoff(&key)?;
 
         // Slow path: acquire per-key lock to prevent concurrent connection
         // creation. Without this, multiple threads (e.g. FUSE startup with
@@ -335,9 +333,7 @@ impl ClientConnPool {
 
         // Re-check backoff while holding the lock: another task may have just
         // recorded a failure for this key.
-        if let Err(e) = self.check_backoff(&key) {
-            return Err(e);
-        }
+        self.check_backoff(&key)?;
 
         debug!(
             "ClientConnPool: slow path creating connection {} (channel={}, client_id={})",
@@ -388,7 +384,7 @@ impl ClientConnPool {
                 });
             entry.attempts = entry.attempts.saturating_add(1);
             // attempts=1 -> base, 2 -> 2*base, 3 -> 4*base, ...
-            let shift = entry.attempts.saturating_sub(1).min(20) as u32;
+            let shift = entry.attempts.saturating_sub(1).min(20);
             let delay = self
                 .config
                 .backoff_base
