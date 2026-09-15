@@ -229,9 +229,11 @@ jobs:
 
       - name: Deploy powerfs.ko and mount on both VMs
         run: |
-          for PORT in ${{ env.VM1_SSH_PORT }} ${{ env.VM2_SSH_PORT }}; do
-            echo "=== Deploying to VM (port $PORT) ==="
-            ssh -p $PORT -o StrictHostKeyChecking=no root@localhost sh <<'REMOTE_EOF'
+          for PORT_CERT in "${{ env.VM1_SSH_PORT }}:kernel-client-1" "${{ env.VM2_SSH_PORT }}:kernel-client-2"; do
+            PORT="${PORT_CERT%%:*}"
+            CERT_NAME="${PORT_CERT##*:}"
+            echo "=== Deploying to VM (port $PORT, cert $CERT_NAME) ==="
+            ssh -p $PORT -o StrictHostKeyChecking=no root@localhost sh <<REMOTE_EOF
               # Unmount and unload if already loaded
               umount /mnt/pfs 2>/dev/null || umount -l /mnt/pfs 2>/dev/null || true
               rmmod powerfs 2>/dev/null || true
@@ -249,17 +251,17 @@ jobs:
               cp /mnt/host/powerfs.ko /root/powerfs.ko
               insmod /root/powerfs.ko master_addr=172.30.0.11,172.30.0.12,172.30.0.13 master_port=9334 shard_count=3
               mkdir -p /mnt/pfs
-              mount -t powerfs none /mnt/pfs -o master_addr=172.30.0.11,master_port=9334
+              mount -t powerfs none /mnt/pfs -o master_addr=172.30.0.11,master_port=9334,ca_crt=/mnt/host/ca.crt,client_crt=/mnt/host/${CERT_NAME}.crt,client_key=/mnt/host/${CERT_NAME}.key
 
               # Verify
               if mount | grep -q powerfs; then
-                echo "Deploy OK: $(mount | grep powerfs | head -1)"
+                echo "Deploy OK: \$(mount | grep powerfs | head -1)"
               else
                 echo "ERROR: powerfs mount failed"
                 dmesg | tail -10
                 exit 1
               fi
-          REMOTE_EOF
+REMOTE_EOF
             if [ $? -ne 0 ]; then
               echo "::error::Deploy failed on port $PORT"
               exit 1
