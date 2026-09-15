@@ -1893,6 +1893,7 @@ impl MetaShardClient {
     /// Raw body matching the filer's `handle_fingerprint_record`:
     ///   fp[32] + needle_id[8] + volume_id[8] + crc32[4] + data_size[8]
     ///   + prefix[64] = 124 bytes
+    #[allow(clippy::too_many_arguments)]
     pub async fn fingerprint_record(
         &self,
         shard_id: u64,

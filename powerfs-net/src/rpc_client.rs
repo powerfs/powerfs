@@ -129,6 +129,7 @@ pub async fn call_once_with(
 }
 
 /// Same as [`call_once_with`] but uses a custom transport (e.g. RDMA).
+#[allow(clippy::too_many_arguments)]
 pub async fn call_once_with_transport(
     addr: &str,
     client_type: ClientType,

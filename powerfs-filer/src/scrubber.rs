@@ -448,7 +448,7 @@ impl ScrubberWorker {
             }
 
             // 按文件大小选择 EC tier (data_shards, parity_shards)
-            let file_size: u64 = chunks.iter().map(|c| c.size as u64).sum();
+            let file_size: u64 = chunks.iter().map(|c| c.size).sum();
             let (data_shards, parity_shards) = self.config.select_ec_config(file_size);
             let total_shards = (data_shards + parity_shards) as usize;
 

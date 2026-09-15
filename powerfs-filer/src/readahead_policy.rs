@@ -18,6 +18,11 @@
 //! 触发点: update_inode_size_chunks_atomic 成功后 (文件大小变化时).
 //! 只在策略变化时写 xattr (避免冗余 Raft 写入).
 
+// Dense matrix inference/training (MLP 5→8→1) indexes several weight and
+// activation arrays by the same (i,j) coordinates; indexed loops are the
+// conventional readable form for this numeric code.
+#![allow(clippy::needless_range_loop)]
+
 use crate::meta_shard_manager::MetaShardManager;
 use crate::raft_group_manager_v2::ShardId;
 use crate::readahead_trace::{IoTraceAggregator, TraceFeatures};

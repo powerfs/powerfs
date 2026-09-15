@@ -169,8 +169,9 @@ pub struct VolumeConfig {
     /// 存储引擎选择（v1/v2 并行切换，方案 §17 P1）：
     /// - "needle"（默认）：v1 needle 引擎（RocksDB 索引 + 数据文件 append）；
     /// - "wal"：v2 统一日志引擎（docs/wal-volume-engine-plan.md）。
-    /// 只影响本节点新建卷；已有卷按原引擎目录形态打开（v1 卷目录含
-    /// metadata/，WAL 卷目录含 seg_*.log）。
+    ///
+    ///   只影响本节点新建卷；已有卷按原引擎目录形态打开（v1 卷目录含
+    ///   metadata/，WAL 卷目录含 seg_*.log）。
     #[serde(default)]
     pub volume_engine: Option<String>,
     /// WAL 引擎段大小（字节），默认 64 MiB。

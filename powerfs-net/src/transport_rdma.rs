@@ -24,6 +24,18 @@
 //! 通过 extern "C" 链接系统共享库.
 
 #![cfg(feature = "rdma")]
+// FFI bindings mirror the C ABI of libibverbs/librdmacm: C-style type
+// names (e.g. `ibv_wc_status`), binding symbols kept for API completeness
+// even if not yet called, and libc integer aliases (int32_t → c_int) are
+// intentional. Scope these allows to the RDMA module only.
+#![allow(
+    non_camel_case_types,
+    dead_code,
+    unused_imports,
+    unused_variables,
+    deprecated,
+    clippy::unnecessary_cast
+)]
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -2485,10 +2497,7 @@ impl AsyncRead for RdmaReadHalf {
                         self.recv_pos = n;
                         Poll::Ready(Ok(()))
                     }
-                    Err(e) => Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))),
+                    Err(e) => Poll::Ready(Err(std::io::Error::other(e.to_string()))),
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -2531,10 +2540,7 @@ impl AsyncWrite for RdmaWriteHalf {
                     match result {
                         Ok(()) => {}
                         Err(e) => {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            )));
+                            return Poll::Ready(Err(std::io::Error::other(e.to_string())));
                         }
                     }
                 }
@@ -2553,14 +2559,11 @@ impl AsyncWrite for RdmaWriteHalf {
         // magic"). If buf exceeds buffer size, return an error.
         let max_len = self.channel.mr_pool.buf_size();
         if buf.len() > max_len {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "RDMA write: frame {} exceeds buffer size {}",
-                    buf.len(),
-                    max_len
-                ),
-            )));
+            return Poll::Ready(Err(std::io::Error::other(format!(
+                "RDMA write: frame {} exceeds buffer size {}",
+                buf.len(),
+                max_len
+            ))));
         }
         let write_len = buf.len();
 
@@ -2575,10 +2578,7 @@ impl AsyncWrite for RdmaWriteHalf {
                 self.pending_send = None;
                 match result {
                     Ok(()) => Poll::Ready(Ok(write_len)),
-                    Err(e) => Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))),
+                    Err(e) => Poll::Ready(Err(std::io::Error::other(e.to_string()))),
                 }
             }
             Poll::Pending => Poll::Pending,
@@ -2597,10 +2597,7 @@ impl AsyncWrite for RdmaWriteHalf {
                     match result {
                         Ok(()) => {}
                         Err(e) => {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                e.to_string(),
-                            )));
+                            return Poll::Ready(Err(std::io::Error::other(e.to_string())));
                         }
                     }
                 }

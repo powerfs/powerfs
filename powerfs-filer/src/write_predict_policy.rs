@@ -15,6 +15,11 @@
 //!   首次写 → 低重复概率 (threshold 0.0, 不算指纹)
 //!   追加写 → 低重复概率 (threshold 0.1)
 
+// Dense matrix inference/training (MLP 7→16→1) indexes several weight and
+// activation arrays by the same (i,j) coordinates; indexed loops are the
+// conventional readable form for this numeric code.
+#![allow(clippy::needless_range_loop)]
+
 use crate::meta_shard_manager::MetaShardManager;
 use crate::raft_group_manager_v2::ShardId;
 use crate::readahead_trace::IoTraceAggregator;
@@ -286,7 +291,7 @@ mod tests {
         let nn = WritePredictNN::new();
         let input = [0.5; NN_INPUT_SIZE];
         let prob = nn.predict(&input);
-        assert!(prob >= 0.0 && prob <= 1.0);
+        assert!((0.0..=1.0).contains(&prob));
     }
 
     #[test]

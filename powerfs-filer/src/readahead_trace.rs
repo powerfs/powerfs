@@ -237,7 +237,7 @@ impl IoTraceAggregator {
         let traces = self.traces.lock().unwrap();
         traces
             .iter()
-            .filter_map(|(&ino, state)| {
+            .map(|(&ino, state)| {
                 let elapsed = state.last_ts.duration_since(state.first_ts).as_secs_f64();
                 let iops = if elapsed > 0.0 {
                     (state.total_samples * KERNEL_SAMPLE_RATE) as f64 / elapsed
@@ -270,7 +270,7 @@ impl IoTraceAggregator {
                     }
                 };
 
-                Some((
+                (
                     ino,
                     TraceFeatures {
                         iops,
@@ -281,7 +281,7 @@ impl IoTraceAggregator {
                     },
                     state.last_seq_run,
                     state.last_rand_run,
-                ))
+                )
             })
             .collect()
     }

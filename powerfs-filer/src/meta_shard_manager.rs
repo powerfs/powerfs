@@ -1,7 +1,6 @@
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -132,7 +131,8 @@ pub struct MetaShardManager {
     raft_group_manager: Arc<RaftGroupManagerV2>,
     shard_stores: RwLock<HashMap<ShardId, Arc<ShardStore>>>,
     shard_strategy: Arc<ShardStrategy>,
-    /// Filer node id.
+    /// Filer node id (retained for node-scoped lease/notify attribution).
+    #[allow(dead_code)]
     node_id: u64,
     data_path: String,
     root_inodes: RwLock<HashMap<String, u64>>,
@@ -294,6 +294,10 @@ impl LayoutMigrationStats {
         }
     }
 }
+
+/// One file-creation request in a [`MetaShardManager::batch_create_file`]
+/// batch: `(ino, parent_ino, name, mode, uid, gid, mtime, atime)`.
+pub type BatchCreateEntry = (u64, u64, String, u32, u32, u32, u64, u64);
 
 impl MetaShardManager {
     pub fn new(
@@ -1347,7 +1351,7 @@ impl MetaShardManager {
     /// - `Err`: propose failed.
     pub async fn batch_create_file(
         &self,
-        entries: &[(u64, u64, String, u32, u32, u32, u64, u64)],
+        entries: &[BatchCreateEntry],
     ) -> Vec<Result<Option<u8>, String>> {
         let n = entries.len();
         let mut results: Vec<Result<Option<u8>, String>> = vec![Ok(None); n];

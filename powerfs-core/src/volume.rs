@@ -29,13 +29,6 @@ pub struct Volume {
     /// Write-back coalescing buffer for per-Needle partial over-writes.
     /// See the [`crate::write_coalescer` docs for design & rationale.
     coalescer: Arc<WriteCoalescer>,
-    /// Cheap counter used for opportunistic deadline flushes.  Every
-    /// `write_needle_blob` does a wrapping increment and whenever it
-    /// wraps to 0 we call flush_expired_dirty().  This ensures we do not
-    /// leave dirty entries sitting around forever when the per-entry
-    /// triggers never fire and there is no external scheduler ticker
-    /// calling us periodically.
-    op_counter: std::sync::atomic::AtomicU32,
     /// Compact 正在进行时设为 true，阻止并发 write
     compacting: AtomicBool,
 }
@@ -172,7 +165,6 @@ impl Volume {
             backend,
             backend_volume_id,
             coalescer: Arc::new(WriteCoalescer::new(coalescer_config)),
-            op_counter: std::sync::atomic::AtomicU32::new(0),
             compacting: AtomicBool::new(false),
         })
     }
@@ -344,16 +336,6 @@ impl Volume {
             };
             self.append_needle_version(needle_id, data, existing)
         }
-    }
-
-    /// Expose a cheap helper that flushes `Some` return value from
-    /// [`WriteCoalescer::record_write`] into the Volume, returning Result so
-    /// callers can use `?`.
-    fn flush_option(&self, maybe: Option<(NeedleId, Vec<u8>, bool)>) -> Result<()> {
-        if let Some((id, vec, is_new)) = maybe {
-            self.flush_coalescer_entry(id, vec, is_new)?;
-        }
-        Ok(())
     }
 
     /// 外部写入口：若 volume 正在 compact 则短暂等待（compact 会重写存活 needle
@@ -968,15 +950,19 @@ impl Volume {
         // for this needle_id; if yes, skip the backend RMW completely and
         // merge straight into RAM.
         if self.coalescer.is_dirty(&needle_id) {
-            // record_write 现在总是返回 None（不触发同步 flush），
-            // flush 由后台线程异步执行，写入路径零 IO
-            let _ = self.coalescer.record_write(
+            // Async mode: record_write returns None and the background flush
+            // thread materialises later. Disabled mode returns a forced flush
+            // payload which must be materialised synchronously here to remain
+            // immediately visible.
+            if let Some((fid, merged, is_new)) = self.coalescer.record_write(
                 &needle_id,
                 data_offset,
                 &data[..data_size],
                 data_offset + data_size,
                 None,
-            );
+            ) {
+                self.flush_coalescer_entry(fid, merged, is_new)?;
+            }
             return Ok(());
         }
 
@@ -1011,15 +997,19 @@ impl Volume {
             existing_data = None;
         }
 
-        // record_write 现在总是返回 None（不触发同步 flush），
-        // flush 由后台线程异步执行，写入路径零 IO
-        let _ = self.coalescer.record_write(
+        // Async mode: record_write returns None and the background flush
+        // thread materialises later (write path does zero backend IO).
+        // Disabled mode: it returns a forced flush payload which must be
+        // materialised synchronously so the write is durable+visible on return.
+        if let Some((fid, merged, is_new)) = self.coalescer.record_write(
             &needle_id,
             data_offset,
             &data[..data_size],
             full_size_hint,
             existing_data,
-        );
+        ) {
+            self.flush_coalescer_entry(fid, merged, is_new)?;
+        }
         Ok(())
     }
 
@@ -1183,9 +1173,8 @@ impl Volume {
     /// [`WriteCoalescer::record_write`]): when the total dirty-bytes budget
     /// is exceeded we mark a victim as expired synchronously, but we do
     /// NOT block the caller on that victim's backend I/O.  Instead this
-    /// method must be called periodically (either by an external scheduler
-    /// tick, or via the embedded `op_counter` opportunistic hook below)
-    /// to do the actual flushing.
+    /// method must be called periodically by the background maintenance
+    /// thread to do the actual flushing.
     pub fn flush_expired_dirty(&self) -> usize {
         self.coalescer.flush_expired(|id, vec, is_new| {
             self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
@@ -1211,24 +1200,6 @@ impl Volume {
                 Ok(())
             });
         Ok(n)
-    }
-
-    /// Opportunistic deadline flush helper: cheap on the hot path (a single
-    /// wrapping fetch_add) and fires flush_expired_dirty() roughly once per
-    /// FLUSH_EVERY writes, regardless of needle id.  This guarantees that
-    /// entries never sit in the dirty buffer longer than roughly:
-    ///
-    ///   config.deadline + FLUSH_EVERY * avg_write_latency
-    ///
-    /// even when per-entry triggers never fire and no external scheduler
-    /// is driving us periodically.
-    fn opportunistic_flush_expired(&self) {
-        // 后台统一维护线程（main.rs 中的 BG_FLUSH）每 50ms 扫描所有 volume
-        // 并 flush 过期 needle，写入路径完全不触发 flush，零 IO 阻塞。
-        // op_counter 保留用于统计，但不再触发同步 flush。
-        let _ = self
-            .op_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

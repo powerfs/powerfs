@@ -559,12 +559,25 @@ mod tests {
         let coal = WriteCoalescer::new(cfg);
         let id = NeedleId(5);
         let hint = 4;
-        coal.record_write(&id, 0, b"1111", hint, None);
-        coal.record_write(&id, 0, b"2222", hint, None);
-        let third = coal.record_write(&id, 0, b"3333", hint, None);
-        let (fid, fv, _) = third.expect("3rd write should hit min_pending_writes");
-        assert_eq!(fid.0, id.0);
-        assert_eq!(fv, b"3333");
+        // Async design: record_write never returns flush data synchronously;
+        // it marks the entry expired once pending_writes reaches the
+        // threshold and the background flush_expired drains it.
+        assert!(coal.record_write(&id, 0, b"1111", hint, None).is_none());
+        assert!(coal.record_write(&id, 0, b"2222", hint, None).is_none());
+        assert!(coal.record_write(&id, 0, b"3333", hint, None).is_none());
+        let mut flushed = Vec::new();
+        let n = coal.flush_expired(|fid, v, _is_new| {
+            flushed.push((fid.0, v));
+            Ok(())
+        });
+        assert_eq!(
+            n, 1,
+            "3rd write marks the entry expired for background flush"
+        );
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].0, id.0);
+        // Last write at offset 0 overwrites the earlier bytes.
+        assert_eq!(flushed[0].1, b"3333");
         assert_eq!(coal.dirty_entry_count(), 0);
     }
 

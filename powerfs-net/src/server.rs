@@ -696,6 +696,7 @@ impl PowerFsNetServer {
     /// `handle_new_connection` variant runnable as a spawned `'static` task,
     /// taking all shared components by owned Arc clone (no borrow of self).
     /// Mirrors `handle_new_connection` semantics exactly.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_new_connection_spawned(
         handler: Arc<dyn NetHandler>,
         manager: Option<Arc<ServerConnectionManager>>,
@@ -942,16 +943,6 @@ impl PowerFsNetServer {
 
     async fn active_connections(&self) -> u64 {
         self.shutdown.read().await.active_connections
-    }
-
-    async fn increment_connections(&self) {
-        let mut state = self.shutdown.write().await;
-        state.active_connections += 1;
-    }
-
-    async fn decrement_connections(&self) {
-        let mut state = self.shutdown.write().await;
-        state.active_connections = state.active_connections.saturating_sub(1);
     }
 }
 
