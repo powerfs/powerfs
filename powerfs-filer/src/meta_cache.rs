@@ -1129,6 +1129,22 @@ impl MetaCache {
 
     // ---------- read path ----------
 
+    /// Lightweight presence check (no clone, no touch).
+    /// Returns `Some(true)` if the inode is cached in an active state
+    /// (Clean/Staging/Dirty), `Some(false)` if missing or Trimming,
+    /// `None` if marked Deleted.
+    pub fn is_inode_cached(&self, inode: u64) -> Option<bool> {
+        let tbl = self.inode_table.read().unwrap();
+        match tbl.get(&inode) {
+            None => Some(false),
+            Some(ci) => match ci.state {
+                CacheState::Deleted => None,
+                CacheState::Trimming => Some(false),
+                _ => Some(true),
+            },
+        }
+    }
+
     /// Try to read an inode from the cache.
     ///
     /// Returns:

@@ -1291,7 +1291,7 @@ impl VolumeClient {
                     let shift = busy_attempts.min(7);
                     let delay_ms = std::cmp::min(200, 2u64 * (1u64 << shift));
                     busy_attempts += 1;
-                    if busy_attempts <= 3 || busy_attempts % 5 == 0 {
+                    if busy_attempts <= 3 || busy_attempts.is_multiple_of(5) {
                         log::warn!(
                             "send_write_needle_direct: volume={} addr={} BUSY (admission \
                              reject), retry {}/{} after {}ms",

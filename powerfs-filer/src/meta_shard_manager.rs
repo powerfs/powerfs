@@ -4294,6 +4294,36 @@ impl MetaShardManager {
         let chunks_for_projection = chunks.clone();
         let inline_for_projection = inline_data.clone();
 
+        // Phase 1 fix: Ensure MetaCache has the inode before projection.
+        // On cache miss (evicted by trim_pass, InvalidateHandler EVICT,
+        // or never backfilled), project_update_size_chunks is a no-op
+        // (returns Ok(()) immediately). In async mode this means the
+        // projection is silently skipped, and a concurrent lookup/getattr
+        // from another client falls through to ShardStore — which still
+        // holds the pre-apply value (e.g. 4 migration-time pre-alloc
+        // chunks with size=0). The stale entry is then cached as Clean,
+        // and open() P4 cache-trust skips the Filer refresh entirely.
+        // Result: reads beyond chunk 0 return zeros (metadata_size=0).
+        //
+        // Fix: backfill from ShardStore as Clean BEFORE projection so the
+        // Dirty update lands on a real entry. Cost: one RocksDB read on
+        // cache miss only (close-sync is not a hot path). After Raft
+        // apply, cache_put_clean will overwrite with the authoritative
+        // value; the Dirty entry is never evicted (trim skips Dirty).
+        if self.meta_cache.is_inode_cached(inode) == Some(false) {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(ref store) = store {
+                if let Some(info) = store.get_inode(inode) {
+                    if info.delete_time == 0 {
+                        self.meta_cache.cache_put_clean(info);
+                    }
+                }
+            }
+        }
+
         // STALE_INLINE_REJECT pre-check (#106 step 1): project BEFORE
         // propose_meta. If the client submitted inline_data for an inode
         // already migrated to Flat/Stripe, project returns Err and we skip
