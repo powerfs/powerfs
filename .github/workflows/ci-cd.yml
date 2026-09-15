@@ -80,7 +80,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev libibverbs-dev
         sudo chmod 666 /dev/fuse
 
     - name: Format Check
@@ -152,7 +152,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev libibverbs-dev
         sudo chmod 666 /dev/fuse
 
     - name: Build All
@@ -220,7 +220,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev libibverbs-dev
         sudo chmod 666 /dev/fuse
 
     - name: Unit Tests
@@ -315,7 +315,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev libibverbs-dev
         sudo chmod 666 /dev/fuse
 
     - name: Build Benchmark
@@ -405,7 +405,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev libibverbs-dev
         sudo chmod 666 /dev/fuse
 
     - name: Run Tests with Coverage
@@ -494,7 +494,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev
+        sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev libibverbs-dev
 
     - name: Build Release Binaries
       run: |
