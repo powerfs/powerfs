@@ -59,9 +59,22 @@ async fn fs_open_rdonly_multi_client_shared_read() {
         "SHARED 状态 eval_issued 只读"
     );
 
-    // close
-    a.unlock(INODE_FILE_READ, LockType::File, r1.sn);
-    a.unlock(INODE_FILE_READ, LockType::File, r2.sn);
+    // close C1: C2 成为唯一 holder → 被 promote 到 LONER 并 bump sn.
+    // (生产环境该新 sn 经 CapUpgradeNotify 下发, client 用它更新 token.)
+    let promote = a
+        .unlock(INODE_FILE_READ, LockType::File, r1.sn)
+        .expect("sole survivor C2 is promoted to LONER");
+    assert_eq!(promote.0, "C2");
+    let c2_sn = promote.1;
+    assert_ne!(c2_sn, r2.sn, "promotion bumps sn for fencing");
+
+    // close C2 必须用 promote 后的当前 sn (旧 sn 是被 fence 的旧代,
+    // unlock 严格按 sn 匹配以防旧代 close 误放新代锁).
+    assert_eq!(
+        a.unlock(INODE_FILE_READ, LockType::File, c2_sn),
+        None,
+        "last holder removed, lock back to AVAILABLE"
+    );
 
     // close 后状态 AVAILABLE
     let r3 = a.rdlock(INODE_FILE_READ, LockType::File, "C3");

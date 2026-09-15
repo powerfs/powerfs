@@ -121,6 +121,39 @@ impl UpgradeNotifyCapture {
     }
 }
 
+// ==================== 辅助: 经 GATHER 握手让 writer+reader 进入 SHARED ====================
+
+/// 在 writer 已 open(RDWR, LONER) 的前提下, 让 `reader` 经真实
+/// rdlock GATHER 协议成为 SHARED holder:
+/// 1. reader 首次 open → granted NONE + 对脏写者的 W|X recall
+/// 2. 写者 ACK (flush + 降级 CAP_R), GATHER(ToShared) 完成
+/// 3. reader 重试 open → granted CAP_R, 正式加入 holders
+fn shared_with_reader(mgr: &CapManager, inode: u64, reader: &str) {
+    let pending = mgr.open_grant(inode, reader, false);
+    assert_eq!(
+        pending.granted_caps,
+        CapSet::NONE,
+        "{} blocked in GATHER until writer flushes",
+        reader
+    );
+    assert_eq!(
+        pending.recall_tasks.len(),
+        1,
+        "one writer recall for {}",
+        reader
+    );
+    for t in &pending.recall_tasks {
+        mgr.recall_ack(inode, &t.holder, &t.token).unwrap();
+    }
+    let granted = mgr.open_grant(inode, reader, false);
+    assert_eq!(
+        granted.granted_caps,
+        CapSet::CAP_R,
+        "{} granted CAP_R after writer flush + downgrade",
+        reader
+    );
+}
+
 // ==================== S4.1: 双向 client_id map 填充 + on_disconnect 反查 ====================
 
 #[test]
@@ -131,7 +164,8 @@ fn s4_1_client_id_map_bidirectional_lookup() {
     // 模拟 handle_cap_open_grant: 多 client 注册, net_cid 分配
     let _r1 = mgr.open_grant(100, "fuse-1", true);
     map.insert("fuse-1", 5001);
-    let _r2 = mgr.open_grant(100, "fuse-2", false);
+    // reader 经 GATHER 握手 (fuse-1 flush+降级) 后成为 inode 100 的 holder
+    shared_with_reader(&mgr, 100, "fuse-2");
     map.insert("fuse-2", 5002);
     let _r3 = mgr.open_grant(200, "fuse-1", true);
     // fuse-1 在两个 inode 都有锁, 但 net_cid 相同 (同连接)
@@ -151,8 +185,8 @@ fn s4_1_client_id_map_bidirectional_lookup() {
     assert_eq!(string_cid, "fuse-2");
     let (changed, _promote) = mgr.evict_session_full(&string_cid);
     assert!(!changed.is_empty(), "fuse-2 有锁, changed 非空");
-    // evict fuse-2 (reader) 后剩 fuse-1 (已 LONER), 不触发 promote (已 full)
-    // (promote_to_loner 仅对 caps 不全的 holder bump sn, fuse-1 已 EXCL)
+    // evict fuse-2 (reader) 后剩 fuse-1; GATHER 已把 fuse-1 降级为 CAP_R,
+    // 故此路径会把它 promote 回 full (本测试只关注 changed 非空 + map 清理).
     map.remove(5002);
     assert_eq!(map.lookup_net("fuse-2"), None, "清理后正查 None");
     assert_eq!(map.lookup_string(5002), None, "清理后反查 None");
@@ -183,8 +217,9 @@ fn s4_2_sweep_loop_force_reclaim_promotes_loner() {
     // 错开 50ms, 让 C2 的 lease 比 C1 晚 50ms 过期
     std::thread::sleep(Duration::from_millis(50));
 
-    // C2 open RDONLY → SHARED (C2 expire_at = T0+50+100 = T0+150)
-    let _r2 = mgr.open_grant(200, "C2", false);
+    // C2 open RDONLY → 经 GATHER 握手 (C1 flush+降级) 进入 SHARED
+    // (C2 expire_at = T0+50+100 = T0+150)
+    shared_with_reader(&mgr, 200, "C2");
 
     // sleep 60ms → T0+110: C1 过期 (T0+100 < T0+110), C2 仍有效 (T0+150 > T0+110)
     std::thread::sleep(Duration::from_millis(60));
@@ -285,9 +320,9 @@ async fn s4_3_acquire_xlock_gather_dispatch_and_await() {
 fn s4_4_release_cap_reuses_push_upgrade_notify() {
     let mgr = CapManager::new();
 
-    // C1 LONER + C2 reader → SHARED
+    // C1 LONER + C2 reader 经 GATHER 握手 → SHARED (C1 已降级 CAP_R)
     let r1 = mgr.open_grant(400, "C1", true);
-    let _r2 = mgr.open_grant(400, "C2", false);
+    shared_with_reader(&mgr, 400, "C2");
 
     // C1 release → promote C2 to LONER → UpgradeTask
     let up = mgr.release_cap(400, "C1", &r1.token).unwrap();
@@ -359,9 +394,9 @@ fn s4_6_on_disconnect_multi_inode_promote_dispatch() {
     // 场景: C1 在 inode 600/601 都是 LONER, 各有一个 reader (C2/C3)
     // evict C1 后, C2 和 C3 各自升级为 LONER (2 个 promote)
     let _r1a = mgr.open_grant(600, "C1", true);
-    let _r2a = mgr.open_grant(600, "C2", false); // C1 LONER + C2 reader
+    shared_with_reader(&mgr, 600, "C2"); // C1 writer + C2 reader → SHARED
     let _r1b = mgr.open_grant(601, "C1", true);
-    let _r3b = mgr.open_grant(601, "C3", false); // C1 LONER + C3 reader
+    shared_with_reader(&mgr, 601, "C3"); // C1 writer + C3 reader → SHARED
 
     map.insert("C1", 8001);
     map.insert("C2", 8002);
@@ -418,7 +453,7 @@ fn s4_7_sweep_and_disconnect_reuse_push_notify_pattern() {
     // C1 LONER + C4 reader → SHARED; C1 lease 先过期 → promote C4.
     let _r1 = mgr.open_grant(700, "C1", true); // C1 LONER (expire T0+100)
     std::thread::sleep(Duration::from_millis(50));
-    let _r4 = mgr.open_grant(700, "C4", false); // C4 reader (expire T0+150)
+    shared_with_reader(&mgr, 700, "C4"); // C4 reader 经 GATHER 共存 (expire T0+150)
     map.insert("C1", 9001);
     map.insert("C4", 9004);
 
@@ -433,7 +468,7 @@ fn s4_7_sweep_and_disconnect_reuse_push_notify_pattern() {
 
     // 场景 B: on_disconnect promote (evict 路径)
     let _r3 = mgr.open_grant(701, "C3", true); // C3 LONER
-    let _r5 = mgr.open_grant(701, "C5", false); // C3 LONER + C5 reader
+    shared_with_reader(&mgr, 701, "C5"); // C5 reader 经 GATHER 共存
     map.insert("C3", 9003);
     map.insert("C5", 9005);
 
