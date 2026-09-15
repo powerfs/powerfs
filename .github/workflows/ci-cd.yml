@@ -507,7 +507,32 @@ jobs:
         docker buildx version 2>/dev/null || docker buildx create --use --driver docker
 
     - name: Pull base image via mirror
-      run: docker pull ubuntu:20.04
+      run: |
+        # self-hosted runner 无法直连 Docker Hub (registry-1.docker.io 超时),
+        # 先看本地缓存, 再依次尝试直连 + 可达的公共镜像源; 拉取后重新打回
+        # 基础镜像 tag, 供 docker/Dockerfile 的 FROM ubuntu:20.04 本地复用.
+        BASE_IMAGE="ubuntu:20.04"
+        if docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+          echo "base image $BASE_IMAGE already present locally"
+          exit 0
+        fi
+        CANDIDATES=(
+          "$BASE_IMAGE"
+          "docker.m.daocloud.io/library/$BASE_IMAGE"
+          "docker.1ms.run/library/$BASE_IMAGE"
+        )
+        for IMG in "${CANDIDATES[@]}"; do
+          echo "--- trying $IMG ---"
+          if timeout 180 docker pull "$IMG"; then
+            if [ "$IMG" != "$BASE_IMAGE" ]; then
+              docker tag "$IMG" "$BASE_IMAGE"
+              docker rmi "$IMG" >/dev/null 2>&1 || true
+            fi
+            docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 && { echo "got $BASE_IMAGE"; exit 0; }
+          fi
+        done
+        echo "::error::failed to pull $BASE_IMAGE from Docker Hub and all mirrors"
+        exit 1
 
     - name: Login to GHCR
       env:
@@ -518,6 +543,8 @@ jobs:
     - name: Build and Push PowerFS Image
       run: |
         IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/powerfs"
+        # 不传 --pull: 上面经镜像源拉取并打回 tag 的本地 ubuntu:20.04 会被
+        # BuildKit 直接复用 (pull policy=missing), 不回源 registry-1.docker.io.
         docker build -f docker/Dockerfile -t "${IMAGE_TAG}:latest" -t "${IMAGE_TAG}:${GITHUB_SHA}" .
         docker push "${IMAGE_TAG}:latest"
         docker push "${IMAGE_TAG}:${GITHUB_SHA}"
