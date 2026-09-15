@@ -8,7 +8,7 @@
 //! 测试不依赖网络层 (使用默认 NoopCapRevoker), 直接通过 cap_manager
 //! 公开 API 验证 lock_arbiter 桥接正确性.
 
-use powerfs_filer::cap_manager::{CapManager, CapSet};
+use powerfs_filer::cap_manager::{CapManager, CapSet, OpenGrantResult};
 use powerfs_filer::lock_arbiter::{LockArbiter, LockType};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,6 +67,55 @@ impl powerfs_filer::cap_manager::RecallTimeoutPenalty for CountingPenalty {
     }
 }
 
+// ==================== 辅助: 经真实 GATHER 流程建立 writer+reader SHARED 共存 ====================
+
+/// 让 LONER 写者 `C1` 与读者 `C2` 在 `inode` 上进入 SHARED 共存,
+/// 完整走 `lock_arbiter::rdlock` 的 GATHER 协议 (读者必须等脏写者
+/// flush + 降级后才被授予, 否则会读到旧数据/零):
+///
+/// 1. C1 RDWR → LONER (CAP_R|W|X)
+/// 2. C2 RDONLY → granted NONE, 同时下发对 C1 的 W|X recall (保留 R)
+/// 3. C1 ACK recall (flush + 降级 CAP_R, GATHER ToShared 完成)
+/// 4. C2 重试 RDONLY → granted CAP_R; 锁变为 SHARED, 双 holder
+///
+/// 返回 (r1, r2) 的 grant 结果.
+fn establish_writer_reader_shared(
+    mgr: &CapManager,
+    inode: u64,
+) -> (OpenGrantResult, OpenGrantResult) {
+    let r1 = mgr.open_grant(inode, "C1", true);
+    assert!(r1.granted_caps.is_exclusive(), "C1 starts as LONER writer");
+
+    let pending = mgr.open_grant(inode, "C2", false);
+    assert_eq!(
+        pending.granted_caps,
+        CapSet::NONE,
+        "reader is blocked while the dirty writer must flush first"
+    );
+    let recall = pending
+        .recall_tasks
+        .first()
+        .expect("GATHER recall issued for C1 W|X");
+    assert_eq!(recall.holder, "C1");
+    assert_eq!(recall.caps_to_recall, CapSet::CAP_W | CapSet::CAP_X);
+    assert_eq!(recall.retained_caps, CapSet::CAP_R);
+
+    mgr.recall_ack(inode, "C1", &recall.token)
+        .expect("C1 recall ack completes GATHER ToShared");
+
+    let r2 = mgr.open_grant(inode, "C2", false);
+    assert_eq!(
+        r2.granted_caps,
+        CapSet::CAP_R,
+        "C2 gets CAP_R after writer flush + downgrade"
+    );
+    assert!(
+        r2.recall_tasks.is_empty(),
+        "no further recall once writer is downgraded"
+    );
+    (r1, r2)
+}
+
 // ==================== T1.1: open(RDONLY) 单 reader → granted CAP_R ====================
 
 #[test]
@@ -115,22 +164,47 @@ fn t1_3_multiple_readers_compatible() {
     assert_ne!(r1.token, r2.token, "distinct tokens per client");
 }
 
-// ==================== T1.4: writer + reader 共存 — rdlock 不 recall writer ====================
+// ==================== T1.4: writer + reader — rdlock 经 GATHER 让写者先 flush ====================
 
 #[test]
 fn t1_4_writer_then_reader_triggers_recall() {
     let revoker = Arc::new(CapturingRevoker::default());
     let mgr = CapManager::new().with_revoker(revoker.clone());
 
-    let _r1 = mgr.open_grant(400, "C1", true); // C1 LONER
-    let r2 = mgr.open_grant(400, "C2", false); // C2 reader → 打破 LONER → SHARED
+    let _r1 = mgr.open_grant(400, "C1", true); // C1 LONER (脏写可能未落盘)
 
-    // C2 拿到 CAP_R
-    assert_eq!(r2.granted_caps, CapSet::CAP_R, "C2 reader gets CAP_R");
-    // rdlock 不 recall writer 的 caps (C1 仍持 EXCL, 仅 state 降级为 SHARED)
-    // 这与 wrlock 触发 GATHER recall 不同 — rdlock 是兼容的共享读
-    assert!(r2.recall_tasks.is_empty(), "rdlock does NOT trigger recall");
-    assert_eq!(revoker.count(), 0, "no recall dispatched for reader");
+    // C2 reader 不能在写者脏页未落盘时直接读: rdlock 进入 GATHER,
+    // 返回 NONE 并下发对 C1 W|X 的 recall (保留 CAP_R).
+    let pending = mgr.open_grant(400, "C2", false);
+    assert_eq!(
+        pending.granted_caps,
+        CapSet::NONE,
+        "C2 blocked during GATHER until writer flushes"
+    );
+    let recall = pending.recall_tasks.first().expect("recall for C1");
+    assert_eq!(recall.holder, "C1");
+    assert_eq!(recall.caps_to_recall, CapSet::CAP_W | CapSet::CAP_X);
+    assert_eq!(recall.retained_caps, CapSet::CAP_R);
+    // open_grant 仅返回 recall_tasks 交给 net_handler 异步派发,
+    // 自身不直接调 revoker.
+    assert_eq!(
+        revoker.count(),
+        0,
+        "open_grant does not dispatch revoker inline"
+    );
+
+    // C1 flush + ACK 后, GATHER(ToShared) 完成; C2 重试获得 CAP_R.
+    mgr.recall_ack(400, "C1", &recall.token).unwrap();
+    let r2 = mgr.open_grant(400, "C2", false);
+    assert_eq!(
+        r2.granted_caps,
+        CapSet::CAP_R,
+        "C2 reader gets CAP_R after downgrade"
+    );
+    assert!(
+        r2.recall_tasks.is_empty(),
+        "no further recall once writer holds only CAP_R"
+    );
 }
 
 // ==================== T1.5: 两 writer → GATHER recall 第一个 writer, 第二个 granted NONE ====================
@@ -165,13 +239,11 @@ fn t1_5_two_writers_gather_recall_second_gets_none() {
 fn t1_6_release_writer_triggers_upgrade_to_loner() {
     let mgr = CapManager::new();
 
-    // C1 open RDWR → LONER (holders: [C1 EXCL])
-    let r1 = mgr.open_grant(600, "C1", true);
-    // C2 open RDONLY → 打破 LONER, state=SHARED, holders: [C1 EXCL, C2 CAP_R]
-    // (rdlock 不 recall C1, 仅降级 state; C1 仍持 EXCL caps)
-    let _r2 = mgr.open_grant(600, "C2", false);
+    // C1 writer + C2 reader 经 GATHER 进入 SHARED (C1 已降级为 CAP_R,
+    // holders: [C1 CAP_R, C2 CAP_R]).
+    let (r1, _r2) = establish_writer_reader_shared(&mgr, 600);
 
-    // C1 release → holders 删 C1, 剩 C2 (CAP_R), holders.len()==1 && state==SHARED
+    // C1 release → holders 删 C1, 仅剩 C2 (CAP_R), holders.len()==1
     // → promote_to_loner 升级 C2 到 EXCLUSIVE (bump sn 用于 fencing)
     let up1 = mgr.release_cap(600, "C1", &r1.token).unwrap();
     assert!(up1.is_some(), "C2 promoted to LONER after C1 release");
@@ -358,9 +430,9 @@ fn t1_13_full_lifecycle_open_recall_ack_release_upgrade() {
 fn t1_14_evict_session_full_returns_promote_tasks() {
     let mgr = CapManager::new();
 
-    // C1 wrlock LONER + C2 rdlock → SHARED (holders: [C1 EXCL, C2 CAP_R])
-    let _r1 = mgr.open_grant(1400, "C1", true);
-    let _r2 = mgr.open_grant(1400, "C2", false);
+    // C1 writer LONER + C2 reader 经 GATHER 进入 SHARED
+    // (holders: [C1 CAP_R, C2 CAP_R]).
+    establish_writer_reader_shared(&mgr, 1400);
 
     // evict C1 → 剩 C2 (CAP_R), promote_to_loner 升级 C2 到 EXCL
     let (changed, promote) = mgr.evict_session_full("C1");
