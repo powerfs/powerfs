@@ -2288,9 +2288,7 @@ impl FilerNetHandler {
                 // 客户端缓存后直接用于后续 setattr/getattr 等路由
                 enc.add_u64(FieldId::ShardId, setattr_shard.0);
 
-                if !is_special_file
-                    && matches!(storage_mode, powerfs_layout::StorageMode::Flat)
-                {
+                if !is_special_file && matches!(storage_mode, powerfs_layout::StorageMode::Flat) {
                     // === Flat (权威布局来自 LayoutPredictor, 如 .bin 规则) ===
                     // 分配 volume_id/needle_id 并持久化 chunk 映射, 与传统 Flat
                     // 路径一致. flat_alloc 可能为 None (inline_max 已配置但

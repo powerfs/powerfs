@@ -1442,6 +1442,26 @@ impl PowerFsFs {
         }
     }
 
+    /// Write-path size update: monotonic (never shrinks).
+    ///
+    /// fallocate(mode=0) preallocates the file far beyond the written data
+    /// (e.g. 8MB file size, 507KB actually written). When a write triggers
+    /// Inline→Flat/Stripe migration (or rebuilds an evicted inline buffer),
+    /// using `new_end`/`buf_len` as the size would SHRINK the file. The
+    /// kernel's GETATTR then runs fuse_change_attributes() →
+    /// truncate_pagecache(), discarding in-flight dirty pages beyond the
+    /// new smaller size → silent data loss. Writes must never shrink the
+    /// size; only ftruncate/fallocate may.
+    fn update_size_write_monotonic(&self, inode: u64, new_end: u64) {
+        let current = self
+            .cache
+            .peek_inode(inode)
+            .map(|e| std::cmp::max(e.size, e.content_size))
+            .unwrap_or(0);
+        self.cache
+            .update_size(inode, std::cmp::max(current, new_end));
+    }
+
     /// Store a reconstructed file buffer into ChunkCache split at the chunk
     /// boundary and mark every covered chunk dirty.
     ///
@@ -3375,7 +3395,26 @@ impl FileSystem for PowerFsFs {
                         Some(existing) => !existing.dirty,
                         None => true,
                     };
-                    if needs_insert {
+                    // Stale-migration guard: a dir-shard attr can still say
+                    // Inline after the file already migrated (Raft apply lag
+                    // on the inode shard). Inserting the placeholder then
+                    // would make read() serve zeros/EOF from the empty buffer
+                    // and write() trigger a SECOND migrate_inline_alloc that
+                    // overwrites the real volume data. The migrated layout
+                    // (chunks/fid) in the local cache is authoritative.
+                    let already_migrated = self
+                        .cache
+                        .peek_inode(ino)
+                        .map(|e| !e.chunks.is_empty() || e.fid.is_some())
+                        .unwrap_or(false);
+                    if already_migrated {
+                        debug!(
+                            "lookup: skipping inline_buffers prefill for inode={} \
+                             (stale Inline attr during migration apply lag, cache \
+                             already holds chunks/fid)",
+                            ino
+                        );
+                    } else if needs_insert {
                         debug!(
                             "lookup: prefilling inline_buffers from LOOKUP response for inode={}, data_len={}, attr.size={}, needs_refresh={}",
                             ino, dlen, attr.size, needs_refresh
@@ -5169,7 +5208,34 @@ impl FileSystem for PowerFsFs {
                         .get_inode(inode)
                         .map(|e| std::cmp::max(e.size, e.content_size))
                         .unwrap_or(0);
-                    if data_len == 0 && attr.size == 0 && local_size > 0 {
+                    // Impossible-signature guard (stale pre-migration view):
+                    // a genuine inline file can NEVER exceed INLINE_HARD_LIMIT
+                    // (the inline write path returns EFBIG beyond it and
+                    // migration runs first). is_inline() + size beyond the
+                    // limit + empty payload therefore means the inode shard is
+                    // serving the PRE-migration Inline placement while the
+                    // real data lives in Flat/Stripe chunks on the volume.
+                    // Typical trigger: InvalidateHandler EVICT wiped the local
+                    // migrated layout on a post-write invalidate, then a fresh
+                    // open's getattr raced the Raft apply. Inserting the
+                    // buffer would short-circuit reads with zeros/EOF ("bad
+                    // magic header 0"). already_migrated below cannot catch
+                    // this case — the EVICT removed the local chunks/fid.
+                    // Skip the insert; the read path's spin-wait getattr will
+                    // pick up the post-migration layout once apply catches up.
+                    if data_len == 0 && attr.size > INLINE_HARD_LIMIT as u64 {
+                        warn!(
+                            "OPEN_DBG: inode={} skipping empty inline_buf INSERT \
+                             (impossible inline signature: attr.size={} > \
+                             INLINE_HARD_LIMIT={} with empty payload — stale \
+                             pre-migration view, data lives in Flat/Stripe chunks)",
+                            inode, attr.size, INLINE_HARD_LIMIT
+                        );
+                        // Keep the filer-reported size (it matches the real
+                        // file size) but do NOT insert an empty buffer and do
+                        // NOT notify kernel inval (no local state changed).
+                        self.cache.set_content_size(inode, attr.size);
+                    } else if data_len == 0 && attr.size == 0 && local_size > 0 {
                         warn!(
                             "OPEN_DBG: inode={} skipping empty inline_buf INSERT (split-create apply lag: local_size={} but filer attr.size=0 data_len=0)",
                             inode, local_size
@@ -5177,36 +5243,76 @@ impl FileSystem for PowerFsFs {
                         // Do NOT set_content_size(0) either. Keep the
                         // lookup-seeded size in the cache entry.
                     } else {
-                        // 更新 cache size 为权威值 (Filer 端 inline 文件的 size)
-                        self.cache.set_content_size(inode, attr.size);
-                        if let Some(max_size) = attr.inline_max_size {
-                            self.inline_max_sizes.insert(inode, max_size);
+                        // Stale-migration guard: the same signature as a
+                        // legitimate fallocate file (size>0, inline_data=None)
+                        // also appears when the file has ALREADY migrated to
+                        // Flat/Stripe and the inode-shard Raft apply lag still
+                        // serves the pre-migration Inline placement. Inserting
+                        // an empty buffer here would route subsequent writes
+                        // back into the inline path and trigger a SECOND
+                        // migrate_inline_alloc — overwriting the real data on
+                        // the original volume. If the local cache already holds
+                        // a migrated layout (chunks/fid), trust it and skip.
+                        let already_migrated = self
+                            .cache
+                            .peek_inode(inode)
+                            .map(|e| !e.chunks.is_empty() || e.fid.is_some())
+                            .unwrap_or(false);
+                        if already_migrated && data_len == 0 {
+                            warn!(
+                                "OPEN_DBG: inode={} skipping empty inline_buf INSERT \
+                                 (stale Inline getattr during apply lag: attr.size={}, \
+                                 local cache already migrated chunks/fid)",
+                                inode, attr.size
+                            );
+                            // Also drop any placeholder buffer a concurrent
+                            // lookup/readdir prefill may have inserted from the
+                            // same stale Inline attr. Leaving it in place would
+                            // let read() serve zeros/EOF from the empty buffer
+                            // (L5608 dispatch fires before the chunked path).
+                            if let Some(stale) = self.inline_buffers.get(&inode) {
+                                if !stale.dirty && stale.data.is_empty() {
+                                    drop(stale);
+                                    self.inline_buffers.remove(&inode);
+                                    warn!(
+                                        "OPEN_DBG: inode={} removed stale empty \
+                                         prefill inline_buf (cache already migrated)",
+                                        inode
+                                    );
+                                }
+                            }
+                        } else {
+                            // 更新 cache size 为权威值 (Filer 端 inline 文件的 size)
+                            self.cache.set_content_size(inode, attr.size);
+                            if let Some(max_size) = attr.inline_max_size {
+                                self.inline_max_sizes.insert(inode, max_size);
+                            }
+                            // 填充 inline buffer (已关闭的 inline 文件数据来自 Filer)
+                            warn!(
+                                "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, was_stale={}, thread={:?}",
+                                inode, data_len, attr.size, was_stale, std::thread::current().id()
+                            );
+                            self.inline_buffers.insert(
+                                inode,
+                                InlineBuffer {
+                                    data,
+                                    dirty: false,
+                                    original_len: data_len,
+                                    modified_in_place: false,
+                                    needs_refresh: false,
+                                },
+                            );
+                            // L4.21 fix: Invalidate the kernel page cache after
+                            // refreshing the inline buffer from the Filer. The
+                            // kernel may still hold stale page cache from a previous
+                            // open (e.g., during concurrent appends where delayed
+                            // RELEASEs keep the inode "open" in the kernel's view,
+                            // preventing automatic page cache invalidation even
+                            // though keep_cache is not set). Without this, reads
+                            // after the open serve from the stale kernel page cache
+                            // instead of the freshly-refreshed inline buffer.
+                            self.notify_kernel_inval_inode(inode);
                         }
-                        // 填充 inline buffer (已关闭的 inline 文件数据来自 Filer)
-                        warn!(
-                            "OPEN_DBG: inode={} inline_buf INSERT from filer, data_len={}, attr.size={}, was_stale={}, thread={:?}",
-                            inode, data_len, attr.size, was_stale, std::thread::current().id()
-                        );
-                        self.inline_buffers.insert(
-                            inode,
-                            InlineBuffer {
-                                data,
-                                dirty: false,
-                                original_len: data_len,
-                                modified_in_place: false,
-                                needs_refresh: false,
-                            },
-                        );
-                        // L4.21 fix: Invalidate the kernel page cache after
-                        // refreshing the inline buffer from the Filer. The
-                        // kernel may still hold stale page cache from a previous
-                        // open (e.g., during concurrent appends where delayed
-                        // RELEASEs keep the inode "open" in the kernel's view,
-                        // preventing automatic page cache invalidation even
-                        // though keep_cache is not set). Without this, reads
-                        // after the open serve from the stale kernel page cache
-                        // instead of the freshly-refreshed inline buffer.
-                        self.notify_kernel_inval_inode(inode);
                     }
                 }
                 Ok(_) => {
@@ -5490,7 +5596,15 @@ impl FileSystem for PowerFsFs {
                         if attr.is_inline() {
                             let data = attr.inline_data.unwrap_or_default();
                             let dlen = data.len();
-                            if dlen == 0 && attr.size == 0 && local_size > 0 {
+                            // Impossible-signature guard (mirrors the open-path
+                            // guard): is_inline() + size beyond INLINE_HARD_LIMIT
+                            // + empty payload is a stale PRE-migration view — a
+                            // real inline file can never exceed the hard limit.
+                            // Keep spinning until the post-migration layout
+                            // (non-inline chunks/fid) is applied.
+                            if dlen == 0 && attr.size > INLINE_HARD_LIMIT as u64 {
+                                (false, 0)
+                            } else if dlen == 0 && attr.size == 0 && local_size > 0 {
                                 // Split-create lag: wait a bit and retry
                                 (false, 0)
                             } else {
@@ -5558,6 +5672,34 @@ impl FileSystem for PowerFsFs {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_micros(LAG_SLEEP_US));
+            }
+        }
+
+        // Stale-prefill guard (read side): a lookup/readdir/open prefill may
+        // have inserted an EMPTY placeholder buffer from a STALE dir-shard or
+        // inode-shard Inline attr after the file already migrated to
+        // Flat/Stripe. The dispatch below serves reads from inline_buffers
+        // unconditionally, so the placeholder would return zeros/EOF for the
+        // migrated data. The migrated layout (chunks/fid) is authoritative —
+        // drop the clean empty placeholder and let the chunked path serve.
+        let entry_migrated = self
+            .cache
+            .peek_inode(inode)
+            .map(|e| !e.chunks.is_empty() || e.fid.is_some())
+            .unwrap_or(false);
+        if entry_migrated {
+            let drop_stale = self
+                .inline_buffers
+                .get(&inode)
+                .map(|b| !b.dirty && b.data.is_empty())
+                .unwrap_or(false);
+            if drop_stale {
+                self.inline_buffers.remove(&inode);
+                warn!(
+                    "read: inode={} removed stale empty prefill inline_buf \
+                     (cache already migrated chunks/fid) — serving from chunked layout",
+                    inode
+                );
             }
         }
 
@@ -6589,8 +6731,21 @@ impl FileSystem for PowerFsFs {
                 let chunk_offset = (current_offset / self.chunk_cache.chunk_size())
                     * self.chunk_cache.chunk_size();
                 let metadata_size = chunk_size_map.get(&chunk_offset).copied().unwrap_or(0);
-                let effective_data_len =
-                    std::cmp::min(chunk_data.data.len(), metadata_size as usize);
+                // Clamp to metadata size ONLY when the layout view actually
+                // knows this chunk (entry present). A MISSING entry means the
+                // local layout view is stale/partial (e.g. re-inserted from a
+                // dir-shard attr snapshot that predates close-time chunk sync,
+                // so it only holds migration-time pre-alloc entries). The data
+                // in chunk_cache came from a successful needle read — holes
+                // return "needle not found" and never reach the cache — so the
+                // bytes are real written data. Clamping a missing entry to 0
+                // here zero-fills valid data (observed as "read returns zeros
+                // beyond 1MB" during Inline→Stripe migration + EVICT races).
+                let effective_data_len = if chunk_size_map.contains_key(&chunk_offset) {
+                    std::cmp::min(chunk_data.data.len(), metadata_size as usize)
+                } else {
+                    chunk_data.data.len()
+                };
                 let available_in_chunk = effective_data_len.saturating_sub(chunk_start);
                 let bytes_left_in_chunk = available_in_chunk.min((end - current_offset) as usize);
 
@@ -7193,6 +7348,42 @@ impl FileSystem for PowerFsFs {
         // self.inline_buffers.remove() — otherwise the remove tries to
         // acquire a write lock on the same shard that RefMut still holds,
         // causing a deadlock (fuse_worker thread hangs in futex_wait).
+        //
+        // Stale-prefill guard (write side): a lookup/readdir/open prefill can
+        // re-insert an EMPTY placeholder buffer from a STALE Inline attr after
+        // the file already migrated (Raft apply lag on the inode shard). With
+        // a buffer present, writes would enter the inline branch below: small
+        // writes land in the placeholder and vanish; large writes trigger a
+        // SECOND migrate_inline_alloc whose merged_data (empty + new write)
+        // replaces the real data on the volume. The migrated layout
+        // (chunks/fid) in the cache is authoritative — drop the clean stale
+        // placeholder and take the chunked path. A DIRTY buffer on a migrated
+        // entry is anomalous (migration removes its own buffer); keep it and
+        // warn loudly rather than silently discarding user data.
+        {
+            let cache_migrated = !entry.chunks.is_empty() || entry.fid.is_some();
+            if cache_migrated {
+                let drop_stale = self
+                    .inline_buffers
+                    .get(&inode)
+                    .map(|b| !b.dirty && b.data.is_empty())
+                    .unwrap_or(false);
+                if drop_stale {
+                    self.inline_buffers.remove(&inode);
+                    warn!(
+                        "write: inode={} discarded stale empty prefill inline_buf \
+                         (cache already migrated chunks/fid) — chunked write path",
+                        inode
+                    );
+                } else if self.inline_buffers.contains_key(&inode) {
+                    error!(
+                        "write: inode={} dirty inline_buf coexists with migrated \
+                         chunks/fid — entering inline branch (data loss risk)",
+                        inode
+                    );
+                }
+            }
+        }
         let migrate_data: Option<(Vec<u8>, u64, u64)> = {
             if let Some(mut inline_buf) = self.inline_buffers.get_mut(&inode) {
                 let new_end = offset + read_len as u64;
@@ -7266,8 +7457,10 @@ impl FileSystem for PowerFsFs {
                         "write inline: inode={} offset={} len={} buffer_len={}",
                         inode, offset, read_len, updated_size
                     );
-                    // Update content_size in cache so getattr reports correct size
-                    self.cache.update_size(inode, updated_size);
+                    // Update content_size in cache so getattr reports correct size.
+                    // Monotonic: fallocate(mode=0) may have preextended the size
+                    // far beyond this write — never shrink it back to buf_len.
+                    self.update_size_write_monotonic(inode, updated_size);
                     // EntryState: 标记 Dirty 以反映 inline buffer 已修改
                     // §13 Cap model: mark CAP_W dirty for recall flush.
                     self.cache.mark_dirty_cap_w(inode);
@@ -7409,7 +7602,9 @@ impl FileSystem for PowerFsFs {
                     }];
                     self.cache.update_fid(inode, Some(fid));
                     self.cache.update_chunks(inode, chunks);
-                    self.cache.update_size(inode, new_size);
+                    // Monotonic: keep fallocate-preextended size (chunk carries
+                    // only the written data; the hole reads back as zeros).
+                    self.update_size_write_monotonic(inode, new_end);
 
                     // 移除 inline buffer, 后续 write 走 Flat 路径
                     // Safe: RefMut was dropped at scope end above, no DashMap lock held
@@ -7467,10 +7662,30 @@ impl FileSystem for PowerFsFs {
                         .collect();
 
                     // Stripe files use per-chunk needle IDs, not a single fid.
+                    // Stripe reads locate data by per-1MB chunk (offset,size)
+                    // coverage; the placeholder units below all have size=0.
+                    // The migrated data occupies [0, new_end) in the chunk
+                    // cache, so populate those chunk sizes NOW — otherwise a
+                    // read hitting after the background flusher drains chunk 0
+                    // finds no covering chunk entry and returns zeros
+                    // (fio verify "bad magic header 0" at offset 0).
+                    // ORDER MATTERS: update_chunks must install the placeholder
+                    // list FIRST, then update_chunk_sizes_after_write_stripe
+                    // fills sizes on the installed list (a borrow-first call
+                    // would mutate the pre-migration list and get clobbered).
                     self.cache.update_fid(inode, None);
-                    self.cache.update_placement(inode, Some(placement));
-                    self.cache.update_chunks(inode, chunks);
-                    self.cache.update_size(inode, new_size);
+                    self.cache.update_placement(inode, Some(placement.clone()));
+                    self.cache.update_chunks(inode, chunks.clone());
+                    self.cache.update_chunk_sizes_after_write_stripe(
+                        inode,
+                        0,
+                        new_end,
+                        self.chunk_cache.chunk_size(),
+                        &placement,
+                        &chunks,
+                    );
+                    // Monotonic: keep fallocate-preextended size across migration.
+                    self.update_size_write_monotonic(inode, new_end);
 
                     self.inline_buffers.remove(&inode);
                     self.inline_max_sizes.remove(&inode);
@@ -8014,7 +8229,8 @@ impl FileSystem for PowerFsFs {
                         }];
                         self.cache.update_fid(inode, Some(fid));
                         self.cache.update_chunks(inode, chunks);
-                        self.cache.update_size(inode, new_size);
+                        // Monotonic: keep fallocate-preextended size across migration.
+                        self.update_size_write_monotonic(inode, new_end);
                         self.inline_buffers.remove(&inode);
                         self.inline_max_sizes.remove(&inode);
                         debug!(
@@ -8057,10 +8273,25 @@ impl FileSystem for PowerFsFs {
                                 crc32: 0,
                             })
                             .collect();
+                        // Populate per-1MB chunk sizes for the migrated data
+                        // range (same rationale as the primary migrate path:
+                        // placeholder units are size=0; Stripe reads need
+                        // chunk coverage or they return zeros).
+                        // ORDER MATTERS: install the placeholder list first,
+                        // then fill sizes on the installed list.
                         self.cache.update_fid(inode, None);
-                        self.cache.update_placement(inode, Some(placement));
-                        self.cache.update_chunks(inode, chunks);
-                        self.cache.update_size(inode, new_size);
+                        self.cache.update_placement(inode, Some(placement.clone()));
+                        self.cache.update_chunks(inode, chunks.clone());
+                        self.cache.update_chunk_sizes_after_write_stripe(
+                            inode,
+                            0,
+                            new_end,
+                            self.chunk_cache.chunk_size(),
+                            &placement,
+                            &chunks,
+                        );
+                        // Monotonic: keep fallocate-preextended size across migration.
+                        self.update_size_write_monotonic(inode, new_end);
                         self.inline_buffers.remove(&inode);
                         self.inline_max_sizes.remove(&inode);
                         info!(
@@ -8110,7 +8341,9 @@ impl FileSystem for PowerFsFs {
                 inline_buf.data[start..end].copy_from_slice(&buf[..]);
                 inline_buf.dirty = true;
                 let updated_size = inline_buf.data.len() as u64;
-                self.cache.update_size(inode, updated_size);
+                // Monotonic: fallocate-preextended size must survive the
+                // buffer rebuild (buf_len may be far below the file size).
+                self.update_size_write_monotonic(inode, updated_size);
                 // §13 Cap model: mark CAP_W dirty for recall flush.
                 self.cache.mark_dirty_cap_w(inode);
                 return Ok(read_len);
@@ -8943,7 +9176,23 @@ impl FileSystem for PowerFsFs {
                                     Some(existing) => !existing.dirty,
                                     None => true,
                                 };
-                                if needs_insert {
+                                // Stale-migration guard (mirrors the lookup
+                                // prefill guard): a dir-shard attr can still
+                                // say Inline after the file already migrated.
+                                // The placeholder would make read() serve
+                                // zeros/EOF and write() re-migrate.
+                                let already_migrated = self
+                                    .cache
+                                    .peek_inode(child.inode)
+                                    .map(|e| !e.chunks.is_empty() || e.fid.is_some())
+                                    .unwrap_or(false);
+                                if already_migrated {
+                                    debug!(
+                                        "readdir: skipping inline_buffers prefill for \
+                                         inode={} (cache already migrated chunks/fid)",
+                                        child.inode
+                                    );
+                                } else if needs_insert {
                                     debug!(
                                         "readdir: prefilling inline_buffers from READDIR attrs for inode={}, data_len={}, attr.size={}, needs_refresh={}",
                                         child.inode, dlen, attr.size, needs_refresh
