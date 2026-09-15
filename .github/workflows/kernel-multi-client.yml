@@ -233,7 +233,8 @@ jobs:
             PORT="${PORT_CERT%%:*}"
             CERT_NAME="${PORT_CERT##*:}"
             echo "=== Deploying to VM (port $PORT, cert $CERT_NAME) ==="
-            ssh -p $PORT -o StrictHostKeyChecking=no root@localhost sh <<REMOTE_EOF
+            ssh -p $PORT -o StrictHostKeyChecking=no root@localhost sh -s "$CERT_NAME" <<'REMOTE_EOF'
+              CERT_NAME="$1"
               # Unmount and unload if already loaded
               umount /mnt/pfs 2>/dev/null || umount -l /mnt/pfs 2>/dev/null || true
               rmmod powerfs 2>/dev/null || true
@@ -255,13 +256,13 @@ jobs:
 
               # Verify
               if mount | grep -q powerfs; then
-                echo "Deploy OK: \$(mount | grep powerfs | head -1)"
+                echo "Deploy OK: $(mount | grep powerfs | head -1)"
               else
                 echo "ERROR: powerfs mount failed"
                 dmesg | tail -10
                 exit 1
               fi
-REMOTE_EOF
+          REMOTE_EOF
             if [ $? -ne 0 ]; then
               echo "::error::Deploy failed on port $PORT"
               exit 1
