@@ -106,31 +106,44 @@ where
     where
         RB: RangeBounds<u64> + Clone + Debug + OptionalSend,
     {
-        let start = match range.start_bound() {
+        // RocksDB 迭代器可能阻塞（L0 stall / compaction），必须放在 blocking 线程，
+        // 否则会卡住 tokio worker，导致 raft 心跳/选主等所有 async 任务停滞。
+        // 提取 range 的数值边界（不把 RB 整体移入 'static 闭包，RB 非 'static）。
+        let db = self.db.clone();
+        let start_key = match range.start_bound() {
             std::ops::Bound::Included(x) => id_to_bin(*x),
             std::ops::Bound::Excluded(x) => id_to_bin(*x + 1),
             std::ops::Bound::Unbounded => id_to_bin(0),
         };
+        let end_exclusive = match range.end_bound() {
+            std::ops::Bound::Included(x) => x + 1,
+            std::ops::Bound::Excluded(x) => *x,
+            std::ops::Bound::Unbounded => u64::MAX,
+        };
 
-        let mut res = Vec::new();
+        C::spawn_blocking(move || {
+            let cf = db
+                .cf_handle(CF_LOG)
+                .expect("CF_LOG must exist (checked in new())");
+            let it = db.iterator_cf(
+                cf,
+                rocksdb::IteratorMode::From(&start_key, Direction::Forward),
+            );
 
-        let it = self.db.iterator_cf(
-            self.cf_log(),
-            rocksdb::IteratorMode::From(&start, Direction::Forward),
-        );
-        for item_res in it {
-            let (id, val) = item_res.map_err(read_logs_err)?;
-
-            let id = bin_to_id(&id);
-            if !range.contains(&id) {
-                break;
+            let mut res = Vec::new();
+            for item_res in it {
+                let (id, val) = item_res.map_err(read_logs_err)?;
+                let id = bin_to_id(&id);
+                if id >= end_exclusive {
+                    break;
+                }
+                let entry: EntryOf<C> = serde_json::from_slice(&val).map_err(read_logs_err)?;
+                assert_eq!(id, entry.index());
+                res.push(entry);
             }
-
-            let entry: EntryOf<C> = serde_json::from_slice(&val).map_err(read_logs_err)?;
-            assert_eq!(id, entry.index());
-            res.push(entry);
-        }
-        Ok(res)
+            Ok(res)
+        })
+        .await?
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error> {
@@ -145,27 +158,44 @@ where
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<C>, io::Error> {
-        let last = self
-            .db
-            .iterator_cf(self.cf_log(), rocksdb::IteratorMode::End)
-            .next();
+        // 一次 spawn_blocking 内完成所有 RocksDB 读（iterator + meta get），
+        // 避免在 async 上下文被 L0 stall/compaction 阻塞。
+        let db = self.db.clone();
+        let (last_log_id, last_purged_log_id) = C::spawn_blocking(move || {
+            let cf = db
+                .cf_handle(CF_LOG)
+                .expect("CF_LOG must exist (checked in new())");
+            let last = db.iterator_cf(cf, rocksdb::IteratorMode::End).next();
 
-        let last_log_id = match last {
-            None => None,
-            Some(res) => {
-                let (_log_index, entry_bytes) = res.map_err(read_logs_err)?;
-                let ent =
-                    serde_json::from_slice::<EntryOf<C>>(&entry_bytes).map_err(read_logs_err)?;
-                Some(ent.log_id())
-            }
-        };
+            let last_log_id = match last {
+                None => None,
+                Some(res) => {
+                    let (_log_index, entry_bytes) = res.map_err(read_logs_err)?;
+                    let ent = serde_json::from_slice::<EntryOf<C>>(&entry_bytes)
+                        .map_err(read_logs_err)?;
+                    Some(ent.log_id())
+                }
+            };
 
-        let last_purged_log_id = self.get_meta::<meta::LastPurged>()?;
+            let meta_cf = db
+                .cf_handle(CF_LOG_META)
+                .expect("CF_LOG_META must exist (checked in new())");
+            let bytes = db
+                .get_cf(meta_cf, <meta::LastPurged as meta::StoreMeta<C>>::KEY)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let last_purged_log_id = match bytes {
+                Some(b) => Some(
+                    serde_json::from_slice(&b)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+                ),
+                None => None,
+            };
 
-        let last_log_id = match last_log_id {
-            None => last_purged_log_id.clone(),
-            Some(x) => Some(x),
-        };
+            Ok::<_, io::Error>((last_log_id, last_purged_log_id))
+        })
+        .await??;
+
+        let last_log_id = last_log_id.or(last_purged_log_id.clone());
 
         Ok(LogState {
             last_purged_log_id,

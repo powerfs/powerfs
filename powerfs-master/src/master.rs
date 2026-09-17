@@ -4295,9 +4295,21 @@ impl MasterNode {
         // message forwarder and `broadcast::Sender<OutgoingMessage>` have been
         // removed.
 
-        // Keep the master running
-        tokio::signal::ctrl_c().await?;
-        info!("Received shutdown signal, stopping master node");
+        // Keep the master running until a shutdown signal arrives.
+        // Listen for BOTH SIGINT (ctrl-c) and SIGTERM (docker stop / compose down
+        // send SIGTERM, not SIGINT). Previously only ctrl_c() was handled, so
+        // `docker stop` waited the 10s grace then SIGKILL'd the process —
+        // raft/rocksdb never got a graceful flush opportunity (exit 137 every time).
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT (ctrl-c), stopping master node");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM (container stop), stopping master node");
+            }
+        }
 
         Ok(())
     }

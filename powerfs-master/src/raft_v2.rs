@@ -589,6 +589,19 @@ impl RaftNodeV2 {
             // 超过 9s 仍是 Leader 但 propose 失败 → 假 Leader, 停止服务.
             let fake_leader_threshold = tokio::time::Duration::from_secs(9);
 
+            // 假 Leader 自杀兜底：停止服务后仍持续无法恢复，说明 quorum 视图
+            // 可能已分裂（follower 持续收到心跳但 leader 收不到响应 → 对端永不发起选举）。
+            // 此时主动退出，让 restart policy 拉起后参与新一轮选举，结束脑裂。
+            // 加 per-node 抖动（0~60s）避免多节点同时退出导致 quorum 长期缺失。
+            let suicide_jitter = tokio::time::Duration::from_secs(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64 % 60)
+                    .unwrap_or(0),
+            );
+            let suicide_threshold =
+                tokio::time::Duration::from_secs(300).saturating_add(suicide_jitter);
+
             let mut fake_leader_since: Option<tokio::time::Instant> = None;
             let mut last_state = ServerState::Leader; // dummy init
             let mut was_unavailable = false;
@@ -673,6 +686,22 @@ impl RaftNodeV2 {
                                         node_id,
                                         elapsed
                                     );
+                                }
+
+                                // 自杀兜底：UNAVAILABLE 超过 suicide_threshold 仍不恢复，
+                                // 说明对端并未发起选举（典型场景：复制流接收方向永久失活，
+                                // 心跳仍送达但响应无法回到本节点，quorum 视图虚假存活）。
+                                // 主动退出让 restart policy 重启，结束脑裂。
+                                if elapsed >= suicide_threshold {
+                                    log::error!(
+                                        "RaftNodeV2: node={} fake Leader for {:?} \
+                                         (>= suicide_threshold {:?}) — exiting to break \
+                                         split-brain; restart policy will re-elect",
+                                        node_id,
+                                        elapsed,
+                                        suicide_threshold
+                                    );
+                                    std::process::exit(1);
                                 }
                             }
                         }
