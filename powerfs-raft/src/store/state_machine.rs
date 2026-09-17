@@ -317,9 +317,11 @@ where
             batch.put_cf(cf_meta, "last_membership", serialize(membership)?);
         }
 
-        self.db
-            .write(batch)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        // RocksDB write 可能阻塞（WAL fsync / L0 stall / compaction），
+        // 必须放在 blocking 线程，否则卡住 tokio worker 会拖垮 raft 心跳/选主。
+        let db = self.db.clone();
+        C::spawn_blocking(move || db.write(batch).map_err(|e| io::Error::other(e.to_string())))
+            .await??;
 
         // 持久化成功后再发送响应。
         for (responder, response) in responses {
