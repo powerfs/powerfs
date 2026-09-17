@@ -5,11 +5,15 @@ on:
     branches: [master, main]
     paths:
       - 'kernel/powerfs_mod/**'
+      # A submodule bump changes the gitlink at path 'kernel' itself,
+      # which does NOT match the kernel/powerfs_mod/** glob above.
+      - 'kernel'
       - '.github/workflows/kernel-multi-client.yml'
   pull_request:
     branches: [master, main]
     paths:
       - 'kernel/powerfs_mod/**'
+      - 'kernel'
       - '.github/workflows/kernel-multi-client.yml'
   schedule:
     # Nightly full test at 02:00 UTC (10:00 CST)
