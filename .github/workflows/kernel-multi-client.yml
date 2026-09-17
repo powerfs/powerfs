@@ -235,9 +235,26 @@ jobs:
             echo "=== Deploying to VM (port $PORT, cert $CERT_NAME) ==="
             ssh -p $PORT -o StrictHostKeyChecking=no root@localhost sh -s "$CERT_NAME" <<'REMOTE_EOF'
               CERT_NAME="$1"
-              # Unmount and unload if already loaded
+              # Tear down any pre-existing powerfs mount/module. Previous CI
+              # runs or manual qemuctl2 testing can leave mounts at /mnt/pfs
+              # OR /mnt/powerfs; a surviving mount keeps module refcount > 0,
+              # rmmod then fails silently and insmod dies with "File exists".
+              for mp in $(awk '$3=="powerfs"{print $2}' /proc/mounts); do
+                umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+              done
               umount /mnt/pfs 2>/dev/null || umount -l /mnt/pfs 2>/dev/null || true
-              rmmod powerfs 2>/dev/null || true
+              umount /mnt/powerfs 2>/dev/null || umount -l /mnt/powerfs 2>/dev/null || true
+              # Retry rmmod until the module is actually gone (refs drain async)
+              for i in $(seq 1 10); do
+                lsmod | grep -q '^powerfs ' || break
+                rmmod powerfs 2>/dev/null || true
+                sleep 1
+              done
+              if lsmod | grep -q '^powerfs '; then
+                echo "ERROR: stale powerfs module still loaded (refcount > 0)"
+                echo "remaining powerfs mounts:"; grep powerfs /proc/mounts || true
+                exit 1
+              fi
 
               # Check 9p share
               if [ ! -f /mnt/host/powerfs.ko ]; then
@@ -247,6 +264,15 @@ jobs:
                 ls -la /mnt/host/ 2>/dev/null || echo "/mnt/host not accessible"
                 exit 1
               fi
+
+              # Pre-check mTLS certs are present AND readable (9p passthrough)
+              for f in ca.crt "${CERT_NAME}.crt" "${CERT_NAME}.key"; do
+                if [ ! -r "/mnt/host/$f" ]; then
+                  echo "ERROR: cert /mnt/host/$f missing or unreadable"
+                  ls -la /mnt/host/ca.crt /mnt/host/kernel-client-*.crt /mnt/host/kernel-client-*.key 2>&1 || true
+                  exit 1
+                fi
+              done
 
               # Deploy
               cp /mnt/host/powerfs.ko /root/powerfs.ko

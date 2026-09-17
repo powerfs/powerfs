@@ -542,7 +542,11 @@ jobs:
 
     - name: Build and Push PowerFS Image
       run: |
-        IMAGE_TAG="ghcr.io/${{ github.repository_owner }}/powerfs"
+        # 用 github.repository 而非固定的 owner/powerfs：private 仓库
+        # (powerfs/powerfs-private) 的 GITHUB_TOKEN 无权写入 public 仓库
+        # 创建的 ghcr.io/powerfs/powerfs 包，导致 docker job permission_denied。
+        # 按仓库名推送后各推各的包，从根本上避免跨仓库权限冲突。
+        IMAGE_TAG="ghcr.io/${{ github.repository }}"
         # 不传 --pull: 上面经镜像源拉取并打回 tag 的本地 ubuntu:20.04 会被
         # BuildKit 直接复用 (pull policy=missing), 不回源 registry-1.docker.io.
         docker build -f docker/Dockerfile -t "${IMAGE_TAG}:latest" -t "${IMAGE_TAG}:${GITHUB_SHA}" .
