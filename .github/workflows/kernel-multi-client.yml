@@ -183,7 +183,18 @@ jobs:
           cp kernel/powerfs_mod/powerfs.ko kernel/vm/share/powerfs.ko
           # Compile static PUNCH_HOLE test binary (for MC-107, no gcc on VM)
           gcc -static -Wall -o kernel/vm/share/test_punch_hole kernel/vm/test_punch_hole.c
-          ls -la kernel/vm/share/powerfs.ko kernel/vm/share/test_punch_hole
+          # mTLS certs (*.crt/*.key) are gitignored in kernel/vm/share but the
+          # signed client certs live in docker/certs-default (tracked). Copy
+          # ca.crt + kernel-client-1/2 into the 9p share so the VM can mount
+          # against the HA masters. Without this the deploy step fails with
+          # "cert /mnt/host/ca.crt missing" on a fresh checkout.
+          cp docker/certs-default/ca.crt kernel/vm/share/ca.crt
+          for n in 1 2; do
+            cp docker/certs-default/kernel-client-${n}.crt kernel/vm/share/
+            cp docker/certs-default/kernel-client-${n}.key kernel/vm/share/
+          done
+          ls -la kernel/vm/share/powerfs.ko kernel/vm/share/test_punch_hole \
+                 kernel/vm/share/ca.crt kernel/vm/share/kernel-client-*.crt kernel/vm/share/kernel-client-*.key
 
       - name: Start VM1
         run: |
