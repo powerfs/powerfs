@@ -57,9 +57,16 @@ jobs:
           # (GnuTLS recv error -110) both killed past runs at checkout.
           # The runner shares this host with the canonical working repos, so
           # fetch from the local repos first (local transport hardlinks
-          # objects — zero network, instant). Only fall back to https (with
-          # retries) when the target SHA is absent locally (e.g. pull requests).
+          # objects — zero network, instant). Fall back to SSH (git@github.com,
+          # port 22 — HTTPS:443 is unreliable here) with retries when the target
+          # SHA is absent locally (e.g. pull requests from forks).
           cd "$GITHUB_WORKSPACE"
+          # Rewrite https://github.com/ URLs to SSH on this self-hosted runner:
+          # github.com:443 is unreliable here (GnuTLS recv error -110, connection
+          # timeouts), but SSH (port 22) works. This makes both the main-repo
+          # fallback below and `git submodule update` (which reads the HTTPS URLs
+          # from .gitmodules) go through SSH. ci-cd.yml uses the same rewrite.
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
           # Clean workspace. sudo pass first is REQUIRED: earlier job steps run
           # QEMU via sudo (run_qemu_*.sh writes root-owned disk images under
           # kernel/vm/output inside the workspace). A plain user-level rm cannot
@@ -81,8 +88,11 @@ jobs:
             echo "Local main repo has target commit ${GITHUB_SHA:0:7} (no network needed)"
             FETCH_OK=1
           else
-            echo "=== Local main repo missing ${GITHUB_SHA:0:7} — fetching from GitHub with retries ==="
-            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            echo "=== Local main repo missing ${GITHUB_SHA:0:7} — fetching from GitHub via SSH with retries ==="
+            # SSH (git@github.com:22) works on this runner; HTTPS (:443) does not
+            # (GnuTLS resets + connection timeouts). GH_TOKEN is kept for parity
+            # with ci-cd.yml but SSH key auth is what actually succeeds here.
+            git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
             for attempt in 1 2 3 4 5; do
               if git fetch --depth 1 origin "$GITHUB_SHA"; then FETCH_OK=1; break; fi
               wait_s=$((attempt * 15))
