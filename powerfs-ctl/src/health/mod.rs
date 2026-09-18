@@ -76,10 +76,11 @@ impl HealthGate {
                     self.timeout
                 ));
             }
+            let samples = sample_all(probe, self.port, master_ips).await;
             let mut leaders: Vec<(String, MasterMetrics)> = Vec::new();
-            for ip in master_ips {
-                match probe.fetch(ip, self.port).await {
-                    Ok(m) if m.is_leader => leaders.push((ip.clone(), m)),
+            for (ip, res) in samples {
+                match res {
+                    Ok(m) if m.is_leader => leaders.push((ip, m)),
                     Ok(_) => {}
                     Err(e) => {
                         // transient probe failure — log and continue; the
@@ -158,6 +159,122 @@ impl HealthGate {
                 commit_index: m2.commit_index,
             });
         }
+    }
+}
+
+/// One-shot findings (vs HealthGate, which polls until healthy or timeout).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftFinding {
+    Healthy {
+        leader: String,
+        term: u64,
+        commit_index: u64,
+    },
+    /// Nobody claims leadership (cluster stopped or mid-election).
+    NoLeader,
+    /// Every probe failed — usually a network/daemon problem rather than raft.
+    ProbeFailure { errors: Vec<(String, String)> },
+    /// Two+ masters claim leadership simultaneously.
+    SplitBrain { leaders: Vec<String> },
+    /// A leader exists but cannot serve: commit_index==0 (asymmetric
+    /// split-brain zombie) or /healthz still rejects it (scheme C fake-leader).
+    Zombie { leader: String },
+    /// Raft commits, but the state-machine applier is behind.
+    ApplierLag {
+        leader: String,
+        last_applied: u64,
+        commit_index: u64,
+    },
+    /// Leader term moved between the two samples — election storm.
+    ElectionStorm {
+        leader: String,
+        term_from: u64,
+        term_to: u64,
+    },
+}
+
+/// Probe every master once. Failed probes are kept as Err so callers can
+/// distinguish "reachable but follower" from "unreachable".
+pub(crate) async fn sample_all(
+    probe: &dyn MetricsProbe,
+    port: u16,
+    master_ips: &[String],
+) -> Vec<(String, Result<MasterMetrics, String>)> {
+    let mut out = Vec::with_capacity(master_ips.len());
+    for ip in master_ips {
+        let res = probe.fetch(ip, port).await;
+        out.push((ip.clone(), res));
+    }
+    out
+}
+
+/// Single-round raft diagnosis: sample every master, and when exactly one
+/// leader shows up, take a second sample after `settle` to verify term
+/// stability and commit progress. Never polls or waits beyond `settle`.
+pub async fn inspect(
+    probe: &dyn MetricsProbe,
+    port: u16,
+    master_ips: &[String],
+    settle: Duration,
+) -> RaftFinding {
+    let samples = sample_all(probe, port, master_ips).await;
+    let mut leaders: Vec<(String, MasterMetrics)> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+    for (ip, res) in samples {
+        match res {
+            Ok(m) if m.is_leader => leaders.push((ip, m)),
+            Ok(_) => {}
+            Err(e) => errors.push((ip, e)),
+        }
+    }
+    if leaders.len() > 1 {
+        return RaftFinding::SplitBrain {
+            leaders: leaders.into_iter().map(|(ip, _)| ip).collect(),
+        };
+    }
+    if leaders.is_empty() {
+        return if !errors.is_empty() && errors.len() == master_ips.len() {
+            RaftFinding::ProbeFailure { errors }
+        } else {
+            RaftFinding::NoLeader
+        };
+    }
+
+    let (lip, m1) = leaders.pop().unwrap();
+    if !m1.healthz_ok {
+        // scheme C flagged this leader as fake — it cannot serve writes.
+        return RaftFinding::Zombie { leader: lip };
+    }
+    tokio::time::sleep(settle).await;
+    let m2 = match probe.fetch(&lip, port).await {
+        Ok(m) => m,
+        Err(e) => {
+            return RaftFinding::ProbeFailure {
+                errors: vec![(lip, e)],
+            }
+        }
+    };
+    if m2.term != m1.term {
+        return RaftFinding::ElectionStorm {
+            leader: lip,
+            term_from: m1.term,
+            term_to: m2.term,
+        };
+    }
+    if m2.commit_index == 0 {
+        return RaftFinding::Zombie { leader: lip };
+    }
+    if m2.last_applied < m2.commit_index {
+        return RaftFinding::ApplierLag {
+            leader: lip,
+            last_applied: m2.last_applied,
+            commit_index: m2.commit_index,
+        };
+    }
+    RaftFinding::Healthy {
+        leader: lip,
+        term: m2.term,
+        commit_index: m2.commit_index,
     }
 }
 
@@ -299,5 +416,105 @@ pub mod tests {
         let g = gate();
         let info = g.run(&probe, &["m1".into()]).await.unwrap();
         assert_eq!(info.commit_index, 3);
+    }
+
+    /// Probe whose every fetch fails (docker daemon down / network cut).
+    struct FailingProbe;
+    #[async_trait]
+    impl MetricsProbe for FailingProbe {
+        async fn fetch(&self, _ip: &str, _port: u16) -> Result<MasterMetrics, String> {
+            Err("connection refused".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_healthy_leader() {
+        // round 1 across 3 IPs: leader, follower, follower; round 2: leader.
+        let probe = MockProbe {
+            states: Mutex::new(vec![
+                leader(5, 5, 2),
+                follower(),
+                follower(),
+                leader(6, 6, 2),
+            ]),
+        };
+        let f = inspect(
+            &probe,
+            9300,
+            &["m1".into(), "m2".into(), "m3".into()],
+            Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(
+            f,
+            RaftFinding::Healthy {
+                leader: "m1".into(),
+                term: 2,
+                commit_index: 6,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_zombie() {
+        let probe = MockProbe::fixed(leader(0, 0, 1));
+        let f = inspect(&probe, 9300, &["m1".into()], Duration::from_millis(0)).await;
+        assert_eq!(
+            f,
+            RaftFinding::Zombie {
+                leader: "m1".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_split_brain() {
+        // every IP reports the same leader state → two leaders in round 1.
+        let probe = MockProbe::fixed(leader(5, 5, 2));
+        let f = inspect(
+            &probe,
+            9300,
+            &["m1".into(), "m2".into()],
+            Duration::from_millis(0),
+        )
+        .await;
+        assert_eq!(
+            f,
+            RaftFinding::SplitBrain {
+                leaders: vec!["m1".into(), "m2".into()]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_applier_lag() {
+        let probe = MockProbe::fixed(leader(5, 3, 2));
+        let f = inspect(&probe, 9300, &["m1".into()], Duration::from_millis(0)).await;
+        assert_eq!(
+            f,
+            RaftFinding::ApplierLag {
+                leader: "m1".into(),
+                last_applied: 3,
+                commit_index: 5,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_reports_probe_failure_when_all_unreachable() {
+        let f = inspect(
+            &FailingProbe,
+            9300,
+            &["m1".into(), "m2".into()],
+            Duration::from_millis(0),
+        )
+        .await;
+        match f {
+            RaftFinding::ProbeFailure { errors } => {
+                assert_eq!(errors.len(), 2);
+                assert!(errors[0].1.contains("connection refused"));
+            }
+            other => panic!("expected ProbeFailure, got {other:?}"),
+        }
     }
 }

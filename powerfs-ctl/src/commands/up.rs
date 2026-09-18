@@ -37,7 +37,7 @@ pub fn services_for_role(role: &Option<String>, rc: &ResolvedCluster) -> Vec<Str
 
 /// True iff cluster.toml is newer than the rendered compose file, or the
 /// compose file doesn't exist — either way we need to re-render before up.
-fn render_is_stale(home: &Home) -> bool {
+pub(crate) fn render_is_stale(home: &Home) -> bool {
     let compose = home.rendered_compose();
     let cluster = home.cluster_toml();
     match (compose.metadata().ok(), cluster.metadata().ok()) {

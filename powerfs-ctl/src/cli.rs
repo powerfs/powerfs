@@ -77,7 +77,7 @@ pub enum Commands {
     },
 
     /// Certificate lifecycle: fetch CA, issue node/client certs, list registry.
-    /// (renew/revoke are M4+ — pending master `POST /api/cert/revoke` endpoint.)
+    /// (renew/revoke are M5+ — pending master `POST /api/cert/revoke` endpoint.)
     Cert {
         #[command(subcommand)]
         action: CertAction,
