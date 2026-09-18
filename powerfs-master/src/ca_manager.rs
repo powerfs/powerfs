@@ -29,7 +29,8 @@ use std::sync::{Arc, RwLock};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use log::{info, warn};
 use rcgen::{
@@ -503,7 +504,164 @@ impl CaManager {
             _ => true,
         }
     }
+
+    // ---------- registry admin (list / renew / revoke; M5) ----------
+
+    /// Return every issued certificate record, sorted by client name then
+    /// fingerprint (stable output for `cert list`).
+    pub fn list_client_entries(&self) -> Vec<IssuedClientCert> {
+        let reg = self.registry.read().unwrap();
+        let mut entries: Vec<IssuedClientCert> = reg.by_fingerprint.values().cloned().collect();
+        entries.sort_by(|a, b| {
+            a.client_name
+                .cmp(&b.client_name)
+                .then_with(|| a.cert_fingerprint_sha256.cmp(&b.cert_fingerprint_sha256))
+        });
+        entries
+    }
+
+    /// Re-issue a client certificate using the bindings (san_ips /
+    /// mount_dirs / client_id) stored for the client's current certificate.
+    /// A fresh keypair and fingerprint are produced and `by_client_name`
+    /// moves to the new entry.
+    ///
+    /// `revoke_old=false` (default) leaves the previous certificate valid
+    /// until its expiry — a rollover window so the operator can deploy the
+    /// new cert without losing access mid-distribution. `revoke_old=true`
+    /// marks the previous fingerprint revoked in the same operation.
+    ///
+    /// Errors: `NotFound` if the client was never enrolled; `Revoked` if
+    /// its current cert is already revoked (must re-enroll with fresh
+    /// bindings, not renew); `Internal` for signing/persistence failures.
+    pub fn renew_client_cert(
+        &self,
+        client_name: &str,
+        revoke_old: bool,
+    ) -> Result<(String, String), CertAdminError> {
+        let (bindings, old_fp) = {
+            let reg = self.registry.read().unwrap();
+            let fp = reg
+                .by_client_name
+                .get(client_name)
+                .cloned()
+                .ok_or_else(|| CertAdminError::NotFound(client_name.to_string()))?;
+            let entry = reg
+                .by_fingerprint
+                .get(&fp)
+                .ok_or_else(|| CertAdminError::NotFound(client_name.to_string()))?;
+            if entry.revoked {
+                return Err(CertAdminError::Revoked(client_name.to_string()));
+            }
+            (
+                RenewedBindings {
+                    client_id: entry.client_id.clone(),
+                    san_ips: entry.san_ips.clone(),
+                    mount_dirs: entry.mount_dirs.clone(),
+                },
+                fp,
+            )
+        };
+
+        // sign_client_cert_v2 validates inputs, signs, updates the reverse
+        // index and persists under its own write lock.
+        let issued = self
+            .sign_client_cert_v2(
+                client_name,
+                bindings.client_id.as_deref(),
+                &bindings.san_ips,
+                &bindings.mount_dirs,
+            )
+            .map_err(|e| CertAdminError::Internal(e.to_string()))?;
+
+        if revoke_old {
+            // Separate lock acquisition on purpose: signing is CPU work and
+            // must not happen while holding the registry lock. The window is
+            // benign — we only flip the *previous* fingerprint to revoked,
+            // which is idempotent w.r.t. any concurrent admin operation.
+            let mut reg = self.registry.write().unwrap();
+            if let Some(old) = reg.by_fingerprint.get_mut(&old_fp) {
+                old.revoked = true;
+                reg.save(&self.ca_dir)
+                    .map_err(|e| CertAdminError::Internal(e.to_string()))?;
+            }
+        }
+        Ok(issued)
+    }
+
+    /// Revoke a certificate. Selection is either the current certificate of
+    /// a client name (reverse index) or an explicit fingerprint. Idempotent:
+    /// revoking an already-revoked entry succeeds; selecting a name/fingerprint
+    /// that was never issued returns `NotFound`.
+    pub fn revoke_client_cert(&self, selector: RevokeSelector) -> Result<(), CertAdminError> {
+        let mut reg = self.registry.write().unwrap();
+        let fp = match selector {
+            RevokeSelector::ClientName(name) => reg
+                .by_client_name
+                .get(&name)
+                .cloned()
+                .ok_or(CertAdminError::NotFound(name))?,
+            RevokeSelector::Fingerprint(fp) => {
+                if !reg.by_fingerprint.contains_key(&fp) {
+                    return Err(CertAdminError::NotFound(fp));
+                }
+                fp
+            }
+        };
+        let entry = reg
+            .by_fingerprint
+            .get_mut(&fp)
+            .ok_or_else(|| CertAdminError::NotFound(fp.clone()))?;
+        if !entry.revoked {
+            entry.revoked = true;
+            reg.save(&self.ca_dir)
+                .map_err(|e| CertAdminError::Internal(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
+
+/// Bindings copied from the current certificate when renewing.
+struct RenewedBindings {
+    client_id: Option<String>,
+    san_ips: Vec<String>,
+    mount_dirs: Vec<String>,
+}
+
+/// Selector for [`CaManager::revoke_client_cert`].
+pub enum RevokeSelector {
+    /// Revoke the current certificate recorded for this client name.
+    ClientName(String),
+    /// Revoke one specific certificate fingerprint.
+    Fingerprint(String),
+}
+
+/// Admin-cert-operation failures. Mapped to HTTP by the axum handlers:
+/// `NotFound`→404, `Revoked`→409, `Internal`→500.
+#[derive(Debug)]
+pub enum CertAdminError {
+    NotFound(String),
+    Revoked(String),
+    Internal(String),
+}
+
+impl std::fmt::Display for CertAdminError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CertAdminError::NotFound(id) => {
+                write!(f, "no issued certificate found for '{id}'")
+            }
+            CertAdminError::Revoked(id) => {
+                write!(
+                    f,
+                    "current certificate for '{id}' is revoked; re-enroll instead of renew"
+                )
+            }
+            CertAdminError::Internal(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+impl std::error::Error for CertAdminError {}
 
 // ===========================================================================
 // Helpers
@@ -661,4 +819,345 @@ fn check_admin_auth(ca: &CaManager, headers: &HeaderMap) -> bool {
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
     ca.verify_admin_token(provided)
+}
+
+/// All `/api/cert/*` routes, parameterised by the shared [`CaManager`].
+/// `metrics.rs` calls `.with_state(ca)` before nesting under `/api/cert`.
+pub fn cert_router() -> Router<Arc<CaManager>> {
+    Router::new()
+        .route("/ca", get(get_ca_cert))
+        .route("/sign-client", post(sign_client))
+        .route("/sign-server", post(sign_server))
+        // M5 registry admin:
+        .route("/list", get(list_certs))
+        .route("/renew", post(renew_cert))
+        .route("/revoke", post(revoke_cert))
+}
+
+#[derive(Deserialize)]
+pub struct RenewCertRequest {
+    pub client_name: String,
+    /// Revoke the previous certificate immediately after re-issuing.
+    /// Default false (keep a rollover window until the old cert expires).
+    #[serde(default)]
+    pub revoke_old: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct RevokeCertRequest {
+    #[serde(default)]
+    pub client_name: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+fn cert_admin_err_to_http(e: CertAdminError) -> (StatusCode, String) {
+    let msg = e.to_string();
+    match e {
+        CertAdminError::NotFound(_) => (StatusCode::NOT_FOUND, msg),
+        CertAdminError::Revoked(_) => (StatusCode::CONFLICT, msg),
+        CertAdminError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+    }
+}
+
+/// `GET /api/cert/list` — every issued certificate record. Requires the
+/// admin token (bindings/fingerprints are cluster-sensitive).
+pub async fn list_certs(
+    State(ca): State<Arc<CaManager>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<IssuedClientCert>>, (StatusCode, String)> {
+    if !check_admin_auth(&ca, &headers) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
+    }
+    Ok(Json(ca.list_client_entries()))
+}
+
+/// `POST /api/cert/renew` — re-sign a client certificate with its stored
+/// bindings; returns the new cert + key.
+pub async fn renew_cert(
+    State(ca): State<Arc<CaManager>>,
+    headers: HeaderMap,
+    Json(req): Json<RenewCertRequest>,
+) -> Result<Json<SignResponse>, (StatusCode, String)> {
+    if !check_admin_auth(&ca, &headers) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
+    }
+    let (cert, key) = ca
+        .renew_client_cert(&req.client_name, req.revoke_old.unwrap_or(false))
+        .map_err(cert_admin_err_to_http)?;
+    Ok(Json(SignResponse { cert, key }))
+}
+
+/// `POST /api/cert/revoke` — revoke by client name or fingerprint.
+/// Exactly one of the two selectors must be provided.
+pub async fn revoke_cert(
+    State(ca): State<Arc<CaManager>>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeCertRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !check_admin_auth(&ca, &headers) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_string()));
+    }
+    let selector = match (req.client_name, req.fingerprint) {
+        (Some(name), None) => RevokeSelector::ClientName(name),
+        (None, Some(fp)) => RevokeSelector::Fingerprint(fp),
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "exactly one of client_name or fingerprint is required".to_string(),
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "provide either client_name or fingerprint, not both".to_string(),
+            ));
+        }
+    };
+    ca.revoke_client_cert(selector)
+        .map_err(cert_admin_err_to_http)?;
+    Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "test-admin-token";
+
+    fn test_ca() -> (tempfile::TempDir, Arc<CaManager>) {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(CaManager::new(dir.path(), Some(TOKEN.to_string())).unwrap());
+        (dir, ca)
+    }
+
+    fn issue(ca: &CaManager, name: &str) -> String {
+        let (_cert, _key) = ca
+            .sign_client_cert_v2(
+                name,
+                None,
+                &["10.0.0.2".to_string()],
+                &["/mnt/powerfs".to_string()],
+            )
+            .unwrap();
+        ca.list_client_entries()
+            .into_iter()
+            .find(|e| e.client_name == name)
+            .unwrap()
+            .cert_fingerprint_sha256
+    }
+
+    fn authed(method: &str, uri: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[test]
+    fn list_is_sorted_and_empty_initially() {
+        let (_dir, ca) = test_ca();
+        assert!(ca.list_client_entries().is_empty());
+        issue(&ca, "client-b");
+        issue(&ca, "client-a");
+        let names: Vec<String> = ca
+            .list_client_entries()
+            .iter()
+            .map(|e| e.client_name.clone())
+            .collect();
+        assert_eq!(names, vec!["client-a", "client-b"]);
+    }
+
+    #[test]
+    fn renew_reissues_with_stored_bindings_and_keeps_old_by_default() {
+        let (_dir, ca) = test_ca();
+        let old_fp = issue(&ca, "fuse-1");
+
+        let (new_cert, _new_key) = ca.renew_client_cert("fuse-1", false).unwrap();
+        let new_fp = CaManager::fingerprint_sha256(&new_cert);
+        assert_ne!(old_fp, new_fp);
+
+        let entries = ca.list_client_entries();
+        assert_eq!(entries.len(), 2);
+        let new_entry = entries
+            .iter()
+            .find(|e| e.cert_fingerprint_sha256 == new_fp)
+            .unwrap();
+        assert_eq!(new_entry.san_ips, vec!["10.0.0.2".to_string()]);
+        assert_eq!(new_entry.mount_dirs, vec!["/mnt/powerfs".to_string()]);
+        assert!(!new_entry.revoked);
+        // old cert stays valid during the rollover window
+        let old_entry = entries
+            .iter()
+            .find(|e| e.cert_fingerprint_sha256 == old_fp)
+            .unwrap();
+        assert!(!old_entry.revoked);
+    }
+
+    #[test]
+    fn renew_with_revoke_old_revokes_previous_fingerprint() {
+        let (_dir, ca) = test_ca();
+        let old_fp = issue(&ca, "fuse-1");
+        ca.renew_client_cert("fuse-1", true).unwrap();
+        let old_entry = ca
+            .list_client_entries()
+            .into_iter()
+            .find(|e| e.cert_fingerprint_sha256 == old_fp)
+            .unwrap();
+        assert!(old_entry.revoked);
+    }
+
+    #[test]
+    fn renew_unknown_is_not_found() {
+        let (_dir, ca) = test_ca();
+        match ca.renew_client_cert("ghost", false).unwrap_err() {
+            CertAdminError::NotFound(name) => assert_eq!(name, "ghost"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn renew_revoked_client_is_conflict() {
+        let (_dir, ca) = test_ca();
+        issue(&ca, "fuse-1");
+        ca.revoke_client_cert(RevokeSelector::ClientName("fuse-1".into()))
+            .unwrap();
+        match ca.renew_client_cert("fuse-1", false).unwrap_err() {
+            CertAdminError::Revoked(name) => assert_eq!(name, "fuse-1"),
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoke_by_name_is_idempotent_and_persists() {
+        let (dir, ca) = test_ca();
+        let fp = issue(&ca, "fuse-1");
+        ca.revoke_client_cert(RevokeSelector::ClientName("fuse-1".into()))
+            .unwrap();
+        ca.revoke_client_cert(RevokeSelector::ClientName("fuse-1".into()))
+            .unwrap();
+        let entry = ca
+            .list_client_entries()
+            .into_iter()
+            .find(|e| e.cert_fingerprint_sha256 == fp)
+            .unwrap();
+        assert!(entry.revoked);
+
+        // reload from disk: revocation is durable
+        let reloaded = CaManager::new(dir.path(), Some(TOKEN.to_string())).unwrap();
+        assert!(reloaded
+            .list_client_entries()
+            .into_iter()
+            .any(|e| e.cert_fingerprint_sha256 == fp && e.revoked));
+    }
+
+    #[test]
+    fn revoke_by_fingerprint_works_unknown_is_not_found() {
+        let (_dir, ca) = test_ca();
+        let fp = issue(&ca, "fuse-1");
+        ca.revoke_client_cert(RevokeSelector::Fingerprint(fp.clone()))
+            .unwrap();
+        match ca
+            .revoke_client_cert(RevokeSelector::Fingerprint("nope".into()))
+            .unwrap_err()
+        {
+            CertAdminError::NotFound(id) => assert_eq!(id, "nope"),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    async fn body_status(resp: axum::response::Response) -> (u16, String) {
+        let status = resp.status().as_u16();
+        let bytes = hyper_014::body::to_bytes(resp.into_body()).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn http_list_requires_token_and_returns_entries() {
+        let (_dir, ca) = test_ca();
+        issue(&ca, "fuse-1");
+        let app = cert_router().with_state(ca);
+
+        // no token → 401
+        let req = Request::builder()
+            .method("GET")
+            .uri("/list")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = body_status(app.clone().oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 401);
+
+        // bad token → 401
+        let req = Request::builder()
+            .method("GET")
+            .uri("/list")
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = body_status(app.clone().oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 401);
+
+        let req = authed("GET", "/list", "");
+        let (status, body) = body_status(app.oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 200, "body={body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_renew_and_revoke_happy_path() {
+        let (_dir, ca) = test_ca();
+        issue(&ca, "fuse-1");
+        let app = cert_router().with_state(ca);
+
+        let req = authed("POST", "/renew", r#"{"client_name":"fuse-1"}"#);
+        let (status, body) = body_status(app.clone().oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 200, "body={body}");
+        assert!(serde_json::from_str::<serde_json::Value>(&body)
+            .unwrap()
+            .get("cert")
+            .unwrap()
+            .is_string());
+
+        let req = authed("POST", "/revoke", r#"{"client_name":"fuse-1"}"#);
+        let (status, _) = body_status(app.clone().oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 200);
+
+        // renewing a revoked client → 409
+        let req = authed("POST", "/renew", r#"{"client_name":"fuse-1"}"#);
+        let (status, _) = body_status(app.clone().oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 409);
+
+        // renewing an unknown client → 404
+        let req = authed("POST", "/renew", r#"{"client_name":"ghost"}"#);
+        let (status, _) = body_status(app.clone().oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn http_revoke_validates_selector_shape() {
+        let (_dir, ca) = test_ca();
+        issue(&ca, "fuse-1");
+        let app = cert_router().with_state(ca);
+
+        // neither selector → 400
+        let req = authed("POST", "/revoke", "{}");
+        let (status, _) = body_status(app.clone().oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 400);
+
+        // both selectors → 400
+        let req = authed(
+            "POST",
+            "/revoke",
+            r#"{"client_name":"fuse-1","fingerprint":"fp"}"#,
+        );
+        let (status, _) = body_status(app.oneshot(req).await.unwrap()).await;
+        assert_eq!(status, 400);
+    }
 }
