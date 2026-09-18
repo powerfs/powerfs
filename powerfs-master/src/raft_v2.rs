@@ -202,6 +202,87 @@ pub struct ClusterInfoV2 {
     pub last_applied: u64,
 }
 
+/// One raft cluster member as reported by the admin HTTP API.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MemberInfo {
+    pub id: String,
+    pub addr: String,
+    /// `"voter"` or `"learner"`.
+    pub role: String,
+}
+
+/// Membership snapshot for `GET /api/admin/masters`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MastersSnapshot {
+    /// This node's raft id.
+    pub local: String,
+    /// Current leader's raft id (`None` during an election).
+    pub leader: Option<String>,
+    pub members: Vec<MemberInfo>,
+}
+
+/// Why a master-removal guard rejected the request. Mapped to HTTP status
+/// codes by the admin API layer (`UnknownMember`→404, `LastVoter`→400,
+/// `LeaderRemoval`→409).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberGuardError {
+    UnknownMember(String),
+    LastVoter(String),
+    LeaderRemoval(String),
+}
+
+impl std::fmt::Display for MemberGuardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemberGuardError::UnknownMember(id) => {
+                write!(f, "raft member {id} is not part of the cluster")
+            }
+            MemberGuardError::LastVoter(id) => {
+                write!(f, "refusing to remove the last remaining voter {id}")
+            }
+            MemberGuardError::LeaderRemoval(id) => {
+                write!(
+                    f,
+                    "refusing to remove the current leader {id}; transfer leadership \
+                     first or re-run with force=true to accept an election"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MemberGuardError {}
+
+/// Pure safety guard for removing a master voter. Returns the surviving voter
+/// id set on success. Rules:
+/// - target unknown to membership (neither voter nor learner) → UnknownMember;
+/// - removal would leave zero voters → LastVoter;
+/// - target is the current leader and `force` is false → LeaderRemoval.
+pub fn guard_remove_master(
+    voters: &[String],
+    known_nodes: &[String],
+    target: &str,
+    leader: Option<&str>,
+    force: bool,
+) -> Result<Vec<String>, MemberGuardError> {
+    if !known_nodes.iter().any(|n| n == target) {
+        return Err(MemberGuardError::UnknownMember(target.to_string()));
+    }
+    let mut remaining: Vec<String> = voters
+        .iter()
+        .filter(|v| v.as_str() != target)
+        .cloned()
+        .collect();
+    if remaining.is_empty() {
+        return Err(MemberGuardError::LastVoter(target.to_string()));
+    }
+    if !force && leader == Some(target) {
+        return Err(MemberGuardError::LeaderRemoval(target.to_string()));
+    }
+    remaining.sort();
+    Ok(remaining)
+}
+
 /// openraft v2 封装的 Raft 节点，替换旧 `RaftNode`。
 ///
 /// 持有 `Raft<MasterTypeConfig, RocksStateMachine>` 句柄（内部 `Arc`，可廉价克隆），
@@ -540,6 +621,94 @@ impl RaftNodeV2 {
             .await
             .map_err(|e| format!("change_membership failed: {}", e))?;
         Ok(())
+    }
+
+    /// 当前 raft 成员快照（供 admin HTTP API）。同步读 metrics watch，无 I/O。
+    pub fn list_members(&self) -> MastersSnapshot {
+        let metrics_rx = self.raft.metrics();
+        let metrics = metrics_rx.borrow_watched();
+        let membership = metrics.membership_config.membership();
+        let voters: std::collections::BTreeSet<String> = membership.voter_ids().collect();
+
+        let mut members: Vec<MemberInfo> = membership
+            .nodes()
+            .map(|(id, node)| MemberInfo {
+                id: id.clone(),
+                addr: node.addr.clone(),
+                role: if voters.contains(id) {
+                    "voter"
+                } else {
+                    "learner"
+                }
+                .to_string(),
+            })
+            .collect();
+        members.sort_by(|a, b| a.id.cmp(&b.id));
+
+        MastersSnapshot {
+            local: self.node_id.clone(),
+            leader: metrics.current_leader.clone(),
+            members,
+        }
+    }
+
+    /// 加入一个新 master：先以 learner 身份加入（openraft blocking 等待日志
+    /// 追平），再提升为 voter。
+    ///
+    /// 幂等：目标已是 voter 时直接成功；已是 learner 时跳过 add_learner
+    /// 直接提升。调用方必须是 leader（admin HTTP 层负责检查）。
+    pub async fn add_voter(&self, peer_id: u64, addr: String) -> Result<(), String> {
+        let node_id = peer_id.to_string();
+        let snapshot = self.list_members();
+        let already_voter = snapshot
+            .members
+            .iter()
+            .any(|m| m.id == node_id && m.role == "voter");
+        if already_voter {
+            info!("add_voter: node {node_id} already a voter; no-op");
+            return Ok(());
+        }
+        let already_learner = snapshot.members.iter().any(|m| m.id == node_id);
+        if !already_learner {
+            // blocking=true：等 learner 复制到当前 commit 后才返回；
+            // 新节点 raft 端口不可达时这里会报错且没有任何成员副作用。
+            self.add_learner(peer_id, addr).await?;
+        } else {
+            info!("add_voter: node {node_id} already a learner; promoting directly");
+        }
+
+        // 以当前 voter 集合 + 新节点做 change_membership。地址对已存在节点
+        // 沿用 membership 中记录（openraft change_membership 只收 id）。
+        let mut members: Vec<(u64, String)> = snapshot
+            .members
+            .iter()
+            .filter(|m| m.role == "voter")
+            .map(|m| {
+                let id: u64 = m
+                    .id
+                    .parse()
+                    .map_err(|_| format!("non-numeric raft voter id in membership: {}", m.id))?;
+                Ok((id, m.addr.clone()))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        members.push((peer_id, String::new()));
+        self.change_membership(members).await?;
+        info!("add_voter: node {node_id} promoted to voter");
+        Ok(())
+    }
+
+    /// 移除一个 master voter。`remaining_voters` 由 admin 层的
+    /// [`guard_remove_master`] 计算（已做 leader/last-voter/未知节点检查）。
+    pub async fn set_voters(&self, remaining_voters: &[String]) -> Result<(), String> {
+        let members: Vec<(u64, String)> = remaining_voters
+            .iter()
+            .map(|id| {
+                id.parse::<u64>()
+                    .map(|n| (n, String::new()))
+                    .map_err(|_| format!("non-numeric raft voter id in membership: {id}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.change_membership(members).await
     }
 
     /// 转移领导者（等价于旧 `RaftNode::transfer_leader`）。
@@ -908,5 +1077,65 @@ impl RaftNodeV2 {
     /// 获取内部 Raft 句柄（供高级用法）。
     pub fn raft(&self) -> &Raft<MasterTypeConfig, RocksStateMachine> {
         &self.raft
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn guard_removes_follower_and_keeps_sorted_set() {
+        let voters = v(&["1", "2", "3"]);
+        let nodes = voters.clone();
+        let out = guard_remove_master(&voters, &nodes, "2", Some("1"), false).unwrap();
+        assert_eq!(out, v(&["1", "3"]));
+    }
+
+    #[test]
+    fn guard_unknown_member_is_404() {
+        let voters = v(&["1", "2", "3"]);
+        let err = guard_remove_master(&voters, &voters, "9", Some("1"), false).unwrap_err();
+        assert_eq!(err, MemberGuardError::UnknownMember("9".into()));
+    }
+
+    #[test]
+    fn guard_last_voter_rejected() {
+        let voters = v(&["1"]);
+        let err = guard_remove_master(&voters, &voters, "1", Some("1"), false).unwrap_err();
+        assert!(matches!(err, MemberGuardError::LastVoter(_)));
+        // force must not bypass the last-voter guard (quorum destruction).
+        let err = guard_remove_master(&voters, &voters, "1", Some("1"), true).unwrap_err();
+        assert!(matches!(err, MemberGuardError::LastVoter(_)));
+    }
+
+    #[test]
+    fn guard_leader_removal_needs_force() {
+        let voters = v(&["1", "2", "3"]);
+        let err = guard_remove_master(&voters, &voters, "1", Some("1"), false).unwrap_err();
+        assert!(matches!(err, MemberGuardError::LeaderRemoval(_)));
+        // force=true accepts the election; remaining set excludes leader.
+        let out = guard_remove_master(&voters, &voters, "1", Some("1"), true).unwrap();
+        assert_eq!(out, v(&["2", "3"]));
+    }
+
+    #[test]
+    fn guard_learner_target_unknown_to_voters_is_removable() {
+        // Learners are not voters; removing one should be a no-op voter set.
+        let voters = v(&["1", "2", "3"]);
+        let nodes = v(&["1", "2", "3", "4"]);
+        let out = guard_remove_master(&voters, &nodes, "4", Some("1"), false).unwrap();
+        assert_eq!(out, v(&["1", "2", "3"]));
+    }
+
+    #[test]
+    fn guard_no_known_leader_still_allows_follower_removal() {
+        let voters = v(&["1", "2", "3"]);
+        let out = guard_remove_master(&voters, &voters, "2", None, false).unwrap();
+        assert_eq!(out, v(&["1", "3"]));
     }
 }

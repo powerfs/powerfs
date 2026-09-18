@@ -1,3 +1,4 @@
+pub mod admin_api;
 pub mod allocator_integration;
 pub mod ca_manager;
 pub mod collection;

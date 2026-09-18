@@ -1,12 +1,13 @@
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::{routing::get, routing::post, Router, Server};
+use axum::{routing::get, Router, Server};
 use log::{error, info};
 use prometheus::{register_counter, register_gauge, Counter, Encoder, Gauge, TextEncoder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::ca_manager::{get_ca_cert, sign_client, sign_server, CaManager};
+use crate::admin_api::{admin_router, AdminOps, AdminState};
+use crate::ca_manager::{cert_router, CaManager};
 
 /// Global flag set by the raft health monitor when the node is a
 /// fake-Leader (lease expired but still Leader). The /healthz endpoint
@@ -74,18 +75,25 @@ lazy_static::lazy_static! {
     ).unwrap();
 }
 
-pub async fn start_metrics_server(addr: &str, ca_manager: Arc<CaManager>) -> Result<(), String> {
+pub async fn start_metrics_server(
+    addr: &str,
+    ca_manager: Arc<CaManager>,
+    admin: Arc<AdminState>,
+) -> Result<(), String> {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         // Health endpoint for Docker healthcheck. Returns 503 when the
         // master is a fake-Leader (raft_unavailable=true) so Docker
         // restarts the container automatically (#58).
         .route("/healthz", get(healthz_handler))
-        // Certificate Authority HTTP API (master acts as cluster CA).
-        .route("/api/cert/ca", get(get_ca_cert))
-        .route("/api/cert/sign-client", post(sign_client))
-        .route("/api/cert/sign-server", post(sign_server))
-        .with_state(ca_manager);
+        // Certificate Authority HTTP API (master acts as cluster CA),
+        // including the M5 registry admin routes (list/renew/revoke).
+        .nest("/api/cert", cert_router().with_state(ca_manager))
+        // M5 master administration API (raft membership, node lifecycle).
+        .nest(
+            "/api/admin",
+            admin_router().with_state(admin as Arc<dyn AdminOps>),
+        );
 
     let addr = addr
         .parse()

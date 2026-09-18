@@ -4215,13 +4215,26 @@ impl MasterNode {
             // codepath in net_handler. This avoids a silent bootstrap
             // where start() retroactively enables CA and all storage
             // nodes get rejected with "cert fp unknown".
+
+            // M5: shared state for the /api/admin/* endpoints (raft
+            // membership changes, data-node lifecycle). Independent of
+            // which CA branch below serves the cert routes.
+            let admin_state = std::sync::Arc::new(crate::admin_api::AdminState::new(
+                self.admin_token.clone(),
+                self.raft_v2.clone(),
+                self.clone(),
+            ));
+
             match (self.ca_manager.clone(), self.ca_dir.clone()) {
                 (Some(ca), _) => {
                     info!(
                         "Starting metrics + cert API server on {} (CA manager ready)",
                         metrics_addr
                     );
-                    if let Err(e) = crate::metrics::start_metrics_server(&metrics_addr, ca).await {
+                    if let Err(e) =
+                        crate::metrics::start_metrics_server(&metrics_addr, ca, admin_state.clone())
+                            .await
+                    {
                         error!(
                             "Failed to start metrics/cert server on {}: {}",
                             metrics_addr, e
@@ -4236,8 +4249,12 @@ impl MasterNode {
                     match crate::ca_manager::CaManager::new(&ca_dir, self.admin_token.clone()) {
                         Ok(ca) => {
                             let ca = Arc::new(ca);
-                            if let Err(e) =
-                                crate::metrics::start_metrics_server(&metrics_addr, ca).await
+                            if let Err(e) = crate::metrics::start_metrics_server(
+                                &metrics_addr,
+                                ca,
+                                admin_state.clone(),
+                            )
+                            .await
                             {
                                 error!(
                                     "Failed to start metrics/cert server on {}: {}",
@@ -4269,8 +4286,12 @@ impl MasterNode {
                     ) {
                         Ok(ca) => {
                             let ca = Arc::new(ca);
-                            if let Err(e) =
-                                crate::metrics::start_metrics_server(&metrics_addr, ca).await
+                            if let Err(e) = crate::metrics::start_metrics_server(
+                                &metrics_addr,
+                                ca,
+                                admin_state.clone(),
+                            )
+                            .await
                             {
                                 error!(
                                     "Failed to start metrics/cert server on {}: {}",
