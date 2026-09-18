@@ -1,0 +1,23 @@
+# Rendered by powerfs-ctl for filer-{{ idx }}. DO NOT EDIT.
+[global]
+log_level = "info"
+redis_url = "{{ redis_url }}"
+
+[filer]
+transport = "tcp"
+port = 8888
+grpc_port = 8889
+metrics_port = 8900
+net_port = 9334
+ip = "0.0.0.0"
+master_addresses = [{% for a in master_addrs %}"{{ a }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+master_net_port = 9334
+data_dir = "/data/filer"
+shard_count = {{ shard_count }}
+raft_id = {{ raft_id }}
+raft_peers = [{% for a in filer_raft_addrs %}"{{ a }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+inline_max_size = 8192
+registration_token = "{{ registration_token }}"
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/filer-{{ idx }}.crt"
+client_key = "/etc/powerfs/certs/filer-{{ idx }}.key"
