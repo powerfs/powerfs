@@ -1,13 +1,19 @@
 //! Command handlers. M1 implements init + config (render/check/show);
-//! the rest print a clear "not implemented in M1" message so the command
+//! M2 adds up/down/status with compose driver + zombie-leader health gate.
+//! The rest print a clear "not implemented in M2" message so the command
 //! surface is fully discoverable via --help.
 
 mod config_check;
 mod config_render;
 mod config_show;
+mod down;
 mod init;
+mod status;
+mod up;
 
 use crate::cli::{CertAction, ClientAction, Commands, ConfigAction, NodeAction};
+use crate::compose::DockerComposeDriver;
+use crate::health::ReqwestProbe;
 use crate::home::Home;
 
 pub async fn dispatch(cmd: Commands, home: &Home) -> Result<(), String> {
@@ -19,10 +25,18 @@ pub async fn dispatch(cmd: Commands, home: &Home) -> Result<(), String> {
             ConfigAction::Show => config_show::run(home).await,
         },
         Commands::Bootstrap { .. } => not_impl("bootstrap"),
-        Commands::Up { .. } => not_impl("up"),
-        Commands::Down { .. } => not_impl("down"),
+        Commands::Up { role } => {
+            up::run(
+                home,
+                role,
+                &DockerComposeDriver::new(),
+                &ReqwestProbe::new(),
+            )
+            .await
+        }
+        Commands::Down { purge, role } => down::run_default(home, purge, role).await,
         Commands::Restart { .. } => not_impl("restart"),
-        Commands::Status => not_impl("status"),
+        Commands::Status => status::run(home).await,
         Commands::Cert { action } => match action {
             CertAction::InitCa => not_impl("cert init-ca"),
             CertAction::Issue { .. } => not_impl("cert issue"),
@@ -45,7 +59,7 @@ pub async fn dispatch(cmd: Commands, home: &Home) -> Result<(), String> {
 
 fn not_impl(name: &str) -> Result<(), String> {
     Err(format!(
-        "`powerfs-ctl {}` is not implemented in M1 (see .trae/documents/powerfs-ctl_M1_plan.md)",
+        "`powerfs-ctl {}` is not implemented in M2 (see .trae/documents/powerfs-ctl_M2_plan.md)",
         name
     ))
 }
