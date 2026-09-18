@@ -29,6 +29,20 @@ lazy_static::lazy_static! {
         "1 if this node is leader, 0 otherwise"
     ).unwrap();
 
+    // Raft progress gauges — consumed by powerfs-ctl's health gate to detect
+    // zombie leaders (asymmetric split-brain where heartbeats round-trip but
+    // AppendEntries can't commit, so commit_index never advances even though
+    // scheme C's ensure_linearizable probe returns OK).
+    pub static ref RAFT_COMMIT_INDEX: Gauge = register_gauge!(
+        "powerfs_raft_commit_index",
+        "Raft commit index (local node view)"
+    ).unwrap();
+
+    pub static ref RAFT_LAST_APPLIED: Gauge = register_gauge!(
+        "powerfs_raft_last_applied",
+        "Last applied log index (local node view)"
+    ).unwrap();
+
     pub static ref VOLUME_COUNT: Gauge = register_gauge!(
         "powerfs_volume_count",
         "Total number of volumes in the cluster"
