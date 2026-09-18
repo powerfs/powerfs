@@ -2,12 +2,15 @@
 //! M2 adds up/down/status with compose driver + zombie-leader health gate;
 //! M3 adds cert (init-ca/issue/list) + client enroll + bootstrap one-shot;
 //! M4 adds rolling restart (per-node gate), read-only doctor, and logs.
-//! node lifecycle remains a placeholder pending master admin HTTP APIs (M5).
+//! M5 wires node master/data lifecycle + cert renew/revoke to the master
+//! admin HTTP API.
 
 mod bootstrap;
 mod cert_init_ca;
 mod cert_issue;
 mod cert_list;
+mod cert_renew;
+mod cert_revoke;
 mod client_enroll;
 mod config_check;
 mod config_render;
@@ -16,14 +19,20 @@ mod doctor;
 mod down;
 mod init;
 mod logs;
+mod node_data;
+mod node_master;
 mod restart;
 mod status;
 mod up;
 
+use crate::admin::MasterAdminClient;
 use crate::cert::MasterCertClient;
-use crate::cli::{CertAction, ClientAction, Commands, ConfigAction, NodeAction, ProfileArg};
+use crate::cli::{
+    CertAction, ClientAction, Commands, ConfigAction, DataAction, MasterAction, NodeAction,
+    ProfileArg,
+};
 use crate::compose::DockerComposeDriver;
-use crate::health::ReqwestProbe;
+use crate::health::{sample_all, MetricsProbe, ReqwestProbe};
 use crate::home::Home;
 use crate::schema::Profile;
 
@@ -101,12 +110,70 @@ pub async fn dispatch(cmd: Commands, home: &Home) -> Result<(), String> {
                 )
                 .await
             }
-            CertAction::List => cert_list::run(home).await,
+            CertAction::List => {
+                let (api, tok) = master_api_and_token(home)?;
+                cert_list::run(home, &MasterCertClient::new(), &api, &tok).await
+            }
+            CertAction::Renew {
+                client_name,
+                revoke_old,
+            } => {
+                let (api, tok) = master_api_and_token(home)?;
+                cert_renew::run(
+                    home,
+                    &MasterCertClient::new(),
+                    &api,
+                    &tok,
+                    &client_name,
+                    revoke_old,
+                )
+                .await
+            }
+            CertAction::Revoke {
+                client_name,
+                fingerprint,
+            } => {
+                let (api, tok) = master_api_and_token(home)?;
+                cert_revoke::run(
+                    &MasterCertClient::new(),
+                    &api,
+                    &tok,
+                    client_name,
+                    fingerprint,
+                )
+                .await
+            }
         },
         Commands::Node { action } => match action {
-            NodeAction::Add { .. } => not_impl("node add"),
-            NodeAction::Remove { .. } => not_impl("node remove"),
-            NodeAction::Maintenance { .. } => not_impl("node maintenance"),
+            NodeAction::Master { action } => match action {
+                MasterAction::Add { id, addr } => {
+                    let probe = ReqwestProbe::new();
+                    let (api, tok) = leader_api_and_token(home, &probe).await?;
+                    node_master::add(&MasterAdminClient::new(), &api, &tok, id, &addr).await
+                }
+                MasterAction::Remove { id, force } => {
+                    let probe = ReqwestProbe::new();
+                    let (api, tok) = leader_api_and_token(home, &probe).await?;
+                    node_master::remove(&MasterAdminClient::new(), &api, &tok, &id, force).await
+                }
+                MasterAction::List => {
+                    // GET /api/admin/masters works on any master (no require_leader).
+                    let (api, tok) = master_api_and_token(home)?;
+                    node_master::list(&MasterAdminClient::new(), &api, &tok).await
+                }
+            },
+            NodeAction::Data { action } => match action {
+                DataAction::Maintenance { name, off } => {
+                    let probe = ReqwestProbe::new();
+                    let (api, tok) = leader_api_and_token(home, &probe).await?;
+                    node_data::maintenance(&MasterAdminClient::new(), &api, &tok, &name, !off).await
+                }
+                DataAction::Remove { name, force } => {
+                    let probe = ReqwestProbe::new();
+                    let (api, tok) = leader_api_and_token(home, &probe).await?;
+                    node_data::remove(&MasterAdminClient::new(), &api, &tok, &name, force).await
+                }
+            },
         },
         Commands::Client { action } => match action {
             ClientAction::Enroll { name, ip, kind } => {
@@ -133,11 +200,40 @@ fn master_api_and_token(home: &Home) -> Result<(String, String), String> {
     ))
 }
 
-fn not_impl(name: &str) -> Result<(), String> {
-    Err(format!(
-        "`powerfs-ctl {name}` is not implemented yet — planned for M5 \
-         (requires new master admin HTTP APIs for raft membership)"
-    ))
+/// Discover the current raft leader via metrics probe and return its HTTP
+/// address (`ip:9300`) + admin_token. Used by admin handlers whose calls are
+/// raft-mutating (POST/DELETE under `/api/admin/*`). `node master list` uses
+/// `master_api_and_token` instead since `GET /api/admin/masters` works on any
+/// master (no `require_leader`). Errors on no-leader or split-brain.
+pub(crate) async fn leader_api_and_token(
+    home: &Home,
+    probe: &dyn MetricsProbe,
+) -> Result<(String, String), String> {
+    let cfg = home.load_cluster()?;
+    let rc = cfg.validate().map_err(|e| e.to_string())?;
+    let samples = sample_all(probe, 9300, &rc.master_ips).await;
+    let mut leaders: Vec<String> = Vec::new();
+    for (ip, res) in &samples {
+        if let Ok(m) = res {
+            if m.is_leader {
+                leaders.push(ip.clone());
+            }
+        }
+    }
+    if leaders.len() > 1 {
+        return Err(format!(
+            "split-brain: {} masters claim leadership ({}) — resolve before \
+             mutating raft membership",
+            leaders.len(),
+            leaders.join(", ")
+        ));
+    }
+    let ip = leaders.into_iter().next().ok_or_else(|| {
+        "no raft leader — cluster may be down or mid-election (check \
+         `powerfs-ctl status`)"
+            .to_string()
+    })?;
+    Ok((format!("{}:9300", ip), rc.cfg.cluster.admin_token.clone()))
 }
 
 #[cfg(test)]

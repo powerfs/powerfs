@@ -76,8 +76,7 @@ pub enum Commands {
         action: ConfigAction,
     },
 
-    /// Certificate lifecycle: fetch CA, issue node/client certs, list registry.
-    /// (renew/revoke are M5+ — pending master `POST /api/cert/revoke` endpoint.)
+    /// Certificate lifecycle: fetch CA, issue/renew/revoke certs, list registry.
     Cert {
         #[command(subcommand)]
         action: CertAction,
@@ -142,26 +141,80 @@ pub enum CertAction {
         #[arg(long)]
         node: bool,
     },
-    /// List certificates with expiry (reads master-side client_registry.json).
+    /// List certificates with expiry (queries master's GET /api/cert/list).
     List,
+    /// Re-sign a client cert with stored bindings (master returns new cert+key).
+    Renew {
+        /// Client name to renew (must already exist in the registry).
+        client_name: String,
+        /// Revoke the old cert immediately instead of leaving a grace window.
+        #[arg(long)]
+        revoke_old: bool,
+    },
+    /// Revoke a client/node cert by client_name or fingerprint.
+    Revoke {
+        /// Revoke by client name (mutually exclusive with --fingerprint).
+        #[arg(long)]
+        client_name: Option<String>,
+        /// Revoke by cert fingerprint SHA-256 (mutually exclusive with --client-name).
+        #[arg(long)]
+        fingerprint: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum NodeAction {
-    /// Add a new node (render + start + raft join + cert)
-    Add {
-        #[arg(long, value_enum)]
-        role: NodeRole,
-        #[arg(long)]
-        ip: String,
+    /// Raft master lifecycle: add/remove voters, list membership.
+    Master {
+        #[command(subcommand)]
+        action: MasterAction,
     },
-    /// Remove a node (drain → raft remove → stop)
-    Remove { name: String },
-    /// Toggle maintenance mode
+    /// Data-node lifecycle: maintenance toggle, removal.
+    Data {
+        #[command(subcommand)]
+        action: DataAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MasterAction {
+    /// Add a new raft voter (POST /api/admin/masters).
+    /// The new master container must already be running and bootstrapped.
+    Add {
+        /// Raft node id (numeric, e.g. 4).
+        id: u64,
+        /// Raft gRPC address of the new master (ip:9335).
+        addr: String,
+    },
+    /// Remove a raft voter (DELETE /api/admin/masters/{id}).
+    Remove {
+        /// Raft node id to remove.
+        id: String,
+        /// Bypass the leader-removal guard (otherwise 409).
+        #[arg(long)]
+        force: bool,
+    },
+    /// List raft membership and current leader (GET /api/admin/masters).
+    List,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DataAction {
+    /// Toggle maintenance mode on a data node (POST /api/admin/nodes/{name}/maintenance).
     Maintenance {
+        /// Node name (e.g. volume-1).
         name: String,
+        /// Turn maintenance OFF (default is ON).
         #[arg(long)]
         off: bool,
+    },
+    /// Remove a data node (DELETE /api/admin/nodes/{name}).
+    Remove {
+        /// Node name (e.g. volume-2).
+        name: String,
+        /// Force removal even if the node owns routes.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -183,13 +236,6 @@ pub enum ProfileArg {
     Simple,
     Ha,
     Rdma,
-}
-
-#[derive(clap::ValueEnum, Debug, Clone, Copy)]
-pub enum NodeRole {
-    Master,
-    Volume,
-    Filer,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
