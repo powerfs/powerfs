@@ -7,11 +7,11 @@
 //!   POST /api/cert/sign-client  — issue a client OR node cert (mount_dirs=[]
 //!                                 for node certs, non-empty for client certs)
 //!   POST /api/cert/sign-server  — issue a server cert (not yet wired to a
-//!                                 command; reserved for M4+ if needed)
+//!                                 command; reserved for later if needed)
 //! `cert renew` / `cert revoke` are intentionally absent — master has no
 //! HTTP endpoints for them (the `revoked` field exists in `IssuedClientCert`
 //! but no route flips it). They return once master grows
-//! `POST /api/cert/revoke` + `GET /api/cert/list` in M4+.
+//! `POST /api/cert/revoke` + `GET /api/cert/list` in M5+.
 
 pub mod reqwest_client;
 pub use reqwest_client::MasterCertClient;

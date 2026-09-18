@@ -27,6 +27,15 @@ pub struct ServiceStatus {
 pub trait ComposeDriver: Send + Sync {
     async fn up(&self, compose_file: &Path, services: &[&str]) -> Result<(), String>;
     async fn down(&self, compose_file: &Path, purge: bool) -> Result<(), String>;
+    async fn restart(&self, compose_file: &Path, services: &[&str]) -> Result<(), String>;
+    /// Stream `docker compose logs`. stdio is inherited so `follow` works
+    /// like the raw CLI (Ctrl-C passes through to the child).
+    async fn logs(
+        &self,
+        compose_file: &Path,
+        services: &[&str],
+        follow: bool,
+    ) -> Result<(), String>;
     async fn ps(&self, compose_file: &Path) -> Result<Vec<ServiceStatus>, String>;
 }
 
@@ -86,6 +95,50 @@ impl ComposeDriver for DockerComposeDriver {
                 "docker compose down failed (exit {:?}): {}",
                 out.status.code(),
                 String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn restart(&self, compose_file: &Path, services: &[&str]) -> Result<(), String> {
+        let mut c = self.base_cmd(compose_file);
+        c.arg("restart").args(services);
+        let out = c
+            .output()
+            .await
+            .map_err(|e| format!("spawn docker compose restart: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "docker compose restart failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    async fn logs(
+        &self,
+        compose_file: &Path,
+        services: &[&str],
+        follow: bool,
+    ) -> Result<(), String> {
+        let mut c = self.base_cmd(compose_file);
+        // base_cmd pipes stdout/stderr; logs must stream straight to the tty.
+        c.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        c.arg("logs");
+        if follow {
+            c.arg("--follow");
+        }
+        c.args(services);
+        let status = c
+            .status()
+            .await
+            .map_err(|e| format!("spawn docker compose logs: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "docker compose logs exited with {:?}",
+                status.code()
             ));
         }
         Ok(())
@@ -161,6 +214,22 @@ pub mod tests {
             });
             Ok(())
         }
+        async fn restart(&self, _f: &Path, services: &[&str]) -> Result<(), String> {
+            self.record(format!("restart {}", services.join(",")));
+            Ok(())
+        }
+        async fn logs(&self, _f: &Path, services: &[&str], follow: bool) -> Result<(), String> {
+            self.record(format!(
+                "logs{}{}",
+                if follow { " -f" } else { "" },
+                if services.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", services.join(","))
+                }
+            ));
+            Ok(())
+        }
         async fn ps(&self, _f: &Path) -> Result<Vec<ServiceStatus>, String> {
             self.record("ps".into());
             Ok(self.ps_rows.clone())
@@ -198,5 +267,29 @@ pub mod tests {
         d.up(Path::new("/x.yml"), &svcs).await.unwrap();
         let calls = d.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|c| c.contains("master-1,master-2")));
+    }
+
+    #[tokio::test]
+    async fn restart_passes_service_list() {
+        let d = MockComposeDriver::new(vec![]);
+        let svcs = ["master-2"];
+        d.restart(Path::new("/x.yml"), &svcs).await.unwrap();
+        let calls = d.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|c| c == "restart master-2"));
+    }
+
+    #[tokio::test]
+    async fn logs_sets_follow_flag_and_services() {
+        let d = MockComposeDriver::new(vec![]);
+        d.logs(Path::new("/x.yml"), &["filer-1"], true)
+            .await
+            .unwrap();
+        d.logs(Path::new("/x.yml"), &[], false).await.unwrap();
+        let calls = d.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|c| c == "logs -f filer-1"),
+            "got: {calls:?}"
+        );
+        assert!(calls.iter().any(|c| c == "logs"), "got: {calls:?}");
     }
 }
