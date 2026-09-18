@@ -1,0 +1,18 @@
+# Rendered by powerfs-ctl for master-{{ idx }}. DO NOT EDIT.
+[global]
+log_level = "info"
+redis_url = "{{ redis_url }}"
+
+[master]
+port = 9333
+raft_port = 9335
+metrics_port = 9300
+net_port = 9334
+dir = "/data/master"
+ip = "0.0.0.0"
+advertise_addr = "{{ ip }}:9333"
+raft_id = {{ raft_id }}
+raft_peers = [{% for a in master_raft_addrs %}"{{ a }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+admin_token = "{{ admin_token }}"
+ca_dir = "/data/master/ca"
+registration_token = "{{ registration_token }}"

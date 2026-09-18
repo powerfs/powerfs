@@ -1,0 +1,21 @@
+# Rendered by powerfs-ctl for fuse client. DO NOT EDIT.
+[global]
+log_level = "info"
+redis_url = "{{ redis_url }}"
+
+[fuse]
+mount_point = "/mnt/powerfs"
+master_addresses = [{% for ip in master_net_addrs %}"{{ ip }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+master_net_port = 9334
+volume_net_port = 8901
+filer_net_port = 9334
+collection = "default"
+replication = "000"
+threads = 8
+verbose = false
+container = false
+
+[fuse.lease]
+mode = "cap"
+lease_duration_ms = 30000
+renew_interval_ms = 10000

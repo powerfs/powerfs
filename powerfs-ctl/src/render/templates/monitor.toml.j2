@@ -1,0 +1,12 @@
+# Rendered by powerfs-ctl for monitor. DO NOT EDIT.
+[global]
+log_level = "info"
+redis_url = "{{ redis_url }}"
+
+[monitor]
+addr = "0.0.0.0:8081"
+redis_url = "{{ redis_url }}"
+s3_endpoint = "http://{{ s3_ip }}:9000"
+s3_backend_endpoint = "http://{{ s3_ip }}:9000"
+master_endpoint = "{{ master_addrs[0] }}"
+master_endpoints = [{% for a in master_addrs %}"{{ a }}"{% if not loop.last %}, {% endif %}{% endfor %}]

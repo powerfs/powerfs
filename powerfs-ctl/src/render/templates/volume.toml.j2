@@ -1,0 +1,24 @@
+# Rendered by powerfs-ctl for volume-{{ idx }}. DO NOT EDIT.
+[global]
+log_level = "info"
+redis_url = "{{ redis_url }}"
+
+[volume]
+transport = "tcp"
+grpc_port = 8080
+http_port = 8091
+net_port = 8901
+data_dir = "/data"
+master_addresses = [{% for a in master_addrs %}"{{ a }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+master_net_port = 9334
+node_id = "{{ node_id }}"
+max_volume_size = 107374182400
+initial_volume_count = 4
+advertise_addr = "{{ advertise_addr }}"
+lease_enabled = false
+force_sync_on_write = false
+wal_idle_sync_secs = 30
+registration_token = "{{ registration_token }}"
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/volume-{{ idx }}.crt"
+client_key = "/etc/powerfs/certs/volume-{{ idx }}.key"

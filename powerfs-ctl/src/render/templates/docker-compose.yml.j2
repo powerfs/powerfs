@@ -1,0 +1,140 @@
+# Rendered by powerfs-ctl. DO NOT EDIT — edit cluster.toml and run `powerfs-ctl config render`.
+
+networks:
+  powerfs-network:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: {{ bridge }}
+    ipam:
+      config:
+        - subnet: {{ subnet }}
+          gateway: {{ gateway }}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "3"
+
+volumes:
+{% for i in range(master_ips | length) %}
+  master-{{ i + 1 }}-data:
+{% endfor %}
+{% for i in range(volume_ips | length) %}
+  volume-{{ i + 1 }}-data:
+{% endfor %}
+{% for i in range(filer_ips | length) %}
+  filer-{{ i + 1 }}-data:
+{% endfor %}
+  redis-data:
+  s3-data:
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    logging: *default-logging
+    networks:
+      powerfs-network:
+        ipv4_address: {{ redis_ip }}
+    volumes:
+      - redis-data:/data
+    command: redis-server --bind 0.0.0.0 --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+{% for i in range(master_ips | length) %}
+  master-{{ i + 1 }}:
+    image: {{ image_tag }}
+    container_name: master-{{ i + 1 }}
+    logging: *default-logging
+    restart: unless-stopped
+    networks:
+      powerfs-network:
+        ipv4_address: {{ master_ips[i] }}
+    volumes:
+      - master-{{ i + 1 }}-data:/data
+      - ./certs:/data/master/ca
+      - ./config/master-{{ i + 1 }}.toml:/app/config/master.toml:ro
+    environment:
+      - REDIS_URL=redis://redis:6379
+    command: /app/powerfs-master --config /app/config/master.toml
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://{{ master_ips[i] }}:9300/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    depends_on:
+      redis:
+        condition: service_healthy
+
+{% endfor %}
+{% for i in range(volume_ips | length) %}
+  volume-{{ i + 1 }}:
+    image: {{ image_tag }}
+    container_name: volume-{{ i + 1 }}
+    logging: *default-logging
+    restart: unless-stopped
+    networks:
+      powerfs-network:
+        ipv4_address: {{ volume_ips[i] }}
+    volumes:
+      - volume-{{ i + 1 }}-data:/data
+      - ./certs:/etc/powerfs/certs:ro
+      - ./config/volume-{{ i + 1 }}.toml:/app/config/volume.toml:ro
+    command: /app/powerfs-volume --config /app/config/volume.toml
+    depends_on:
+      - master-1
+
+{% endfor %}
+{% for i in range(filer_ips | length) %}
+  filer-{{ i + 1 }}:
+    image: {{ image_tag }}
+    container_name: filer-{{ i + 1 }}
+    logging: *default-logging
+    restart: unless-stopped
+    networks:
+      powerfs-network:
+        ipv4_address: {{ filer_ips[i] }}
+    volumes:
+      - filer-{{ i + 1 }}-data:/data
+      - ./certs:/etc/powerfs/certs:ro
+      - ./config/filer-{{ i + 1 }}.toml:/app/config/filer.toml:ro
+    command: /app/powerfs-filer --config /app/config/filer.toml
+    depends_on:
+      - master-1
+
+{% endfor %}
+  monitor:
+    image: {{ image_tag }}
+    container_name: monitor
+    logging: *default-logging
+    restart: unless-stopped
+    networks:
+      powerfs-network:
+        ipv4_address: {{ monitor_ip }}
+    volumes:
+      - ./config/monitor.toml:/app/config/monitor.toml:ro
+    ports:
+      - "8083:8081"
+    command: /app/powerfs-monitor --config /app/config/monitor.toml
+    depends_on:
+      - master-1
+
+  s3:
+    image: {{ image_tag }}
+    container_name: s3
+    logging: *default-logging
+    restart: unless-stopped
+    networks:
+      powerfs-network:
+        ipv4_address: {{ s3_ip }}
+    volumes:
+      - s3-data:/data
+    command: /app/powerfs-s3 --config /app/config/s3.toml
+    depends_on:
+      - master-1
