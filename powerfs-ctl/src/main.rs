@@ -2,6 +2,8 @@ use clap::Parser;
 
 mod cli;
 mod commands;
+mod compose;
+mod health;
 mod home;
 mod render;
 mod schema;
