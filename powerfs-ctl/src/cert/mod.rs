@@ -2,16 +2,15 @@
 //! (master acts as cluster CA). Trait-based so tests inject a MockCertClient;
 //! the real `MasterCertClient` lives in `reqwest_client.rs`.
 //!
-//! Only the three endpoints master actually exposes are wrapped:
+//! Endpoints wrapped (master grew list/renew/revoke in M5 Part 1):
 //!   GET  /api/cert/ca           — fetch CA cert PEM
 //!   POST /api/cert/sign-client  — issue a client OR node cert (mount_dirs=[]
 //!                                 for node certs, non-empty for client certs)
 //!   POST /api/cert/sign-server  — issue a server cert (not yet wired to a
 //!                                 command; reserved for later if needed)
-//! `cert renew` / `cert revoke` are intentionally absent — master has no
-//! HTTP endpoints for them (the `revoked` field exists in `IssuedClientCert`
-//! but no route flips it). They return once master grows
-//! `POST /api/cert/revoke` + `GET /api/cert/list` in M5+.
+//!   GET  /api/cert/list         — every issued cert record (M5)
+//!   POST /api/cert/renew        — re-sign a client cert with stored bindings (M5)
+//!   POST /api/cert/revoke       — revoke by client_name or fingerprint (M5)
 
 pub mod reqwest_client;
 pub use reqwest_client::MasterCertClient;
@@ -31,6 +30,28 @@ pub trait CertClient: Send + Sync {
         admin_token: &str,
         req: &SignClientRequest,
     ) -> Result<IssuedCert, String>;
+    /// `GET /api/cert/list` — every issued cert record.
+    async fn list_certs(
+        &self,
+        master_api: &str,
+        admin_token: &str,
+    ) -> Result<Vec<RegistryEntry>, String>;
+    /// `POST /api/cert/renew` — re-sign with stored bindings; returns new
+    /// cert + key. Master returns 404 if client unknown, 409 if already revoked.
+    async fn renew(
+        &self,
+        master_api: &str,
+        admin_token: &str,
+        req: &RenewRequest,
+    ) -> Result<IssuedCert, String>;
+    /// `POST /api/cert/revoke` — revoke by client_name or fingerprint.
+    /// Exactly one selector must be set in `req`; master enforces this too.
+    async fn revoke(
+        &self,
+        master_api: &str,
+        admin_token: &str,
+        req: &RevokeRequest,
+    ) -> Result<(), String>;
 }
 
 /// Body for `POST /api/cert/sign-client`. Mirrors master's `SignClientRequestV2`
@@ -51,6 +72,27 @@ pub struct SignClientRequest {
 pub struct IssuedCert {
     pub cert: String,
     pub key: String,
+}
+
+/// Body for `POST /api/cert/renew`. Mirrors master's `RenewCertRequest`
+/// (powerfs-master/src/ca_manager.rs). `revoke_old=None` lets the field
+/// omit from JSON (master treats absent as false — grace rollover window).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RenewRequest {
+    pub client_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revoke_old: Option<bool>,
+}
+
+/// Body for `POST /api/cert/revoke`. Mirrors master's `RevokeCertRequest`.
+/// Exactly one of `client_name` / `fingerprint` must be set; the command
+/// layer validates this before sending (master enforces too — 400 otherwise).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RevokeRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 /// One entry of master's `client_registry.json`. Mirrors
