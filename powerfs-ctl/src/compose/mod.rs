@@ -127,7 +127,7 @@ pub fn parse_ps_json(stdout: &[u8]) -> Result<Vec<ServiceStatus>, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::sync::Mutex;
 

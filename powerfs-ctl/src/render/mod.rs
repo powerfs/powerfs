@@ -51,6 +51,18 @@ pub fn render(rc: &ResolvedCluster) -> Result<Rendered, RenderError> {
     })
 }
 
+/// Render only the fuse client TOML — used by `client enroll` to emit
+/// `<certs_dir>/client-<name>.toml` without re-rendering the whole cluster.
+/// The fuse template carries the cluster's master_net_addrs + redis_url and
+/// has no per-client variation, so every fuse client in the same cluster
+/// gets identical content.
+pub fn render_fuse_client(rc: &ResolvedCluster) -> Result<String, RenderError> {
+    let mut env = Environment::new();
+    env.add_template("fuse", FUSE_TEMPLATE)?;
+    let ctx = build_context(rc)?;
+    Ok(env.get_template("fuse")?.render(&ctx)?)
+}
+
 fn build_context(rc: &ResolvedCluster) -> Result<Map<String, Value>, RenderError> {
     let master_addrs: Vec<String> = rc
         .master_ips

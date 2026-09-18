@@ -76,7 +76,8 @@ pub enum Commands {
         action: ConfigAction,
     },
 
-    /// Certificate lifecycle (wraps `powerfs-cli cert`)
+    /// Certificate lifecycle: fetch CA, issue node/client certs, list registry.
+    /// (renew/revoke are M4+ — pending master `POST /api/cert/revoke` endpoint.)
     Cert {
         #[command(subcommand)]
         action: CertAction,
@@ -124,24 +125,24 @@ pub enum ConfigAction {
 
 #[derive(Subcommand, Debug)]
 pub enum CertAction {
-    /// Initialize (or reuse) the cluster CA
+    /// Initialize (or reuse) the cluster CA — fetch master's CA cert locally.
     InitCa,
-    /// Issue a node or client certificate and register it
+    /// Issue a node or client certificate and persist it under .powerfs/certs/.
     Issue {
-        /// Certificate name (e.g. filer-1, kernel-node7)
+        /// Certificate name (e.g. filer-1, fuse-client-3, kernel-node7)
         name: String,
-        /// SAN IP addresses
+        /// SAN IP addresses (at least one required).
         #[arg(long = "san-ip", num_args = 0..)]
         san_ips: Vec<String>,
-        /// Issue a node certificate (vs client)
+        /// Mount directories the client may access. Required for client certs
+        /// (ignored when --node is set). Pass multiple times for multi-mount.
+        #[arg(long = "mount-dir", num_args = 0..)]
+        mount_dirs: Vec<String>,
+        /// Issue a node certificate (vs client). Node certs have empty mount_dirs.
         #[arg(long)]
         node: bool,
     },
-    /// Renew a certificate
-    Renew { name: String },
-    /// Revoke a certificate
-    Revoke { name: String },
-    /// List certificates with expiry
+    /// List certificates with expiry (reads master-side client_registry.json).
     List,
 }
 
