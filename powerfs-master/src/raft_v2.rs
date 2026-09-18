@@ -612,6 +612,25 @@ impl RaftNodeV2 {
                 let metrics = raft.metrics().borrow_watched().clone();
                 let current_state = metrics.state;
 
+                // Publish raft progress gauges so powerfs-ctl's health gate can
+                // detect zombie leaders (commit_index stalled) without trusting
+                // scheme C's ensure_linearizable probe, which round-trips small
+                // heartbeat packets and returns OK in asymmetric split-brain where
+                // AppendEntries responses are dropped. Followers set their own
+                // view too — harmless, the gate only reads the leader's /metrics.
+                // NOTE: first update happens after check_interval (5s) because the
+                // loop sleeps before the first iteration.
+                let commit = metrics.local_committed.map(|l| l.index()).unwrap_or(0);
+                let applied = metrics.last_applied.map(|l| l.index()).unwrap_or(0);
+                crate::metrics::RAFT_TERM.set(metrics.current_term as f64);
+                crate::metrics::IS_LEADER.set(if current_state == ServerState::Leader {
+                    1.0
+                } else {
+                    0.0
+                });
+                crate::metrics::RAFT_COMMIT_INDEX.set(commit as f64);
+                crate::metrics::RAFT_LAST_APPLIED.set(applied as f64);
+
                 // 状态变化时打印 info 日志
                 if current_state != last_state {
                     info!(
