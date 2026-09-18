@@ -133,6 +133,11 @@ impl Default for Ca {
 pub struct ClientSpec {
     #[serde(rename = "type")]
     pub kind: ClientKind,
+    /// Optional client IP. When set in cluster.toml, `bootstrap` issues a
+    /// client cert for this client; otherwise bootstrap skips it and the
+    /// user runs `client enroll <name> --ip <ip>` on the fly.
+    #[serde(default)]
+    pub ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -2,7 +2,7 @@
 
 use crate::home::Home;
 
-const DEFAULT_CLUSTER_TOML: &str = r#"# PowerFS cluster declaration — the single hand-written source of truth.
+pub const DEFAULT_CLUSTER_TOML: &str = r#"# PowerFS cluster declaration — the single hand-written source of truth.
 # Edit this file, then run `powerfs-ctl config render` to regenerate all
 # docker-compose.yml + per-role TOML configs under .powerfs/rendered/.
 

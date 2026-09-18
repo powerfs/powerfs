@@ -22,3 +22,8 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { version = "0.11", default-features = false, features = ["json"] }
 powerfs-common = { path = "../powerfs-common" }
+
+[dev-dependencies]
+# test-util enables `#[tokio::test(start_paused = true)]` so health-gate
+# sleeps in bootstrap tests complete instantly in virtual time.
+tokio = { workspace = true, features = ["test-util"] }

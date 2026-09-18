@@ -162,7 +162,7 @@ impl HealthGate {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::sync::Mutex;
 
