@@ -146,10 +146,22 @@ pub async fn dispatch(cmd: Commands, home: &Home) -> Result<(), String> {
         },
         Commands::Node { action } => match action {
             NodeAction::Master { action } => match action {
-                MasterAction::Add { id, addr } => {
-                    let probe = ReqwestProbe::new();
-                    let (api, tok) = leader_api_and_token(home, &probe).await?;
-                    node_master::add(&MasterAdminClient::new(), &api, &tok, id, &addr).await
+                MasterAction::Add {
+                    id,
+                    addr,
+                    raft_only,
+                } => {
+                    node_master::add(
+                        home,
+                        &MasterAdminClient::new(),
+                        &MasterCertClient::new(),
+                        &DockerComposeDriver::new(),
+                        &ReqwestProbe::new(),
+                        id,
+                        addr.as_deref(),
+                        raft_only,
+                    )
+                    .await
                 }
                 MasterAction::Remove { id, force } => {
                     let probe = ReqwestProbe::new();
@@ -163,6 +175,15 @@ pub async fn dispatch(cmd: Commands, home: &Home) -> Result<(), String> {
                 }
             },
             NodeAction::Data { action } => match action {
+                DataAction::Add { name } => {
+                    node_data::add(
+                        home,
+                        &MasterCertClient::new(),
+                        &DockerComposeDriver::new(),
+                        &name,
+                    )
+                    .await
+                }
                 DataAction::Maintenance { name, off } => {
                     let probe = ReqwestProbe::new();
                     let (api, tok) = leader_api_and_token(home, &probe).await?;

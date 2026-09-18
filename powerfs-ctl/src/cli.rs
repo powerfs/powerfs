@@ -178,13 +178,18 @@ pub enum NodeAction {
 
 #[derive(Subcommand, Debug)]
 pub enum MasterAction {
-    /// Add a new raft voter (POST /api/admin/masters).
-    /// The new master container must already be running and bootstrapped.
+    /// Provision a new master: render configs, issue cert, start container,
+    /// wait for boot, raft join (POST /api/admin/masters), then health gate.
+    /// The new master must be declared in cluster.toml first (increment count).
     Add {
-        /// Raft node id (numeric, e.g. 4).
+        /// Raft node id (numeric, e.g. 4 — must be declared in cluster.toml).
         id: u64,
-        /// Raft gRPC address of the new master (ip:9335).
-        addr: String,
+        /// Override the raft gRPC address (auto-derived as ip:9335 from cluster.toml).
+        #[arg(long)]
+        addr: Option<String>,
+        /// Skip provisioning — only do the raft join (container must already be up).
+        #[arg(long)]
+        raft_only: bool,
     },
     /// Remove a raft voter (DELETE /api/admin/masters/{id}).
     Remove {
@@ -200,6 +205,13 @@ pub enum MasterAction {
 
 #[derive(Subcommand, Debug)]
 pub enum DataAction {
+    /// Provision a new data node: render configs, issue cert, start container.
+    /// The node must be declared in cluster.toml first (increment count).
+    /// No raft join needed — data nodes auto-register with master.
+    Add {
+        /// Node name (e.g. volume-7, filer-7 — must be declared in cluster.toml).
+        name: String,
+    },
     /// Toggle maintenance mode on a data node (POST /api/admin/nodes/{name}/maintenance).
     Maintenance {
         /// Node name (e.g. volume-1).
