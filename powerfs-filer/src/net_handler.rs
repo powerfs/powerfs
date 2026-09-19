@@ -2687,6 +2687,230 @@ impl FilerNetHandler {
         }
     }
 
+    // ========================================================================
+    // Cross-shard rename 2PC handlers (docs/shard-routing-no-forward-principle.md §4.1)
+    // ========================================================================
+
+    /// Phase 1 source: remove source dir entry + record rename intent.
+    async fn handle_rename_prepare_source(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let (rename_id, parent_ino, name, ino, new_parent_ino, new_name) =
+            match powerfs_net::serialize::decode_rename_prepare_source_req(&msg.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("FILER_NET_RENAME_PREPARE_SOURCE: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+        match self
+            .meta_shard_manager
+            .rename_prepare_source(
+                &rename_id,
+                parent_ino,
+                &name,
+                ino,
+                new_parent_ino,
+                &new_name,
+            )
+            .await
+        {
+            Ok(()) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+            Err(e) => Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await),
+        }
+    }
+
+    /// Phase 1 dest: install target dir entry + record rename intent.
+    async fn handle_rename_prepare_dest(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let (rename_id, parent_ino, name, ino) =
+            match powerfs_net::serialize::decode_rename_prepare_dest_req(&msg.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("FILER_NET_RENAME_PREPARE_DEST: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+        match self
+            .meta_shard_manager
+            .rename_prepare_dest(&rename_id, parent_ino, &name, ino)
+            .await
+        {
+            Ok(()) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+            Err(e) => Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await),
+        }
+    }
+
+    /// Phase 2 source: drop source intent. Notify clients that the old
+    /// (parent, name) dentry is gone.
+    async fn handle_rename_commit_source(
+        &self,
+        msg: &NetMessage,
+        client_id: u64,
+    ) -> NetResult<NetMessage> {
+        let (rename_id, parent_ino, name) =
+            match powerfs_net::serialize::decode_rename_commit_req(&msg.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("FILER_NET_RENAME_COMMIT_SOURCE: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+        match self
+            .meta_shard_manager
+            .rename_commit_source(&rename_id, parent_ino, &name)
+            .await
+        {
+            Ok(()) => {
+                // Invalidate the old dentry on all clients except the caller
+                // (which already invalidated locally before the RPC).
+                let v = self.next_version();
+                self.notify_dentry_change(0, v, parent_ino, &name, Some(client_id));
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await),
+        }
+    }
+
+    /// Phase 2 dest: DecrementNlink(replaced) + drop dest intent. Notify
+    /// clients that the new (parent, name) dentry is now authoritative.
+    async fn handle_rename_commit_dest(
+        &self,
+        msg: &NetMessage,
+        client_id: u64,
+    ) -> NetResult<NetMessage> {
+        let (rename_id, parent_ino, name) =
+            match powerfs_net::serialize::decode_rename_commit_req(&msg.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("FILER_NET_RENAME_COMMIT_DEST: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+        match self
+            .meta_shard_manager
+            .rename_commit_dest(&rename_id, parent_ino, &name)
+            .await
+        {
+            Ok(()) => {
+                let v = self.next_version();
+                self.notify_dentry_change(0, v, parent_ino, &name, Some(client_id));
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new()))
+            }
+            Err(e) => Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await),
+        }
+    }
+
+    /// Rollback one prepared side.
+    async fn handle_rename_abort(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let (rename_id, side, parent_ino, name, ino) =
+            match powerfs_net::serialize::decode_rename_abort_req(&msg.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("FILER_NET_RENAME_ABORT: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
+        let shard_id = self.shard_strategy.calculate_shard(parent_ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+        match self
+            .meta_shard_manager
+            .rename_abort(&rename_id, side, parent_ino, &name, ino)
+            .await
+        {
+            Ok(()) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+            Err(e) => Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await),
+        }
+    }
+
+    /// Update inode record name+parent after a cross-shard rename. Routed to
+    /// calculate_shard(inode). Best-effort.
+    async fn handle_rename_inode(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let (ino, new_name, new_parent_ino) =
+            match powerfs_net::serialize::decode_rename_inode_req(&msg.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("FILER_NET_RENAME_INODE: decode failed: {}", e);
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_BAD_REQUEST,
+                        Vec::new(),
+                    ));
+                }
+            };
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+        match self
+            .meta_shard_manager
+            .rename_inode(ino, &new_name, new_parent_ino)
+            .await
+        {
+            Ok(()) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+            Err(e) => Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await),
+        }
+    }
+
+    /// Decrement an inode's nlink (delete if zero). Routed to the inode's own
+    /// shard. Idempotent.
+    async fn handle_decrement_nlink(&self, msg: &NetMessage) -> NetResult<NetMessage> {
+        let ino = match powerfs_net::serialize::decode_decrement_nlink_req(&msg.body) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("FILER_NET_DECREMENT_NLINK: decode failed: {}", e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_BAD_REQUEST,
+                    Vec::new(),
+                ));
+            }
+        };
+        let shard_id = self.shard_strategy.calculate_shard(ino);
+        if let Err(redirect) = self.check_leader(msg, shard_id).await {
+            return Ok(redirect);
+        }
+        match self.meta_shard_manager.decrement_nlink(ino).await {
+            Ok(()) => Ok(Self::build_response(msg, STATUS_OK, Vec::new())),
+            Err(e) => Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await),
+        }
+    }
+
     /// Handle Unlink request
     async fn handle_unlink(&self, msg: &NetMessage, client_id: u64) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
@@ -5629,6 +5853,21 @@ impl NetHandler for FilerNetHandler {
             // See docs/shard-routing-no-forward-principle.md §3
             MsgType::MkdirPhaseA => self.handle_mkdir_phase_a(msg).await,
             MsgType::MkdirPhaseB => self.handle_mkdir_phase_b(msg).await,
+            // Cross-shard rename 2PC (client-coordinated, no forwarding)
+            // See docs/shard-routing-no-forward-principle.md §4.1
+            MsgType::RenamePrepareSource => self.handle_rename_prepare_source(msg).await,
+            MsgType::RenamePrepareDest => self.handle_rename_prepare_dest(msg).await,
+            MsgType::RenameCommitSource => {
+                self.handle_rename_commit_source(msg, ctx.client.client_id)
+                    .await
+            }
+            MsgType::RenameCommitDest => {
+                self.handle_rename_commit_dest(msg, ctx.client.client_id)
+                    .await
+            }
+            MsgType::RenameAbort => self.handle_rename_abort(msg).await,
+            MsgType::RenameInode => self.handle_rename_inode(msg).await,
+            MsgType::DecrementNlink => self.handle_decrement_nlink(msg).await,
             MsgType::BatchUnlink => self.handle_batch_unlink(msg).await,
             MsgType::BatchCreate => self.handle_batch_create(msg, ctx.client.client_id).await,
             // Phase 2 / 方案 A: Inode metadata lease (Filer-managed)

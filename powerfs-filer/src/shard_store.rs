@@ -16,9 +16,55 @@ const CF_TOMBSTONES: &str = "tombstones"; // For storing CRDT tombstones
 const CF_PENDING_RECLAIMS: &str = "pending_reclaims"; // Phase 5: WAL for GC data chunk reclamation
 const CF_LEASES: &str = "leases"; // Phase 5 §5.3: lease state persistence (token → serialized LeaseEntry)
 const CF_CHILD_SUMMARIES: &str = "child_summaries"; // P4 DirStatSummary cache on parent shard for cross-shard subdirs
+const CF_RENAME_INTENTS: &str = "rename_intents"; // Cross-shard rename 2PC: {rename_id}:{side} → RenameIntent
 
 /// POSIX 根 inode 固定为 1（与 meta_shard_manager::POSIX_ROOT_INODE 一致）。
 const POSIX_ROOT_INODE: u64 = 1;
+
+/// Side of a cross-shard rename 2PC intent. Stored in `CF_RENAME_INTENTS`
+/// keyed by `{rename_id}:{side}` where side is "source" or "dest".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RenameSide {
+    Source,
+    Dest,
+}
+
+impl RenameSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RenameSide::Source => "source",
+            RenameSide::Dest => "dest",
+        }
+    }
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(RenameSide::Source),
+            1 => Some(RenameSide::Dest),
+            _ => None,
+        }
+    }
+}
+
+/// A prepared side of a cross-shard rename. Persisted in `CF_RENAME_INTENTS`
+/// so that a client crash or leader switch can still converge: the intent
+/// records enough state to commit (drop) or abort (restore) idempotently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameIntent {
+    pub rename_id: String,
+    pub side: RenameSide,
+    /// The inode being moved. On the source side this lets abort re-add the
+    /// source dir entry; on the dest side it is the inode now stored under
+    /// the target name.
+    pub inode: u64,
+    pub parent_inode: u64,
+    pub name: String,
+    /// Only on the dest side: the inode that previously occupied the target
+    /// name, captured so commit can DecrementNlink it and abort can restore
+    /// the target dir entry.
+    #[serde(default)]
+    pub replaced_inode: Option<u64>,
+    pub created_at: u64,
+}
 
 /// CF_METADATA 中文件系统格式标记的键。
 /// 落盘内容为 [`FormatMarker`] 的 JSON。一旦存在，任何启动路径都不得再
@@ -322,6 +368,7 @@ impl ShardStore {
             ColumnFamilyDescriptor::new(CF_PENDING_RECLAIMS, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_LEASES, make_cf_opts()),
             ColumnFamilyDescriptor::new(CF_CHILD_SUMMARIES, make_cf_opts()),
+            ColumnFamilyDescriptor::new(CF_RENAME_INTENTS, make_cf_opts()),
         ];
         let known_names: std::collections::HashSet<&'static str> = [
             CF_INODES,
@@ -333,6 +380,7 @@ impl ShardStore {
             CF_PENDING_RECLAIMS,
             CF_LEASES,
             CF_CHILD_SUMMARIES,
+            CF_RENAME_INTENTS,
         ]
         .iter()
         .cloned()
@@ -1078,36 +1126,14 @@ impl ShardStore {
                     self.shard_id.0,
                     inode
                 );
-                if let Some(mut info) = self.get_inode(inode) {
-                    if info.nlink > 0 {
-                        info.nlink -= 1;
-                    }
-                    let new_nlink = info.nlink;
-                    if let Err(e) = self.update_inode(info) {
-                        log::error!(
-                            "Shard {} apply DecrementNlink failed for inode {}: {}",
-                            self.shard_id.0,
-                            inode,
-                            e
-                        );
-                    } else {
-                        log::info!(
-                            "Shard {} DecrementNlink: inode {} nlink -> {}",
-                            self.shard_id.0,
-                            inode,
-                            new_nlink
-                        );
-                    }
-                    // P3: 同步 MetaCache 缓存的 nlink（与 IncrementNlink 对称）。
-                    if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
-                        cache.confirm_decrement_nlink(inode);
-                    }
-                } else {
-                    log::warn!(
-                        "Shard {} apply DecrementNlink: inode {} not found",
-                        self.shard_id.0,
-                        inode
-                    );
+                // Decrements nlink and deletes the inode record when nlink
+                // reaches zero (needed for cross-shard rename over replace,
+                // where the coordinator does not know the replaced inode's
+                // nlink ahead of time).
+                self.decrement_nlink_and_maybe_delete(inode);
+                // P3: 同步 MetaCache 缓存的 nlink（与 IncrementNlink 对称）。
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_decrement_nlink(inode);
                 }
             }
             ShardCommand::RenameInode {
@@ -1149,6 +1175,66 @@ impl ShardStore {
                         inode
                     );
                 }
+            }
+            // ----- Cross-shard rename 2PC (docs §4.1) -----
+            ShardCommand::RenamePrepareSource {
+                rename_id,
+                parent_inode,
+                name,
+                inode,
+                new_parent_inode: _,
+                new_name: _,
+            } => {
+                self.apply_rename_prepare_source(&rename_id, parent_inode, &name, inode);
+            }
+            ShardCommand::RenamePrepareDest {
+                rename_id,
+                parent_inode,
+                name,
+                inode,
+            } => {
+                self.apply_rename_prepare_dest(&rename_id, parent_inode, &name, inode);
+            }
+            ShardCommand::RenameCommitSource {
+                rename_id,
+                parent_inode: _,
+                name: _,
+            } => {
+                // Source dir entry was removed at prepare time; commit just
+                // drops the intent so the move is no longer abortable.
+                self.delete_rename_intent(&rename_id, RenameSide::Source);
+            }
+            ShardCommand::RenameCommitDest {
+                rename_id,
+                parent_inode: _,
+                name: _,
+            } => {
+                // The dest dir entry was installed at prepare time. Commit
+                // just drops the intent so the move is no longer abortable.
+                // nlink of the replaced inode (if any) is decremented by the
+                // client via DecrementNlink routed to the replaced inode's own
+                // shard — it may not live on this dest shard.
+                self.delete_rename_intent(&rename_id, RenameSide::Dest);
+            }
+            ShardCommand::RenameAbort {
+                rename_id,
+                side,
+                parent_inode: _,
+                name: _,
+                inode,
+            } => {
+                let side = match RenameSide::from_u8(side) {
+                    Some(s) => s,
+                    None => {
+                        log::warn!(
+                            "Shard {} apply RenameAbort: invalid side={}",
+                            self.shard_id.0,
+                            side
+                        );
+                        return;
+                    }
+                };
+                self.apply_rename_abort(&rename_id, side, inode);
             }
             // ----- Phase 5 §5.3: lease state persistence -----
             ShardCommand::LeasePut { token, value } => {
@@ -2447,6 +2533,246 @@ impl ShardStore {
         self.bump_dir_version(parent_inode);
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Cross-shard rename 2PC intent helpers (docs §4.1)
+    // ========================================================================
+
+    fn rename_intent_key(rename_id: &str, side: RenameSide) -> String {
+        format!("{}:{}", rename_id, side.as_str())
+    }
+
+    pub fn get_rename_intent(&self, rename_id: &str, side: RenameSide) -> Option<RenameIntent> {
+        let cf = self.db.cf_handle(CF_RENAME_INTENTS)?;
+        let key = Self::rename_intent_key(rename_id, side);
+        let bytes = self.db.get_cf(cf, key.as_bytes()).ok()??;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn put_rename_intent(&self, intent: &RenameIntent) {
+        if let Some(cf) = self.db.cf_handle(CF_RENAME_INTENTS) {
+            let key = Self::rename_intent_key(&intent.rename_id, intent.side);
+            if let Ok(data) = serde_json::to_vec(intent) {
+                let _ = self.db.put_cf(cf, key.as_bytes(), &data);
+            }
+        }
+    }
+
+    pub fn delete_rename_intent(&self, rename_id: &str, side: RenameSide) {
+        if let Some(cf) = self.db.cf_handle(CF_RENAME_INTENTS) {
+            let key = Self::rename_intent_key(rename_id, side);
+            let _ = self.db.delete_cf(cf, key.as_bytes());
+        }
+    }
+
+    /// Phase 1 source: remove the source dir entry and persist an intent so
+    /// the move can be aborted (restore) or committed (drop) idempotently.
+    ///
+    /// Idempotency: if the intent for this rename_id already exists, the
+    /// prepare was already applied — no-op. If the source dir entry is gone
+    /// but the intent exists, also no-op (the entry was removed by a prior
+    /// apply of this same command).
+    fn apply_rename_prepare_source(
+        &self,
+        rename_id: &str,
+        parent_inode: u64,
+        name: &str,
+        inode: u64,
+    ) {
+        if self
+            .get_rename_intent(rename_id, RenameSide::Source)
+            .is_some()
+        {
+            return;
+        }
+        // Remove the source dir entry (idempotent: absent entry is fine).
+        let _ = self.remove_dir_entry(parent_inode, name);
+        let intent = RenameIntent {
+            rename_id: rename_id.to_string(),
+            side: RenameSide::Source,
+            inode,
+            parent_inode,
+            name: name.to_string(),
+            replaced_inode: None,
+            created_at: chrono::Utc::now().timestamp() as u64,
+        };
+        self.put_rename_intent(&intent);
+        log::info!(
+            "Shard {} RenamePrepareSource: removed {}/{} inode={} intent={}",
+            self.shard_id.0,
+            parent_inode,
+            name,
+            inode,
+            rename_id
+        );
+    }
+
+    /// Phase 1 dest: install the target dir entry. If the target name was
+    /// already occupied, capture the replaced inode in the intent so commit
+    /// can DecrementNlink it and abort can restore it.
+    ///
+    /// Idempotency: existing intent → no-op.
+    fn apply_rename_prepare_dest(
+        &self,
+        rename_id: &str,
+        parent_inode: u64,
+        name: &str,
+        inode: u64,
+    ) {
+        if self
+            .get_rename_intent(rename_id, RenameSide::Dest)
+            .is_some()
+        {
+            return;
+        }
+        let replaced_inode = self.get_dir_entry_inode(parent_inode, name);
+        if replaced_inode.is_some() {
+            // Temporarily remove the existing target entry; it is restored on
+            // abort or its inode is DecrementNlink'd on commit.
+            let _ = self.remove_dir_entry(parent_inode, name);
+        }
+        // Best-effort: ignore add error (e.g. parent dir missing on this shard
+        // for cross-shard subdirs); the intent still records the state.
+        let _ = self.add_dir_entry(parent_inode, name, inode);
+        let intent = RenameIntent {
+            rename_id: rename_id.to_string(),
+            side: RenameSide::Dest,
+            inode,
+            parent_inode,
+            name: name.to_string(),
+            replaced_inode,
+            created_at: chrono::Utc::now().timestamp() as u64,
+        };
+        self.put_rename_intent(&intent);
+        log::info!(
+            "Shard {} RenamePrepareDest: set {}/{} -> inode={} replaced={:?} intent={}",
+            self.shard_id.0,
+            parent_inode,
+            name,
+            inode,
+            replaced_inode,
+            rename_id
+        );
+    }
+
+    /// Roll back one prepared side. Idempotent: no intent → no-op.
+    fn apply_rename_abort(&self, rename_id: &str, side: RenameSide, inode: u64) {
+        let intent = match self.get_rename_intent(rename_id, side) {
+            Some(i) => i,
+            None => return,
+        };
+        match side {
+            RenameSide::Source => {
+                // Restore the source dir entry (use the inode from the intent,
+                // falling back to the request inode).
+                let restore_inode = intent.inode;
+                let _ = self.add_dir_entry(intent.parent_inode, &intent.name, restore_inode);
+            }
+            RenameSide::Dest => {
+                // Remove the target entry we installed, then restore the
+                // original target if there was one.
+                let _ = self.remove_dir_entry(intent.parent_inode, &intent.name);
+                if let Some(replaced) = intent.replaced_inode {
+                    let _ = self.add_dir_entry(intent.parent_inode, &intent.name, replaced);
+                }
+            }
+        }
+        self.delete_rename_intent(rename_id, side);
+        log::info!(
+            "Shard {} RenameAbort: restored side={} {}/{} inode={} intent={}",
+            self.shard_id.0,
+            side.as_str(),
+            intent.parent_inode,
+            intent.name,
+            inode,
+            rename_id
+        );
+    }
+
+    /// Decrement nlink on an inode; when it reaches zero, delete the inode
+    /// record. Used by RenameCommitDest to release a replaced target inode.
+    fn decrement_nlink_and_maybe_delete(&self, inode: u64) {
+        if let Some(mut info) = self.get_inode(inode) {
+            if info.nlink > 0 {
+                info.nlink -= 1;
+            }
+            let new_nlink = info.nlink;
+            if new_nlink == 0 {
+                let _ = self.delete_inode(inode);
+                log::info!(
+                    "Shard {} DecrementNlink: inode {} nlink=0, deleted",
+                    self.shard_id.0,
+                    inode
+                );
+            } else if let Err(e) = self.update_inode(info) {
+                log::error!(
+                    "Shard {} DecrementNlink failed for inode {}: {}",
+                    self.shard_id.0,
+                    inode,
+                    e
+                );
+            } else {
+                log::info!(
+                    "Shard {} DecrementNlink: inode {} nlink -> {}",
+                    self.shard_id.0,
+                    inode,
+                    new_nlink
+                );
+            }
+        } else {
+            log::warn!(
+                "Shard {} DecrementNlink: inode {} not found",
+                self.shard_id.0,
+                inode
+            );
+        }
+    }
+
+    /// Garbage-collect rename intents older than `ttl_secs`. For each stale
+    /// intent, run the abort-side action (restore dir entry) and delete the
+    /// intent. This recovers from coordinators that crashed after prepare
+    /// but before commit/abort. Returns the number of intents reaped.
+    ///
+    /// Caller must be the shard leader (writes are applied to the local
+    /// store directly, not via Raft).
+    pub fn gc_stale_rename_intents(&self, now_unix_secs: u64, ttl_secs: u64) -> usize {
+        let cf = match self.db.cf_handle(CF_RENAME_INTENTS) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let threshold = now_unix_secs.saturating_sub(ttl_secs);
+        let mut reaped = 0usize;
+        let iter = self.db.iterator_cf(cf, rocksdb::IteratorMode::Start);
+        for item in iter {
+            let (key, value) = match item {
+                Ok((k, v)) => (k, v),
+                Err(_) => continue,
+            };
+            let intent: RenameIntent = match serde_json::from_slice(&value) {
+                Ok(i) => i,
+                Err(_) => {
+                    // Corrupt intent — drop it to avoid infinite re-scan.
+                    let _ = self.db.delete_cf(cf, &key);
+                    reaped += 1;
+                    continue;
+                }
+            };
+            if intent.created_at >= threshold {
+                continue;
+            }
+            log::warn!(
+                "Shard {} GC: reaping stale rename intent {} side={} age={}s",
+                self.shard_id.0,
+                intent.rename_id,
+                intent.side.as_str(),
+                now_unix_secs.saturating_sub(intent.created_at)
+            );
+            // Reuse the abort apply path.
+            self.apply_rename_abort(&intent.rename_id, intent.side, intent.inode);
+            reaped += 1;
+        }
+        reaped
     }
 
     /// Increment a directory's version counter (shared_gen).

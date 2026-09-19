@@ -391,6 +391,23 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         filer_cfg.raft_id,
     ));
 
+    // Cross-shard rename 2PC intent GC: reap prepared intents whose
+    // coordinator never committed/aborted (TTL 60s, sweep every 30s).
+    // Leader-only — gc_rename_intents checks leadership per shard.
+    {
+        let msm = meta_shard_manager.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                let reaped = msm.gc_rename_intents(60).await;
+                if reaped > 0 {
+                    log::info!("Rename-intent GC reaped {} stale intent(s)", reaped);
+                }
+            }
+        });
+    }
+
     info!("Initializing {} metadata shards...", filer_cfg.shard_count);
     let peers: Vec<powerfs_filer::Peer> = if filer_cfg.raft_peers.is_empty() {
         vec![powerfs_filer::Peer {

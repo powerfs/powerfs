@@ -267,6 +267,66 @@ pub enum ShardCommand {
         new_parent_inode: u64,
     },
 
+    // ----- Cross-shard rename 2PC (client-coordinated, docs §4.1) -----
+    //
+    // Cross-shard rename cannot be done atomically on a single shard, and the
+    // no-forwarding principle forbids a filer proposing to another shard's
+    // leader. Instead the client drives a two-phase commit across old_shard
+    // and new_shard. Each command below is idempotent (keyed by `rename_id`)
+    // so client retries and Raft replay converge to the same state.
+    //
+    // Phase 1 (prepare, abortable):
+    //   - RenamePrepareSource (old_shard): remove source dir entry + intent
+    //   - RenamePrepareDest   (new_shard): install target entry + intent
+    //     (captures replaced_inode when target already exists)
+    // Phase 2 (commit, idempotent):
+    //   - RenameCommitSource (old_shard): drop source intent
+    //   - RenameCommitDest   (new_shard): drop dest intent + DecrementNlink(replaced)
+    // Rollback:
+    //   - RenameAbort: restore the side's dir entry + drop intent
+    /// Phase 1 source side: remove the source dir entry and record an intent
+    /// so the move can be aborted or committed. Idempotent on `rename_id`.
+    RenamePrepareSource {
+        rename_id: String,
+        parent_inode: u64,
+        name: String,
+        inode: u64,
+        new_parent_inode: u64,
+        new_name: String,
+    },
+    /// Phase 1 dest side: install the target dir entry (replacing an existing
+    /// entry if present, recording it in the intent) and record an intent.
+    RenamePrepareDest {
+        rename_id: String,
+        parent_inode: u64,
+        name: String,
+        inode: u64,
+    },
+    /// Phase 2 source side: drop the source intent. The dir entry was already
+    /// removed during prepare. Idempotent.
+    RenameCommitSource {
+        rename_id: String,
+        parent_inode: u64,
+        name: String,
+    },
+    /// Phase 2 dest side: DecrementNlink the replaced inode (if any) and drop
+    /// the dest intent. The target dir entry stays. Idempotent.
+    RenameCommitDest {
+        rename_id: String,
+        parent_inode: u64,
+        name: String,
+    },
+    /// Roll back one prepared side. `side`: 0 = source, 1 = dest. Restores
+    /// the dir entry (source: re-add `inode`; dest: re-add replaced_inode if
+    /// present) and drops the intent. Idempotent.
+    RenameAbort {
+        rename_id: String,
+        side: u8,
+        parent_inode: u64,
+        name: String,
+        inode: u64,
+    },
+
     // ----- Phase 5 §5.3: Lease state persistence via Raft -----
     //
     // The lease manager (`InodeLeaseManager`) keeps lease state in memory.

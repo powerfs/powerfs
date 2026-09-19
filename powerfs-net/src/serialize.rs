@@ -837,6 +837,159 @@ pub fn decode_rename_req(body: &[u8]) -> Result<(u64, String, u64, String), NetE
     Ok((old_parent_ino, old_name, new_parent_ino, new_name))
 }
 
+// ============================================================================
+// Cross-shard rename 2PC (client-coordinated, docs §4.1)
+// ============================================================================
+
+/// Encode RenamePrepareSource request (Phase 1, routed to old_shard leader).
+/// Removes the source dir entry and records a rename intent so the move can
+/// be aborted or committed idempotently.
+pub fn encode_rename_prepare_source_req(
+    rename_id: &str,
+    parent_ino: u64,
+    name: &str,
+    ino: u64,
+    new_parent_ino: u64,
+    new_name: &str,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_string(FieldId::RenameId, rename_id)?;
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_u64(FieldId::NewParentIno, new_parent_ino);
+    enc.add_string(FieldId::NewName, new_name)?;
+    Ok(enc.into_bytes())
+}
+
+#[allow(clippy::type_complexity)]
+pub fn decode_rename_prepare_source_req(
+    body: &[u8],
+) -> Result<(String, u64, String, u64, u64, String), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let rename_id = dec.next_string(FieldId::RenameId)?;
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    let ino = dec.next_u64(FieldId::Ino)?;
+    let new_parent_ino = dec.next_u64(FieldId::NewParentIno)?;
+    let new_name = dec.next_string(FieldId::NewName)?;
+    Ok((rename_id, parent_ino, name, ino, new_parent_ino, new_name))
+}
+
+/// Encode RenamePrepareDest request (Phase 1, routed to new_shard leader).
+/// Installs the target dir entry (capturing replaced_inode if the target
+/// already existed) and records a rename intent.
+pub fn encode_rename_prepare_dest_req(
+    rename_id: &str,
+    parent_ino: u64,
+    name: &str,
+    ino: u64,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_string(FieldId::RenameId, rename_id)?;
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    enc.add_u64(FieldId::Ino, ino);
+    Ok(enc.into_bytes())
+}
+
+pub fn decode_rename_prepare_dest_req(body: &[u8]) -> Result<(String, u64, String, u64), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let rename_id = dec.next_string(FieldId::RenameId)?;
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    let ino = dec.next_u64(FieldId::Ino)?;
+    Ok((rename_id, parent_ino, name, ino))
+}
+
+/// Encode RenameCommitSource / RenameCommitDest request (Phase 2).
+/// Same body shape for both sides; the MsgType selects the handler.
+pub fn encode_rename_commit_req(
+    rename_id: &str,
+    parent_ino: u64,
+    name: &str,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_string(FieldId::RenameId, rename_id)?;
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    Ok(enc.into_bytes())
+}
+
+pub fn decode_rename_commit_req(body: &[u8]) -> Result<(String, u64, String), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let rename_id = dec.next_string(FieldId::RenameId)?;
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    Ok((rename_id, parent_ino, name))
+}
+
+/// Encode RenameAbort request (rollback one prepared side).
+/// `side`: 0 = source, 1 = dest. `ino` is the moved inode (source) needed to
+/// restore the source dir entry; for dest it is ignored (abort restores
+/// replaced_inode from the intent if present).
+pub fn encode_rename_abort_req(
+    rename_id: &str,
+    side: u8,
+    parent_ino: u64,
+    name: &str,
+    ino: u64,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_string(FieldId::RenameId, rename_id)?;
+    enc.add_u8(FieldId::RenameSide, side);
+    enc.add_u64(FieldId::ParentIno, parent_ino);
+    enc.add_string(FieldId::Name, name)?;
+    enc.add_u64(FieldId::Ino, ino);
+    Ok(enc.into_bytes())
+}
+
+pub fn decode_rename_abort_req(body: &[u8]) -> Result<(String, u8, u64, String, u64), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let rename_id = dec.next_string(FieldId::RenameId)?;
+    let side = dec.next_u8(FieldId::RenameSide)?;
+    let parent_ino = dec.next_u64(FieldId::ParentIno)?;
+    let name = dec.next_string(FieldId::Name)?;
+    let ino = dec.next_u64(FieldId::Ino)?;
+    Ok((rename_id, side, parent_ino, name, ino))
+}
+
+/// Encode RenameInode request (update inode record name+parent after a
+/// cross-shard rename). Routed to calculate_shard(inode).
+pub fn encode_rename_inode_req(
+    ino: u64,
+    new_name: &str,
+    new_parent_ino: u64,
+) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    enc.add_string(FieldId::NewName, new_name)?;
+    enc.add_u64(FieldId::NewParentIno, new_parent_ino);
+    Ok(enc.into_bytes())
+}
+
+pub fn decode_rename_inode_req(body: &[u8]) -> Result<(u64, String, u64), NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let ino = dec.next_u64(FieldId::Ino)?;
+    let new_name = dec.next_string(FieldId::NewName)?;
+    let new_parent_ino = dec.next_u64(FieldId::NewParentIno)?;
+    Ok((ino, new_name, new_parent_ino))
+}
+
+/// Encode a DecrementNlink request (release a replaced inode after a
+/// cross-shard rename). Routed to calculate_shard(inode).
+pub fn encode_decrement_nlink_req(ino: u64) -> Result<Vec<u8>, NetError> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, ino);
+    Ok(enc.into_bytes())
+}
+
+pub fn decode_decrement_nlink_req(body: &[u8]) -> Result<u64, NetError> {
+    let mut dec = TlvDecoder::new(body);
+    let ino = dec.next_u64(FieldId::Ino)?;
+    Ok(ino)
+}
+
 /// Encode an unlink/rmdir request
 pub fn encode_delete_req(ino: u64, is_dir: bool) -> Result<Vec<u8>, NetError> {
     let mut enc = TlvEncoder::new();
