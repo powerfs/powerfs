@@ -106,13 +106,12 @@ docker run -d --name redis -p 6379:6379 redis:7-alpine
 # 3. Start 3 Volumes
 ./target/release/powerfs-volume --config config/volume-{1,2,3}.toml
 
-# 4. Init Filers (format root inode, run once per Filer)
-./target/release/powerfs-init --config config/filer-{1,2,3}.toml
-
-# 5. Start 3 Filers
+# 4. Start 3 Filers (each formats the POSIX root on first boot, via Raft;
+#    no separate init step needed — see "Filer Node (metadata format is
+#    automatic)" below)
 ./target/release/powerfs-filer --config config/filer-{1,2,3}.toml
 
-# 6. Mount
+# 5. Mount
 ./target/release/powerfs-fuse --config config/fuse.toml
 ```
 
@@ -207,7 +206,7 @@ cargo build -p powerfs-master
 cargo build -p powerfs-volume
 cargo build -p powerfs-filer
 cargo build -p powerfs-fuse
-cargo build -p powerfs-init
+cargo build -p powerfs-ctl      # deployment & lifecycle control plane
 ```
 
 ### Component Architecture
@@ -220,8 +219,10 @@ PowerFS adopts a **multi-binary independent deployment** architecture, where eac
 | **Volume** | `powerfs-volume` | 8080 (gRPC), 8091 (http), 8901 (net) | Data storage plane, Needle storage, Lease lock management |
 | **Filer** | `powerfs-filer` | 8888 (S3), 8889 (gRPC), 8890 (net) | Metadata sharding, Raft strong consistency, S3 gateway |
 | **FUSE** | `powerfs-fuse` | Userspace FUSE | POSIX interface client, three-client communication architecture |
-| **Init** | `powerfs-init` | None | Independent initialization tool, formats POSIX root inode |
+| **Ctl** | `powerfs-ctl` | None | Declarative deployment & lifecycle control (bootstrap/up/restart/doctor/cert/node) |
 | **CLI** | `powerfs-cli` | None | Command-line management tool |
+
+> Filers format the POSIX root inode themselves on first boot (replicated via Raft, guarded by a persistent format marker) — no separate init step is required. The legacy `powerfs-init` binary is deprecated and will be removed.
 
 ### Configuration
 
@@ -287,17 +288,13 @@ docker run -d --name redis -p 6379:6379 redis:7-alpine
 ./target/release/powerfs-volume --config config/volume-2.toml
 ./target/release/powerfs-volume --config config/volume-3.toml
 
-# Step 4: Initialize 3 Filer nodes (format POSIX root BEFORE starting Filers)
-./target/release/powerfs-init --config config/filer-1.toml
-./target/release/powerfs-init --config config/filer-2.toml
-./target/release/powerfs-init --config config/filer-3.toml
-
-# Step 5: Start 3 Filer nodes
+# Step 4: Start 3 Filer nodes (POSIX root is formatted automatically on
+# first boot through Raft — no separate init step)
 ./target/release/powerfs-filer --config config/filer-1.toml
 ./target/release/powerfs-filer --config config/filer-2.toml
 ./target/release/powerfs-filer --config config/filer-3.toml
 
-# Step 6: Mount FUSE
+# Step 5: Mount FUSE
 ./target/release/powerfs-fuse --config config/fuse.toml
 ```
 
@@ -320,28 +317,22 @@ powerfs-volume --config config/volume-2.toml
 powerfs-volume --config config/volume-3.toml
 ```
 
-#### Initialize Tool (powerfs-init)
+#### Filer Node (metadata format is automatic)
 
-Follows the **mkfs → mount** pattern. **Must run BEFORE starting Filer**. Directly operates RocksDB to create the POSIX root inode:
+A Filer formats the POSIX root inode (`inode 1`, `/`) itself on first boot — there is no separate init step. Formatting is a Raft-replicated command that also persists a filesystem marker (`fsid`, `shard_count`, creation time); every Filer checks the marker at startup:
 
-```bash
-# Initialize Filer metadata (creates POSIX root inode = /)
-powerfs-init --config config/filer-1.toml
-
-# Force overwrite existing data
-powerfs-init --config config/filer-1.toml --force
-```
-
-> **Important**: `powerfs-init` uses the SAME config file as `powerfs-filer` to ensure path consistency.
-
-#### Filer Node
+- marker present → the node joins the existing filesystem and **never reformats** (a `shard_count` mismatch aborts startup);
+- no marker + empty store → first-boot format;
+- no marker but data already exists (wrong disk mount, foreign data dir) → the Filer **refuses to start** unless `force_format = true` is explicitly set in `filer.toml`.
 
 ```bash
-# Start after powerfs-init has formatted the data
+# Just start it — formatting/adoption happens behind the boot gate.
 powerfs-filer --config config/filer-1.toml
 powerfs-filer --config config/filer-2.toml
 powerfs-filer --config config/filer-3.toml
 ```
+
+> The legacy `powerfs-init` binary (offline RocksDB writer, bypassing Raft) is deprecated and will be removed; its role is fully covered by the boot gate above. To discard metadata intentionally, wipe the data volumes instead (e.g. `powerfs-ctl down --purge`).
 
 #### FUSE Client
 
@@ -420,12 +411,11 @@ docker compose -f docker-compose.test.yml down
 **Deployment Order**:
 1. **Wave 1**: Redis
 2. **Wave 2**: Masters (all 3 start simultaneously for Raft)
-3. **Wave 3a**: Volumes
-4. **Wave 3b**: Init-Filers (format metadata, run once)
-5. **Wave 4**: Filers (start after init completes)
-6. **Wave 5**: FUSE client
+3. **Wave 3**: Volumes
+4. **Wave 4**: Filers (each formats/adopts metadata on first boot via a Raft-replicated, marker-guarded gate)
+5. **Wave 5**: FUSE client
 
-> **Key Principle**: Formatting is handled by the `powerfs-init` tool. Service startup MUST NOT contain initialization logic.
+> **Key Principle**: formatting is part of the Filer startup gate, not a separate offline step. A persistent filesystem marker ensures existing metadata is never reformatted; an unmarked but non-empty data directory makes the Filer refuse to start (override only with explicit `force_format = true`).
 
 ### Login Information
 
@@ -522,7 +512,7 @@ powerfs/
 ├── powerfs-filer/       # Filer service: Raft strong consistency metadata shards, S3 API, gRPC meta service
 ├── powerfs-fuse/        # FUSE client: POSIX interface, cache management, InvalidateHandler
 ├── powerfs-fuse-core/   # FUSE client core: MasterClient, MetaShardClient, VolumeClient, LeaseManager
-├── powerfs-init/        # Init tool: Format POSIX root inode before Filer startup
+├── powerfs-ctl/         # Deployment & lifecycle control plane: bootstrap, render, up/down/restart, doctor, cert/node ops
 ├── powerfs-cli/         # CLI tool: Cluster management commands (fsck, compact, etc.)
 ├── powerfs-monitor/     # Monitor: Health check, metrics, alerts
 ├── powerfs-kv-client/   # KV client: Native KV cache engine
@@ -592,19 +582,31 @@ Options:
   -V, --version          Print version
 ```
 
-#### powerfs-init
+#### powerfs-ctl
 
 ```
-PowerFS Init Tool - Format POSIX root inode BEFORE Filer startup
+PowerFS deployment & lifecycle control plane
 
-Usage: powerfs-init --config <CONFIG> [--force]
+Usage: powerfs-ctl [--home <DIR>] <COMMAND>
 
-Options:
-  -c, --config <CONFIG>  Path to Filer TOML configuration file (required)
-  -f, --force             Overwrite existing data (WARNING: destroys metadata!)
-  -h, --help              Print help
-  -V, --version           Print version
+Commands:
+  bootstrap   One-shot: init + render + cert + up + health gate
+  init        Generate cluster.toml + .powerfs/ skeleton
+  up          Render-if-stale + compose up + health gate
+  down        Stop the cluster (--purge wipes data volumes)
+  restart     Follower-first rolling restart with per-node health gate
+  status      Cluster health overview
+  config      render | check | show
+  cert        init-ca | issue | list | renew | revoke
+  node        master add/remove/list | data add/maintenance/remove
+  client      enroll
+  doctor      Automated diagnostics
+  logs        Aggregated logs for a role
+
+(Global: --home <DIR> or POWERFS_HOME, default ./.powerfs)
 ```
+
+See [powerfs-ctl/README.md](powerfs-ctl/README.md) for the full guide.
 
 #### powerfs-cli
 
@@ -759,7 +761,7 @@ Cert subcommands (use --master-api <addr:port> --admin-token <token>):
 - [x] TLV protocol extension (2B+4B+4GB) with bytes::Bytes zero-copy
 - [x] Volume RocksDB index migration (from sled)
 - [x] L1 crash recovery (WAL auto-recovery)
-- [x] Independent init tool (powerfs-init, mkfs→mount pattern)
+- [x] Metadata formatting: initially a standalone init tool (mkfs→mount pattern), now a Raft-replicated, marker-guarded format step inside the Filer boot gate (`powerfs-init` deprecated)
 - [x] Raft 3-node deployment configuration
 - [x] Transport trait abstraction (TCP/RDMA/QUIC unified interface)
 
@@ -874,9 +876,11 @@ This section records critical issues discovered and resolved during development.
 
 **Root Cause**: Service startup contained `format_posix_root` initialization logic, violating the separation of concerns principle.
 
-**Fix**: Created independent `powerfs-init` tool following the **mkfs → mount** pattern. The tool directly operates RocksDB to create the POSIX root inode BEFORE service startup. Services only load existing data, never initialize it.
+**Fix (original)**: Created independent `powerfs-init` tool following the **mkfs → mount** pattern. The tool directly operates RocksDB to create the POSIX root inode BEFORE service startup. Services only load existing data, never initialize it.
 
-**Lesson**: Service startup MUST NOT contain initialization logic. Use independent tools (like `mkfs` for filesystems, `etcdctl init` for etcd).
+**Lesson (original)**: Service startup MUST NOT contain unguarded initialization logic. Use independent tools (like `mkfs` for filesystems, `etcdctl init` for etcd).
+
+> **Update (2026-09)**: `powerfs-init` was later deprecated. It wrote the shard RocksDB directly, **bypassing Raft**, which is wrong once metadata is raft-replicated — and a fresh empty Filer joining a populated cluster had no way to recognize existing data and could trigger a root rebuild. Formatting now runs inside the Filer boot gate as a Raft-replicated `FormatPosixRoot` command gated by a persistent FS marker (see "Filer Node (metadata format is automatic)"). The surviving principle is the same — never blindly initialize over existing data — but the mechanism is now replicated and marker-guarded rather than an offline tool.
 
 ### 8. Configuration Path Inconsistency
 
@@ -1005,7 +1009,7 @@ This section records critical issues discovered and resolved during development.
 
 Based on the issues above, the following guidelines MUST be followed:
 
-1. **Independent Initialization**: Use `powerfs-init` before starting Filer. NEVER embed format/init logic in service startup.
+1. **Safe Metadata Formatting**: Filer formats the POSIX root on first boot via a **Raft-replicated command**, guarded by a persistent filesystem marker (`fsid`, `shard_count`). Existing metadata must never be reformatted: marker present → skip; unmarked but non-empty data dir → refuse to start unless `force_format = true`. Do NOT reintroduce offline tools that write the RocksDB metadata shards while bypassing Raft (the legacy `powerfs-init` is deprecated).
 2. **Unified Configuration**: All tools and services use the same TOML config file via `--config`.
 3. **Raft 3+ Nodes**: Production MUST use 3+ Raft nodes. Single-node is dev-only.
 4. **No Hardcoded Defaults**: All ports and addresses MUST be in config files.
