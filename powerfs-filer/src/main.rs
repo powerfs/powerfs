@@ -423,9 +423,9 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     for peer in &peers {
         raft_group_manager.register_peer(peer.clone()).await;
     }
-    // Note: start_message_transmitter() is no longer needed — openraft uses
-    // gRPC RaftService (MultiRaftServiceImpl) for inter-node communication,
-    // started automatically inside RaftGroupManagerV2::new().
+    // 注意：RaftGroupManagerV2::new() 不 bind 任何端口；openraft 的
+    // gRPC RaftService (MultiRaftServiceImpl) 在下方、格式门之前统一启动，
+    // 否则首次格式化所需的 Raft 选举收不到投票（见格式门前说明）。
 
     for i in 0..filer_cfg.shard_count {
         let shard_id = ShardId(i as u64);
@@ -506,6 +506,32 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         let predictor: Option<std::sync::Arc<dyn powerfs_layout::LayoutPredictor>> = predictor
             .map(|p| std::sync::Arc::new(p) as std::sync::Arc<dyn powerfs_layout::LayoutPredictor>);
         meta_shard_manager.set_layout_predictor(predictor, layout_config.min_confidence);
+    }
+
+    // 共享 gRPC server 必须在格式门之前启动：first-boot 格式化是一条经
+    // Raft 复制的 FormatPosixRoot 提案，而 Raft 的投票/AppendEntries 入口
+    // 就是这个 server 上的 RaftService。若等到格式门之后才监听 8889，
+    // 三个节点都收不到投票，永远选不出 leader，格式门必然超时退出（死锁）。
+    let grpc_service =
+        FilerMetaServiceImpl::new(meta_shard_manager.clone(), shard_strategy.clone());
+    let grpc_addr: std::net::SocketAddr = grpc_address.parse()?;
+    info!(
+        "Starting shared gRPC server (RaftService + FilerMetaService) on {}",
+        grpc_address
+    );
+    {
+        use powerfs_filer::powerfs::filer_meta_service_server::FilerMetaServiceServer;
+        let raft_service = raft_group_manager.raft_service();
+        tokio::spawn(async move {
+            if let Err(e) = tonic::transport::Server::builder()
+                .add_service(raft_service)
+                .add_service(FilerMetaServiceServer::new(grpc_service))
+                .serve(grpc_addr)
+                .await
+            {
+                error!("gRPC server error: {}", e);
+            }
+        });
     }
 
     // 文件系统格式化硬门（启动同步执行，失败即 exit 1）。
@@ -596,28 +622,6 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         meta_shard_manager.clone(),
         shard_scheduler.clone(),
     );
-
-    let grpc_service =
-        FilerMetaServiceImpl::new(meta_shard_manager.clone(), shard_strategy.clone());
-
-    let grpc_addr: std::net::SocketAddr = grpc_address.parse()?;
-    info!(
-        "Starting shared gRPC server (RaftService + FilerMetaService) on {}",
-        grpc_address
-    );
-
-    use powerfs_filer::powerfs::filer_meta_service_server::FilerMetaServiceServer;
-    let raft_service = raft_group_manager.raft_service();
-    tokio::spawn(async move {
-        if let Err(e) = tonic::transport::Server::builder()
-            .add_service(raft_service)
-            .add_service(FilerMetaServiceServer::new(grpc_service))
-            .serve(grpc_addr)
-            .await
-        {
-            error!("gRPC server error: {}", e);
-        }
-    });
 
     if net_port > 0 {
         // Phase 2: Create ConnRegistry + ServerConnectionManager and
