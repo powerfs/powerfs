@@ -222,7 +222,7 @@ PowerFS adopts a **multi-binary independent deployment** architecture, where eac
 | **Ctl** | `powerfs-ctl` | None | Declarative deployment & lifecycle control (bootstrap/up/restart/doctor/cert/node) |
 | **CLI** | `powerfs-cli` | None | Command-line management tool |
 
-> Filers format the POSIX root inode themselves on first boot (replicated via Raft, guarded by a persistent format marker) — no separate init step is required. The legacy `powerfs-init` binary is deprecated and will be removed.
+> Filers format the POSIX root inode themselves on first boot (replicated via Raft, guarded by a persistent format marker) — no separate init step is required. The legacy `powerfs-init` binary has been removed.
 
 ### Configuration
 
@@ -332,7 +332,7 @@ powerfs-filer --config config/filer-2.toml
 powerfs-filer --config config/filer-3.toml
 ```
 
-> The legacy `powerfs-init` binary (offline RocksDB writer, bypassing Raft) is deprecated and will be removed; its role is fully covered by the boot gate above. To discard metadata intentionally, wipe the data volumes instead (e.g. `powerfs-ctl down --purge`).
+> The legacy `powerfs-init` binary (offline RocksDB writer, bypassing Raft) has been removed; its role is fully covered by the boot gate above. To discard metadata intentionally, wipe the data volumes instead (e.g. `powerfs-ctl down --purge`).
 
 #### FUSE Client
 
@@ -761,7 +761,7 @@ Cert subcommands (use --master-api <addr:port> --admin-token <token>):
 - [x] TLV protocol extension (2B+4B+4GB) with bytes::Bytes zero-copy
 - [x] Volume RocksDB index migration (from sled)
 - [x] L1 crash recovery (WAL auto-recovery)
-- [x] Metadata formatting: initially a standalone init tool (mkfs→mount pattern), now a Raft-replicated, marker-guarded format step inside the Filer boot gate (`powerfs-init` deprecated)
+- [x] Metadata formatting: initially a standalone init tool (mkfs→mount pattern), now a Raft-replicated, marker-guarded format step inside the Filer boot gate (the offline `powerfs-init` binary was removed)
 - [x] Raft 3-node deployment configuration
 - [x] Transport trait abstraction (TCP/RDMA/QUIC unified interface)
 
@@ -880,7 +880,7 @@ This section records critical issues discovered and resolved during development.
 
 **Lesson (original)**: Service startup MUST NOT contain unguarded initialization logic. Use independent tools (like `mkfs` for filesystems, `etcdctl init` for etcd).
 
-> **Update (2026-09)**: `powerfs-init` was later deprecated. It wrote the shard RocksDB directly, **bypassing Raft**, which is wrong once metadata is raft-replicated — and a fresh empty Filer joining a populated cluster had no way to recognize existing data and could trigger a root rebuild. Formatting now runs inside the Filer boot gate as a Raft-replicated `FormatPosixRoot` command gated by a persistent FS marker (see "Filer Node (metadata format is automatic)"). The surviving principle is the same — never blindly initialize over existing data — but the mechanism is now replicated and marker-guarded rather than an offline tool.
+> **Update (2026-09)**: `powerfs-init` has been removed. It wrote the shard RocksDB directly, **bypassing Raft**, which is wrong once metadata is raft-replicated — and a fresh empty Filer joining a populated cluster had no way to recognize existing data and could trigger a root rebuild. Formatting now runs inside the Filer boot gate as a Raft-replicated `FormatPosixRoot` command gated by a persistent FS marker (see "Filer Node (metadata format is automatic)"). The surviving principle is the same — never blindly initialize over existing data — but the mechanism is now replicated and marker-guarded rather than an offline tool.
 
 ### 8. Configuration Path Inconsistency
 
@@ -1009,7 +1009,7 @@ This section records critical issues discovered and resolved during development.
 
 Based on the issues above, the following guidelines MUST be followed:
 
-1. **Safe Metadata Formatting**: Filer formats the POSIX root on first boot via a **Raft-replicated command**, guarded by a persistent filesystem marker (`fsid`, `shard_count`). Existing metadata must never be reformatted: marker present → skip; unmarked but non-empty data dir → refuse to start unless `force_format = true`. Do NOT reintroduce offline tools that write the RocksDB metadata shards while bypassing Raft (the legacy `powerfs-init` is deprecated).
+1. **Safe Metadata Formatting**: Filer formats the POSIX root on first boot via a **Raft-replicated command**, guarded by a persistent filesystem marker (`fsid`, `shard_count`). Existing metadata must never be reformatted: marker present → skip; unmarked but non-empty data dir → refuse to start unless `force_format = true`. Do NOT reintroduce offline tools that write the RocksDB metadata shards while bypassing Raft (the former `powerfs-init` binary was removed for this reason).
 2. **Unified Configuration**: All tools and services use the same TOML config file via `--config`.
 3. **Raft 3+ Nodes**: Production MUST use 3+ Raft nodes. Single-node is dev-only.
 4. **No Hardcoded Defaults**: All ports and addresses MUST be in config files.

@@ -46,7 +46,6 @@ BINS=(
   -p powerfs-volume
   -p powerfs-monitor
   -p powerfs-cli
-  -p powerfs-init
 )
 
 echo "==> POWERFS_BUILD_ID=${POWERFS_BUILD_ID}"

@@ -86,7 +86,7 @@ check_tools() {
     fi
 
     if ! command -v cargo >/dev/null 2>&1 && [ "$SKIP_RUST" -eq 0 ]; then
-        local binaries=("powerfs-master" "powerfs-filer" "powerfs-s3" "powerfs-volume" "powerfs-monitor" "powerfs-fuse" "powerfs-init" "powerfs-cli")
+        local binaries=("powerfs-master" "powerfs-filer" "powerfs-s3" "powerfs-volume" "powerfs-monitor" "powerfs-fuse" "powerfs-cli")
         local all_exist=1
         for bin in "${binaries[@]}"; do
             if [ ! -f "${PROJECT_ROOT}/target/release/${bin}" ]; then
@@ -137,7 +137,7 @@ build_rust() {
         return 0
     fi
 
-    local binaries=("powerfs-master" "powerfs-filer" "powerfs-s3" "powerfs-volume" "powerfs-monitor" "powerfs-fuse" "powerfs-init" "powerfs-cli")
+    local binaries=("powerfs-master" "powerfs-filer" "powerfs-s3" "powerfs-volume" "powerfs-monitor" "powerfs-fuse" "powerfs-cli")
     local all_exist=1
     for bin in "${binaries[@]}"; do
         if [ ! -f "${PROJECT_ROOT}/target/release/${bin}" ]; then
