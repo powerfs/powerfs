@@ -54,6 +54,7 @@ services:
         ipv4_address: 172.30.0.11
     volumes:
       - master-1-data:/data
+      - ./certs-default:/data/master/ca
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
@@ -81,6 +82,7 @@ services:
         ipv4_address: 172.30.0.12
     volumes:
       - master-2-data:/data
+      - ./certs-default:/data/master/ca
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
@@ -108,6 +110,7 @@ services:
         ipv4_address: 172.30.0.13
     volumes:
       - master-3-data:/data
+      - ./certs-default:/data/master/ca
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-master:/app/powerfs-master:ro
     ports:
@@ -136,6 +139,7 @@ services:
         ipv4_address: 172.30.0.21
     volumes:
       - volume-1-data:/data
+      - ./certs-default:/etc/powerfs/certs:ro
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
@@ -163,6 +167,7 @@ services:
         ipv4_address: 172.30.0.22
     volumes:
       - volume-2-data:/data
+      - ./certs-default:/etc/powerfs/certs:ro
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
@@ -190,6 +195,7 @@ services:
         ipv4_address: 172.30.0.23
     volumes:
       - volume-3-data:/data
+      - ./certs-default:/etc/powerfs/certs:ro
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-volume:/app/powerfs-volume:ro
     ports:
@@ -226,6 +232,7 @@ services:
     command: /app/powerfs-filer --config /config/filer-1.toml
     volumes:
       - filer-1-data:/data/filer
+      - ./certs-default:/etc/powerfs/certs:ro
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     healthcheck:
@@ -257,6 +264,7 @@ services:
     command: /app/powerfs-filer --config /config/filer-2.toml
     volumes:
       - filer-2-data:/data/filer
+      - ./certs-default:/etc/powerfs/certs:ro
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     healthcheck:
@@ -285,6 +293,7 @@ services:
     command: /app/powerfs-filer --config /config/filer-3.toml
     volumes:
       - filer-3-data:/data/filer
+      - ./certs-default:/etc/powerfs/certs:ro
       - ./config:/config:ro
       - /home/portion/powerfs/target/release/powerfs-filer:/app/powerfs-filer:ro
     healthcheck:
@@ -306,9 +315,9 @@ services:
     init: true
     networks:
       powerfs-network:
-        ipv4_address: 172.30.0.40
+        ipv4_address: 172.30.0.41
     ports:
-      - "9991:9999"
+      - "9991:9998"
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:
@@ -325,25 +334,26 @@ services:
     command:
       - -c
       - |
-        mkdir -p /mnt/fuse
-        /app/powerfs-fuse --config /config/fuse.toml &
+        mkdir -p /mnt/powerfs
+        /app/powerfs-fuse --config /config/fuse-1.toml &
         FUSE_PID=$$!
         for i in $$(seq 1 30); do
-          if mount | grep -q "/mnt/fuse"; then
-            echo "FUSE mounted at /mnt/fuse"
+          if mount | grep -q "/mnt/powerfs"; then
+            echo "FUSE mounted at /mnt/powerfs"
             break
           fi
           sleep 1
         done
-        echo "FUSE ready, mount point: /mnt/fuse"
+        echo "FUSE ready, mount point: /mnt/powerfs"
         wait $$FUSE_PID
     volumes:
       - /tmp/powerfs/test:/tmp/test-results
       - ./config:/config:ro
+      - ./certs-default:/etc/powerfs/certs:ro
       - /home/portion/powerfs/target/release/powerfs-fuse:/app/powerfs-fuse:ro
       - /home/portion/powerfs/target/release/powerfs-cli:/app/powerfs-cli:ro
     healthcheck:
-      test: ["CMD-SHELL", "ls /mnt/fuse > /dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "ls /mnt/powerfs > /dev/null 2>&1 || exit 1"]
       interval: 3s
       timeout: 3s
       retries: 10
@@ -364,9 +374,9 @@ services:
     init: true
     networks:
       powerfs-network:
-        ipv4_address: 172.30.0.41
+        ipv4_address: 172.30.0.42
     ports:
-      - "9992:9999"
+      - "9992:9998"
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:
@@ -383,25 +393,26 @@ services:
     command:
       - -c
       - |
-        mkdir -p /mnt/fuse
-        /app/powerfs-fuse --config /config/fuse.toml &
+        mkdir -p /mnt/powerfs
+        /app/powerfs-fuse --config /config/fuse-2.toml &
         FUSE_PID=$$!
         for i in $$(seq 1 30); do
-          if mount | grep -q "/mnt/fuse"; then
-            echo "FUSE mounted at /mnt/fuse"
+          if mount | grep -q "/mnt/powerfs"; then
+            echo "FUSE mounted at /mnt/powerfs"
             break
           fi
           sleep 1
         done
-        echo "FUSE ready, mount point: /mnt/fuse"
+        echo "FUSE ready, mount point: /mnt/powerfs"
         wait $$FUSE_PID
     volumes:
       - /tmp/powerfs/test:/tmp/test-results
       - ./config:/config:ro
+      - ./certs-default:/etc/powerfs/certs:ro
       - /home/portion/powerfs/target/release/powerfs-fuse:/app/powerfs-fuse:ro
       - /home/portion/powerfs/target/release/powerfs-cli:/app/powerfs-cli:ro
     healthcheck:
-      test: ["CMD-SHELL", "ls /mnt/fuse > /dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "ls /mnt/powerfs > /dev/null 2>&1 || exit 1"]
       interval: 3s
       timeout: 3s
       retries: 10
