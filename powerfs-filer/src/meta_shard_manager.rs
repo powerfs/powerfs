@@ -9,7 +9,9 @@ use crate::crdt_orset::{
 };
 use crate::raft_group_manager_v2::RaftGroupManagerV2;
 use crate::raft_group_manager_v2::{Peer, ShardCommand, ShardId};
-use crate::shard_store::{DirEntry, FileType, InodeInfo, ShardStats, ShardStore, StoredFileChunk};
+use crate::shard_store::{
+    DirEntry, FileType, FormatMarker, InodeInfo, ShardStats, ShardStore, StoredFileChunk,
+};
 use crate::shard_strategy::ShardStrategy;
 use crate::tlv_volume_client::TlvVolumeClient;
 use crate::volume_router::VolumeRouter;
@@ -163,6 +165,11 @@ pub struct MetaShardManager {
     /// - Env: `POWERFS_ASYNC_META_PERSIST=0` to disable
     async_meta_persist: std::sync::atomic::AtomicBool,
 
+    /// 数据安全开关：数据目录非空但缺少格式标记时是否允许继续格式化。
+    /// 默认 false（拒绝启动）。来自 filer.toml 的 `force_format`，
+    /// 仅供运维排障；格式化路径本身只增不删。
+    force_format: std::sync::atomic::AtomicBool,
+
     /// Staging cache for newly created metadata entries.
     ///
     /// When async_meta_persist is true, `create_inode()` stages the new
@@ -299,6 +306,71 @@ impl LayoutMigrationStats {
 /// batch: `(ino, parent_ino, name, mode, uid, gid, mtime, atime)`.
 pub type BatchCreateEntry = (u64, u64, String, u32, u32, u32, u64, u64);
 
+/// 启动时对文件系统格式状态的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatAction {
+    /// 格式标记已存在：文件系统早已格式化，绝不重复格式化（只校验）。
+    AlreadyFormatted,
+    /// 无标记但 POSIX root 已存在：早于格式标记特性的旧集群，
+    /// 只补写标记（adopt），root 数据一行不动。
+    Adopt,
+    /// 空存储：全新集群，执行首次格式化。
+    Format,
+}
+
+/// [`MetaShardManager::ensure_filesystem_formatted`] 的执行结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatOutcome {
+    pub action: FormatAction,
+    /// 落盘的文件系统 ID（并发提案时取首个 apply 成功者的 fsid）。
+    pub fsid: String,
+}
+
+/// 纯函数：根据本地落盘状态决定本次启动的格式化动作。
+///
+/// 这是"有老数据就不能被格式化"策略的单一事实来源，不依赖 Raft/网络，
+/// 因此可以在单元测试中穷举所有分支。
+///
+/// - 标记存在但 shard_count 与当前配置不符 → Err（拒绝启动）；
+/// - 无标记 + root 存在 → Adopt（旧版本集群升级）；
+/// - 无标记 + root 不存在 + 有其他数据 → Err，除非 `force_format`；
+/// - 无标记 + 完全空 → Format。
+fn decide_format_action(
+    marker: Option<&FormatMarker>,
+    root_exists: bool,
+    has_other_data: bool,
+    configured_shard_count: u32,
+    force_format: bool,
+) -> Result<FormatAction, String> {
+    match marker {
+        Some(m) => {
+            if m.shard_count != configured_shard_count {
+                return Err(format!(
+                    "refusing to start: metadata was formatted with shard_count={} but filer.toml \
+                     configures shard_count={} (fsid={}). Fix the config or reattach the original \
+                     data disks.",
+                    m.shard_count, configured_shard_count, m.fsid
+                ));
+            }
+            Ok(FormatAction::AlreadyFormatted)
+        }
+        None if root_exists =>
+        // 早于格式标记特性的旧集群：root 在，说明是可信的已格式化数据，
+        // adopt 只补标记，不重建、不修改 root。
+        {
+            Ok(FormatAction::Adopt)
+        }
+        None if has_other_data && !force_format => Err(
+            "refusing to format: metadata directory contains user data but has no filesystem format \
+             marker (possible wrong disk mount or foreign data). Inspect the data directory; if you \
+             are certain this is safe, set force_format=true in filer.toml to proceed. Formatting \
+             never deletes existing data."
+                .to_string(),
+        ),
+        None => Ok(FormatAction::Format),
+    }
+}
+
 impl MetaShardManager {
     pub fn new(
         raft_group_manager: Arc<RaftGroupManagerV2>,
@@ -325,6 +397,7 @@ impl MetaShardManager {
             delta_logs: RwLock::new(HashMap::new()),
             orset_states: RwLock::new(HashMap::new()),
             async_meta_persist: std::sync::atomic::AtomicBool::new(async_default),
+            force_format: std::sync::atomic::AtomicBool::new(false),
             meta_cache: std::sync::Arc::new(crate::meta_cache::MetaCache::new()),
             inode_notifier: std::sync::RwLock::new(None),
             lease_mgr: std::sync::RwLock::new(None),
@@ -379,6 +452,14 @@ impl MetaShardManager {
     /// true = performance mode (default), false = strict mode.
     pub fn set_async_meta_persist(&self, enabled: bool) {
         self.async_meta_persist
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the data-safety escape hatch from filer.toml (`force_format`).
+    /// When false (default), boot refuses to format an unmarked but
+    /// non-empty metadata directory.
+    pub fn set_force_format(&self, enabled: bool) {
+        self.force_format
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -3849,95 +3930,139 @@ impl MetaShardManager {
         Ok(current_inode)
     }
 
-    /// Check if POSIX root inode exists in the store
-    pub fn has_posix_root(&self) -> bool {
+    /// 启动硬门 + `/admin/init-root` 共用入口：确保文件系统已格式化。
+    ///
+    /// 数据安全语义（详见 [`decide_format_action`] 与
+    /// [`ShardStore::apply_format_posix_root`]）：
+    /// - 有格式标记 → 永不重新格式化，只校验 shard_count；
+    /// - 无标记但 root 在 → 旧集群 adopt，只补标记；
+    /// - 无标记且数据非空 → 拒绝（除非 `force_format=true`）；
+    /// - 空存储 → 首次格式化。
+    ///
+    /// 决策在 propose 之前本地完成；格式化命令经 Raft 复制，apply 端按标记
+    /// 严格幂等 —— 任何节点（含加入老集群的全新空节点）在启动时调用
+    /// 都不会破坏既有数据。
+    pub async fn ensure_filesystem_formatted(&self) -> Result<FormatOutcome, String> {
         let shard_id = self.shard_strategy.calculate_shard(POSIX_ROOT_INODE);
-        let stores = self.shard_stores.read().unwrap();
-        stores
-            .get(&shard_id)
-            .map(|s| s.get_inode(POSIX_ROOT_INODE).is_some())
-            .unwrap_or(false)
-    }
+        let configured_shard_count = self.shard_strategy.get_shard_count() as u32;
+        let force_format = self.force_format.load(std::sync::atomic::Ordering::Relaxed);
 
-    /// Format POSIX root inode (inode 1, directory "/")
-    pub async fn format_posix_root(&self) -> Result<u64, String> {
-        // Check if already exists
-        if self.has_posix_root() {
-            info!("POSIX root inode {} already exists", POSIX_ROOT_INODE);
-            return Ok(POSIX_ROOT_INODE);
+        let action = {
+            let stores = self.shard_stores.read().unwrap();
+            let store = stores
+                .get(&shard_id)
+                .ok_or_else(|| format!("root shard {} store not initialized", shard_id.0))?;
+            let marker = store.read_format_marker();
+            let root_exists = store.get_inode(POSIX_ROOT_INODE).is_some();
+            let has_other_data = store.has_any_user_data();
+            decide_format_action(
+                marker.as_ref(),
+                root_exists,
+                has_other_data,
+                configured_shard_count,
+                force_format,
+            )?
+        };
+
+        if action == FormatAction::AlreadyFormatted {
+            let fsid = self
+                .shard_stores
+                .read()
+                .unwrap()
+                .get(&shard_id)
+                .and_then(|s| s.read_format_marker().map(|m| m.fsid))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            info!(
+                "Filesystem already formatted (fsid={}, shard_count={}); auto-format skipped",
+                fsid, configured_shard_count
+            );
+            return Ok(FormatOutcome { action, fsid });
         }
 
-        let shard_id = self.shard_strategy.calculate_shard(POSIX_ROOT_INODE);
-        let cmd = ShardCommand::CreateDirectory {
-            parent_inode: 0,
-            name: "/".to_string(),
-            inode: POSIX_ROOT_INODE,
+        // fsid 在整个重试过程中只生成一次。多个节点并发提案时，以首个
+        // 成功 apply 的提案为准（apply 幂等），最终读回实际落盘的 fsid。
+        let fsid = uuid::Uuid::new_v4().to_string();
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cmd = ShardCommand::FormatPosixRoot {
+            fsid: fsid.clone(),
+            shard_count: configured_shard_count,
+            created_at,
         };
         let data = cmd.serialize();
 
-        // Retry propose with backoff to handle leader election and forwarding.
-        // openraft returns one of:
-        //   - "not the leader"
-        //   - "has to forward request to: Some(\"<id>\"), Some(BasicNode { addr: ... })"
-        // when the local node is not the leader. We retry until leader election completes.
-        let mut propose_retries = 0;
-        loop {
-            match self
-                .raft_group_manager
-                .propose(shard_id, data.clone())
-                .await
-            {
-                Ok(idx) => {
-                    info!(
-                        "POSIX root proposed at log index {} on shard {}",
-                        idx, shard_id.0
-                    );
-                    break;
-                }
-                Err(e) => {
-                    let is_forward =
-                        e.contains("not the leader") || e.contains("has to forward request to");
-                    if is_forward {
-                        propose_retries += 1;
-                        if propose_retries >= 60 {
-                            return Err(format!(
-                                "failed to propose POSIX root: leader election timeout after {} retries: {}",
-                                propose_retries, e
-                            ));
-                        }
-                        debug!(
-                            "Waiting for Raft leader election (retry {}/60): {}",
-                            propose_retries, e
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                    } else {
-                        return Err(format!("failed to propose POSIX root: {}", e));
-                    }
-                }
-            }
-        }
+        // Leader-only proposal, marker-based completion:
+        // - only the shard leader may propose (the raft layer never forwards;
+        //   a follower that blindly retries would burn 12s and then fail the
+        //   boot gate);
+        // - followers just wait for the marker to arrive via raft replication
+        //   (this is also exactly what a fresh empty node joining an already
+        //   formatted cluster experiences — its marker arrives by log/snapshot);
+        // - every round is gated on the marker, so it does not matter which
+        //   node proposes or how many nodes race: once applied, all other
+        //   proposals are no-ops.
+        let local_marker = || {
+            let stores = self.shard_stores.read().unwrap();
+            stores.get(&shard_id).and_then(|s| s.read_format_marker())
+        };
 
-        // Wait for apply (up to 30 seconds; leader election can take 5+ seconds).
-        let mut retries = 0;
-        while retries < 300 {
-            let applied = {
-                let stores = self.shard_stores.read().unwrap();
-                stores
-                    .get(&shard_id)
-                    .map(|s| s.get_inode(POSIX_ROOT_INODE).is_some())
-                    .unwrap_or(false)
-            };
-            if applied {
+        let mut proposed = false;
+        // Up to ~90s for a leader to emerge (cold election / slow startup);
+        // apply after a successful proposal normally lands within seconds.
+        for round in 0..90 {
+            if let Some(marker) = local_marker() {
+                // Another proposer (e.g. the cluster leader while we were a
+                // follower) may have won with a different fsid — then what
+                // happened to us is replication, not a first format.
+                let effective_action = if action == FormatAction::Format && marker.fsid != fsid {
+                    FormatAction::AlreadyFormatted
+                } else {
+                    action
+                };
                 info!(
-                    "POSIX root inode {} initialized successfully",
-                    POSIX_ROOT_INODE
+                    "Filesystem format settled: action={:?} fsid={} shard_count={}",
+                    effective_action, marker.fsid, marker.shard_count
                 );
-                return Ok(POSIX_ROOT_INODE);
+                return Ok(FormatOutcome {
+                    action: effective_action,
+                    fsid: marker.fsid,
+                });
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            retries += 1;
+
+            if !proposed && self.raft_group_manager.is_shard_leader(shard_id).await {
+                match self
+                    .raft_group_manager
+                    .propose(shard_id, data.clone())
+                    .await
+                {
+                    Ok(idx) => {
+                        proposed = true;
+                        info!(
+                            "Filesystem format proposed at log index {} on shard {} (action={:?})",
+                            idx, shard_id.0, action
+                        );
+                    }
+                    Err(e) if e.contains("not_leader") || e.contains("redirect") => {
+                        // Lost/disputed leadership between check and propose;
+                        // stay in the loop and wait for the winner.
+                        debug!(
+                            "filesystem format propose lost leadership (round {}): {}",
+                            round, e
+                        );
+                    }
+                    Err(e) => return Err(format!("failed to propose filesystem format: {}", e)),
+                }
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-        Err("failed to create POSIX root: timeout waiting for apply".to_string())
+        Err(format!(
+            "failed to format filesystem: no format marker appeared on shard {} after 90s \
+             (no raft leader or apply stalled)",
+            shard_id.0
+        ))
     }
 
     pub fn register_root_inode(&self, bucket: &str, inode: u64) {
@@ -5763,5 +5888,211 @@ mod tests {
             delta_trimmed, 0,
             "small delta log should not trigger compaction"
         );
+    }
+
+    // ----- filesystem format gate -----
+
+    fn marker(shard_count: u32) -> FormatMarker {
+        FormatMarker {
+            fsid: "fsid-unit".to_string(),
+            shard_count,
+            created_at: 1_700_000_000,
+            format_generation: 1,
+        }
+    }
+
+    #[test]
+    fn test_decide_marked_matching_shard_count_skips_format() {
+        let m = marker(64);
+        assert_eq!(
+            decide_format_action(Some(&m), true, true, 64, false).unwrap(),
+            FormatAction::AlreadyFormatted
+        );
+    }
+
+    #[test]
+    fn test_decide_marked_shard_count_mismatch_refuses_even_with_force() {
+        let m = marker(64);
+        // force_format must NOT override the marker mismatch: this is a config
+        // error against existing data, not an empty-dir decision.
+        let err = decide_format_action(Some(&m), true, true, 32, true).unwrap_err();
+        assert!(err.contains("shard_count"), "{}", err);
+    }
+
+    #[test]
+    fn test_decide_legacy_root_without_marker_is_adopted() {
+        // pre-feature cluster: root present, no marker → adopt even when other
+        // data exists, regardless of force_format.
+        assert_eq!(
+            decide_format_action(None, true, true, 64, false).unwrap(),
+            FormatAction::Adopt
+        );
+    }
+
+    #[test]
+    fn test_decide_unmarked_nonempty_without_root_refuses() {
+        // the core data-safety case: wrong disk mount / foreign data
+        let err = decide_format_action(None, false, true, 64, false).unwrap_err();
+        assert!(err.contains("refusing to format"), "{}", err);
+    }
+
+    #[test]
+    fn test_decide_unmarked_nonempty_force_escape_allows_format() {
+        assert_eq!(
+            decide_format_action(None, false, true, 64, true).unwrap(),
+            FormatAction::Format
+        );
+    }
+
+    #[test]
+    fn test_decide_empty_store_formats() {
+        assert_eq!(
+            decide_format_action(None, false, false, 64, false).unwrap(),
+            FormatAction::Format
+        );
+        assert_eq!(
+            decide_format_action(None, false, false, 64, true).unwrap(),
+            FormatAction::Format
+        );
+    }
+
+    async fn make_fresh_manager(shards: u64) -> (Arc<MetaShardManager>, String) {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "powerfs-filer-format-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let data_path = tmp_dir.to_string_lossy().to_string();
+
+        let port = next_test_port();
+        let raft_addr = format!("127.0.0.1:{}", port);
+        let raft_mgr = RaftGroupManagerV2::new(1, raft_addr.clone(), format!("{}/raft", data_path))
+            .await
+            .unwrap();
+        let strategy = Arc::new(ShardStrategy::new(shards));
+        let mgr = Arc::new(MetaShardManager::new(
+            raft_mgr,
+            strategy,
+            format!("{}/shards", data_path),
+            1,
+        ));
+        (mgr, raft_addr)
+    }
+
+    #[tokio::test]
+    async fn test_ensure_formatted_fresh_then_already() {
+        let (mgr, raft_addr) = make_fresh_manager(4).await;
+        mgr.create_shard(
+            ShardId(0),
+            vec![Peer {
+                id: 1,
+                address: raft_addr,
+                net_address: String::new(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        // empty cluster → first format goes through raft
+        let first = mgr.ensure_filesystem_formatted().await.unwrap();
+        assert_eq!(first.action, FormatAction::Format);
+
+        let persisted = {
+            let stores = mgr.shard_stores.read().unwrap();
+            stores
+                .get(&ShardId(0))
+                .and_then(|s| s.read_format_marker())
+                .expect("marker replicated to local store")
+        };
+        assert_eq!(persisted.fsid, first.fsid);
+        assert_eq!(persisted.shard_count, 4);
+        assert!(stores_root_exists(&mgr));
+
+        // second call must never format again
+        let second = mgr.ensure_filesystem_formatted().await.unwrap();
+        assert_eq!(second.action, FormatAction::AlreadyFormatted);
+        assert_eq!(second.fsid, first.fsid);
+    }
+
+    #[tokio::test]
+    async fn test_ensure_formatted_refuses_unmarked_nonempty() {
+        // A node whose local shard carries foreign metadata without marker/root must
+        // be stopped at the gate by default.
+        let (mgr, raft_addr) = make_fresh_manager(4).await;
+        mgr.create_shard(
+            ShardId(0),
+            vec![Peer {
+                id: 1,
+                address: raft_addr,
+                net_address: String::new(),
+            }],
+        )
+        .await
+        .unwrap();
+
+        // inject stray data (non-root inode) directly into the local store
+        {
+            let stores = mgr.shard_stores.read().unwrap();
+            let store = stores.get(&ShardId(0)).unwrap();
+            store
+                .create_inode_atomic(make_test_inode(777, 0, "foreign"), 0, "foreign")
+                .unwrap();
+        }
+
+        let err = mgr.ensure_filesystem_formatted().await.unwrap_err();
+        assert!(err.contains("refusing to format"), "{}", err);
+        assert!(store_marker_absent(&mgr), "no marker may be written");
+    }
+
+    fn stores_root_exists(mgr: &Arc<MetaShardManager>) -> bool {
+        let stores = mgr.shard_stores.read().unwrap();
+        stores
+            .get(&ShardId(0))
+            .map(|s| s.get_inode(POSIX_ROOT_INODE).is_some())
+            .unwrap_or(false)
+    }
+
+    fn store_marker_absent(mgr: &Arc<MetaShardManager>) -> bool {
+        let stores = mgr.shard_stores.read().unwrap();
+        stores
+            .get(&ShardId(0))
+            .map(|s| s.read_format_marker().is_none())
+            .unwrap_or(true)
+    }
+
+    fn make_test_inode(ino: u64, parent: u64, name: &str) -> InodeInfo {
+        InodeInfo {
+            inode: ino,
+            name: name.to_string(),
+            parent_inode: parent,
+            file_type: FileType::File,
+            size: 0,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            blocks: 0,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks: vec![],
+            inline_data: None,
+            extended: std::collections::HashMap::new(),
+            symlink_target: None,
+            nlink: 1,
+            version: 0,
+            delete_time: 0,
+            reliability: powerfs_layout::reliability::Reliability::default(),
+            reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
+            compression_state: powerfs_layout::reliability::CompressionState::default(),
+            replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Inline,
+        }
     }
 }

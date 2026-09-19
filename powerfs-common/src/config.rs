@@ -227,6 +227,15 @@ pub struct FilerConfig {
     /// 即使 force=true，master 仍会下发告警日志，便于事后审计。
     #[serde(default)]
     pub force_register: bool,
+    /// 数据安全逃生开关：元数据目录非空但缺少文件系统格式标记时，是否
+    /// 允许继续启动并补格式化。
+    ///
+    /// 默认 false：遇到"有数据、无标记"（典型于数据盘挂错路径、data_dir
+    /// 指向外来数据）直接 exit 1，宁可起不来也不碰可疑数据。
+    /// 正常部署永远不需要设置它；仅在确认数据可信（如手工迁移、排障）
+    /// 时临时置 true。注意格式化路径本身只增不删，不会清空已有 inode。
+    #[serde(default)]
+    pub force_format: bool,
     /// Prometheus metrics HTTP server port. **Must be explicitly configured
     /// — no port-derivation shortcuts allowed.**  Exposes `/metrics`
     /// (Prometheus text format) for lease manager + MetaCache counters.

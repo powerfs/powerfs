@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use rocksdb::{ColumnFamilyDescriptor, DB};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -16,6 +16,32 @@ const CF_TOMBSTONES: &str = "tombstones"; // For storing CRDT tombstones
 const CF_PENDING_RECLAIMS: &str = "pending_reclaims"; // Phase 5: WAL for GC data chunk reclamation
 const CF_LEASES: &str = "leases"; // Phase 5 §5.3: lease state persistence (token → serialized LeaseEntry)
 const CF_CHILD_SUMMARIES: &str = "child_summaries"; // P4 DirStatSummary cache on parent shard for cross-shard subdirs
+
+/// POSIX 根 inode 固定为 1（与 meta_shard_manager::POSIX_ROOT_INODE 一致）。
+const POSIX_ROOT_INODE: u64 = 1;
+
+/// CF_METADATA 中文件系统格式标记的键。
+/// 落盘内容为 [`FormatMarker`] 的 JSON。一旦存在，任何启动路径都不得再
+/// 自动格式化（只允许校验），这是"有老数据就不能被格式化"的权威依据。
+const FS_FORMAT_KEY: &[u8] = b"fs_format";
+
+/// 文件系统格式标记 —— 本 shard 副本所属文件系统的"身份证"。
+///
+/// 由首次格式化通过 Raft（`ShardCommand::FormatPosixRoot`）写入并复制到
+/// 所有 filer 副本；新空节点加入老集群时会随 Raft 日志/快照获得该标记，
+/// 因此永远不会误触发二次格式化。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FormatMarker {
+    /// 集群首次格式化时生成的文件系统唯一 ID（uuid v4）。
+    pub fsid: String,
+    /// 格式化时的 shard 数量。启动时与当前配置比对，不一致直接拒绝启动。
+    pub shard_count: u32,
+    /// 格式化时间（UNIX 秒）。
+    pub created_at: u64,
+    /// 格式代数，保留给未来需要显式 reformat 的场景；当前恒为 1。
+    pub format_generation: u32,
+}
+
 /// Reserved key in `CF_LEASES` for the persisted epoch counter. A NUL
 /// byte prefix ensures it can never collide with a real lease token
 /// (tokens are NUL-free opaque strings from `powerfs-lease`).
@@ -426,6 +452,80 @@ impl ShardStore {
     }
 
     // ========================================================================
+    // Filesystem format marker (data-safety: never auto-format existing data)
+    // ========================================================================
+
+    /// 读取本 shard 落盘的文件系统格式标记。不存在返回 None（全新副本，
+    /// 或早于该特性的旧版本数据）。
+    pub fn read_format_marker(&self) -> Option<FormatMarker> {
+        let cf = self.db.cf_handle(CF_METADATA)?;
+        let raw = self.db.get_cf(cf, FS_FORMAT_KEY).ok()??;
+        serde_json::from_slice::<FormatMarker>(&raw).ok()
+    }
+
+    /// 落盘格式标记。仅供 Raft apply 路径调用（所有副本执行相同写入）。
+    fn write_format_marker(&self, marker: &FormatMarker) {
+        if let Some(cf) = self.db.cf_handle(CF_METADATA) {
+            if let Ok(data) = serde_json::to_vec(marker) {
+                if let Err(e) = self.db.put_cf(cf, FS_FORMAT_KEY, &data) {
+                    error!(
+                        "Shard {} failed to persist FS format marker: {}",
+                        self.shard_id.0, e
+                    );
+                }
+            }
+        }
+    }
+
+    /// 本地 RocksDB 是否包含任何用户元数据（inode 记录或目录项）。
+    ///
+    /// 启动时用于识别"无格式标记但目录非空"的危险情形：数据盘挂错、
+    /// data_dir 指向了外来数据。直接扫 CF 而非依赖内存 stats，避免 stats
+    /// 键缺失/过期造成误判。
+    pub fn has_any_user_data(&self) -> bool {
+        let cf_nonempty = |cf_name: &str| -> bool {
+            match self.db.cf_handle(cf_name) {
+                Some(cf) => {
+                    let mut it = self.db.raw_iterator_cf(cf);
+                    it.seek_to_first();
+                    it.valid()
+                }
+                None => false,
+            }
+        };
+        cf_nonempty(CF_INODES) || cf_nonempty(CF_DIR_ENTRIES)
+    }
+
+    /// Raft apply: 写入格式标记并确保 POSIX root 存在。**严格幂等**。
+    ///
+    /// - 标记已存在 → 整体 no-op（新空副本加入老集群时收到重复提案，
+    ///   或多个节点启动时竞相提案，都靠这里挡住，绝不重置 root 子项/统计）。
+    /// - 标记不存在、root 已存在 → 旧版本集群的 adopt 路径：只补标记，
+    ///   root 一行都不动。
+    /// - 都不存在 → 写标记 + 建 root（create_directory 自身也幂等）。
+    ///
+    /// 返回 true 表示本副本首次写入标记。该函数只增不删。
+    pub fn apply_format_posix_root(&self, marker: &FormatMarker) -> bool {
+        if self.read_format_marker().is_some() {
+            info!(
+                "Shard {} FS format marker already present (fsid={}), format is a no-op",
+                self.shard_id.0, marker.fsid
+            );
+            return false;
+        }
+        self.write_format_marker(marker);
+        // root 已存在时（旧版本数据 adopt），幂等保护会跳过，不会清空
+        // root 的内存目录项映射，也不会重复计数。
+        // 根目录的 parent_inode 固定为 0（与历史格式化路径保持一致）。
+        self.create_directory(0, "/".to_string(), POSIX_ROOT_INODE);
+        info!(
+            "Shard {} FS format marker written: fsid={} shard_count={} generation={}",
+            self.shard_id.0, marker.fsid, marker.shard_count, marker.format_generation
+        );
+        true
+    }
+
+    // ========================================================================
     // CRDT OR-Set State Persistence
     // ========================================================================
 
@@ -704,6 +804,18 @@ impl ShardStore {
             }
             ShardCommand::DeleteDirectory { parent_inode, name } => {
                 self.delete_directory(parent_inode, name);
+            }
+            ShardCommand::FormatPosixRoot {
+                fsid,
+                shard_count,
+                created_at,
+            } => {
+                self.apply_format_posix_root(&FormatMarker {
+                    fsid,
+                    shard_count,
+                    created_at,
+                    format_generation: 1,
+                });
             }
             ShardCommand::Rename {
                 old_parent_inode,
@@ -1576,6 +1688,20 @@ impl ShardStore {
     }
 
     fn create_directory(&self, parent_inode: u64, name: String, inode: u64) {
+        // 幂等 apply 保护：inode 已存在时整体 no-op。
+        // 不能只靠 proposer 预检 —— Raft 日志在重启/快照后可能重放，
+        // 新空副本也可能把过时提案转发到含数据的 leader。若继续盲写，
+        // 下方 `dir_entries.insert(inode, BTreeMap::new())` 会清空该目录
+        // 的内存子项映射（根目录场景即"新节点加入老集群"事故），stats
+        // 也会重复计数。目录语义上 mkdir 已存在本就该被上层拒绝，跳过
+        // 不损失任何合法行为。
+        if self.inodes.read().unwrap().contains_key(&inode) {
+            warn!(
+                "Shard {} create_directory idempotent skip: inode={} name={} already exists",
+                self.shard_id.0, inode, name
+            );
+            return;
+        }
         let now = chrono::Utc::now().timestamp() as u64;
 
         let inode_info = InodeInfo {
@@ -3988,5 +4114,171 @@ mod tests {
             store.get_inode(1500).is_none(),
             "empty directory inode should be removed"
         );
+    }
+
+    // ----- Filesystem format marker (data-safety gate) -----
+
+    fn format_marker(fsid: &str) -> FormatMarker {
+        FormatMarker {
+            fsid: fsid.to_string(),
+            shard_count: 64,
+            created_at: 1_700_000_000,
+            format_generation: 1,
+        }
+    }
+
+    #[test]
+    fn test_format_empty_store_creates_marker_and_root() {
+        let store = make_store();
+        assert!(store.read_format_marker().is_none());
+        assert!(!store.has_any_user_data());
+
+        let applied = store.apply_format_posix_root(&format_marker("fsid-fresh"));
+        assert!(applied, "first format must apply");
+
+        // marker persisted and readable
+        let marker = store.read_format_marker().expect("format marker persisted");
+        assert_eq!(marker.fsid, "fsid-fresh");
+        assert_eq!(marker.shard_count, 64);
+        assert_eq!(marker.format_generation, 1);
+
+        // POSIX root + its dir entry exist
+        let root = store
+            .get_inode(POSIX_ROOT_INODE)
+            .expect("root inode created");
+        assert_eq!(root.parent_inode, 0);
+        assert_eq!(root.name, "/");
+        assert_eq!(
+            store.lookup(0, "/").map(|i| i.inode),
+            Some(POSIX_ROOT_INODE)
+        );
+
+        let stats = store.get_stats();
+        assert_eq!(stats.dir_count, 1, "root counted exactly once");
+        assert!(store.has_any_user_data());
+    }
+
+    #[test]
+    fn test_format_is_idempotent_and_never_resets_root_children() {
+        let store = make_store();
+        assert!(store.apply_format_posix_root(&format_marker("fsid-a")));
+
+        // data lives under root
+        store
+            .create_inode_atomic(make_inode(2, POSIX_ROOT_INODE, "a.txt"), 1, "a.txt")
+            .unwrap();
+
+        // another proposal (different fsid — e.g. a second node racing at boot)
+        // must be an overall no-op
+        let applied = store.apply_format_posix_root(&format_marker("fsid-b"));
+        assert!(!applied, "second format must be a no-op");
+
+        let marker = store.read_format_marker().unwrap();
+        assert_eq!(marker.fsid, "fsid-a", "winner fsid must not be overwritten");
+        assert!(
+            store.lookup(1, "a.txt").is_some(),
+            "root children map must survive a duplicate format apply"
+        );
+        assert!(store.get_inode(2).is_some());
+        assert_eq!(store.get_stats().dir_count, 1, "no double dir counting");
+    }
+
+    #[test]
+    fn test_format_adopts_legacy_root_in_place() {
+        let store = make_store();
+
+        // pre-feature cluster: root exists via the legacy CreateDirectory path,
+        // but there is NO format marker on disk
+        store.apply_command(ShardCommand::CreateDirectory {
+            parent_inode: 0,
+            name: "/".to_string(),
+            inode: POSIX_ROOT_INODE,
+        });
+        store
+            .create_inode_atomic(make_inode(5, POSIX_ROOT_INODE, "old.dat"), 1, "old.dat")
+            .unwrap();
+        assert!(store.read_format_marker().is_none());
+        let dirs_before = store.get_stats().dir_count;
+
+        let applied = store.apply_format_posix_root(&format_marker("fsid-adopt"));
+        assert!(applied, "adoption writes the marker");
+
+        assert_eq!(store.read_format_marker().unwrap().fsid, "fsid-adopt");
+        assert!(store.get_inode(POSIX_ROOT_INODE).is_some());
+        assert!(store.lookup(1, "old.dat").is_some(), "old data untouched");
+        assert_eq!(
+            store.get_stats().dir_count,
+            dirs_before,
+            "root not re-counted"
+        );
+    }
+
+    #[test]
+    fn test_legacy_create_directory_replay_is_idempotent() {
+        let store = make_store();
+
+        // Simulate the same legacy CreateDirectory root log applied twice (log
+        // replay after restart, or stale proposal forwarded by an empty replica).
+        store.apply_command(ShardCommand::CreateDirectory {
+            parent_inode: 0,
+            name: "/".to_string(),
+            inode: POSIX_ROOT_INODE,
+        });
+        store
+            .create_inode_atomic(make_inode(7, POSIX_ROOT_INODE, "kid"), 1, "kid")
+            .unwrap();
+        store.apply_command(ShardCommand::CreateDirectory {
+            parent_inode: 0,
+            name: "/".to_string(),
+            inode: POSIX_ROOT_INODE,
+        });
+
+        assert!(
+            store.lookup(1, "kid").is_some(),
+            "children must not be wiped"
+        );
+        assert_eq!(store.get_stats().dir_count, 1);
+        assert_eq!(
+            store.lookup(0, "/").map(|i| i.inode),
+            Some(POSIX_ROOT_INODE)
+        );
+    }
+
+    #[test]
+    fn test_has_any_user_data_distinguishes_empty_from_foreign() {
+        let store = make_store();
+        assert!(!store.has_any_user_data());
+
+        // unmarked store carrying foreign/stray metadata must look non-empty
+        store
+            .create_inode_atomic(make_inode(99, 0, "stranger"), 0, "stranger")
+            .unwrap();
+        assert!(store.has_any_user_data());
+    }
+
+    #[test]
+    fn test_format_marker_survives_reopen() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "powerfs-format-marker-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        {
+            let store =
+                ShardStore::new(ShardId(0), (0, 1_000_000), tmp_dir.to_str().unwrap()).unwrap();
+            store.apply_format_posix_root(&format_marker("fsid-persist"));
+        }
+
+        // reopen: marker must come back from disk (this is what makes a
+        // rebooted/rejoined node recognize an existing filesystem)
+        let reopened =
+            ShardStore::new(ShardId(0), (0, 1_000_000), tmp_dir.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.read_format_marker().unwrap().fsid, "fsid-persist");
+        assert!(reopened.get_inode(POSIX_ROOT_INODE).is_some());
     }
 }

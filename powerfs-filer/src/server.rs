@@ -214,11 +214,16 @@ async fn admin_status(State(state): State<Arc<FilerState>>) -> Json<FilerStatus>
 }
 
 async fn admin_init_root(State(state): State<Arc<FilerState>>) -> axum::response::Response {
-    match state.meta_shard_manager.format_posix_root().await {
-        Ok(inode) => Json(serde_json::json!({
+    // Same marker-guarded path as the boot gate: never formats an already
+    // formatted filesystem, and refuses unmarked non-empty data unless the node was
+    // started with force_format=true.
+    match state.meta_shard_manager.ensure_filesystem_formatted().await {
+        Ok(outcome) => Json(serde_json::json!({
             "success": true,
-            "inode": inode,
-            "message": format!("POSIX root inode {} initialized", inode)
+            "inode": 1,
+            "action": format!("{:?}", outcome.action),
+            "fsid": outcome.fsid,
+            "message": format!("filesystem format gate: {:?} (fsid={})", outcome.action, outcome.fsid)
         }))
         .into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

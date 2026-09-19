@@ -810,6 +810,7 @@ fn build_config(
             gc_grace_period_secs: None,
             inline_max_size: None,
             force_register: false,
+            force_format: false,
             metrics_port: cfg.filer_metrics_port,
             registration_token: None,
             ca_crt: None,
