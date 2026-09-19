@@ -72,6 +72,26 @@ pub enum ShardCommand {
         name: String,
         inode: u64,
     },
+    /// Cluster-wide "mkfs": write the persistent FS format marker
+    /// (`fsid` / `shard_count` / `created_at`) plus the POSIX root inode
+    /// in one replicated command.
+    ///
+    /// Safety model — every filer may propose this at boot; correctness does
+    /// not depend on WHO proposes. On an already-formatted cluster the marker
+    /// is present and apply is a no-op, so a fresh empty replica joining an old
+    /// cluster can never rebuild or reset the root. On a fresh cluster the first
+    /// applied proposal wins and its fsid is replicated everywhere. On
+    /// pre-feature clusters (root exists, no marker) the marker is adopted
+    /// without touching the root.
+    ///
+    /// The command only ever adds data; it never deletes. The local
+    /// "unmarked but non-empty data dir" refusal happens before propose
+    /// (see `MetaShardManager::ensure_filesystem_formatted`).
+    FormatPosixRoot {
+        fsid: String,
+        shard_count: u32,
+        created_at: u64,
+    },
     DeleteDirectory {
         parent_inode: u64,
         name: String,

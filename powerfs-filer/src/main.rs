@@ -508,22 +508,30 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         meta_shard_manager.set_layout_predictor(predictor, layout_config.min_confidence);
     }
 
-    // 初始化 POSIX root inode (inode=1, 目录 "/").
-    // 首次启动或全新部署时必须创建, 否则 FUSE getattr(1) 返回 ENOENT,
-    // 导致挂载点显示为 d????????? (无法访问).
-    // format_posix_root 内部有幂等检查和 Raft leader 等待重试.
-    {
-        let mgr = meta_shard_manager.clone();
-        tokio::spawn(async move {
-            match mgr.format_posix_root().await {
-                Ok(ino) => {
-                    info!("POSIX root inode {} initialized", ino);
-                }
-                Err(e) => {
-                    error!("Failed to initialize POSIX root inode: {}", e);
-                }
-            }
-        });
+    // 文件系统格式化硬门（启动同步执行，失败即 exit 1）。
+    //
+    // 数据安全策略：POSIX root (inode=1) 必须存在，否则 FUSE getattr(1)
+    // 返回 ENOENT、挂载点显示 d?????????；但"缺 root 就补建"绝不能覆盖
+    // 老数据。判定依据落盘的格式标记（fsid + shard_count）：
+    //   - 有标记 → 永不格式化，只校验 shard_count；
+    //   - 无标记但 root 在 → 旧集群 adopt 补标记；
+    //   - 无标记且数据非空 → 拒绝启动（盘挂错/外来数据），
+    //     除非 filer.toml 显式设置 force_format=true；
+    //   - 空存储 → 首次格式化（经 Raft 复制，apply 幂等）。
+    // 详见 meta_shard_manager::ensure_filesystem_formatted。
+    meta_shard_manager.set_force_format(filer_cfg.force_format);
+    match meta_shard_manager.ensure_filesystem_formatted().await {
+        Ok(outcome) => {
+            info!(
+                "Filesystem format gate passed: {:?} (fsid={})",
+                outcome.action, outcome.fsid
+            );
+        }
+        Err(e) => {
+            error!("FATAL: filesystem format gate failed: {}", e);
+            error!("Refusing to start to protect existing metadata. Fix the configuration/data mount and restart.");
+            std::process::exit(1);
+        }
     }
 
     let shard_scheduler = Arc::new(ShardScheduler::new(
