@@ -2289,6 +2289,158 @@ impl MetaShardManager {
         }
     }
 
+    // ========================================================================
+    // Cross-shard rename 2PC (client-coordinated, docs/shard-routing-no-forward-principle.md §4.1)
+    //
+    // Each method proposes a single shard-scoped command to the shard that
+    // owns the relevant parent dir entry. The client drives the protocol and
+    // routes each phase to the correct shard leader; followers return
+    // not_leader → STATUS_ERR_REDIRECT, the client retries against the leader.
+    // No filer-to-filer forwarding.
+    // ========================================================================
+
+    /// Phase 1 source: remove source dir entry + record intent. Routed to
+    /// old_parent's shard.
+    pub async fn rename_prepare_source(
+        &self,
+        rename_id: &str,
+        parent_inode: u64,
+        name: &str,
+        inode: u64,
+        new_parent_inode: u64,
+        new_name: &str,
+    ) -> Result<(), String> {
+        let shard = self.shard_strategy.calculate_shard(parent_inode);
+        let cmd = ShardCommand::RenamePrepareSource {
+            rename_id: rename_id.to_string(),
+            parent_inode,
+            name: name.to_string(),
+            inode,
+            new_parent_inode,
+            new_name: new_name.to_string(),
+        };
+        self.propose_meta(shard, cmd.serialize()).await
+    }
+
+    /// Phase 1 dest: install target dir entry + record intent (capturing
+    /// replaced_inode). Routed to new_parent's shard.
+    pub async fn rename_prepare_dest(
+        &self,
+        rename_id: &str,
+        parent_inode: u64,
+        name: &str,
+        inode: u64,
+    ) -> Result<(), String> {
+        let shard = self.shard_strategy.calculate_shard(parent_inode);
+        let cmd = ShardCommand::RenamePrepareDest {
+            rename_id: rename_id.to_string(),
+            parent_inode,
+            name: name.to_string(),
+            inode,
+        };
+        self.propose_meta(shard, cmd.serialize()).await
+    }
+
+    /// Phase 2 source: drop source intent. Routed to old_parent's shard.
+    pub async fn rename_commit_source(
+        &self,
+        rename_id: &str,
+        parent_inode: u64,
+        name: &str,
+    ) -> Result<(), String> {
+        let shard = self.shard_strategy.calculate_shard(parent_inode);
+        let cmd = ShardCommand::RenameCommitSource {
+            rename_id: rename_id.to_string(),
+            parent_inode,
+            name: name.to_string(),
+        };
+        self.propose_meta(shard, cmd.serialize()).await
+    }
+
+    /// Phase 2 dest: DecrementNlink(replaced) + drop dest intent. Routed to
+    /// new_parent's shard.
+    pub async fn rename_commit_dest(
+        &self,
+        rename_id: &str,
+        parent_inode: u64,
+        name: &str,
+    ) -> Result<(), String> {
+        let shard = self.shard_strategy.calculate_shard(parent_inode);
+        let cmd = ShardCommand::RenameCommitDest {
+            rename_id: rename_id.to_string(),
+            parent_inode,
+            name: name.to_string(),
+        };
+        self.propose_meta(shard, cmd.serialize()).await
+    }
+
+    /// Rollback one prepared side. Routed to the side's parent shard.
+    /// `side`: 0 = source, 1 = dest.
+    pub async fn rename_abort(
+        &self,
+        rename_id: &str,
+        side: u8,
+        parent_inode: u64,
+        name: &str,
+        inode: u64,
+    ) -> Result<(), String> {
+        let shard = self.shard_strategy.calculate_shard(parent_inode);
+        let cmd = ShardCommand::RenameAbort {
+            rename_id: rename_id.to_string(),
+            side,
+            parent_inode,
+            name: name.to_string(),
+            inode,
+        };
+        self.propose_meta(shard, cmd.serialize()).await
+    }
+
+    /// Update an inode record's name + parent_inode in-place. Routed to
+    /// calculate_shard(inode). Best-effort after a cross-shard rename.
+    pub async fn rename_inode(
+        &self,
+        inode: u64,
+        new_name: &str,
+        new_parent_inode: u64,
+    ) -> Result<(), String> {
+        let shard = self.shard_strategy.calculate_shard(inode);
+        let cmd = ShardCommand::RenameInode {
+            inode,
+            new_name: new_name.to_string(),
+            new_parent_inode,
+        };
+        self.propose_meta(shard, cmd.serialize()).await
+    }
+
+    /// Decrement an inode's nlink on its own shard. Used by the cross-shard
+    /// rename coordinator to release a replaced target inode.
+    pub async fn decrement_nlink(&self, inode: u64) -> Result<(), String> {
+        let shard = self.shard_strategy.calculate_shard(inode);
+        let cmd = ShardCommand::DecrementNlink { inode };
+        self.propose_meta(shard, cmd.serialize()).await
+    }
+
+    /// Sweep stale rename intents on every shard this node leads. Intents
+    /// older than `ttl_secs` are aborted (dir entry restored) and dropped.
+    /// Returns the total number of intents reaped across all shards.
+    ///
+    /// Leader-only: we only reap on shards where this node is the leader,
+    /// because writes go straight to the local store (not through Raft).
+    pub async fn gc_rename_intents(&self, ttl_secs: u64) -> usize {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let stores: Vec<(ShardId, Arc<ShardStore>)> = {
+            let guard = self.shard_stores.read().unwrap();
+            guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        let mut total = 0usize;
+        for (shard_id, store) in stores {
+            if self.raft_group_manager.is_shard_leader(shard_id).await {
+                total += store.gc_stale_rename_intents(now, ttl_secs);
+            }
+        }
+        total
+    }
+
     pub fn lookup(&self, parent_inode: u64, name: &str) -> Option<InodeInfo> {
         // With split-create, the dir entry lives on `calculate_shard(parent_inode)`
         // but the inode record lives on `calculate_shard(inode)`. These may be

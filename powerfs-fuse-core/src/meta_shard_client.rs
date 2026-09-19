@@ -318,6 +318,9 @@ pub struct MetaShardClient {
     /// Filer's ShardStrategy (both use powerfs_allocator::ShardMap).
     /// Updated from topology via `update_shard_map()`.
     shard_map: Arc<Mutex<ShardMap>>,
+    /// Monotonic counter for generating unique rename_ids in cross-shard
+    /// rename 2PC. Combined with client_id → globally unique rename_id.
+    rename_seq: AtomicU64,
 }
 
 impl MetaShardClient {
@@ -352,6 +355,7 @@ impl MetaShardClient {
             client_id,
             cache_epoch: Arc::new(AtomicU64::new(0)),
             shard_map: Arc::new(Mutex::new(ShardMap::new())),
+            rename_seq: AtomicU64::new(0),
         }
     }
 
@@ -2616,14 +2620,176 @@ impl MetadataClient for MetaShardClient {
         let name = name.to_string();
         let new_name = new_name.to_string();
         Box::pin(async move {
-            let body = serialize::encode_rename_req(parent_ino, &name, new_parent_ino, &new_name)
-                .map_err(map_err)?;
-            let resp = self
-                .send_coherence_msg(MsgType::Rename, shard_id, body)
+            let old_shard = self.calculate_shard_id(parent_ino);
+            let new_shard = self.calculate_shard_id(new_parent_ino);
+
+            // Same-shard: legacy single-RPC path (server handles atomically).
+            if old_shard == new_shard {
+                let body =
+                    serialize::encode_rename_req(parent_ino, &name, new_parent_ino, &new_name)
+                        .map_err(map_err)?;
+                let resp = self
+                    .send_coherence_msg(MsgType::Rename, shard_id, body)
+                    .await
+                    .map_err(map_err)?;
+                let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
+                return Ok(attr_from_resp(attr_resp));
+            }
+
+            // =================================================================
+            // Cross-shard rename — client-coordinated optimistic 2PC.
+            // See docs/shard-routing-no-forward-principle.md §4.1.
+            //
+            // Pre-step: resolve the inode from the source dir entry, and the
+            // replaced inode (if the dest already exists) so the client can
+            // DecrementNlink it on its own shard after commit.
+            // =================================================================
+            let attr = self
+                .lookup(parent_ino, &name, old_shard)
                 .await
                 .map_err(map_err)?;
-            let attr_resp = serialize::decode_attr_resp(&resp).map_err(map_err)?;
-            Ok(attr_from_resp(attr_resp))
+            let ino = attr.inode;
+
+            // Look up the dest entry. If it exists, we must decrement its
+            // inode's nlink after commit. A lookup error (e.g. ENOENT) means
+            // there is no replaced inode to release.
+            let replaced_inode: Option<u64> = self
+                .lookup(new_parent_ino, &new_name, new_shard)
+                .await
+                .ok()
+                .map(|a| a.inode);
+
+            let rename_id = format!(
+                "{}:{}",
+                self.client_id,
+                self.rename_seq.fetch_add(1, Ordering::Relaxed)
+            );
+
+            // ---------- Phase 1: Prepare (both sides) ----------
+            let src_body = serialize::encode_rename_prepare_source_req(
+                &rename_id,
+                parent_ino,
+                &name,
+                ino,
+                new_parent_ino,
+                &new_name,
+            )
+            .map_err(map_err)?;
+            let dst_body = serialize::encode_rename_prepare_dest_req(
+                &rename_id,
+                new_parent_ino,
+                &new_name,
+                ino,
+            )
+            .map_err(map_err)?;
+
+            let (src_res, dst_res) = tokio::join!(
+                self.send_coherence_msg(MsgType::RenamePrepareSource, old_shard, src_body),
+                self.send_coherence_msg(MsgType::RenamePrepareDest, new_shard, dst_body),
+            );
+
+            let src_ok = src_res.is_ok();
+            let dst_ok = dst_res.is_ok();
+
+            if !src_ok || !dst_ok {
+                // Abort whichever side(s) succeeded.
+                if src_ok {
+                    let ab = serialize::encode_rename_abort_req(
+                        &rename_id, 0u8, // source
+                        parent_ino, &name, ino,
+                    )
+                    .map_err(map_err)?;
+                    let _ = self
+                        .send_coherence_msg(MsgType::RenameAbort, old_shard, ab)
+                        .await;
+                }
+                if dst_ok {
+                    let ab = serialize::encode_rename_abort_req(
+                        &rename_id,
+                        1u8, // dest
+                        new_parent_ino,
+                        &new_name,
+                        ino,
+                    )
+                    .map_err(map_err)?;
+                    let _ = self
+                        .send_coherence_msg(MsgType::RenameAbort, new_shard, ab)
+                        .await;
+                }
+                // Surface the originating error.
+                return match (src_res, dst_res) {
+                    (Err(e), _) | (_, Err(e)) => Err(map_err(e)),
+                    _ => unreachable!(),
+                };
+            }
+
+            // ---------- Phase 2: Commit (both sides, idempotent) ----------
+            let commit_src_body =
+                serialize::encode_rename_commit_req(&rename_id, parent_ino, &name)
+                    .map_err(map_err)?;
+            let commit_dst_body =
+                serialize::encode_rename_commit_req(&rename_id, new_parent_ino, &new_name)
+                    .map_err(map_err)?;
+
+            // Retry commit on transient failure — commit is idempotent (intent
+            // already gone is a no-op). We retry a bounded number of times;
+            // persistent failure leaves an intent that GC will clean up.
+            const COMMIT_RETRIES: u32 = 3;
+            let mut last_err: Option<String> = None;
+            for attempt in 0..COMMIT_RETRIES {
+                let (c_src, c_dst) = tokio::join!(
+                    self.send_coherence_msg(
+                        MsgType::RenameCommitSource,
+                        old_shard,
+                        commit_src_body.clone()
+                    ),
+                    self.send_coherence_msg(
+                        MsgType::RenameCommitDest,
+                        new_shard,
+                        commit_dst_body.clone()
+                    ),
+                );
+                match (c_src, c_dst) {
+                    (Ok(_), Ok(_)) => break,
+                    (a, b) => {
+                        last_err = a.err().or(b.err());
+                        if attempt + 1 < COMMIT_RETRIES {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                50 * (attempt + 1) as u64,
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(map_err(e));
+            }
+
+            // ---------- Post-commit: release replaced inode (if any) ----------
+            // The replaced inode may live on a different shard than the dest,
+            // so the client routes DecrementNlink to the replaced inode's own
+            // shard. Best-effort: failure leaks nlink (acceptable vs. blocking
+            // the rename).
+            if let Some(replaced) = replaced_inode {
+                let replaced_shard = self.calculate_shard_id(replaced);
+                let dec_body = serialize::encode_decrement_nlink_req(replaced).map_err(map_err)?;
+                let _ = self
+                    .send_coherence_msg(MsgType::DecrementNlink, replaced_shard, dec_body)
+                    .await;
+            }
+
+            // ---------- Post-commit: update inode record (best-effort) ----------
+            // Failure here does not affect dir-entry correctness; getattr
+            // falls back to the dir entry's name/parent.
+            let inode_shard = self.calculate_shard_id(ino);
+            let inode_body = serialize::encode_rename_inode_req(ino, &new_name, new_parent_ino)
+                .map_err(map_err)?;
+            let _ = self
+                .send_coherence_msg(MsgType::RenameInode, inode_shard, inode_body)
+                .await;
+
+            Ok(attr)
         })
     }
 
