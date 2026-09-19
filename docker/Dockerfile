@@ -67,7 +67,6 @@ COPY target/release/powerfs-s3     /opt/bins-stash/powerfs-s3
 COPY target/release/powerfs-volume /opt/bins-stash/powerfs-volume
 COPY target/release/powerfs-monitor /opt/bins-stash/powerfs-monitor
 COPY target/release/powerfs-fuse   /opt/bins-stash/powerfs-fuse
-COPY target/release/powerfs-init   /opt/bins-stash/powerfs-init
 COPY target/release/powerfs-cli    /opt/bins-stash/powerfs-cli
 COPY target/release/powerfs-testutil /opt/bins-stash/powerfs-testutil
 

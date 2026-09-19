@@ -10,7 +10,6 @@
 #   powerfs-fuse_0.1.0_amd64.deb
 #   powerfs-s3_0.1.0_amd64.deb
 #   powerfs-monitor_0.1.0_amd64.deb
-#   powerfs-init_0.1.0_amd64.deb
 #
 # Usage:
 #   ./scripts/build-deb.sh                 # build all packages
@@ -36,7 +35,6 @@ ALL_PACKAGES=(
     powerfs-fuse
     powerfs-s3
     powerfs-monitor
-    powerfs-init
 )
 
 # Colors for output
@@ -169,7 +167,6 @@ log "Next steps:"
 log "  1. Copy .deb files to target nodes"
 log "  2. On each node: sudo dpkg -i powerfs-cli_*.deb <role-package>.deb"
 log "  3. Generate configs:  powerfs-cli config gen --masters ... --output /etc/powerfs"
-log "  4. (Filer only) init: powerfs-init --config /etc/powerfs/filer-1.toml"
-log "  5. Start service:     sudo systemctl start powerfs-<role>"
+log "  4. Start service:     sudo systemctl start powerfs-<role> (filers auto-format on first boot)"
 log ""
 ok "Done."

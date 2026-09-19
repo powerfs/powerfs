@@ -730,8 +730,8 @@ pub fn config_gen(args: &ConfigGenArgs) -> Result<(), String> {
     );
     println!("\nNext steps:");
     println!("  1. Copy config files to each node");
-    println!("  2. Run powerfs-init --config filer-N.toml on each filer node");
-    println!("  3. Start services: powerfs-master --config master-N.toml");
+    println!("  2. Start services: powerfs-master --config master-N.toml");
+    println!("     (filers self-format the POSIX root on first boot — no init step)");
     Ok(())
 }
 

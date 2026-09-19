@@ -3,7 +3,7 @@
 # PowerFS Test Environment Startup Script
 #
 # Starts the full test cluster using docker-compose.test.yml:
-#   Redis → Masters → Volumes → Init Filers → Filers → FUSE Client
+#   Redis → Masters → Volumes → Filers (self-format on first boot) → FUSE
 #
 # Usage:
 #   ./docker/start_test_env.sh                # Start cluster
@@ -111,14 +111,14 @@ wait_healthy() {
 
 # ========== Start sequence ==========
 start_redis() {
-    log_step "[1/6] Starting Redis"
+    log_step "[1/5] Starting Redis"
     cd "$DOCKER_DIR"
     $COMPOSE_CMD -f "$COMPOSE_FILE" up -d redis
     wait_healthy "redis-test" 30 || log_warn "Redis not healthy, continuing..."
 }
 
 start_masters() {
-    log_step "[2/6] Starting Master Nodes"
+    log_step "[2/5] Starting Master Nodes"
     cd "$DOCKER_DIR"
     $COMPOSE_CMD -f "$COMPOSE_FILE" up -d master-1
     wait_healthy "master-1-test" 60 || log_warn "master-1 not healthy"
@@ -131,7 +131,7 @@ start_masters() {
 }
 
 start_volumes() {
-    log_step "[3/6] Starting Volume Nodes"
+    log_step "[3/5] Starting Volume Nodes"
     cd "$DOCKER_DIR"
     $COMPOSE_CMD -f "$COMPOSE_FILE" up -d volume-1 volume-2 volume-3
     for name in volume-1-test volume-2-test volume-3-test; do
@@ -139,16 +139,8 @@ start_volumes() {
     done
 }
 
-start_init_filers() {
-    log_step "[4/6] Initializing Filer Metadata"
-    cd "$DOCKER_DIR"
-    # init-filer containers run once and exit
-    $COMPOSE_CMD -f "$COMPOSE_FILE" up --abort-on-container-exit init-filer-1 init-filer-2 init-filer-3 2>&1 | tail -10 || true
-    log_pass "Filer metadata initialized"
-}
-
 start_filers() {
-    log_step "[5/6] Starting Filer Nodes"
+    log_step "[4/5] Starting Filer Nodes (auto-format on first boot)"
     cd "$DOCKER_DIR"
     $COMPOSE_CMD -f "$COMPOSE_FILE" up -d filer-1 filer-2 filer-3
     for name in filer-1-test filer-2-test filer-3-test; do
@@ -157,7 +149,7 @@ start_filers() {
 }
 
 start_fuse() {
-    log_step "[6/6] Starting FUSE Clients (fuse-1, fuse-2)"
+    log_step "[5/5] Starting FUSE Clients (fuse-1, fuse-2)"
     cd "$DOCKER_DIR"
     $COMPOSE_CMD -f "$COMPOSE_FILE" up -d fuse-1 fuse-2
 
@@ -247,7 +239,6 @@ main() {
     start_redis
     start_masters
     start_volumes
-    start_init_filers
     start_filers
 
     if [ "$BACKEND_ONLY" -eq 0 ]; then

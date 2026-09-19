@@ -127,7 +127,7 @@ services:
       master-2:
         condition: service_healthy
 
-  # ── Wave 3a: Volumes ──
+  # ── Wave 3: Volumes ──
   volume-1:
     image: powerfs:latest
     container_name: volume-1-test
@@ -209,56 +209,7 @@ services:
       master-1:
         condition: service_healthy
 
-  # ── Wave 3a: Initialize Filer Metadata (run once to create POSIX root) ──
-  init-filer-1:
-    image: powerfs:latest
-    container_name: init-filer-1-test
-    networks:
-      powerfs-network:
-        ipv4_address: 172.30.0.30
-    command: /app/powerfs-init --config /config/filer-1.toml --force
-    volumes:
-      - filer-1-data:/data/filer
-      - ./config:/config:ro
-      - /home/portion/powerfs/target/release/powerfs-init:/app/powerfs-init:ro
-    depends_on:
-      master-1:
-        condition: service_healthy
-    restart: "no"
-
-  init-filer-2:
-    image: powerfs:latest
-    container_name: init-filer-2-test
-    networks:
-      powerfs-network:
-        ipv4_address: 172.30.0.34
-    command: /app/powerfs-init --config /config/filer-2.toml --force
-    volumes:
-      - filer-2-data:/data/filer
-      - ./config:/config:ro
-      - /home/portion/powerfs/target/release/powerfs-init:/app/powerfs-init:ro
-    depends_on:
-      master-1:
-        condition: service_healthy
-    restart: "no"
-
-  init-filer-3:
-    image: powerfs:latest
-    container_name: init-filer-3-test
-    networks:
-      powerfs-network:
-        ipv4_address: 172.30.0.38
-    command: /app/powerfs-init --config /config/filer-3.toml --force
-    volumes:
-      - filer-3-data:/data/filer
-      - ./config:/config:ro
-      - /home/portion/powerfs/target/release/powerfs-init:/app/powerfs-init:ro
-    depends_on:
-      master-1:
-        condition: service_healthy
-    restart: "no"
-
-  # ── Wave 3b: Filers ──
+  # ── Wave 4: Filers (POSIX root is formatted on first boot via Raft) ──
   filer-1:
     image: powerfs:latest
     container_name: filer-1-test
@@ -282,14 +233,13 @@ services:
       interval: 3s
       timeout: 3s
       retries: 3
-      start_period: 10s
+      # Generous grace: on a cold first boot the Filer runs the Raft
+      # format gate (election + replicated FormatPosixRoot) before opening
+      # its data ports. Failures inside start_period do not mark unhealthy.
+      start_period: 40s
     depends_on:
-      init-filer-1:
-        condition: service_completed_successfully
-      init-filer-2:
-        condition: service_completed_successfully
-      init-filer-3:
-        condition: service_completed_successfully
+      master-1:
+        condition: service_healthy
 
   filer-2:
     image: powerfs:latest
@@ -314,14 +264,10 @@ services:
       interval: 3s
       timeout: 3s
       retries: 3
-      start_period: 15s
+      start_period: 40s
     depends_on:
-      init-filer-1:
-        condition: service_completed_successfully
-      init-filer-2:
-        condition: service_completed_successfully
-      init-filer-3:
-        condition: service_completed_successfully
+      master-1:
+        condition: service_healthy
 
   filer-3:
     image: powerfs:latest
@@ -346,16 +292,12 @@ services:
       interval: 3s
       timeout: 3s
       retries: 3
-      start_period: 15s
+      start_period: 40s
     depends_on:
-      init-filer-1:
-        condition: service_completed_successfully
-      init-filer-2:
-        condition: service_completed_successfully
-      init-filer-3:
-        condition: service_completed_successfully
+      master-1:
+        condition: service_healthy
 
-  # ── Wave 4: FUSE Clients (multi-client for cap coherence testing) ──
+  # ── Wave 5: FUSE Clients (multi-client for cap coherence testing) ──
   fuse-1:
     image: powerfs-test:latest
     container_name: fuse-1-test
@@ -488,7 +430,7 @@ services:
         condition: service_healthy
     command: sleep infinity
 
-  # ── Wave 5: Monitor ──
+  # ── Wave 6: Monitor ──
   monitor:
     image: powerfs:latest
     container_name: monitor-test

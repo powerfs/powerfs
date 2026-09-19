@@ -23,7 +23,6 @@ members = [
     "powerfs-orset",
     "powerfs-filer",
     "powerfs-coherence",
-    "powerfs-init",
     "powerfs-ctl",
     "powerfs-raft",
     "rfs_tester",
