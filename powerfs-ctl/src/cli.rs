@@ -41,7 +41,7 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Reconcile-start the cluster (first run auto-renders configs + issues certs)
+    /// Reconcile-start the cluster (renders if cluster.toml is stale, then compose up + health gate)
     Up {
         /// Only start a single role or node, e.g. master, master-1
         #[arg(long)]

@@ -53,8 +53,38 @@ PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency + Cap mo
 
 ## Quick Start
 
+### Recommended: powerfs-ctl (declarative one-command deployment)
+
+`powerfs-ctl` renders the whole stack from a single `cluster.toml`, issues
+mTLS certs, brings services up behind raft health gates, and handles day-2
+operations (restart/scale/doctor/cert renewal). See
+[powerfs-ctl/README.md](powerfs-ctl/README.md) for the full guide.
+
 ```bash
 git clone https://github.com/powerfs/powerfs.git
+cd powerfs
+
+# Build the control tool (requires Docker Engine + compose v2)
+cargo build --release -p powerfs-ctl
+
+# One command: 3-master HA cluster (init → render → certs → up → health gate)
+./target/release/powerfs-ctl bootstrap --profile ha
+
+./target/release/powerfs-ctl status
+```
+
+Topology changes are declarative — edit `[nodes.*]` counts in
+`.powerfs/cluster.toml`, then reconcile:
+
+```bash
+powerfs-ctl node master add 4      # render → cert → start → raft join → gate
+powerfs-ctl node data add volume-7
+powerfs-ctl doctor                 # diagnostics
+```
+
+### Alternative: raw docker compose
+
+```bash
 cd powerfs/docker
 
 # Build & launch full cluster (Redis + Masters + Volumes + Filers + FUSE)
@@ -62,7 +92,7 @@ sudo ./build_powerfs_image.sh
 docker compose -f docker-compose.test.yml up -d
 ```
 
-Or build from source:
+### Alternative: run binaries manually from source
 
 ```bash
 cargo build --release
@@ -85,6 +115,9 @@ docker run -d --name redis -p 6379:6379 redis:7-alpine
 # 6. Mount
 ./target/release/powerfs-fuse --config config/fuse.toml
 ```
+
+**Kernel client**: install `powerfs.ko` via DKMS so it rebuilds across kernel
+upgrades — see [kernel/README.md](kernel/README.md#dkms-install-auto-rebuild-on-kernel-upgrades).
 
 **Default credentials**: admin / admin123 · **S3**: powerfs / powerfs123 @ http://localhost:9000
 
