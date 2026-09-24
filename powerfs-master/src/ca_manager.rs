@@ -197,6 +197,28 @@ impl CaManager {
         self.ca_cert_pem.clone()
     }
 
+    /// Re-read `client_registry.json` from disk and replace the in-memory
+    /// registry if the on-disk version is newer (has more entries).
+    ///
+    /// This handles the race where a follower master started before the
+    /// leader signed any certs — its in-memory registry is empty, but the
+    /// leader has since written new entries to the shared `ca_dir`.
+    fn try_reload_registry(&self) {
+        let fresh = ClientRegistry::load(&self.ca_dir);
+        let mut guard = match self.registry.write() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if fresh.by_fingerprint.len() > guard.by_fingerprint.len() {
+            info!(
+                "CaManager: reloading client registry from disk ({} -> {} entries)",
+                guard.by_fingerprint.len(),
+                fresh.by_fingerprint.len()
+            );
+            *guard = fresh;
+        }
+    }
+
     /// SHA-256 fingerprint of a PEM certificate block (hex-encoded).
     pub fn fingerprint_sha256(pem: &str) -> String {
         let der = pem_to_der(pem).unwrap_or_default();
@@ -357,16 +379,32 @@ impl CaManager {
         mount_point: &str,
     ) -> Result<String, String> {
         let fingerprint = Self::fingerprint_sha256(client_pem);
-        let reg = self
-            .registry
-            .read()
-            .map_err(|_| "registry lock poisoned".to_string())?;
-        let entry = reg.by_fingerprint.get(&fingerprint).ok_or_else(|| {
-            format!(
-                "cert fp={:.16}… unknown (not issued by master)",
-                fingerprint
-            )
-        })?;
+        let entry = {
+            let reg = self
+                .registry
+                .read()
+                .map_err(|_| "registry lock poisoned".to_string())?;
+            match reg.by_fingerprint.get(&fingerprint).cloned() {
+                Some(e) => e,
+                None => {
+                    drop(reg);
+                    self.try_reload_registry();
+                    let reg = self
+                        .registry
+                        .read()
+                        .map_err(|_| "registry lock poisoned".to_string())?;
+                    reg.by_fingerprint
+                        .get(&fingerprint)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "cert fp={:.16}… unknown (not issued by master)",
+                                fingerprint
+                            )
+                        })?
+                }
+            }
+        };
         if entry.revoked {
             return Err(format!("cert fp={:.16}… has been revoked", fingerprint));
         }
@@ -437,16 +475,32 @@ impl CaManager {
         node_id: &str,
     ) -> Result<String, String> {
         let fingerprint = Self::fingerprint_sha256(client_pem);
-        let reg = self
-            .registry
-            .read()
-            .map_err(|_| "registry lock poisoned".to_string())?;
-        let entry = reg.by_fingerprint.get(&fingerprint).ok_or_else(|| {
-            format!(
-                "cert fp={:.16}… unknown (not issued by master)",
-                fingerprint
-            )
-        })?;
+        let entry = {
+            let reg = self
+                .registry
+                .read()
+                .map_err(|_| "registry lock poisoned".to_string())?;
+            match reg.by_fingerprint.get(&fingerprint).cloned() {
+                Some(e) => e,
+                None => {
+                    drop(reg);
+                    self.try_reload_registry();
+                    let reg = self
+                        .registry
+                        .read()
+                        .map_err(|_| "registry lock poisoned".to_string())?;
+                    reg.by_fingerprint
+                        .get(&fingerprint)
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "cert fp={:.16}… unknown (not issued by master)",
+                                fingerprint
+                            )
+                        })?
+                }
+            }
+        };
         if entry.revoked {
             return Err(format!("cert fp={:.16}… has been revoked", fingerprint));
         }
