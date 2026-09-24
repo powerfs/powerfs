@@ -21,9 +21,12 @@ scaling masters/data nodes, cert renewal, diagnostics).
 ## Build
 
 ```bash
-# from repo root
-cargo build --release -p powerfs-ctl
-# binary: target/release/powerfs-ctl
+# from repo root — build everything: the rendered compose bind-mounts the
+# host's target/release/powerfs-{master,filer,volume,monitor,s3} binaries
+# into the containers, so `-p powerfs-ctl` alone leaves bootstrap without
+# the services it needs (ctl now preflight-checks this and errors out).
+cargo build --release
+# ctl binary: target/release/powerfs-ctl
 ```
 
 All examples below assume the binary is on `PATH` (or prefix with

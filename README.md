@@ -64,8 +64,10 @@ operations (restart/scale/doctor/cert renewal). See
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
 
-# Build the control tool (requires Docker Engine + compose v2)
-cargo build --release -p powerfs-ctl
+# Build all binaries (ctl + master/filer/volume/monitor/s3; requires Docker Engine + compose v2)
+# The rendered compose bind-mounts target/release/powerfs-* into the containers,
+# so building powerfs-ctl alone is not enough.
+cargo build --release
 
 # One command: 3-master HA cluster (init → render → certs → up → health gate)
 ./target/release/powerfs-ctl bootstrap --profile ha

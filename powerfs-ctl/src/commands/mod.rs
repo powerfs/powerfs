@@ -264,8 +264,32 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    static FAKE_BIN_ONCE: std::sync::Once = std::sync::Once::new();
+
+    /// Point the up preflight (POWERFS_BIN_DIR) at a fake bin dir containing
+    /// empty files for every service binary, so bootstrap/up/node tests never
+    /// depend on whether the host happens to have a release build.
+    fn install_fake_bin_dir() {
+        FAKE_BIN_ONCE.call_once(|| {
+            let mut dir = std::env::temp_dir();
+            dir.push(format!("powerfs-ctl-test-bins-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            for b in [
+                "powerfs-master",
+                "powerfs-filer",
+                "powerfs-volume",
+                "powerfs-monitor",
+                "powerfs-s3",
+            ] {
+                std::fs::write(dir.join(b), b"").unwrap();
+            }
+            // SAFETY NOTE: tests run single-process; edition 2021 set_var.
+            std::env::set_var("POWERFS_BIN_DIR", &dir);
+        });
+    }
 
     fn fresh_dir() -> PathBuf {
+        install_fake_bin_dir();
         let mut dir = std::env::temp_dir();
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
         dir.push(format!("powerfs-ctl-test-{}-{}", std::process::id(), n));

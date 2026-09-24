@@ -63,6 +63,7 @@ pub async fn add<C: CertClient>(
             compose.display()
         ));
     }
+    super::up::ensure_service_binaries(&[name.to_string()])?;
     println!("• docker compose up -d {name}");
     driver.up(&compose, &[name]).await?;
 

@@ -92,6 +92,7 @@ where
         ));
     }
     let svc = format!("master-{id}");
+    super::up::ensure_service_binaries(std::slice::from_ref(&svc))?;
     println!("• docker compose up -d {svc}");
     driver.up(&compose, &[svc.as_str()]).await?;
 
