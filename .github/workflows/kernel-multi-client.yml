@@ -144,7 +144,34 @@ jobs:
             docker ps --format 'table {{.Names}}\t{{.Status}}'
             exit 1
           }
-          echo "PowerFS backend OK"
+          # The VMs mount with the tracked client certs under
+          # docker/certs-default (copied into the 9p share in the Deploy
+          # step). Container-name grep alone is not enough: a separately
+          # bootstrapped cluster that happens to occupy 172.30.0.0/16 has
+          # its own freshly generated master CA, and the mount then dies
+          # with "cert fp=... unknown (not issued by master)" only after
+          # the VMs boot. Compare the running master-1 CA against the
+          # certs-default CA so a wrong backend fails the job immediately.
+          MASTER_CTNR=$(docker ps --format '{{.Names}}' | grep -E '^(master-1|master-1-test)$' | head -1)
+          [ -n "$MASTER_CTNR" ] || {
+            echo "::error::master-1 container not found"
+            exit 1
+          }
+          CA_SRC=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data/master/ca"}}{{.Source}}{{end}}{{end}}' "$MASTER_CTNR")
+          [ -n "$CA_SRC" ] || {
+            echo "::error::cannot resolve /data/master/ca mount source of $MASTER_CTNR"
+            exit 1
+          }
+          want_fp=$(openssl x509 -in docker/certs-default/ca.crt -noout -fingerprint -sha256 | cut -d= -f2)
+          got_fp=$(openssl x509 -in "$CA_SRC/ca.crt" -noout -fingerprint -sha256 | cut -d= -f2)
+          if [ "$want_fp" != "$got_fp" ]; then
+            echo "::error::backend master CA does not match docker/certs-default"
+            echo "  expected: $want_fp"
+            echo "  actual:   $got_fp ($MASTER_CTNR -> $CA_SRC)"
+            echo "  restore the canonical backend: cd docker && docker compose -f docker-compose.yml up -d"
+            exit 1
+          fi
+          echo "PowerFS backend OK (CA $got_fp)"
 
       - name: Build kernel module
         run: |
