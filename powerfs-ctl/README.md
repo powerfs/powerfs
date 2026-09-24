@@ -181,6 +181,15 @@ Issues a client certificate and renders the client-side config (client.toml /
 fuse config). Kernel clients also need the module installed on that host —
 see the [kernel DKMS guide](../kernel/README.md#dkms-install-auto-rebuild-on-kernel-upgrades).
 
+For fuse clients the rendered compose has no fuse service — run the enrolled
+client with the helper script (mirrors the fuse services of
+`docker/docker-compose.yml`, but with certs/config from the enroll output):
+
+```bash
+docker/run-fuse-client.sh fuse-ws1 172.30.0.99   # start, host mount: /tmp/powerfs/fuse-ws1
+docker/run-fuse-client.sh stop fuse-ws1          # remove
+```
+
 ## Command reference
 
 | Command | Purpose |

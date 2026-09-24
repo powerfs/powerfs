@@ -64,15 +64,38 @@ operations (restart/scale/doctor/cert renewal). See
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
 
-# Build all binaries (ctl + master/filer/volume/monitor/s3; requires Docker Engine + compose v2)
-# The rendered compose bind-mounts target/release/powerfs-* into the containers,
-# so building powerfs-ctl alone is not enough.
+# 1. Build all binaries (ctl + master/filer/volume/monitor/s3; requires Docker Engine + compose v2).
+#    The rendered compose bind-mounts target/release/powerfs-* into the containers,
+#    so building powerfs-ctl alone is not enough.
 cargo build --release
 
-# One command: 3-master HA cluster (init → render → certs → up → health gate)
+# 2. One command: 3-master HA cluster (init → render → certs → up → health gate)
 ./target/release/powerfs-ctl bootstrap --profile ha
-
 ./target/release/powerfs-ctl status
+
+# 3. Add two FUSE clients (they are NOT part of the rendered compose):
+#    enroll signs a per-client cert + writes client-<name>.toml,
+#    the script launches the container against the cluster network.
+./target/release/powerfs-ctl client enroll fuse-1 --ip 172.30.0.41 --kind fuse
+./target/release/powerfs-ctl client enroll fuse-2 --ip 172.30.0.42 --kind fuse
+docker/run-fuse-client.sh fuse-1 172.30.0.41
+docker/run-fuse-client.sh fuse-2 172.30.0.42
+
+# 4. Try it — one shared filesystem across both clients:
+docker exec fuse-1 sh -c 'echo "hello powerfs" > /mnt/powerfs/hello.txt'
+docker exec fuse-2 cat /mnt/powerfs/hello.txt      # → hello powerfs
+docker exec fuse-2 sh -c 'mkdir -p /mnt/powerfs/demo && cp /mnt/powerfs/hello.txt /mnt/powerfs/demo/'
+docker exec fuse-1 ls -l /mnt/powerfs/demo/        # → hello.txt, visible here too
+```
+
+> The host bind dir `/tmp/powerfs/<name>` does not track the FUSE view
+> (Docker binds are rprivate) — always go through `docker exec <name>`.
+
+Tear everything down:
+
+```bash
+docker/run-fuse-client.sh stop fuse-1 && docker/run-fuse-client.sh stop fuse-2
+docker compose -f .powerfs/rendered/docker-compose.yml down -v
 ```
 
 Topology changes are declarative — edit `[nodes.*]` counts in
