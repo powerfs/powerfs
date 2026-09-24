@@ -59,6 +59,7 @@ services:
       - master-{{ i + 1 }}-data:/data
       - ./certs:/data/master/ca
       - ./config/master-{{ i + 1 }}.toml:/app/config/master.toml:ro
+      - ../../target/release/powerfs-master:/app/powerfs-master:ro
     environment:
       - REDIS_URL=redis://redis:6379
     command: /app/powerfs-master --config /app/config/master.toml
@@ -86,6 +87,7 @@ services:
       - volume-{{ i + 1 }}-data:/data
       - ./certs:/etc/powerfs/certs:ro
       - ./config/volume-{{ i + 1 }}.toml:/app/config/volume.toml:ro
+      - ../../target/release/powerfs-volume:/app/powerfs-volume:ro
     command: /app/powerfs-volume --config /app/config/volume.toml
     depends_on:
       - master-1
@@ -104,6 +106,7 @@ services:
       - filer-{{ i + 1 }}-data:/data
       - ./certs:/etc/powerfs/certs:ro
       - ./config/filer-{{ i + 1 }}.toml:/app/config/filer.toml:ro
+      - ../../target/release/powerfs-filer:/app/powerfs-filer:ro
     command: /app/powerfs-filer --config /app/config/filer.toml
     depends_on:
       - master-1
@@ -119,6 +122,7 @@ services:
         ipv4_address: {{ monitor_ip }}
     volumes:
       - ./config/monitor.toml:/app/config/monitor.toml:ro
+      - ../../target/release/powerfs-monitor:/app/powerfs-monitor:ro
     ports:
       - "8083:8081"
     command: /app/powerfs-monitor --config /app/config/monitor.toml
@@ -135,6 +139,8 @@ services:
         ipv4_address: {{ s3_ip }}
     volumes:
       - s3-data:/data
+      - ./config/s3.toml:/app/config/s3.toml:ro
+      - ../../target/release/powerfs-s3:/app/powerfs-s3:ro
     command: /app/powerfs-s3 --config /app/config/s3.toml
     depends_on:
       - master-1

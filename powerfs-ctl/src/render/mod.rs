@@ -20,6 +20,7 @@ pub fn render(rc: &ResolvedCluster) -> Result<Rendered, RenderError> {
     env.add_template("volume", VOLUME_TEMPLATE)?;
     env.add_template("filer", FILER_TEMPLATE)?;
     env.add_template("monitor", MONITOR_TEMPLATE)?;
+    env.add_template("s3", S3_TEMPLATE)?;
     env.add_template("fuse", FUSE_TEMPLATE)?;
 
     let ctx = build_context(rc)?;
@@ -43,6 +44,7 @@ pub fn render(rc: &ResolvedCluster) -> Result<Rendered, RenderError> {
         configs.insert(name, env.get_template("filer")?.render(&c)?);
     }
     configs.insert("monitor".into(), env.get_template("monitor")?.render(&ctx)?);
+    configs.insert("s3".into(), env.get_template("s3")?.render(&ctx)?);
     configs.insert("fuse".into(), env.get_template("fuse")?.render(&ctx)?);
 
     Ok(Rendered {
@@ -165,6 +167,7 @@ const MASTER_TEMPLATE: &str = include_str!("templates/master.toml.j2");
 const VOLUME_TEMPLATE: &str = include_str!("templates/volume.toml.j2");
 const FILER_TEMPLATE: &str = include_str!("templates/filer.toml.j2");
 const MONITOR_TEMPLATE: &str = include_str!("templates/monitor.toml.j2");
+const S3_TEMPLATE: &str = include_str!("templates/s3.toml.j2");
 const FUSE_TEMPLATE: &str = include_str!("templates/fuse.toml.j2");
 
 #[cfg(test)]
