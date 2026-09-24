@@ -210,6 +210,7 @@ mod tests {
                 "filer" => ServiceType::Filer,
                 "monitor" => ServiceType::Monitor,
                 "fuse" => ServiceType::Fuse,
+                "s3" => ServiceType::S3,
                 other => panic!("unexpected rendered role: {}", other),
             };
             cfg.validate_for(svc).unwrap_or_else(|e| {
