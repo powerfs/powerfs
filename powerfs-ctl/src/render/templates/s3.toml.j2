@@ -1,0 +1,17 @@
+# PowerFS S3 service config (rendered by powerfs-ctl)
+
+[global]
+log_level = "info"
+redis_url = "{{ redis_url }}"
+
+[s3]
+port = 9000
+master_address = "{{ master_addrs[0] }}"
+master_endpoints = [
+{%- for addr in master_addrs %}
+  "{{ addr }}"{% if not loop.last %},{% endif %}
+{% endfor %}
+]
+dir = "/data/s3"
+access_key = "powerfs"
+secret_key = "powerfs123"
