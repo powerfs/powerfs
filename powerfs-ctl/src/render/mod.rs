@@ -141,7 +141,7 @@ fn ctx_for_node(
         "filer" => (rc.filer_ips[idx - 1].clone(), idx as u64),
         _ => return Err(RenderError::UnknownRole(role.into())),
     };
-    let node_id = format!("{}-server-{}", role, idx);
+    let node_id = format!("{}-{}", role, idx);
     let mut m = base.clone();
     m.insert("idx".into(), json!(idx));
     m.insert("role".into(), json!(role));
