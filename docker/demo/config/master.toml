@@ -1,0 +1,19 @@
+# PowerFS demo image — single-node master. All services share 127.0.0.1
+# inside one container. Do not use this layout outside the demo image.
+[global]
+log_level = "info"
+redis_url = "redis://127.0.0.1:6379"
+
+[master]
+port = 9333
+raft_port = 9335
+metrics_port = 9300
+net_port = 9334
+dir = "/data/master"
+ip = "0.0.0.0"
+advertise_addr = "127.0.0.1:9333"
+raft_id = 1
+raft_peers = ["127.0.0.1:9335"]
+admin_token = "powerfs-admin"
+ca_dir = "/data/master/ca"
+registration_token = "powerfs-cluster"

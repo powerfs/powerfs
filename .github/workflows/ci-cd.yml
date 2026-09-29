@@ -4,6 +4,7 @@ name: PowerFS CI/CD Pipeline
 on:
   push:
     branches: [fronted, master, main]
+    tags: ['v*']
   pull_request:
     branches: [fronted, master, main]
   workflow_dispatch:
@@ -434,7 +435,10 @@ jobs:
   docker:
     runs-on: [self-hosted, Linux, X64]
     needs: [quality, build, test]
-    if: (github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') && github.event_name == 'push'
+    if: >-
+      ((github.ref == 'refs/heads/fronted' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+        || startsWith(github.ref, 'refs/tags/v'))
+      && github.event_name == 'push'
     permissions:
       contents: read
       packages: write
@@ -552,6 +556,22 @@ jobs:
         docker build -f docker/Dockerfile -t "${IMAGE_TAG}:latest" -t "${IMAGE_TAG}:${GITHUB_SHA}" .
         docker push "${IMAGE_TAG}:latest"
         docker push "${IMAGE_TAG}:${GITHUB_SHA}"
+
+    - name: Build and Push Demo Image
+      run: |
+        # Self-contained trial image (redis+master+filer+volume+fuse in one
+        # container). Release tags get an additional :vX.Y.Z tag.
+        DEMO_TAG="ghcr.io/${{ github.repository }}-demo"
+        docker build -f docker/demo/Dockerfile \
+          -t "${DEMO_TAG}:latest" -t "${DEMO_TAG}:${GITHUB_SHA}" .
+        if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          docker tag "${DEMO_TAG}:latest" "${DEMO_TAG}:${GITHUB_REF_NAME}"
+        fi
+        docker push "${DEMO_TAG}:latest"
+        docker push "${DEMO_TAG}:${GITHUB_SHA}"
+        if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          docker push "${DEMO_TAG}:${GITHUB_REF_NAME}"
+        fi
 
   # 部署到测试环境
   deploy-test:

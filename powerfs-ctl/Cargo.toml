@@ -21,6 +21,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { version = "0.11", default-features = false, features = ["json"] }
+# cert demo-bundle: offline CA/leaf minting for the single-container demo image.
+rcgen = { version = "0.13", features = ["pem"] }
+sha2 = "0.10"
+time = "0.3"
 powerfs-common = { path = "../powerfs-common" }
 
 [dev-dependencies]

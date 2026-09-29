@@ -2,6 +2,7 @@ use clap::Parser;
 
 mod admin;
 mod cert;
+mod cert_bundle;
 mod cli;
 mod commands;
 mod compose;

@@ -53,6 +53,36 @@ PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency + Cap mo
 
 ## Quick Start
 
+### Try it in one container (fastest — no source build)
+
+A self-contained demo image runs redis + 1 master + 1 filer + 1 volume and a
+FUSE mount in a single container. **Requires a Linux Docker host** (the
+container needs `/dev/fuse`; Docker Desktop on macOS/Windows is not supported
+for this image).
+
+```bash
+docker pull ghcr.io/powerfs/powerfs-demo:latest
+
+docker run -d --name powerfs \
+    --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
+    ghcr.io/powerfs/powerfs-demo:latest
+
+docker logs -f powerfs            # wait for "PowerFS demo cluster is READY"
+
+# play with the filesystem inside the container:
+docker exec -it powerfs bash
+# echo hello > /mnt/powerfs/hello.txt
+# ls -l /mnt/powerfs
+```
+
+Data is ephemeral by default; add `-v powerfs-demo-data:/data` to keep it
+across `docker rm`. Stop with `docker rm -f powerfs`.
+
+> **Demo only** — single-node, loopback-only, throwaway CA baked into the
+> image. Do not store real data or expose it; for anything real use the
+> powerfs-ctl deployment below. Images are published per release tag
+> (`:v1.1.0`, …) plus `:latest`.
+
 ### Recommended: powerfs-ctl (declarative one-command deployment)
 
 `powerfs-ctl` renders the whole stack from a single `cluster.toml`, issues

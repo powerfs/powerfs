@@ -1,0 +1,24 @@
+# PowerFS demo image — single filer (shard owner 0, one-node raft).
+[global]
+log_level = "info"
+redis_url = "redis://127.0.0.1:6379"
+
+[filer]
+transport = "tcp"
+port = 8888
+grpc_port = 8889
+metrics_port = 8900
+# Own net listener — MUST differ from master's net_port (9334) on loopback.
+net_port = 9344
+ip = "0.0.0.0"
+master_addresses = ["127.0.0.1:9333"]
+master_net_port = 9334
+data_dir = "/data/filer"
+shard_count = 1
+raft_id = 1
+raft_peers = ["127.0.0.1:8889"]
+inline_max_size = 8192
+registration_token = "powerfs-cluster"
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/filer-1.crt"
+client_key = "/etc/powerfs/certs/filer-1.key"
