@@ -1,0 +1,24 @@
+# PowerFS demo image — single volume server.
+[global]
+log_level = "info"
+redis_url = "redis://127.0.0.1:6379"
+
+[volume]
+transport = "tcp"
+grpc_port = 8080
+http_port = 8091
+net_port = 8901
+data_dir = "/data/volume"
+master_addresses = ["127.0.0.1:9333"]
+master_net_port = 9334
+node_id = "volume-1"
+max_volume_size = 1073741824
+initial_volume_count = 4
+advertise_addr = "127.0.0.1"
+lease_enabled = false
+force_sync_on_write = false
+wal_idle_sync_secs = 30
+registration_token = "powerfs-cluster"
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/volume-1.crt"
+client_key = "/etc/powerfs/certs/volume-1.key"

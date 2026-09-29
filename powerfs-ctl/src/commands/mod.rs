@@ -143,6 +143,24 @@ pub async fn dispatch(cmd: Commands, home: &Home) -> Result<(), String> {
                 )
                 .await
             }
+            // Purely local: mints CA + certs + registry into --dir, no cluster
+            // contact and no .powerfs state needed.
+            CertAction::DemoBundle {
+                dir,
+                client_name,
+                mount_dir,
+            } => {
+                let spec = crate::cert_bundle::DemoBundleSpec {
+                    client_name,
+                    mount_dir,
+                    ..Default::default()
+                };
+                let path = std::path::PathBuf::from(&dir);
+                crate::cert_bundle::generate(&path, &spec)?;
+                println!("✓ demo cert bundle written to {}", path.display());
+                println!("  DEMO ONLY — CA private key is in that directory; never use it for production.");
+                Ok(())
+            }
         },
         Commands::Node { action } => match action {
             NodeAction::Master { action } => match action {

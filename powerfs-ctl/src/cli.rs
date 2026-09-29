@@ -160,6 +160,21 @@ pub enum CertAction {
         #[arg(long)]
         fingerprint: Option<String>,
     },
+    /// Generate a self-contained loopback cert bundle for the demo image.
+    /// Mints a fresh CA + filer/volume node certs + one FUSE client cert
+    /// (all bound to 127.0.0.1) and a matching client_registry.json.
+    /// DEMO ONLY: the CA private key is written to --dir in cleartext.
+    DemoBundle {
+        /// Output directory for the bundle (created if missing).
+        #[arg(long)]
+        dir: String,
+        /// FUSE client name (CN), default fuse-demo.
+        #[arg(long, default_value = "fuse-demo")]
+        client_name: String,
+        /// Allowed mount directory encoded in the client cert.
+        #[arg(long, default_value = "/mnt/powerfs")]
+        mount_dir: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

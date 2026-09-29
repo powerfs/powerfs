@@ -1,0 +1,31 @@
+# PowerFS demo image — FUSE client mounted inside the demo container.
+[global]
+log_level = "info"
+redis_url = "redis://127.0.0.1:6379"
+
+[fuse]
+mount_point = "/mnt/powerfs"
+master_addresses = ["127.0.0.1"]
+master_net_port = 9334
+volume_net_port = 8901
+filer_net_port = 9344
+collection = "default"
+replication = "000"
+threads = 4
+verbose = false
+container = true
+log_file = "/var/log/powerfs-fuse.log"
+force_mount = true
+filer_addresses = ["127.0.0.1"]
+volume_addresses = ["127.0.0.1"]
+request_timeout_secs = 10
+admin_port = 9998
+# Cert CN = fuse-demo, SAN IP 127.0.0.1, mount URI /mnt/powerfs.
+ca_crt = "/etc/powerfs/certs/ca.crt"
+client_crt = "/etc/powerfs/certs/fuse-demo.crt"
+client_key = "/etc/powerfs/certs/fuse-demo.key"
+
+[fuse.lease]
+mode = "cap"
+lease_duration_ms = 30000
+renew_interval_ms = 10000
