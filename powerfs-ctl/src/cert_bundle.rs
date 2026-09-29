@@ -82,8 +82,8 @@ pub fn generate(dir: &Path, spec: &DemoBundleSpec) -> Result<(), String> {
     ca_params.not_after = now + time::Duration::days(3650);
     let ca_key = KeyPair::generate().map_err(|e| e.to_string())?;
     let ca_cert = ca_params.self_signed(&ca_key).map_err(|e| e.to_string())?;
-    write_file(dir, "ca.crt", &ca_cert.pem())?;
-    write_secret(dir, "ca.key", &ca_key.serialize_pem())?;
+    write_file(dir, "ca.crt", ca_cert.pem())?;
+    write_secret(dir, "ca.key", ca_key.serialize_pem())?;
 
     let ip: std::net::IpAddr = spec
         .san_ip
