@@ -180,6 +180,52 @@ impl MasterNode {
     pub fn cert_enforcement_enabled(&self) -> bool {
         self.ca_manager.is_some()
     }
+
+    /// Record the validated client-cert fingerprint on the live net
+    /// connection for `client_id`, so a later revocation sweep can find
+    /// and drop connections still using a revoked certificate.
+    ///
+    /// The transport is plain TCP/RDMA with application-level cert checks
+    /// (no TLS handshake), so the fingerprint can only be back-filled when
+    /// the first cert-carrying request passes validation.
+    pub async fn record_conn_cert_fingerprint(&self, client_id: u64, cert_pem: &str) {
+        let net_mgr_opt = self.net_manager.read().unwrap().clone();
+        let Some(net_mgr) = net_mgr_opt else {
+            return;
+        };
+        if let Some(conn) = net_mgr.registry().get(client_id) {
+            let fp = crate::ca_manager::CaManager::fingerprint_sha256(cert_pem);
+            conn.set_cert_fingerprint(fp).await;
+        }
+    }
+
+    /// Disconnect every live TLV connection whose recorded client-cert
+    /// fingerprint is no longer active in the CA registry (revoked or
+    /// unknown). Connections with no recorded fingerprint (dev mode,
+    /// admin/internal conns) are never touched.
+    ///
+    /// Disconnection goes through `ClientConn::disconnect` → IoLoop
+    /// shutdown → `registry.unregister` → `handler.on_disconnect`, i.e.
+    /// the normal connection-teardown path with its existing lease cleanup.
+    pub async fn sweep_revoked_cert_connections(
+        net_manager: &RwLock<Option<Arc<ServerConnectionManager>>>,
+        ca: &crate::ca_manager::CaManager,
+    ) {
+        let net_mgr_opt = net_manager.read().unwrap().clone();
+        let Some(net_mgr) = net_mgr_opt else {
+            return;
+        };
+        let registry = net_mgr.registry().clone();
+        for (client_id, fp) in registry.cert_fingerprints().await {
+            if !ca.is_fingerprint_active(&fp) {
+                info!(
+                    "MasterNode: cert fp={:.16}… revoked/unknown — disconnecting client_id={}",
+                    fp, client_id
+                );
+                registry.disconnect(client_id).await;
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -587,7 +633,27 @@ impl MasterNode {
             match crate::ca_manager::CaManager::new(dir, master.admin_token.clone()) {
                 Ok(ca) => {
                     info!("MasterNode: CaManager initialised (ca_dir={})", dir);
-                    master.ca_manager = Some(Arc::new(ca));
+                    let ca = Arc::new(ca);
+                    // Cert revocation must also kill existing connections:
+                    // install the sweep hook so revoke / renew --revoke-old /
+                    // registry reloads that pick up a revocation disconnect
+                    // every live connection still using the revoked cert.
+                    // Weak<CaManager> avoids an Arc cycle (CaManager holds
+                    // the hook, the hook would otherwise hold the CaManager).
+                    let net_manager = master.net_manager.clone();
+                    let ca_weak = Arc::downgrade(&ca);
+                    ca.set_revocation_hook(Arc::new(move || {
+                        let Some(ca) = ca_weak.upgrade() else {
+                            return;
+                        };
+                        let net_manager = net_manager.clone();
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.spawn(async move {
+                                Self::sweep_revoked_cert_connections(&net_manager, &ca).await;
+                            });
+                        }
+                    }));
+                    master.ca_manager = Some(ca);
                 }
                 Err(e) => {
                     error!(
@@ -3906,133 +3972,142 @@ impl MasterNode {
         let master_ref = self.clone();
         let raft_term = *self.raft_term.read().unwrap();
 
-        tokio::spawn(async move {
+        powerfs_common::spawn_supervised("master-node-status-event", move || {
             let mut sys = sysinfo::System::new_all();
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                sys.refresh_all();
+            let master_ref = master_ref.clone();
+            let node_id_str = node_id_str.clone();
+            let address = address.clone();
+            let event_provider = event_provider.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    sys.refresh_all();
 
-                let metrics = collect_system_metrics(&mut sys, ".");
+                    let metrics = collect_system_metrics(&mut sys, ".");
 
-                // 每次循环读取实时的 leader 状态（反映 raft 角色变更）
-                let is_leader = master_ref.raft_v2.is_leader();
+                    // 每次循环读取实时的 leader 状态（反映 raft 角色变更）
+                    let is_leader = master_ref.raft_v2.is_leader();
 
-                let event = Event::NodeStatus(NodeStatusEvent {
-                    node_id: node_id_str.clone(),
-                    node_type: "master".to_string(),
-                    address: address.clone(),
-                    grpc_port,
-                    http_port: grpc_port,
-                    status: if is_leader {
-                        "leader".to_string()
-                    } else {
-                        "follower".to_string()
-                    },
-                    cpu_usage: metrics.cpu_usage,
-                    mem_usage: metrics.mem_usage,
-                    disk_usage: metrics.disk_usage,
-                    network_rx: metrics.network_rx,
-                    network_tx: metrics.network_tx,
-                    uptime: metrics.uptime,
-                    volume_count: 0,
-                    is_leader,
-                    raft_term,
-                });
+                    let event = Event::NodeStatus(NodeStatusEvent {
+                        node_id: node_id_str.clone(),
+                        node_type: "master".to_string(),
+                        address: address.clone(),
+                        grpc_port,
+                        http_port: grpc_port,
+                        status: if is_leader {
+                            "leader".to_string()
+                        } else {
+                            "follower".to_string()
+                        },
+                        cpu_usage: metrics.cpu_usage,
+                        mem_usage: metrics.mem_usage,
+                        disk_usage: metrics.disk_usage,
+                        network_rx: metrics.network_rx,
+                        network_tx: metrics.network_tx,
+                        uptime: metrics.uptime,
+                        volume_count: 0,
+                        is_leader,
+                        raft_term,
+                    });
 
-                if let Err(e) = event_provider.publish(event, &node_id_str).await {
-                    warn!("Failed to publish node_status event: {}", e);
+                    if let Err(e) = event_provider.publish(event, &node_id_str).await {
+                        warn!("Failed to publish node_status event: {}", e);
+                    }
                 }
             }
         });
 
         // 内存泄漏诊断任务：每 30 秒打印一次关键指标
         let diag_master = self.clone();
-        tokio::spawn(async move {
-            let mut prev_snapshot: Option<crate::tracking_allocator::AllocSnapshot> = None;
-            let mut prev_vm_rss: u64 = 0;
-            let mut tick = 0u64;
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                tick += 1;
+        powerfs_common::spawn_supervised("master-mem-diag", move || {
+            let diag_master = diag_master.clone();
+            async move {
+                let mut prev_snapshot: Option<crate::tracking_allocator::AllocSnapshot> = None;
+                let mut prev_vm_rss: u64 = 0;
+                let mut tick = 0u64;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    tick += 1;
 
-                let snap = crate::tracking_allocator::ALLOC_STATS.snapshot();
+                    let snap = crate::tracking_allocator::ALLOC_STATS.snapshot();
 
-                if tick.is_multiple_of(30) {
-                    let vm = crate::tracking_allocator::read_self_vm();
-                    let (rss_kb, data_kb, peak_kb) = vm.unwrap_or((0, 0, 0));
+                    if tick.is_multiple_of(30) {
+                        let vm = crate::tracking_allocator::read_self_vm();
+                        let (rss_kb, data_kb, peak_kb) = vm.unwrap_or((0, 0, 0));
 
-                    let (
-                        jemalloc_res_mb,
-                        jemalloc_active_mb,
-                        jemalloc_mapped_mb,
-                        jemalloc_retained_mb,
-                    ) = match crate::tracking_allocator::read_jemalloc_stats() {
-                        Some((res, act, map, ret)) => (
-                            res / 1024 / 1024,
-                            act / 1024 / 1024,
-                            map / 1024 / 1024,
-                            ret / 1024 / 1024,
-                        ),
-                        None => (0, 0, 0, 0),
-                    };
+                        let (
+                            jemalloc_res_mb,
+                            jemalloc_active_mb,
+                            jemalloc_mapped_mb,
+                            jemalloc_retained_mb,
+                        ) = match crate::tracking_allocator::read_jemalloc_stats() {
+                            Some((res, act, map, ret)) => (
+                                res / 1024 / 1024,
+                                act / 1024 / 1024,
+                                map / 1024 / 1024,
+                                ret / 1024 / 1024,
+                            ),
+                            None => (0, 0, 0, 0),
+                        };
 
-                    // 关键数据结构大小
-                    let topology_n = diag_master.topology.read().unwrap().data_centers.len();
-                    let volumes_n = diag_master.volumes.read().unwrap().len();
-                    let collections_n = diag_master.collections.read().unwrap().len();
-                    let volume_layouts_n = diag_master.volume_layouts.read().unwrap().len();
-                    let client_mgr = diag_master.client_manager.read().unwrap();
-                    let clients_n = client_mgr.clients.len();
-                    let fuse_clients_n = client_mgr.fuse_clients.len();
-                    drop(client_mgr);
+                        // 关键数据结构大小
+                        let topology_n = diag_master.topology.read().unwrap().data_centers.len();
+                        let volumes_n = diag_master.volumes.read().unwrap().len();
+                        let collections_n = diag_master.collections.read().unwrap().len();
+                        let volume_layouts_n = diag_master.volume_layouts.read().unwrap().len();
+                        let client_mgr = diag_master.client_manager.read().unwrap();
+                        let clients_n = client_mgr.clients.len();
+                        let fuse_clients_n = client_mgr.fuse_clients.len();
+                        drop(client_mgr);
 
-                    // 增量计算
-                    let (delta_live_kb, delta_alloc_mb) = if let Some(prev) = prev_snapshot {
-                        let d_live = snap.live_bytes().saturating_sub(prev.live_bytes());
-                        let d_alloc = snap.alloc_bytes.saturating_sub(prev.alloc_bytes);
-                        (d_live / 1024, d_alloc / 1024 / 1024)
-                    } else {
-                        (0, 0)
-                    };
-                    let delta_rss_kb = rss_kb.saturating_sub(prev_vm_rss);
+                        // 增量计算
+                        let (delta_live_kb, delta_alloc_mb) = if let Some(prev) = prev_snapshot {
+                            let d_live = snap.live_bytes().saturating_sub(prev.live_bytes());
+                            let d_alloc = snap.alloc_bytes.saturating_sub(prev.alloc_bytes);
+                            (d_live / 1024, d_alloc / 1024 / 1024)
+                        } else {
+                            (0, 0)
+                        };
+                        let delta_rss_kb = rss_kb.saturating_sub(prev_vm_rss);
 
-                    info!(
-                        "MEM_DIAG tick={} rss_mb={} data_mb={} peak_mb={} live_mb={} live_cnt={} \
-                         delta_live_kb={} delta_rss_kb={} delta_alloc_mb={} \
-                         jemalloc_res_mb={} jemalloc_active_mb={} jemalloc_mapped_mb={} jemalloc_retained_mb={} \
-                         topo={} vols={} cols={} layouts={} clients={} fuse_clients={}",
-                        tick,
-                        rss_kb / 1024,
-                        data_kb / 1024,
-                        peak_kb / 1024,
-                        snap.live_bytes() / 1024 / 1024,
-                        snap.live_count(),
-                        delta_live_kb,
-                        delta_rss_kb,
-                        delta_alloc_mb,
-                        jemalloc_res_mb,
-                        jemalloc_active_mb,
-                        jemalloc_mapped_mb,
-                        jemalloc_retained_mb,
-                        topology_n,
-                        volumes_n,
-                        collections_n,
-                        volume_layouts_n,
-                        clients_n,
-                        fuse_clients_n,
-                    );
+                        info!(
+                            "MEM_DIAG tick={} rss_mb={} data_mb={} peak_mb={} live_mb={} live_cnt={} \
+                             delta_live_kb={} delta_rss_kb={} delta_alloc_mb={} \
+                             jemalloc_res_mb={} jemalloc_active_mb={} jemalloc_mapped_mb={} jemalloc_retained_mb={} \
+                             topo={} vols={} cols={} layouts={} clients={} fuse_clients={}",
+                            tick,
+                            rss_kb / 1024,
+                            data_kb / 1024,
+                            peak_kb / 1024,
+                            snap.live_bytes() / 1024 / 1024,
+                            snap.live_count(),
+                            delta_live_kb,
+                            delta_rss_kb,
+                            delta_alloc_mb,
+                            jemalloc_res_mb,
+                            jemalloc_active_mb,
+                            jemalloc_mapped_mb,
+                            jemalloc_retained_mb,
+                            topology_n,
+                            volumes_n,
+                            collections_n,
+                            volume_layouts_n,
+                            clients_n,
+                            fuse_clients_n,
+                        );
 
-                    prev_snapshot = Some(snap);
-                    prev_vm_rss = rss_kb;
-                } else if tick.is_multiple_of(5) {
-                    info!(
-                        "MEM_DIAG_FAST tick={} alloc_bytes={} alloc_count={} live_bytes={} live_cnt={}",
-                        tick,
-                        snap.alloc_bytes,
-                        snap.alloc_count,
-                        snap.live_bytes(),
-                        snap.live_count(),
-                    );
+                        prev_snapshot = Some(snap);
+                        prev_vm_rss = rss_kb;
+                    } else if tick.is_multiple_of(5) {
+                        info!(
+                            "MEM_DIAG_FAST tick={} alloc_bytes={} alloc_count={} live_bytes={} live_cnt={}",
+                            tick,
+                            snap.alloc_bytes,
+                            snap.alloc_count,
+                            snap.live_bytes(),
+                            snap.live_count(),
+                        );
+                    }
                 }
             }
         });
@@ -4076,21 +4151,24 @@ impl MasterNode {
         // automatic: a fresh heartbeat resets state to Healthy.
         {
             let liveness_master = Arc::clone(&self);
-            tokio::spawn(async move {
-                let interval_secs: u64 = std::env::var("POWERFS_NODE_LIVENESS_INTERVAL")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(10);
-                let offline_secs: i64 = std::env::var("POWERFS_NODE_OFFLINE_TIMEOUT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(30);
-                let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-                loop {
-                    ticker.tick().await;
-                    liveness_master
-                        .check_node_liveness(chrono::Duration::seconds(offline_secs))
-                        .await;
+            powerfs_common::spawn_supervised("master-node-liveness", move || {
+                let liveness_master = liveness_master.clone();
+                async move {
+                    let interval_secs: u64 = std::env::var("POWERFS_NODE_LIVENESS_INTERVAL")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(10);
+                    let offline_secs: i64 = std::env::var("POWERFS_NODE_OFFLINE_TIMEOUT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30);
+                    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+                    loop {
+                        ticker.tick().await;
+                        liveness_master
+                            .check_node_liveness(chrono::Duration::seconds(offline_secs))
+                            .await;
+                    }
                 }
             });
             info!("Node liveness watcher started");

@@ -126,6 +126,11 @@ pub struct CaManager {
     ca_cert_pem: String,
     admin_token: Option<String>,
     registry: RwLock<ClientRegistry>,
+    /// Invoked after any operation that may have revoked a certificate
+    /// (explicit revoke / renew-with-revoke / registry reload that picked
+    /// up revocations). The master installs a hook here that sweeps live
+    /// net connections whose recorded cert fingerprint is no longer active.
+    revocation_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl CaManager {
@@ -190,6 +195,7 @@ impl CaManager {
             ca_cert_pem,
             admin_token,
             registry,
+            revocation_hook: RwLock::new(None),
         })
     }
 
@@ -203,20 +209,68 @@ impl CaManager {
     /// This handles the race where a follower master started before the
     /// leader signed any certs — its in-memory registry is empty, but the
     /// leader has since written new entries to the shared `ca_dir`.
+    ///
+    /// Revocation flips the `revoked` flag without adding entries, so the
+    /// reload also fires when the entry count is unchanged but a `revoked`
+    /// flag differs — this is how revocation performed via another master
+    /// sharing the same `ca_dir` is picked up. After an actual replacement
+    /// the revocation hook is invoked so live connections using a revoked
+    /// certificate get swept.
     fn try_reload_registry(&self) {
         let fresh = ClientRegistry::load(&self.ca_dir);
         let mut guard = match self.registry.write() {
             Ok(g) => g,
             Err(_) => return,
         };
-        if fresh.by_fingerprint.len() > guard.by_fingerprint.len() {
+        let grew = fresh.by_fingerprint.len() > guard.by_fingerprint.len();
+        let revoked_changed = fresh.by_fingerprint.len() == guard.by_fingerprint.len()
+            && fresh
+                .by_fingerprint
+                .iter()
+                .any(|(fp, e)| guard.by_fingerprint.get(fp).map(|g| g.revoked) != Some(e.revoked));
+        if grew || revoked_changed {
             info!(
                 "CaManager: reloading client registry from disk ({} -> {} entries)",
                 guard.by_fingerprint.len(),
                 fresh.by_fingerprint.len()
             );
             *guard = fresh;
+            drop(guard);
+            self.notify_revocation();
         }
+    }
+
+    /// Register a hook invoked after any state change that may have revoked
+    /// a certificate. At most one hook is kept (re-installing replaces).
+    pub fn set_revocation_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.revocation_hook.write().unwrap() = Some(hook);
+    }
+
+    /// Invoke the revocation hook (if any). Never blocks the caller on the
+    /// hook's work — the master-side hook only spawns an async sweep.
+    fn notify_revocation(&self) {
+        let hook = self
+            .revocation_hook
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Whether a certificate fingerprint is currently usable: present in
+    /// the registry and not revoked. Unknown fingerprints are inactive.
+    pub fn is_fingerprint_active(&self, fingerprint: &str) -> bool {
+        self.registry
+            .read()
+            .map(|reg| {
+                reg.by_fingerprint
+                    .get(fingerprint)
+                    .map(|e| !e.revoked)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
     }
 
     /// SHA-256 fingerprint of a PEM certificate block (hex-encoded).
@@ -638,6 +692,8 @@ impl CaManager {
                 reg.save(&self.ca_dir)
                     .map_err(|e| CertAdminError::Internal(e.to_string()))?;
             }
+            drop(reg);
+            self.notify_revocation();
         }
         Ok(issued)
     }
@@ -665,10 +721,15 @@ impl CaManager {
             .by_fingerprint
             .get_mut(&fp)
             .ok_or_else(|| CertAdminError::NotFound(fp.clone()))?;
+        let was_already_revoked = entry.revoked;
         if !entry.revoked {
             entry.revoked = true;
             reg.save(&self.ca_dir)
                 .map_err(|e| CertAdminError::Internal(e.to_string()))?;
+        }
+        drop(reg);
+        if !was_already_revoked {
+            self.notify_revocation();
         }
         Ok(())
     }

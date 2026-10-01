@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use rand::Rng;
 
 use tokio::sync::oneshot;
 
@@ -39,7 +40,9 @@ fn net_backoff_ms(attempt: u32) -> u64 {
     let base = 50u64;
     let shift = (attempt - 1).min(4); // 0..4
     let ms = base << shift;
-    ms.min(1000)
+    let ms = ms.min(1000);
+    // ±25% 随机抖动，避免多客户端在网络错误后同步重试
+    rand::thread_rng().gen_range(ms * 3 / 4..=ms * 5 / 4)
 }
 
 /// 请求结果 - 统一的请求响应类型

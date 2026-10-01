@@ -18,6 +18,7 @@ use powerfs_net::{FieldId, MsgType, Transport, STATUS_OK};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct MasterClient {
     node_id: NodeId,
     http_port: u32,

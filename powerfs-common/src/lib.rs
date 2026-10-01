@@ -32,3 +32,4 @@ pub use traits::{
     MetadataProvider, NodeStats, SessionInfo, SessionStats, StorageProvider, VolumeFilters,
     VolumeProvider,
 };
+pub use utils::spawn_supervised;

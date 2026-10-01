@@ -5,6 +5,7 @@ use bytes::Bytes;
 use log::error;
 use log::trace;
 use log::warn;
+use rand::Rng;
 
 use crate::client_identity::ClientIdentity;
 use crate::meta_shard_client::{
@@ -485,7 +486,10 @@ impl FuseClientFacade {
                         e
                     );
                     if retry < max_retries {
-                        let delay_ms = (500u64) << (retry - 1).min(3); // 500ms, 1s, 2s, 4s
+                        let base_ms = (500u64) << (retry - 1).min(3); // 500ms, 1s, 2s, 4s
+                                                                      // ±25% 随机抖动，避免多客户端同步重试拉取拓扑
+                        let delay_ms =
+                            rand::thread_rng().gen_range(base_ms * 3 / 4..=base_ms * 5 / 4);
                         log::info!("FuseClientFacade: retrying in {}ms...", delay_ms);
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     } else {

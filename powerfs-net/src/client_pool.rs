@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
+use rand::Rng;
 use tokio::time::interval;
 
 use crate::client::{ClientConfig, NotificationHandler, PowerFsNetClient};
@@ -385,12 +386,16 @@ impl ClientConnPool {
             entry.attempts = entry.attempts.saturating_add(1);
             // attempts=1 -> base, 2 -> 2*base, 3 -> 4*base, ...
             let shift = entry.attempts.saturating_sub(1).min(20);
-            let delay = self
+            let capped = self
                 .config
                 .backoff_base
                 .checked_mul(1u32 << shift)
                 .unwrap_or(self.config.backoff_max)
                 .min(self.config.backoff_max);
+            // ±25% 随机抖动，避免多客户端在 backoff 窗口结束后同步重连
+            let base_ms = capped.as_millis() as u64;
+            let jittered_ms = rand::thread_rng().gen_range(base_ms * 3 / 4..=base_ms * 5 / 4);
+            let delay = Duration::from_millis(jittered_ms);
             entry.next_allowed_at = Instant::now() + delay;
             (entry.attempts, delay)
         }; // guard dropped before logging

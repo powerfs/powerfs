@@ -95,6 +95,13 @@ pub enum ConnState {
     Closed,
 }
 
+/// [`ConnRegistry`] 最大活跃连接数 (按 client_id 计, 非通道数).
+///
+/// 取值理由: 单 Volume/Master 节点面向 FUSE 挂载点, 64K 对应 64K 个独立挂载,
+/// 已远超生产部署规模 (通常数百到数千). 达到上限后拒绝新注册, 防止异常场景
+/// (如客户端泄漏导致未正常 unregister) 下 DashMap 无界增长.
+const MAX_CONNECTIONS: usize = 65536;
+
 /// 客户端策略 (可动态修改)
 ///
 /// 表示服务端对单个客户端连接施加的 QoS 策略，
@@ -190,6 +197,11 @@ pub struct ClientConn {
     pub features: u32,
     /// route_hash (握手时从 client_id 计算, 收帧校验防错乱)
     pub route_hash: u8,
+    /// 本连接通过校验的客户端证书 SHA-256 fingerprint (由服务端业务层在
+    /// 校验 ClientCert TLV 成功后记录; 用于证书吊销后的连接清扫).
+    /// 传输层为明文 TCP + 应用层证书校验, 非 mTLS, 因此只能在首个
+    /// 携证请求通过校验后回填, 之前为 None.
+    pub cert_fingerprint: RwLock<Option<String>>,
 
     /// 连接状态
     pub state: RwLock<ConnState>,
@@ -237,6 +249,7 @@ impl ClientConn {
             channel,
             features,
             route_hash,
+            cert_fingerprint: RwLock::new(None),
             state: RwLock::new(ConnState::Active),
             policy: RwLock::new(ClientPolicy::default()),
             stats: RwLock::new(ClientStats {
@@ -282,6 +295,16 @@ impl ClientConn {
     /// 设置关闭句柄 (IoLoop.manage() 调用)
     pub async fn set_close_handle(&self, handle: CloseHandle) {
         *self.close_handle.write().await = Some(handle);
+    }
+
+    /// 记录本连接通过校验的客户端证书 fingerprint (证书吊销清扫用)
+    pub async fn set_cert_fingerprint(&self, fingerprint: String) {
+        *self.cert_fingerprint.write().await = Some(fingerprint);
+    }
+
+    /// 读取本连接记录的证书 fingerprint (未记录时为 None)
+    pub async fn cert_fingerprint(&self) -> Option<String> {
+        self.cert_fingerprint.read().await.clone()
     }
 
     /// 主动断开连接
@@ -373,9 +396,28 @@ impl ConnRegistry {
     /// 同一 client_id 的 data 和 meta 通道连接分别存储,
     /// 互不覆盖. 重复注册同 channel 的连接会覆盖旧连接
     /// (重连场景: 新连接替换旧连接).
+    ///
+    /// 达到 [`MAX_CONNECTIONS`] 上限时拒绝注册 (仅记录 warn, 不panic),
+    /// 并在拒绝前清理一次已标记 Closed 的 stale 条目, 为正常断连兜底.
     pub async fn register(&self, conn: Arc<ClientConn>) {
         let id = conn.id;
         let channel = conn.channel;
+
+        // 上限保护: 新 client_id 且达到 MAX_CONNECTIONS 时拒绝注册.
+        // 已存在的 client_id 不受限 (重连/双通道允许替换或新增 channel).
+        if !self.conns.contains_key(&id) && self.conns.len() >= MAX_CONNECTIONS {
+            self.cleanup_stale();
+            if self.conns.len() >= MAX_CONNECTIONS {
+                log::warn!(
+                    "ConnRegistry: register rejected client_id={} channel={}, max_connections({}) reached",
+                    id,
+                    channel,
+                    MAX_CONNECTIONS
+                );
+                return;
+            }
+        }
+
         if let Some(holder) = conn.holder_uuid.read().await.as_ref() {
             self.by_holder.insert(holder.clone(), id);
         }
@@ -393,6 +435,40 @@ impl ConnRegistry {
                 "ConnRegistry: register new conn client_id={} channel={}",
                 id,
                 channel
+            );
+        }
+    }
+
+    /// 清理已标记 Closed 的 stale 连接条目.
+    ///
+    /// 用于 register 达到上限时的兜底: 异常断连/泄漏路径下, 某些连接可能
+    /// 长期停留在注册表却未走 unregister. 清理它们为合法新连接腾出空间.
+    /// 注意: 对 DashMap 加锁迭代, 仅在上限触发时调用, 热路径无额外开销.
+    fn cleanup_stale(&self) {
+        let mut removed = 0usize;
+        self.conns.retain(|_, inner| {
+            inner.retain(|_, conn| {
+                // 非阻塞读取 state; 读失败视为非 stale, 保守保留.
+                let stale = conn
+                    .state
+                    .try_read()
+                    .map(|s| *s == ConnState::Closed)
+                    .unwrap_or(false);
+                !stale
+            });
+            // inner 为空 (所有通道均被清理) 时移除外层条目.
+            if inner.is_empty() {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+        if removed > 0 {
+            log::warn!(
+                "ConnRegistry: cleanup_stale removed {} stale client entries (remaining={})",
+                removed,
+                self.conns.len()
             );
         }
     }
@@ -494,6 +570,24 @@ impl ConnRegistry {
             conn.disconnect().await;
         }
         true
+    }
+
+    /// 快照所有已记录证书 fingerprint 的连接, 返回 (client_id, fingerprint)
+    /// 列表 (每通道一条, 同一 client_id 可能出现多次).
+    ///
+    /// 供服务端在证书吊销后清扫现存连接: 调用方判断 fingerprint 是否仍
+    /// 有效, 对失效者调用 [`ConnRegistry::disconnect`]. 未记录指纹的连接
+    /// (如 dev 模式、管理面连接) 不在结果中, 不会被误伤.
+    pub async fn cert_fingerprints(&self) -> Vec<(u64, String)> {
+        let mut result = Vec::new();
+        for entry in self.conns.iter() {
+            for conn in entry.value().values() {
+                if let Some(fp) = conn.cert_fingerprint().await {
+                    result.push((conn.id, fp));
+                }
+            }
+        }
+        result
     }
 
     /// 设置客户端策略 (应用到所有通道)

@@ -12,6 +12,29 @@
 use crate::errors::NetError;
 use crate::protocol::{FieldId, MAX_TLV_VALUE_LEN};
 
+/// 单次 TLV list/batch 元素个数上限（防御性）。
+///
+/// 解码侧在 `Vec::with_capacity(count)` 前必须先用此上限夹紧 `count`，
+/// 防止恶意/异常 count 字段（u32/u64 直接 `as usize`）触发巨大预分配导致 OOM。
+///
+/// 取值理由：body 已被帧层 `MAX_BODY_SIZE = 256KB` 约束，单个 TLV entry
+/// 至少 ~30 字节，256KB 实际最多 ~8000 项；100_000 是宽松但安全的余量。
+pub const MAX_LIST_COUNT: usize = 100_000;
+
+/// 将网络侧 count 字段夹紧到 [`MAX_LIST_COUNT`],用于 `Vec::with_capacity` 前。
+///
+/// 返回 Err 表示 count 超过上限（协议异常，调用方应拒绝该请求）。
+#[inline]
+pub fn checked_list_count(count: usize) -> Result<usize, NetError> {
+    if count > MAX_LIST_COUNT {
+        return Err(NetError::Serialize(format!(
+            "list count {} exceeds MAX_LIST_COUNT {}",
+            count, MAX_LIST_COUNT
+        )));
+    }
+    Ok(count)
+}
+
 /// Result of decode_setattr_req: (ino, mode, uid, gid, size, mtime, atime)
 pub type SetattrResult = (
     u64,
@@ -1564,7 +1587,7 @@ pub fn encode_batch_create_req(
 pub fn decode_batch_create_req(body: &[u8]) -> Result<(u64, Vec<BatchCreateEntry>), NetError> {
     let mut dec = TlvDecoder::new(body);
     let shard_id = dec.next_u64(FieldId::ShardId)?;
-    let count = dec.next_u32(FieldId::Count)? as usize;
+    let count = checked_list_count(dec.next_u32(FieldId::Count)? as usize)?;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let entry_bytes = dec.next_bytes(FieldId::Entry)?;
@@ -1623,7 +1646,7 @@ pub fn decode_batch_create_resp(body: &[u8]) -> Result<(u32, Vec<(u64, u8)>), Ne
 /// Returns Vec of (parent_ino, name)
 pub fn decode_batch_unlink_req(body: &[u8]) -> Result<Vec<(u64, String)>, NetError> {
     let mut dec = TlvDecoder::new(body);
-    let count = dec.next_u32(FieldId::Count)? as usize;
+    let count = checked_list_count(dec.next_u32(FieldId::Count)? as usize)?;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let entry_bytes = dec.next_bytes(FieldId::Entry)?;
@@ -1650,7 +1673,7 @@ pub fn encode_batch_unlink_resp(statuses: &[u32]) -> Result<Vec<u8>, NetError> {
 /// Decode a batch unlink response
 pub fn decode_batch_unlink_resp(body: &[u8]) -> Result<Vec<u32>, NetError> {
     let mut dec = TlvDecoder::new(body);
-    let count = dec.next_u32(FieldId::Count)? as usize;
+    let count = checked_list_count(dec.next_u32(FieldId::Count)? as usize)?;
     let mut statuses = Vec::with_capacity(count);
     for _ in 0..count {
         let entry_bytes = dec.next_bytes(FieldId::Entry)?;
