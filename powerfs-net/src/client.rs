@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::{debug, error, info, warn};
+use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 
@@ -978,7 +979,11 @@ impl PowerFsNetClient {
                         attempt, self.config.addr, self.config.port, ch_str, e
                     );
                     if attempt < 3 {
-                        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                        // 重连退避加 ±25% 随机抖动，避免服务端重启后客户端同步重连
+                        let base_ms = 100 * attempt as u64;
+                        let jitter_ms =
+                            rand::thread_rng().gen_range(base_ms * 3 / 4..=base_ms * 5 / 4);
+                        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                     }
                 }
             }

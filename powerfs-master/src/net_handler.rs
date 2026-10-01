@@ -7,7 +7,7 @@ use crate::master::MasterNode;
 use crate::proto::powerfs::VolumeShortInfo;
 use log::{debug, error, info, warn};
 use powerfs_allocator::{ShardMap, ShardState};
-use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+use powerfs_net::serialize::{checked_list_count, TlvDecoder, TlvEncoder};
 use powerfs_net::{
     FieldId, MsgType, NetHandler, NetMessage, NetResult, RequestContext, STATUS_ERR_BAD_REQUEST,
     STATUS_ERR_NOT_FOUND, STATUS_ERR_PERMISSION_DENIED, STATUS_ERR_REDIRECT,
@@ -76,7 +76,7 @@ impl MasterNetHandler {
         msg: &NetMessage,
     ) -> Result<Vec<VolumeLocation>, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
-        let count = dec.next_u64(FieldId::Limit)? as usize;
+        let count = checked_list_count(dec.next_u64(FieldId::Limit)? as usize)?;
         let mut locations = Vec::with_capacity(count);
 
         for _ in 0..count {
@@ -384,6 +384,11 @@ impl MasterNetHandler {
                     Vec::new(),
                 ));
             }
+            // Back-fill the cert fingerprint onto the live connection so a
+            // later revocation sweep can find and drop it.
+            self.master
+                .record_conn_cert_fingerprint(ctx.client.client_id, &client_cert_pem)
+                .await;
         } else if client_cert_pem.is_empty() {
             // Dev mode: warn once if cert absent, still allow.
             warn!(
@@ -628,7 +633,15 @@ impl MasterNetHandler {
                 .master
                 .validate_client_cert(&client_cert_pem, Some(&peer_ip), &mount_point)
             {
-                Ok(name) => Some(name),
+                Ok(name) => {
+                    // Back-fill the cert fingerprint onto the live
+                    // connection so a later revocation sweep can find and
+                    // drop it (cert revocation must kill existing conns).
+                    self.master
+                        .record_conn_cert_fingerprint(ctx.client.client_id, &client_cert_pem)
+                        .await;
+                    Some(name)
+                }
                 Err(e) => {
                     warn!(
                         "NET_REGISTER_CLIENT: rejected uuid={} peer={} mount='{}' — {}",
@@ -1141,6 +1154,11 @@ impl MasterNetHandler {
                     Vec::new(),
                 ));
             }
+            // Back-fill the cert fingerprint onto the live connection so a
+            // later revocation sweep can find and drop it.
+            self.master
+                .record_conn_cert_fingerprint(ctx.client.client_id, &client_cert_pem)
+                .await;
         } else if client_cert_pem.is_empty() {
             // Dev mode: warn once if cert absent, still allow.
             warn!(

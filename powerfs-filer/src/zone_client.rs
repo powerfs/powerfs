@@ -9,10 +9,11 @@
 
 use log::{debug, warn};
 use powerfs_common::types::{make_needle_id, needle_counter, needle_zone_id, ZoneInfo, ZoneVolume};
-use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+use powerfs_net::serialize::{checked_list_count, TlvDecoder, TlvEncoder};
 use powerfs_net::{
     FieldId, RpcOpts, Transport, STATUS_ERR_BAD_REQUEST, STATUS_ERR_REDIRECT, STATUS_OK,
 };
+use rand::Rng;
 use std::sync::Arc;
 
 /// Filer 节点发现信息 (随 RegisterFiler 请求一起发送, 替代 gRPC RegisterFiler)
@@ -217,12 +218,14 @@ fn parse_zones_response(body: &[u8], filer_id: &str) -> Result<Vec<ZoneInfo>, St
     // 多 Zone TLV:
     //   Entries(zone_count) + [ZoneId + Limit(vol_count) + [VolumeId + Owner + Size + UsedSpace] × N] × M
     let mut dec = TlvDecoder::new(body);
-    let zone_count = dec.next_u64(FieldId::Entries).unwrap_or(0) as usize;
+    let zone_count = checked_list_count(dec.next_u64(FieldId::Entries).unwrap_or(0) as usize)
+        .map_err(|e| e.to_string())?;
 
     let mut zones = Vec::with_capacity(zone_count);
     for _ in 0..zone_count {
         let zone_id = dec.next_u32(FieldId::ZoneId).unwrap_or(0);
-        let vol_count = dec.next_u64(FieldId::Limit).unwrap_or(0) as usize;
+        let vol_count = checked_list_count(dec.next_u64(FieldId::Limit).unwrap_or(0) as usize)
+            .map_err(|e| e.to_string())?;
 
         let mut physical_volumes = Vec::with_capacity(vol_count);
         for _ in 0..vol_count {
@@ -333,11 +336,13 @@ pub async fn notify_shard_leader_change(
                 // after 3s — the shard_leader_notifier task is async so
                 // this does not block the filer's main runtime.
                 if depth + 1 < MAX_ATTEMPTS {
+                    // 重试间隔 ±25% 随机抖动，避免多 filer 同步重试
+                    let jitter_ms = rand::thread_rng().gen_range(2250u64..=3750);
                     warn!(
-                        "ZONE_CLIENT: notify_shard_leader_change to {} failed: {} (shard={}, is_leader={}, attempt={}/{}), retrying in 3s",
-                        current_addr, e, shard_id, is_leader, depth + 1, MAX_ATTEMPTS
+                        "ZONE_CLIENT: notify_shard_leader_change to {} failed: {} (shard={}, is_leader={}, attempt={}/{}), retrying in {}ms",
+                        current_addr, e, shard_id, is_leader, depth + 1, MAX_ATTEMPTS, jitter_ms
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
                     continue;
                 }
                 warn!(

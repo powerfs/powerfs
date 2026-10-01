@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use rand::Rng;
 use tokio::sync::oneshot;
 
 use crate::circuit_breaker::CircuitBreakerPool;
@@ -483,9 +484,10 @@ impl VolumeClient {
                     "VolumeClient: volume router empty, waiting for Volume Server heartbeats..."
                 );
 
-                // 重试 3 次，每次间隔 2 秒
+                // 重试 3 次，每次间隔 2 秒（±25% 随机抖动，避免多客户端同步重试）
                 for attempt in 1..=3 {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    let jitter_ms = rand::thread_rng().gen_range(1500u64..=2500);
+                    std::thread::sleep(std::time::Duration::from_millis(jitter_ms));
                     self.sync_volume_router();
                     if !self.volume_router.is_empty() {
                         log::info!(
@@ -1289,7 +1291,10 @@ impl VolumeClient {
                     }
                     // 2ms, 4ms, 8ms, ... capped at 200ms (total < ~3s).
                     let shift = busy_attempts.min(7);
-                    let delay_ms = std::cmp::min(200, 2u64 * (1u64 << shift));
+                    let capped_ms = std::cmp::min(200, 2u64 * (1u64 << shift));
+                    // ±25% 随机抖动，避免多客户端 BUSY 重试同步
+                    let delay_ms =
+                        rand::thread_rng().gen_range(capped_ms * 3 / 4..=capped_ms * 5 / 4);
                     busy_attempts += 1;
                     if busy_attempts <= 3 || busy_attempts.is_multiple_of(5) {
                         log::warn!(

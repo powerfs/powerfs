@@ -1,5 +1,6 @@
 use clap::Parser;
 use log::{error, info, warn};
+use rand::Rng;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -306,34 +307,40 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     let event_provider_clone = event_provider.clone();
     let data_dir_for_event = filer_cfg.data_dir.clone();
 
-    tokio::spawn(async move {
+    powerfs_common::spawn_supervised("filer-node-status-event", move || {
         let mut sys = sysinfo::System::new_all();
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            sys.refresh_all();
+        let node_id = node_id.clone();
+        let event_bind_ip = event_bind_ip.clone();
+        let data_dir_for_event = data_dir_for_event.clone();
+        let event_provider_clone = event_provider_clone.clone();
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                sys.refresh_all();
 
-            let metrics = collect_system_metrics(&mut sys, &data_dir_for_event);
+                let metrics = collect_system_metrics(&mut sys, &data_dir_for_event);
 
-            let event = Event::NodeStatus(NodeStatusEvent {
-                node_id: node_id.clone(),
-                node_type: "filer".to_string(),
-                address: event_bind_ip.clone(),
-                grpc_port: grpc_port_for_event as u32,
-                http_port: grpc_port_for_event as u32,
-                status: "healthy".to_string(),
-                cpu_usage: metrics.cpu_usage,
-                mem_usage: metrics.mem_usage,
-                disk_usage: metrics.disk_usage,
-                network_rx: metrics.network_rx,
-                network_tx: metrics.network_tx,
-                uptime: metrics.uptime,
-                volume_count: 0,
-                is_leader: false,
-                raft_term: 0,
-            });
+                let event = Event::NodeStatus(NodeStatusEvent {
+                    node_id: node_id.clone(),
+                    node_type: "filer".to_string(),
+                    address: event_bind_ip.clone(),
+                    grpc_port: grpc_port_for_event as u32,
+                    http_port: grpc_port_for_event as u32,
+                    status: "healthy".to_string(),
+                    cpu_usage: metrics.cpu_usage,
+                    mem_usage: metrics.mem_usage,
+                    disk_usage: metrics.disk_usage,
+                    network_rx: metrics.network_rx,
+                    network_tx: metrics.network_tx,
+                    uptime: metrics.uptime,
+                    volume_count: 0,
+                    is_leader: false,
+                    raft_term: 0,
+                });
 
-            if let Err(e) = event_provider_clone.publish(event, &node_id).await {
-                warn!("Failed to publish filer node_status event: {}", e);
+                if let Err(e) = event_provider_clone.publish(event, &node_id).await {
+                    warn!("Failed to publish filer node_status event: {}", e);
+                }
             }
         }
     });
@@ -396,13 +403,16 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
     // Leader-only — gc_rename_intents checks leadership per shard.
     {
         let msm = meta_shard_manager.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
-            loop {
-                interval.tick().await;
-                let reaped = msm.gc_rename_intents(60).await;
-                if reaped > 0 {
-                    log::info!("Rename-intent GC reaped {} stale intent(s)", reaped);
+        powerfs_common::spawn_supervised("filer-rename-intent-gc", move || {
+            let msm = msm.clone();
+            async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+                    let reaped = msm.gc_rename_intents(60).await;
+                    if reaped > 0 {
+                        log::info!("Rename-intent GC reaped {} stale intent(s)", reaped);
+                    }
                 }
             }
         });
@@ -586,12 +596,15 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         shard_scheduler.register_node(&peer.id.to_string(), &peer.address);
     }
 
-    tokio::spawn({
+    {
         let shard_scheduler = shard_scheduler.clone();
-        async move {
-            shard_scheduler.run().await;
-        }
-    });
+        powerfs_common::spawn_supervised("filer-shard-scheduler", move || {
+            let shard_scheduler = shard_scheduler.clone();
+            async move {
+                shard_scheduler.run().await;
+            }
+        });
+    }
 
     info!("ShardScheduler started with {} nodes", peers.len());
 
@@ -753,19 +766,22 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         // a stuck client can't block contended inodes indefinitely.
         {
             let sweep_handler = Arc::clone(&net_handler);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
-                // The first tick fires immediately on `tick` creation
-                // (no pending revokes at startup) — skip it.
-                tick.tick().await;
-                loop {
+            powerfs_common::spawn_supervised("filer-lease-force-reclaim-sweep", move || {
+                let sweep_handler = sweep_handler.clone();
+                async move {
+                    let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                    // The first tick fires immediately on `tick` creation
+                    // (no pending revokes at startup) — skip it.
                     tick.tick().await;
-                    let reclaimed = sweep_handler.force_reclaim_expired_revokes();
-                    if reclaimed > 0 {
-                        info!(
-                            "§8.3.1 force-reclaim sweep: reclaimed {} lease(s)",
-                            reclaimed
-                        );
+                    loop {
+                        tick.tick().await;
+                        let reclaimed = sweep_handler.force_reclaim_expired_revokes();
+                        if reclaimed > 0 {
+                            info!(
+                                "§8.3.1 force-reclaim sweep: reclaimed {} lease(s)",
+                                reclaimed
+                            );
+                        }
                     }
                 }
             });
@@ -779,17 +795,20 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         // 等待的 writer/xlock 请求者被唤醒.
         {
             let sweep_handler = Arc::clone(&net_handler);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
-                tick.tick().await; // skip immediate first tick
-                loop {
-                    tick.tick().await;
-                    let promoted = sweep_handler.force_reclaim_expired_cap_recalls();
-                    if promoted > 0 {
-                        info!(
-                            "§13 Stage 4 cap sweep: {} promote task(s) dispatched",
-                            promoted
-                        );
+            powerfs_common::spawn_supervised("filer-cap-sweep", move || {
+                let sweep_handler = sweep_handler.clone();
+                async move {
+                    let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(500));
+                    tick.tick().await; // skip immediate first tick
+                    loop {
+                        tick.tick().await;
+                        let promoted = sweep_handler.force_reclaim_expired_cap_recalls();
+                        if promoted > 0 {
+                            info!(
+                                "§13 Stage 4 cap sweep: {} promote task(s) dispatched",
+                                promoted
+                            );
+                        }
                     }
                 }
             });
@@ -852,146 +871,164 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             // Filer 的可到达地址 (供 kernel 通过 ListFilers 发现本 Filer)
             let advertise_addr_for_reg = format!("{}:{}", advertise_ip, net_port);
 
-            tokio::spawn(async move {
-                let filer_id = format!("filer-{}", filer_raft_id);
-                let shard_ids: Vec<u64> = (0..shard_count).collect();
+            powerfs_common::spawn_supervised("filer-zone-registration", move || {
+                let net_handler_for_zone = net_handler_for_zone.clone();
+                let master_addrs_for_zone = master_addrs_for_zone.clone();
+                let transport_for_zone = transport_for_zone.clone();
+                let registration_token_for_reg = registration_token_for_reg.clone();
+                let client_cert_pem_for_reg = client_cert_pem_for_reg.clone();
+                let advertise_addr_for_reg = advertise_addr_for_reg.clone();
+                async move {
+                    let filer_id = format!("filer-{}", filer_raft_id);
+                    let shard_ids: Vec<u64> = (0..shard_count).collect();
 
-                let registration = powerfs_filer::zone_client::FilerNodeRegistration {
-                    filer_id: filer_id.clone(),
-                    advertise_addr: advertise_addr_for_reg.clone(),
-                    net_port: net_port_for_reg as u32,
-                    http_port: http_port_for_reg as u32,
-                    metrics_port: metrics_port_for_reg as u32,
-                    shard_count,
-                    shard_ids,
-                    force: force_register,
-                    registration_token: registration_token_for_reg,
-                    client_cert_pem: client_cert_pem_for_reg,
-                };
+                    let registration = powerfs_filer::zone_client::FilerNodeRegistration {
+                        filer_id: filer_id.clone(),
+                        advertise_addr: advertise_addr_for_reg.clone(),
+                        net_port: net_port_for_reg as u32,
+                        http_port: http_port_for_reg as u32,
+                        metrics_port: metrics_port_for_reg as u32,
+                        shard_count,
+                        shard_ids,
+                        force: force_register,
+                        registration_token: registration_token_for_reg,
+                        client_cert_pem: client_cert_pem_for_reg,
+                    };
 
-                // 从 master_addresses ("ip:http_port") 提取 IP, 拼接 master_net_port
-                let master_net_addrs: Vec<String> = master_addrs_for_zone
-                    .iter()
-                    .map(|addr| {
-                        let ip = addr.rfind(':').map(|i| &addr[..i]).unwrap_or(addr);
-                        format!("{}:{}", ip, master_net_port)
-                    })
-                    .collect();
+                    // 从 master_addresses ("ip:http_port") 提取 IP, 拼接 master_net_port
+                    let master_net_addrs: Vec<String> = master_addrs_for_zone
+                        .iter()
+                        .map(|addr| {
+                            let ip = addr.rfind(':').map(|i| &addr[..i]).unwrap_or(addr);
+                            format!("{}:{}", ip, master_net_port)
+                        })
+                        .collect();
 
-                info!(
-                    "FILER_ZONE: registering with Master (filer_id={}, net_addrs={:?}, advertise={})",
-                    filer_id, master_net_addrs, advertise_addr_for_reg
-                );
+                    info!(
+                        "FILER_ZONE: registering with Master (filer_id={}, net_addrs={:?}, advertise={})",
+                        filer_id, master_net_addrs, advertise_addr_for_reg
+                    );
 
-                const RETRY_INTERVAL_SECS: u64 = 5;
-                const HEARTBEAT_INTERVAL_SECS: u64 = 60;
-                let mut attempt: u64 = 0;
-                let mut zones_recovered = false;
+                    const RETRY_INTERVAL_SECS: u64 = 5;
+                    const HEARTBEAT_INTERVAL_SECS: u64 = 60;
+                    let mut attempt: u64 = 0;
+                    let mut zones_recovered = false;
 
-                loop {
-                    attempt += 1;
-                    let mut registered = false;
+                    loop {
+                        attempt += 1;
+                        let mut registered = false;
 
-                    for master_addr in &master_net_addrs {
-                        match powerfs_filer::zone_client::register_filer(
-                            master_addr,
-                            &registration,
-                            transport_for_zone.clone(),
-                        )
-                        .await
-                        {
-                            Ok(zones) => {
-                                // 检查是否所有 Zone 都有物理 volume
-                                let total_vols: usize =
-                                    zones.iter().map(|z| z.physical_volumes.len()).sum();
-                                if total_vols == 0 {
-                                    warn!(
-                                        "FILER_ZONE: registered but got 0 physical volumes (attempt={}), volume servers may not be ready, retrying...",
-                                        attempt
-                                    );
-                                    break; // 跳出 master 循环, 进入重试
-                                }
-
-                                let zone_ids: Vec<u32> = zones.iter().map(|z| z.zone_id).collect();
-                                info!(
-                                    "FILER_ZONE: registered successfully (attempt={}), zones={:?}, total_volumes={}",
-                                    attempt, zone_ids, total_vols
-                                );
-                                net_handler_for_zone.set_zones(zones);
-
-                                // P2.5: 首次成功注册后, 从 chunk 映射恢复每个 Zone 的 counter
-                                // (只在第一次注册成功时执行, 后续重注册不需要)
-                                if !zones_recovered {
-                                    let chunks =
-                                        net_handler_for_zone.meta_shard_manager.list_all_chunks();
-                                    let zone_ids = net_handler_for_zone.get_zones();
-                                    for zone_id in zone_ids {
-                                        let recovered = powerfs_filer::zone_client::recover_counter(
-                                            zone_id, &chunks,
+                        for master_addr in &master_net_addrs {
+                            match powerfs_filer::zone_client::register_filer(
+                                master_addr,
+                                &registration,
+                                transport_for_zone.clone(),
+                            )
+                            .await
+                            {
+                                Ok(zones) => {
+                                    // 检查是否所有 Zone 都有物理 volume
+                                    let total_vols: usize =
+                                        zones.iter().map(|z| z.physical_volumes.len()).sum();
+                                    if total_vols == 0 {
+                                        warn!(
+                                            "FILER_ZONE: registered but got 0 physical volumes (attempt={}), volume servers may not be ready, retrying...",
+                                            attempt
                                         );
-                                        net_handler_for_zone.set_zone_counter(zone_id, recovered);
-                                        info!(
-                                            "FILER_ZONE: recovered zone_id={} counter={} (from {} chunks)",
-                                            zone_id, recovered, chunks.len()
-                                        );
+                                        break; // 跳出 master 循环, 进入重试
                                     }
-                                    zones_recovered = true;
-                                }
 
-                                registered = true;
-                                break; // 注册成功, 跳出 master 循环
-                            }
-                            Err(e) => {
-                                // BAD_REQUEST 表示 master 拒绝本 filer 加入集群
-                                // （通常是 shard_count 与集群现有 filer 不一致）。
-                                // 重试无意义——配置不变，结果不变。
-                                //
-                                // 启动门禁策略：
-                                //   - 非 force 模式（force_register=false）：立即退出进程，
-                                //     避免错误配置的节点进入集群导致 inode 路由错位。
-                                //   - force 模式：理论上不应走到这里（已传 force=1，master
-                                //     应放行）；若仍 BAD_REQUEST，说明 master 是旧版本不
-                                //     识别 Force 字段——降级为 warn 并继续重试，让运维
-                                //     有机会升级 master。
-                                if e.contains("(BAD_REQUEST)") {
-                                    if !force_register {
-                                        log::error!(
-                                            "FILER_ZONE: master rejected registration (shard_count \
-                                             mismatch likely): {}. Exiting (set filer.force_register=true \
-                                             to override).",
-                                            e
-                                        );
-                                        std::process::exit(1);
+                                    let zone_ids: Vec<u32> =
+                                        zones.iter().map(|z| z.zone_id).collect();
+                                    info!(
+                                        "FILER_ZONE: registered successfully (attempt={}), zones={:?}, total_volumes={}",
+                                        attempt, zone_ids, total_vols
+                                    );
+                                    net_handler_for_zone.set_zones(zones);
+
+                                    // P2.5: 首次成功注册后, 从 chunk 映射恢复每个 Zone 的 counter
+                                    // (只在第一次注册成功时执行, 后续重注册不需要)
+                                    if !zones_recovered {
+                                        let chunks = net_handler_for_zone
+                                            .meta_shard_manager
+                                            .list_all_chunks();
+                                        let zone_ids = net_handler_for_zone.get_zones();
+                                        for zone_id in zone_ids {
+                                            let recovered =
+                                                powerfs_filer::zone_client::recover_counter(
+                                                    zone_id, &chunks,
+                                                );
+                                            net_handler_for_zone
+                                                .set_zone_counter(zone_id, recovered);
+                                            info!(
+                                                "FILER_ZONE: recovered zone_id={} counter={} (from {} chunks)",
+                                                zone_id, recovered, chunks.len()
+                                            );
+                                        }
+                                        zones_recovered = true;
+                                    }
+
+                                    registered = true;
+                                    break; // 注册成功, 跳出 master 循环
+                                }
+                                Err(e) => {
+                                    // BAD_REQUEST 表示 master 拒绝本 filer 加入集群
+                                    // （通常是 shard_count 与集群现有 filer 不一致）。
+                                    // 重试无意义——配置不变，结果不变。
+                                    //
+                                    // 启动门禁策略：
+                                    //   - 非 force 模式（force_register=false）：立即退出进程，
+                                    //     避免错误配置的节点进入集群导致 inode 路由错位。
+                                    //   - force 模式：理论上不应走到这里（已传 force=1，master
+                                    //     应放行）；若仍 BAD_REQUEST，说明 master 是旧版本不
+                                    //     识别 Force 字段——降级为 warn 并继续重试，让运维
+                                    //     有机会升级 master。
+                                    if e.contains("(BAD_REQUEST)") {
+                                        if !force_register {
+                                            log::error!(
+                                                "FILER_ZONE: master rejected registration (shard_count \
+                                                 mismatch likely): {}. Exiting (set filer.force_register=true \
+                                                 to override).",
+                                                e
+                                            );
+                                            std::process::exit(1);
+                                        } else {
+                                            log::warn!(
+                                                "FILER_ZONE: master returned BAD_REQUEST despite \
+                                                 force_register=true (old master ignores Force field?): \
+                                                 {}. Will keep retrying.",
+                                                e
+                                            );
+                                        }
                                     } else {
-                                        log::warn!(
-                                            "FILER_ZONE: master returned BAD_REQUEST despite \
-                                             force_register=true (old master ignores Force field?): \
-                                             {}. Will keep retrying.",
-                                            e
+                                        warn!(
+                                            "FILER_ZONE: register_filer failed on {} (attempt={}): {}",
+                                            master_addr, attempt, e
                                         );
                                     }
-                                } else {
-                                    warn!(
-                                        "FILER_ZONE: register_filer failed on {} (attempt={}): {}",
-                                        master_addr, attempt, e
-                                    );
                                 }
                             }
                         }
-                    }
 
-                    if registered {
-                        // 注册成功: 60 秒后重新注册 (心跳, 应对 Master leader 切换)
-                        attempt = 0; // 重置 attempt 计数
-                        tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS))
-                            .await;
-                    } else {
-                        warn!(
-                            "FILER_ZONE: all master attempts failed (attempt={}), retrying in {}s...",
-                            attempt, RETRY_INTERVAL_SECS
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(RETRY_INTERVAL_SECS))
-                            .await;
+                        if registered {
+                            // 注册成功: 60 秒后重新注册 (心跳, 应对 Master leader 切换)
+                            // ±25% 随机抖动，避免多 filer 同步重注册
+                            attempt = 0; // 重置 attempt 计数
+                            let jitter_secs = rand::thread_rng().gen_range(
+                                HEARTBEAT_INTERVAL_SECS * 3 / 4..=HEARTBEAT_INTERVAL_SECS * 5 / 4,
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(jitter_secs)).await;
+                        } else {
+                            // 重试间隔 ±25% 随机抖动，避免 master 重启后所有 filer 同步重连
+                            let jitter_secs = rand::thread_rng().gen_range(
+                                RETRY_INTERVAL_SECS * 3 / 4..=RETRY_INTERVAL_SECS * 5 / 4,
+                            );
+                            warn!(
+                                "FILER_ZONE: all master attempts failed (attempt={}), retrying in {}s...",
+                                attempt, jitter_secs
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(jitter_secs)).await;
+                        }
                     }
                 }
             });
@@ -1029,14 +1066,34 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 scrubber_config.ec_tiers,
                 scrubber_config.ec_min_file_size,
             );
-            let scrubber = powerfs_filer::scrubber::ScrubberWorker::new(
-                meta_shard_manager.clone(),
-                volume_client_pool.clone(),
-                net_handler.clone(),
-                scrubber_config,
-            );
-            tokio::spawn(async move {
-                scrubber.run().await;
+            let msm = meta_shard_manager.clone();
+            let vcp = volume_client_pool.clone();
+            let nh = net_handler.clone();
+            powerfs_common::spawn_supervised("filer-scrubber", move || {
+                let msm = msm.clone();
+                let vcp = vcp.clone();
+                let nh = nh.clone();
+                let config = powerfs_filer::scrubber::ScrubberConfig {
+                    scan_interval_secs: std::env::var("POWERFS_SCRUBBER_SCAN_INTERVAL")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(30),
+                    max_inodes_per_scan: std::env::var("POWERFS_SCRUBBER_MAX_INODES")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(50),
+                    replica_count: 2,
+                    ec_min_file_size: std::env::var("POWERFS_EC_MIN_FILE_SIZE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    ec_tiers: powerfs_filer::scrubber::ScrubberConfig::default().ec_tiers,
+                };
+                async move {
+                    let scrubber =
+                        powerfs_filer::scrubber::ScrubberWorker::new(msm, vcp, nh, config);
+                    scrubber.run().await;
+                }
             });
             info!("P4_SCRUBBER: scrubber worker started (TLV protocol)");
         }

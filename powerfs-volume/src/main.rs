@@ -15,6 +15,7 @@ use powerfs_net::{MsgType, NetMessage, NotificationHandler, PowerFsNetServer};
 use powerfs_volume::{
     master_client::MasterClient, master_client::NewMasterClientParams, server::VolumeServer,
 };
+use rand::Rng;
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -342,51 +343,54 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         } else {
             volume_cfg.wal_idle_sync_secs
         };
-        tokio::spawn(async move {
-            // 高频 flush：50ms 一次
-            let mut flush_interval = tokio::time::interval(Duration::from_millis(50));
-            flush_interval.tick().await; // 跳过首次立即触发
-                                         // 低频 WAL fsync：仅在 force_sync_on_write=false 时启用
-            let mut wal_interval_opt = if wal_interval_secs > 0 {
-                Some(tokio::time::interval(Duration::from_secs(
-                    wal_interval_secs,
-                )))
-            } else {
-                None
-            };
-            if let Some(ref mut iv) = wal_interval_opt {
-                iv.tick().await; // 跳过首次立即触发
-            }
-            let mut flush_tick_count = 0u64;
-            loop {
-                tokio::select! {
-                    _ = flush_interval.tick() => {
-                        let n = sm.flush_all_expired();
-                        flush_tick_count += 1;
-                        if n > 0 && flush_tick_count.is_multiple_of(20) {
-                            // 每 1 秒（20×50ms）输出一次 flush 统计
-                            debug!("BG_FLUSH: flushed {} needles", n);
+        powerfs_common::spawn_supervised("volume-bg-flush-wal-sync", move || {
+            let sm = sm.clone();
+            async move {
+                // 高频 flush：50ms 一次
+                let mut flush_interval = tokio::time::interval(Duration::from_millis(50));
+                flush_interval.tick().await; // 跳过首次立即触发
+                                             // 低频 WAL fsync：仅在 force_sync_on_write=false 时启用
+                let mut wal_interval_opt = if wal_interval_secs > 0 {
+                    Some(tokio::time::interval(Duration::from_secs(
+                        wal_interval_secs,
+                    )))
+                } else {
+                    None
+                };
+                if let Some(ref mut iv) = wal_interval_opt {
+                    iv.tick().await; // 跳过首次立即触发
+                }
+                let mut flush_tick_count = 0u64;
+                loop {
+                    tokio::select! {
+                        _ = flush_interval.tick() => {
+                            let n = sm.flush_all_expired();
+                            flush_tick_count += 1;
+                            if n > 0 && flush_tick_count.is_multiple_of(20) {
+                                // 每 1 秒（20×50ms）输出一次 flush 统计
+                                debug!("BG_FLUSH: flushed {} needles", n);
+                            }
                         }
-                    }
-                    _ = async {
-                        if let Some(ref mut iv) = wal_interval_opt {
-                            iv.tick().await;
-                        } else {
-                            // WAL fsync 禁用，永不返回
-                            std::future::pending::<()>().await;
-                        }
-                    } => {
-                        let (total, synced) = sm.sync_all_wals_if_dirty();
-                        if synced > 0 {
-                            info!(
-                                "WAL_IDLE_SYNC: checked {} volumes, fsync'd {} (interval={}s)",
-                                total, synced, wal_interval_secs
-                            );
-                        } else {
-                            debug!(
-                                "WAL_IDLE_SYNC: checked {} volumes, all idle (interval={}s)",
-                                total, wal_interval_secs
-                            );
+                        _ = async {
+                            if let Some(ref mut iv) = wal_interval_opt {
+                                iv.tick().await;
+                            } else {
+                                // WAL fsync 禁用，永不返回
+                                std::future::pending::<()>().await;
+                            }
+                        } => {
+                            let (total, synced) = sm.sync_all_wals_if_dirty();
+                            if synced > 0 {
+                                info!(
+                                    "WAL_IDLE_SYNC: checked {} volumes, fsync'd {} (interval={}s)",
+                                    total, synced, wal_interval_secs
+                                );
+                            } else {
+                                debug!(
+                                    "WAL_IDLE_SYNC: checked {} volumes, all idle (interval={}s)",
+                                    total, wal_interval_secs
+                                );
+                            }
                         }
                     }
                 }
@@ -727,74 +731,26 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
 
         // Spawn background task for heartbeat and volume reporting
         // Volumes are pre-created at startup, no need to request from master
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let storage_manager = storage_manager.clone();
+        let master_client = master_client.clone();
+        powerfs_common::spawn_supervised("volume-heartbeat", move || {
+            let storage_manager = storage_manager.clone();
+            let master_client = master_client.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
 
-            // P5: sysinfo instance for node load metrics (cpu/memory).
-            // Refreshed before each heartbeat; first refresh is a warm-up
-            // (sysinfo needs two reads for accurate cpu delta).
-            let mut sys = sysinfo::System::new_all();
-            sys.refresh_all();
+                // P5: sysinfo instance for node load metrics (cpu/memory).
+                // Refreshed before each heartbeat; first refresh is a warm-up
+                // (sysinfo needs two reads for accurate cpu delta).
+                let mut sys = sysinfo::System::new_all();
+                sys.refresh_all();
 
-            // Send initial heartbeat with pre-created volumes
-            let volumes = storage_manager.list_volumes();
-            let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
-                .into_iter()
-                .map(|v| {
-                    // 从 Volume 结构体获取真实统计 (used/needle_count)
-                    let (used, _total, needle_count) = storage_manager
-                        .get_volume(&v.id)
-                        .map(|vol| vol.get_stats())
-                        .unwrap_or((v.used, v.size, 0));
-                    powerfs_master::proto::VolumeShortInfo {
-                        volume_id: v.id.0,
-                        size: v.size,
-                        read_only: v.state == powerfs_common::types::VolumeState::ReadOnly,
-                        collection: v.collection.0.clone(),
-                        replica_placement: v.replica_count,
-                        ttl: v.ttl.0 as u32,
-                        disk_type: v.disk_type.0.clone(),
-                        used,
-                        file_count: needle_count,
-                        compact_status: 0,
-                        append_offset: 0,
-                    }
-                })
-                .collect();
-
-            info!(
-                "Sending initial heartbeat with {} pre-created volumes: {:?}",
-                proto_volumes.len(),
-                proto_volumes
-                    .iter()
-                    .map(|v| v.volume_id)
-                    .collect::<Vec<_>>()
-            );
-
-            if master_client
-                .send_heartbeat(proto_volumes, 0.0, 0.0)
-                .await
-                .is_err()
-            {
-                warn!("Initial heartbeat failed, reconnecting...");
-                if let Err(e) = master_client.start_heartbeat().await {
-                    warn!("Failed to restart heartbeat: {}", e);
-                }
-            }
-
-            // Continuous heartbeat loop
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-
-                // P5: Collect node load metrics for this heartbeat.
-                let metrics = collect_system_metrics(&mut sys, "");
-                let cpu_usage = (metrics.cpu_usage / 100.0) as f32;
-                let memory_usage = (metrics.mem_usage / 100.0) as f32;
-
+                // Send initial heartbeat with pre-created volumes
                 let volumes = storage_manager.list_volumes();
                 let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                     .into_iter()
                     .map(|v| {
+                        // 从 Volume 结构体获取真实统计 (used/needle_count)
                         let (used, _total, needle_count) = storage_manager
                             .get_volume(&v.id)
                             .map(|vol| vol.get_stats())
@@ -815,12 +771,68 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
                     })
                     .collect();
 
+                info!(
+                    "Sending initial heartbeat with {} pre-created volumes: {:?}",
+                    proto_volumes.len(),
+                    proto_volumes
+                        .iter()
+                        .map(|v| v.volume_id)
+                        .collect::<Vec<_>>()
+                );
+
                 if master_client
-                    .send_heartbeat(proto_volumes, cpu_usage, memory_usage)
+                    .send_heartbeat(proto_volumes, 0.0, 0.0)
                     .await
                     .is_err()
                 {
-                    warn!("Failed to send heartbeat (no active connection)");
+                    warn!("Initial heartbeat failed, reconnecting...");
+                    if let Err(e) = master_client.start_heartbeat().await {
+                        warn!("Failed to restart heartbeat: {}", e);
+                    }
+                }
+
+                // Continuous heartbeat loop
+                loop {
+                    // 心跳周期 ±25% 随机抖动，避免 master 重启后所有 volume 同步心跳/重连
+                    let jitter_ms = rand::thread_rng().gen_range(3750u64..=6250);
+                    tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+
+                    // P5: Collect node load metrics for this heartbeat.
+                    let metrics = collect_system_metrics(&mut sys, "");
+                    let cpu_usage = (metrics.cpu_usage / 100.0) as f32;
+                    let memory_usage = (metrics.mem_usage / 100.0) as f32;
+
+                    let volumes = storage_manager.list_volumes();
+                    let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
+                        .into_iter()
+                        .map(|v| {
+                            let (used, _total, needle_count) = storage_manager
+                                .get_volume(&v.id)
+                                .map(|vol| vol.get_stats())
+                                .unwrap_or((v.used, v.size, 0));
+                            powerfs_master::proto::VolumeShortInfo {
+                                volume_id: v.id.0,
+                                size: v.size,
+                                read_only: v.state == powerfs_common::types::VolumeState::ReadOnly,
+                                collection: v.collection.0.clone(),
+                                replica_placement: v.replica_count,
+                                ttl: v.ttl.0 as u32,
+                                disk_type: v.disk_type.0.clone(),
+                                used,
+                                file_count: needle_count,
+                                compact_status: 0,
+                                append_offset: 0,
+                            }
+                        })
+                        .collect();
+
+                    if master_client
+                        .send_heartbeat(proto_volumes, cpu_usage, memory_usage)
+                        .await
+                        .is_err()
+                    {
+                        warn!("Failed to send heartbeat (no active connection)");
+                    }
                 }
             }
         });

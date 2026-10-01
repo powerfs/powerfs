@@ -1469,3 +1469,36 @@ auto_consistency_check = true
 | **Phase 3** | 一致性校验工具 | ConsistencyChecker 实现 | 6h |
 | **Phase 3** | 恢复流程文档化 | 全集群灾难恢复 Runbook | 2h |
 | **Phase 4** | 自动化恢复演练 | 定期模拟故障恢复测试 | 4h |
+
+---
+
+## 第四部分：一致性加固计划（2026-10-01 评审排入）
+
+> 来源：2026-10-01 全系统代码审视。第一梯队中 WAL strict 模式维持 async 默认
+> （性能考虑，不实施）；布局可靠性结论：inline 由 Raft N=3 保护，非 inline
+> 经 P4→P6 两段式 scrubber 收敛到 EC（文档已同步至 file-layout-design.md §5）。
+> 以下两项排入完善计划，择机实施。
+
+### 4.1 Lease Fencing Token 全链路校验
+
+| 项目 | 详情 |
+|------|------|
+| **现状** | `RangeLease`（powerfs-volume/src/range_lease.rs）已有 `token` + `epoch` 字段，lease 持久化恢复（lease_persistence.rs）已具备；但写路径对 lease token 的校验未覆盖全部入口，存在无 lease 直写/过期 lease 写的理论窗口 |
+| **目标** | Volume 写路径（WriteNeedle/WriteChunk 等）强制校验 lease token + epoch，过期或不匹配拒绝写（ESTALE/EAGAIN），与 `powerfs-lock-health/src/fencer.rs` 的 fencing 语义对齐 |
+| **关键点** | ① 校验点放在 volume 侧入口而非仅 filer 侧；② epoch 单调递增，重启恢复后不接受旧 epoch；③ LeaseGuard drop 的 fire-and-forget release（powerfs-lease/src/guard.rs）改为尽力同步释放 + 超时兜底 |
+| **风险** | 校验增加写路径一次内存查表，开销可忽略；需兼容无 lease 的旧内核客户端（先 warn-only 灰度，再强制） |
+
+### 4.2 Fake-Leader / 非对称脑裂防护增强
+
+| 项目 | 详情 |
+|------|------|
+| **现状** | Filer raft_group_manager_v2.rs 已有 fake-leader 检测（500ms ReadIndex wall-clock 超时）；master raft_v2.rs 有 zombie-leader 自杀兜底。已验证缺陷：非对称分区（leader 能发心跳但收不到响应）下，现有检测依赖 wall-clock，极端时钟漂移时判定窗口失真；且自杀后到重新选举间存在服务空窗 |
+| **目标** | ① ReadIndex 超时改单调时钟（Instant 已全部满足，排查是否混入 SystemTime）；② 增加 follower 侧反向确认：leader 连续 N 轮未收到多数派心跳响应即主动 step down，不依赖 ReadIndex 超时兜底；③ step down 后触发加速重选（缩短 election timeout 随机化区间下界） |
+| **验证** | 复用 ctl 健康门控（powerfs-ctl/src/health/mod.rs zombie leader 检测）做回归；增加非对称分区故障注入测试用例 |
+
+### 4.3 暂缓项（第二梯队，记录备查）
+
+- CAP_R 缓存绕过 TTL 的刷新机制（关联 issue #65 多客户端 stale 缓存，待复现后再定方案）
+- Invalidate 广播丢失窗口（客户端重连期间的失效通知补偿）
+- admin_token / registration_token 强制非空（config.rs 当前允许空 token 启动）
+- 内部 RPC mTLS 与客户端证书解耦（当前共用 client_registry）

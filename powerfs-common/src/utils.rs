@@ -1,7 +1,9 @@
 use crate::types::{FileId, NeedleId, NodeId, VolumeId};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub fn generate_volume_id() -> VolumeId {
@@ -160,4 +162,50 @@ impl Checksum {
         }
         result
     }
+}
+
+/// Spawn a supervised background task that automatically restarts on panic or
+/// unexpected completion, with exponential backoff (1s initial, 30s cap).
+///
+/// `name` is used in logs. `factory` is a closure that produces the future for
+/// each restart, so captured state can be re-created cleanly.
+pub fn spawn_supervised<F, Fut>(name: &'static str, factory: F) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut backoff_secs = 1u64;
+        loop {
+            log::info!("supervised task '{}' starting", name);
+            match tokio::spawn(factory()).await {
+                Ok(()) => {
+                    log::error!(
+                        "supervised task '{}' exited unexpectedly; restarting in {}s",
+                        name,
+                        backoff_secs
+                    );
+                }
+                Err(e) => {
+                    if e.is_panic() {
+                        log::error!(
+                            "supervised task '{}' panicked: {}; restarting in {}s",
+                            name,
+                            e,
+                            backoff_secs
+                        );
+                    } else {
+                        log::error!(
+                            "supervised task '{}' cancelled: {}; restarting in {}s",
+                            name,
+                            e,
+                            backoff_secs
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            backoff_secs = (backoff_secs * 2).min(30);
+        }
+    })
 }

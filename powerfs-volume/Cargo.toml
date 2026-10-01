@@ -45,6 +45,7 @@ powerfs-master = { path = "../powerfs-master" }
 powerfs-master-net = { path = "../powerfs-master-net" }
 powerfs-net = { path = "../powerfs-net" }
 rocksdb = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tempfile = "3"

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use log::{debug, info, warn};
-use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
+use powerfs_net::serialize::{checked_list_count, TlvDecoder, TlvEncoder};
 use powerfs_net::{
     ClientConnPool, ClientPoolConfig, FieldId, MsgType, NetError, NetMessage, STATUS_OK,
 };
@@ -77,7 +77,7 @@ impl FilerShardStatus {
 /// ```
 pub fn decode_filer_raft_status(body: &[u8]) -> Result<Vec<FilerShardStatus>, NetError> {
     let mut dec = TlvDecoder::new(body);
-    let count = dec.next_u64(FieldId::Limit).unwrap_or(0) as usize;
+    let count = checked_list_count(dec.next_u64(FieldId::Limit).unwrap_or(0) as usize)?;
 
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
