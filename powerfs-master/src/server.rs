@@ -1,4 +1,3 @@
-use super::kv_cache_service::KvCacheServiceImpl;
 use super::master::{
     AddNodeParams, FilerNodeInfo, FuseClientInfo, MasterNode, UpdateNodeVolumesParams,
 };
@@ -12,7 +11,6 @@ use powerfs_allocator::management::{ManagementApi, RebalanceAction};
 use powerfs_allocator::{MigrationState, MigrationTaskStatus, MigrationType};
 use powerfs_common::constants::DEFAULT_VOLUME_SIZE;
 use powerfs_common::types::VolumeId;
-use powerfs_core::kv_cache::KVCacheEngine;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::pin::Pin;
@@ -20,37 +18,16 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tonic::{transport::Server, Request, Response, Status, Streaming};
+use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
 pub struct MasterGrpcServer {
     master: Arc<MasterNode>,
-    kv_cache: Arc<KVCacheEngine>,
 }
 
 impl MasterGrpcServer {
-    pub fn new(master: Arc<MasterNode>, kv_cache: Arc<KVCacheEngine>) -> Self {
-        MasterGrpcServer { master, kv_cache }
-    }
-
-    pub async fn start(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-        let kv_svc = KvCacheServiceImpl {
-            engine: self.kv_cache.clone(),
-            volume_client_pool: self.master.volume_client_pool.clone(),
-            master: self.master.clone(),
-        };
-
-        let max_concurrent_streams = 64;
-
-        Server::builder()
-            .http2_keepalive_interval(Some(Duration::from_secs(5)))
-            .http2_keepalive_timeout(Some(Duration::from_secs(15)))
-            .max_concurrent_streams(max_concurrent_streams)
-            .add_service(MasterServiceServer::new(self))
-            .add_service(KvCacheServiceServer::new(kv_svc))
-            .serve(addr)
-            .await?;
-        Ok(())
+    pub fn new(master: Arc<MasterNode>) -> Self {
+        MasterGrpcServer { master }
     }
 }
 

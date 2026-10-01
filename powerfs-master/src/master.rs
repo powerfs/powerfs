@@ -538,10 +538,24 @@ impl MasterNode {
             },
         );
 
-        let kv_cache = Arc::new(KVCacheEngine::new(
-            1024 * 1024 * 1024, // 1GB default
-            2 * 1024 * 1024,    // 2MB block
-        ));
+        // KV cache engine backed by a local RocksDB under the master data
+        // directory: namespaces, generic KV pairs and in-engine blocks are
+        // restored on startup (load_from_db) and survive process restarts.
+        // (The separate `kv_persist` store keeps session/block-fid metadata.)
+        let kv_engine_path = std::path::Path::new(raft_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("kv_engine");
+        let kv_cache = Arc::new(
+            KVCacheEngine::new_with_db(
+                1024 * 1024 * 1024, // 1GB default
+                2 * 1024 * 1024,    // 2MB block
+                kv_engine_path.to_str().unwrap_or("kv_engine"),
+            )
+            .map_err(|e| {
+                PowerFsError::Internal(format!("Failed to create KV cache engine: {}", e))
+            })?,
+        );
 
         let kv_persist_path = std::path::Path::new(raft_path)
             .parent()
@@ -4180,14 +4194,25 @@ impl MasterNode {
 
         tokio::spawn(async move {
             // Phase D: Raft inter-node transport migrated to TLV (MsgType::RaftMessage).
-            // The RaftGrpcServer is no longer registered here; only the MasterService
-            // gRPC server remains (retained for monitoring/admin RPCs).
-            let master_server = crate::server::MasterGrpcServer::new(master_clone, kv_cache_clone);
+            // The RaftGrpcServer is no longer registered here; the gRPC server
+            // serves MasterService (monitoring/admin RPCs) and KVCacheService
+            // (LLM KV-cache + generic KV data plane) on the same port.
+            let kv_svc = crate::kv_cache_service::KvCacheServiceImpl {
+                engine: kv_cache_clone.clone(),
+                volume_client_pool: master_clone.volume_client_pool.clone(),
+                master: master_clone.clone(),
+            };
+            let master_server = crate::server::MasterGrpcServer::new(master_clone.clone());
 
             tonic::transport::Server::builder()
                 .add_service(
                     crate::proto::powerfs::master_service_server::MasterServiceServer::new(
                         master_server,
+                    ),
+                )
+                .add_service(
+                    crate::proto::powerfs::kv_cache_service_server::KvCacheServiceServer::new(
+                        kv_svc,
                     ),
                 )
                 .serve(server_address)

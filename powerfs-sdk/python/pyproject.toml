@@ -4,15 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "powerfs-kv"
-version = "0.1.0"
-description = "PowerFS KV Python SDK"
+version = "0.2.0"
+description = "PowerFS KV Python SDK (gRPC): byte KV, PyTorch tensors, PagedAttention blocks"
 requires-python = ">=3.8"
 dependencies = [
-    "requests>=2.28.0",
+    "grpcio>=1.60.0",
+    "protobuf>=4.22.0",
 ]
 
-[project.scripts]
-powerfs-kv = "powerfs.kv:main"
+[project.optional-dependencies]
+# PyTorch tensor interface; numpy comes in with the torch wheel.
+torch = [
+    "torch>=2.0",
+]
+dev = [
+    "grpcio-tools>=1.60.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.setuptools.package-data]
+powerfs = ["proto/*.py"]

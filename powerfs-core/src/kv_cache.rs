@@ -725,11 +725,14 @@ impl KVCacheEngine {
         namespaces.get(namespace_id).cloned()
     }
 
+    /// List namespaces. An empty `owner_id` means "no filter" and returns
+    /// every namespace (administrative view); a non-empty value filters to
+    /// namespaces owned by that exact owner.
     pub fn list_namespaces(&self, owner_id: &str) -> Vec<KVNamespace> {
         let namespaces = self.namespaces.read().unwrap();
         namespaces
             .values()
-            .filter(|ns| ns.owner_id == owner_id)
+            .filter(|ns| owner_id.is_empty() || ns.owner_id == owner_id)
             .cloned()
             .collect()
     }
@@ -976,8 +979,7 @@ impl KVCacheEngine {
         let prefix = format!("kv:{}:", namespace_id);
         let re = regex::Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
 
-        let mut count = 0;
-        let mut to_delete = Vec::new();
+        let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if let Some(ref db) = self.db {
             let prefix_bytes = prefix.as_bytes();
@@ -992,7 +994,7 @@ impl KVCacheEngine {
                         if key_str.starts_with(&prefix) {
                             let kv_key = key_str.strip_prefix(&prefix).unwrap_or("");
                             if re.is_match(kv_key) {
-                                to_delete.push(key_str.to_string());
+                                to_delete.insert(key_str.to_string());
                             }
                         } else {
                             break;
@@ -1001,18 +1003,20 @@ impl KVCacheEngine {
                     Err(e) => return Err(format!("Failed to iterate: {}", e)),
                 }
             }
+        }
 
-            for key in &to_delete {
-                if db.delete(key).is_ok() {
-                    count += 1;
+        // Also cover keys that exist only in the in-memory ORSet (e.g. an
+        // engine constructed without a RocksDB handle).
+        for full_key in self.kv_store.values() {
+            if let Some(kv_key) = full_key.strip_prefix(&prefix) {
+                if re.is_match(kv_key) {
+                    to_delete.insert(full_key.clone());
                 }
             }
         }
 
-        for key in to_delete {
-            self.kv_store.remove(&key);
-            self.kv_value_cache.write().unwrap().remove(&key);
-        }
+        let count = to_delete.len();
+        self.purge_keys(to_delete);
 
         Ok(count)
     }
@@ -1028,8 +1032,7 @@ impl KVCacheEngine {
         }
 
         let prefix = format!("kv:{}:", namespace_id);
-        let mut count = 0;
-        let mut to_delete = Vec::new();
+        let mut to_delete: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         if let Some(ref db) = self.db {
             let prefix_bytes = prefix.as_bytes();
@@ -1042,7 +1045,7 @@ impl KVCacheEngine {
                     Ok((key, _)) => {
                         let key_str = String::from_utf8_lossy(&key);
                         if key_str.starts_with(&prefix) {
-                            to_delete.push(key_str.to_string());
+                            to_delete.insert(key_str.to_string());
                         } else {
                             break;
                         }
@@ -1050,20 +1053,36 @@ impl KVCacheEngine {
                     Err(e) => return Err(format!("Failed to iterate: {}", e)),
                 }
             }
+        }
 
-            for key in &to_delete {
-                if db.delete(key).is_ok() {
-                    count += 1;
-                }
+        // Also cover keys that exist only in the in-memory ORSet.
+        for full_key in self.kv_store.values() {
+            if full_key.starts_with(&prefix) {
+                to_delete.insert(full_key.clone());
             }
         }
 
-        for key in to_delete {
-            self.kv_store.remove(&key);
-            self.kv_value_cache.write().unwrap().remove(&key);
-        }
+        let count = to_delete.len();
+        self.purge_keys(to_delete);
 
         Ok(count)
+    }
+
+    /// Delete the given full keys from RocksDB (if present), the replicated
+    /// ORSet and the value cache. Best-effort on the DB layer; memory state
+    /// is always cleared.
+    fn purge_keys(&self, keys: std::collections::HashSet<String>) {
+        if let Some(ref db) = self.db {
+            for key in &keys {
+                let _ = db.delete(key);
+            }
+        }
+
+        let mut value_cache = self.kv_value_cache.write().unwrap();
+        for key in keys {
+            self.kv_store.remove(&key);
+            value_cache.remove(&key);
+        }
     }
 
     pub fn kv_get_replica_id(&self) -> &str {

@@ -2,8 +2,11 @@ use tonic::transport::Channel;
 
 pub use powerfs_master::proto::powerfs::kv_cache_service_client::KvCacheServiceClient;
 pub use powerfs_master::proto::powerfs::{
-    CreateSessionRequest, DeleteSessionRequest, GetBlockRequest, GetSessionRequest,
-    GetStatsRequest, ListSessionsRequest, PutBlockRequest,
+    BatchGetRequest, BatchPutRequest, CreateNamespaceRequest, CreateSessionRequest,
+    DeleteNamespaceRequest, DeleteSessionRequest, GetBlockRequest, GetNamespaceRequest,
+    GetSessionRequest, GetStatsRequest, KvBatchGetRequest, KvBatchPutRequest, KvDeleteRequest,
+    KvExistsRequest, KvGetRequest, KvListRequest, KvNamespace, KvPutRequest, KvRemoveAllRequest,
+    KvRemoveByRegexRequest, ListNamespacesRequest, ListSessionsRequest, PutBlockRequest,
 };
 
 pub struct KvCacheClient {

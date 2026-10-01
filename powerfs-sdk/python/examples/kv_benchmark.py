@@ -36,7 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Benchmark scenario to execute.",
     )
 
-    parser.add_argument("--metadata-server", default="http://127.0.0.1:8080")
+    parser.add_argument(
+        "--metadata-server",
+        default="127.0.0.1:9333",
+        help="Master gRPC address (host:9333); comma-separated list supported",
+    )
+    parser.add_argument("--namespace", default="default", help="Target namespace")
+    parser.add_argument(
+        "--owner-id", default="", help="Owner id used for writes (optional)"
+    )
     parser.add_argument("--numjobs", type=int, default=1)
     parser.add_argument("--iodepth", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -322,6 +330,8 @@ class StoreRuntime:
         )
         if setup_ret != 0:
             raise RuntimeError(f"setup failed: {setup_ret}")
+        self.client.namespace = args.namespace
+        self.client.owner_id = args.owner_id
 
     def make_session(
         self,
