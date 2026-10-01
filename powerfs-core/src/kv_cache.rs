@@ -61,6 +61,55 @@ pub struct KVStoredValue {
     pub owner_id: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Monotonic per-key version (proposal time in millis); used to reject
+    /// stale replicated writes. Defaults to 0 for entries written before
+    /// versioning existed.
+    #[serde(default)]
+    pub version: u128,
+}
+
+/// A generic KV value too large for the raft command is stored as a volume
+/// needle; the engine keeps this lightweight JSON reference (not the bytes)
+/// under the normal ``kv:<ns>:<key>`` slot. The read path detects the marker
+/// and fetches the needle by fid.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KVExternalRef {
+    /// Marker discriminator; always ``powerfs-external-ref``.
+    pub kind: String,
+    /// SeaweedFS-style fid of the volume needle holding the value.
+    pub fid: String,
+    /// Value length in bytes.
+    pub size: u64,
+    pub owner_id: String,
+    pub updated_at: u64,
+    pub version: u128,
+}
+
+impl KVExternalRef {
+    pub const KIND: &'static str = "powerfs-external-ref";
+
+    pub fn new(fid: String, size: u64, owner_id: &str, updated_at: u64, version: u128) -> Self {
+        Self {
+            kind: Self::KIND.to_string(),
+            fid,
+            size,
+            owner_id: owner_id.to_string(),
+            updated_at,
+            version,
+        }
+    }
+
+    /// Detect an external-reference record from the raw slot bytes. The slot
+    /// holds either serialized ``KVStoredValue`` JSON (inline value) or this
+    /// marker JSON (value lives in a volume needle).
+    pub fn parse_marker(data: &[u8]) -> Option<Self> {
+        let candidate: KVExternalRef = serde_json::from_slice(data).ok()?;
+        if candidate.kind == Self::KIND {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -92,6 +141,17 @@ pub struct KVBlockMeta {
 pub struct KVBlock {
     pub meta: KVBlockMeta,
     pub data: Vec<u8>,
+}
+
+/// Minimal replicated block descriptor (metadata + fid), independent of the
+/// master-side raft struct so core needs no dependency on master types.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplicatedBlock {
+    pub block_id: u64,
+    pub session_id: String,
+    pub layer_id: u32,
+    pub num_tokens: u32,
+    pub fid: String,
 }
 
 pub type BatchPutRequest = (String, u32, u32, Vec<u8>, String, u32);
@@ -182,6 +242,10 @@ pub struct KVCacheEngine {
     stats: Mutex<KVCacheStats>,
     next_block_id: AtomicU64,
     block_id_map: RwLock<HashMap<u64, String>>,
+    /// block_id -> session_id reverse index; lets a node locate a session for
+    /// a block it only knows by metadata/fid (e.g. followers, after failover)
+    /// without holding the block bytes or relying on a fid-prefix heuristic.
+    block_session_map: RwLock<HashMap<u64, String>>,
     db: Option<rocksdb::DB>,
     kv_store: ReplicatedORSet<String>,
     kv_value_cache: RwLock<HashMap<String, Vec<u8>>>,
@@ -209,6 +273,7 @@ impl KVCacheEngine {
             stats: Mutex::new(KVCacheStats::default()),
             next_block_id: AtomicU64::new(1),
             block_id_map: RwLock::new(HashMap::new()),
+            block_session_map: RwLock::new(HashMap::new()),
             db: None,
             kv_store: ReplicatedORSet::new(&replica_id),
             kv_value_cache: RwLock::new(HashMap::new()),
@@ -245,6 +310,7 @@ impl KVCacheEngine {
             stats: Mutex::new(KVCacheStats::default()),
             next_block_id: AtomicU64::new(1),
             block_id_map: RwLock::new(HashMap::new()),
+            block_session_map: RwLock::new(HashMap::new()),
             db: Some(db),
             kv_store: ReplicatedORSet::new(&replica_id),
             kv_value_cache: RwLock::new(HashMap::new()),
@@ -317,16 +383,24 @@ impl KVCacheEngine {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<(), String> {
-        let mut sessions = self.sessions.write().unwrap();
-        let session = sessions
-            .remove(session_id)
-            .ok_or_else(|| format!("session {} not found", session_id))?;
+        // Remove the session and release the sessions lock BEFORE acquiring
+        // blocks/block_id_map. This avoids a lock-order inversion against
+        // apply_save_blocks (which holds block_id_map and then takes
+        // sessions), which could deadlock the state-machine apply task.
+        let block_ids: Vec<u64> = {
+            let mut sessions = self.sessions.write().unwrap();
+            let session = sessions
+                .remove(session_id)
+                .ok_or_else(|| format!("session {} not found", session_id))?;
+            session.block_ids
+        };
 
         let mut blocks = self.blocks.write().unwrap();
         let mut block_id_map = self.block_id_map.write().unwrap();
+        let mut block_session_map = self.block_session_map.write().unwrap();
         let mut stats = self.stats.lock().unwrap();
 
-        for block_id in &session.block_ids {
+        for block_id in &block_ids {
             if let Some(block) = blocks.remove(block_id) {
                 stats.used_memory_bytes = stats
                     .used_memory_bytes
@@ -335,6 +409,7 @@ impl KVCacheEngine {
                 self.memory_pool.deallocate(block.data);
             }
             block_id_map.remove(block_id);
+            block_session_map.remove(block_id);
         }
 
         stats.total_sessions = stats.total_sessions.saturating_sub(1);
@@ -439,7 +514,26 @@ impl KVCacheEngine {
         let mut block_id_map = self.block_id_map.write().unwrap();
         block_id_map.insert(block_id, fid.to_string());
 
+        self.block_session_map
+            .write()
+            .unwrap()
+            .insert(block_id, session_id.to_string());
+
         Ok(block_id)
+    }
+
+    /// Allocate a block id without storing any bytes/persist state. Used by
+    /// the replicated put path: id is reserved first, bytes go to volume, and
+    /// the id->fid mapping is installed only when the raft entry applies.
+    pub fn alloc_block_id(&self) -> u64 {
+        self.next_block_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Advance the block-id allocator past ``block_id`` so a newly promoted
+    /// leader never reuses an id already replicated.
+    pub fn advance_next_block_id(&self, block_id: u64) {
+        self.next_block_id
+            .fetch_max(block_id.saturating_add(1), Ordering::SeqCst);
     }
 
     pub fn get_fid_by_block_id(&self, block_id: u64) -> Option<String> {
@@ -475,8 +569,25 @@ impl KVCacheEngine {
         }
         drop(blocks);
 
-        let block_id_map = self.block_id_map.read().unwrap();
-        if let Some(fid_str) = block_id_map.get(&block_id) {
+        // Reliable reverse index (covers followers / post-failover).
+        let session_id = self
+            .block_session_map
+            .read()
+            .unwrap()
+            .get(&block_id)
+            .cloned();
+        if let Some(sid) = session_id {
+            return self.sessions.read().unwrap().get(&sid).cloned();
+        }
+
+        // Legacy heuristic fallback. Read the fid and release the map lock
+        // BEFORE taking the sessions lock (global order: sessions -> map) to
+        // avoid an ABBA inversion against evict_lru.
+        let fid_for_check = {
+            let block_id_map = self.block_id_map.read().unwrap();
+            block_id_map.get(&block_id).cloned()
+        };
+        if let Some(fid_str) = fid_for_check {
             let sessions = self.sessions.read().unwrap();
             for sess in sessions.values() {
                 let expected_fid_prefix = format!("{},", sess.session_id.len() % 1000 + 1);
@@ -511,7 +622,10 @@ impl KVCacheEngine {
             .unwrap_or_default()
             .as_secs();
         let meta = block.meta.clone();
-        let data = block.data[..meta.size_bytes as usize].to_vec();
+        // Clamp to the actual buffer length to avoid an out-of-bounds panic on
+        // a corrupted/truncated block.
+        let take = (meta.size_bytes as usize).min(block.data.len());
+        let data = block.data[..take].to_vec();
 
         let mut stats = self.stats.lock().unwrap();
         stats.hits += 1;
@@ -520,16 +634,21 @@ impl KVCacheEngine {
     }
 
     pub fn get_session_blocks(&self, session_id: &str) -> Vec<KVBlockMeta> {
-        let sessions = self.sessions.read().unwrap();
-        let session = match sessions.get(session_id) {
-            Some(s) => s,
-            None => return Vec::new(),
+        // Snapshot the block ids and release the sessions lock BEFORE taking
+        // the blocks lock, matching the global lock order (blocks -> sessions)
+        // used by evict_lru/cleanup_expired and avoiding an ABBA deadlock.
+        let block_ids: Vec<u64> = {
+            let sessions = self.sessions.read().unwrap();
+            match sessions.get(session_id) {
+                Some(s) => s.block_ids.clone(),
+                None => return Vec::new(),
+            }
         };
 
         let blocks = self.blocks.read().unwrap();
         let mut result = Vec::new();
-        for bid in &session.block_ids {
-            if let Some(block) = blocks.get(bid) {
+        for bid in block_ids {
+            if let Some(block) = blocks.get(&bid) {
                 result.push(block.meta.clone());
             }
         }
@@ -798,6 +917,7 @@ impl KVCacheEngine {
             owner_id: owner_id.to_string(),
             created_at: now,
             updated_at: now,
+            version: Self::now_millis(),
         };
 
         self.kv_store.insert(kv_key.clone());
@@ -884,6 +1004,423 @@ impl KVCacheEngine {
         }
     }
 
+    // ==================================================================
+    // Replication apply entry points (driven by raft apply_command).
+    //
+    // These are the ONLY mutators the replicated path uses. They are
+    // idempotent (a leader applies optimistically and again on commit; nodes
+    // replay on startup) and use per-key versions to prevent stale writes
+    // from regressing newer values.
+    // ==================================================================
+
+    /// Current wall time in milliseconds (version clock).
+    fn now_millis() -> u128 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    }
+
+    /// Apply a generic KV upsert. ``is_inline`` selects between raw inline
+    /// bytes and an external volume needle reference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_kv_put(
+        &self,
+        namespace_id: &str,
+        key: &str,
+        is_inline: bool,
+        inline_bytes: &[u8],
+        fid: &str,
+        size: u64,
+        owner_id: &str,
+        version: u128,
+    ) -> Result<(), String> {
+        // Namespace must exist; this naturally drops writes to a namespace
+        // that was deleted before this entry applied.
+        if self.namespaces.read().unwrap().get(namespace_id).is_none() {
+            return Err(format!("namespace {} not found", namespace_id));
+        }
+
+        let kv_key = format!("kv:{}:{}", namespace_id, key);
+
+        // Version guard: never let a stale write overwrite a newer value.
+        if let Some(existing) = self.read_slot_version(&kv_key) {
+            if existing > version {
+                return Ok(());
+            }
+        }
+
+        let now_secs = (version / 1000) as u64;
+        let slot_bytes = if is_inline {
+            let stored = KVStoredValue {
+                data: inline_bytes.to_vec(),
+                owner_id: owner_id.to_string(),
+                created_at: now_secs,
+                updated_at: now_secs,
+                version,
+            };
+            serde_json::to_vec(&stored)
+                .map_err(|e| format!("Failed to serialize stored value: {}", e))?
+        } else {
+            let marker = KVExternalRef::new(fid.to_string(), size, owner_id, now_secs, version);
+            serde_json::to_vec(&marker)
+                .map_err(|e| format!("Failed to serialize external ref: {}", e))?
+        };
+
+        self.kv_store.insert(kv_key.clone());
+        self.kv_value_cache
+            .write()
+            .unwrap()
+            .insert(kv_key.clone(), slot_bytes.clone());
+        if let Some(ref db) = self.db {
+            db.put(&kv_key, slot_bytes)
+                .map_err(|e| format!("Failed to put key: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Read the version recorded in a slot (inline value or external marker).
+    fn read_slot_version(&self, kv_key: &str) -> Option<u128> {
+        let raw = self
+            .kv_value_cache
+            .read()
+            .unwrap()
+            .get(kv_key)
+            .cloned()
+            .or_else(|| {
+                self.db
+                    .as_ref()
+                    .and_then(|db| db.get(kv_key).ok().flatten())
+            })?;
+
+        if let Some(marker) = KVExternalRef::parse_marker(&raw) {
+            return Some(marker.version);
+        }
+        serde_json::from_slice::<KVStoredValue>(&raw)
+            .ok()
+            .map(|v| v.version)
+    }
+
+    /// Apply deletion of an explicit set of keys (single key or a batch that
+    /// the leader enumerated at proposal time).
+    pub fn apply_kv_delete_keys(&self, namespace_id: &str, keys: &[String]) -> Result<(), String> {
+        for key in keys {
+            let kv_key = format!("kv:{}:{}", namespace_id, key);
+            self.kv_store.remove(&kv_key);
+            self.kv_value_cache.write().unwrap().remove(&kv_key);
+            if let Some(ref db) = self.db {
+                let _ = db.delete(&kv_key);
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply namespace creation. Upsert semantics (re-creating after replay)
+    /// but never overwrite an existing namespace.
+    pub fn apply_create_namespace(
+        &self,
+        namespace_id: &str,
+        name: &str,
+        owner_id: &str,
+        version: u128,
+    ) -> Result<(), String> {
+        let mut namespaces = self.namespaces.write().unwrap();
+        if namespaces.contains_key(namespace_id) {
+            return Ok(());
+        }
+        let now_secs = (version / 1000) as u64;
+        let namespace = KVNamespace {
+            id: namespace_id.to_string(),
+            name: name.to_string(),
+            owner_id: owner_id.to_string(),
+            created_at: now_secs,
+            updated_at: now_secs,
+        };
+        namespaces.insert(namespace_id.to_string(), namespace.clone());
+        drop(namespaces);
+        self.save_namespace_to_db(namespace_id, &namespace)
+    }
+
+    /// Apply namespace deletion plus cleanup of its keys and session/block
+    /// metadata.
+    pub fn apply_delete_namespace(&self, namespace_id: &str) -> Result<(), String> {
+        // Remove generic KV slots of this namespace.
+        let prefix = format!("kv:{}:", namespace_id);
+        let mut slot_keys: Vec<String> = Vec::new();
+        if let Some(ref db) = self.db {
+            for (k, _) in db.prefix_iterator(prefix.as_bytes()).flatten() {
+                slot_keys.push(String::from_utf8_lossy(&k).to_string());
+            }
+        }
+        for full in &slot_keys {
+            self.kv_store.remove(full);
+            self.kv_value_cache.write().unwrap().remove(full);
+            if let Some(ref db) = self.db {
+                let _ = db.delete(full);
+            }
+        }
+
+        // Remove sessions (and their block mappings) bound to this namespace.
+        let session_ids: Vec<String> = self
+            .sessions
+            .read()
+            .unwrap()
+            .values()
+            .filter(|s| s.namespace_id == namespace_id)
+            .map(|s| s.session_id.clone())
+            .collect();
+        for sid in session_ids {
+            let _ = self.delete_session(&sid);
+        }
+
+        self.namespaces.write().unwrap().remove(namespace_id);
+        self.delete_namespace_from_db(namespace_id)
+    }
+
+    /// Apply session creation (idempotent).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_create_session(
+        &self,
+        session_id: &str,
+        namespace_id: &str,
+        owner_id: &str,
+        model_name: &str,
+        num_layers: u32,
+        num_heads: u32,
+        head_dim: u32,
+        dtype: &str,
+        ttl_seconds: u64,
+        collection: &str,
+    ) -> Result<(), String> {
+        if self.sessions.read().unwrap().contains_key(session_id) {
+            return Ok(());
+        }
+
+        // Bootstrapped default namespace: sessions without an explicit
+        // namespace live here. Create it locally if missing so session
+        // creation/replay never depends on a separate namespace command.
+        if namespace_id == "default" && self.namespaces.read().unwrap().get("default").is_none() {
+            let now_secs = Self::now_millis() as u64 / 1000;
+            let ns = KVNamespace {
+                id: "default".to_string(),
+                name: "default".to_string(),
+                owner_id: String::new(),
+                created_at: now_secs,
+                updated_at: now_secs,
+            };
+            self.namespaces
+                .write()
+                .unwrap()
+                .insert("default".to_string(), ns.clone());
+            let _ = self.save_namespace_to_db("default", &ns);
+        }
+
+        self.create_session(
+            session_id,
+            namespace_id,
+            owner_id,
+            model_name,
+            num_layers,
+            num_heads,
+            head_dim,
+            KVDtype::parse(dtype).unwrap_or(KVDtype::FP16),
+            ttl_seconds,
+            collection,
+        )
+    }
+
+    /// Apply block metadata + fid mapping for one or more blocks. Metadata
+    /// only: nodes that don't already hold the bytes resolve them on read via
+    /// the fid. Idempotent across leader optimistic apply / commit / replay.
+    pub fn apply_save_blocks(&self, blocks: &[ReplicatedBlock]) -> Result<(), String> {
+        // Phase 1: block-id allocator + id maps. Each guard is temporary and
+        // released before any sessions lock is taken, so no two of these
+        // locks are ever held together.
+        for b in blocks {
+            self.advance_next_block_id(b.block_id);
+            self.block_id_map
+                .write()
+                .unwrap()
+                .insert(b.block_id, b.fid.clone());
+            self.block_session_map
+                .write()
+                .unwrap()
+                .insert(b.block_id, b.session_id.clone());
+        }
+
+        // Phase 2: append ids to sessions (sessions lock only).
+        for b in blocks {
+            let mut sessions = self.sessions.write().unwrap();
+            if let Some(session) = sessions.get_mut(&b.session_id) {
+                if !session.block_ids.contains(&b.block_id) {
+                    session.block_ids.push(b.block_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Leader-only path: cache a block's bytes in the local memory cache and
+    /// install its metadata maps after the bytes have already been written to
+    /// a volume needle. Followers never call this — they only receive the
+    /// metadata via `apply_save_blocks` and fetch bytes from the volume on
+    /// read. Idempotent: if the block is already cached locally this is a
+    /// no-op, so the raft commit replay (apply_save_blocks) cannot double
+    /// count it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_leader_block(
+        &self,
+        block_id: u64,
+        session_id: &str,
+        layer_id: u32,
+        num_tokens: u32,
+        data: &[u8],
+        fid: &str,
+        block_index: u32,
+        pin_mode: PinMode,
+    ) -> Result<(), String> {
+        {
+            let blocks = self.blocks.read().unwrap();
+            if blocks.contains_key(&block_id) {
+                return Ok(()); // already cached (replay) — keep stats intact
+            }
+        }
+
+        {
+            let sessions = self.sessions.read().unwrap();
+            if !sessions.contains_key(session_id) {
+                return Err(format!("session {} not found", session_id));
+            }
+        }
+
+        let size_bytes = data.len() as u64;
+        self.ensure_memory(size_bytes)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut buf = self.memory_pool.allocate();
+        let copy_len = data.len().min(buf.len());
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+
+        let session = {
+            let sessions = self.sessions.read().unwrap();
+            sessions
+                .get(session_id)
+                .ok_or_else(|| format!("session {} not found", session_id))?
+                .clone()
+        };
+
+        let meta = KVBlockMeta {
+            block_id,
+            session_id: session_id.to_string(),
+            namespace_id: session.namespace_id,
+            owner_id: session.owner_id,
+            layer_id,
+            num_tokens,
+            dtype: session.dtype,
+            head_dim: session.head_dim,
+            num_heads: session.num_heads,
+            size_bytes,
+            created_at: now,
+            last_accessed: now,
+            ttl: session.ttl,
+            fid: fid.to_string(),
+            block_index,
+            pin_mode,
+        };
+
+        let block = KVBlock { meta, data: buf };
+        self.save_block_to_db(block_id, &block)?;
+
+        self.blocks.write().unwrap().insert(block_id, block);
+        {
+            let mut sessions = self.sessions.write().unwrap();
+            if let Some(sess) = sessions.get_mut(session_id) {
+                if !sess.block_ids.contains(&block_id) {
+                    sess.block_ids.push(block_id);
+                }
+                sess.last_accessed = now;
+            }
+        }
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.total_blocks += 1;
+            stats.used_memory_bytes += size_bytes;
+        }
+        self.block_id_map
+            .write()
+            .unwrap()
+            .insert(block_id, fid.to_string());
+        self.block_session_map
+            .write()
+            .unwrap()
+            .insert(block_id, session_id.to_string());
+
+        Ok(())
+    }
+
+    /// Authoritatively reset ALL replicated KV state (generic KV slots,
+    /// namespaces, sessions and block mappings), both in memory and in the
+    /// local RocksDB. Used immediately before rebuilding the engine from the
+    /// committed raft log when a node becomes leader, so any state left by a
+    /// failed optimistic apply (a "phantom" entry that never committed) can
+    /// never be served after a re-election. Bytes already written to volumes
+    /// are left intact (they are content-addressed; unreferenced needles are
+    /// harmless garbage).
+    pub fn reset_replicated_state(&self) {
+        let keys_to_delete: Vec<String> = {
+            let mut keys = Vec::new();
+            if let Some(ref db) = self.db {
+                let mut iter = db.iterator(rocksdb::IteratorMode::Start);
+                while let Some(Ok((k, _))) = iter.next() {
+                    let ks = String::from_utf8_lossy(&k);
+                    if ks.starts_with("kv:")
+                        || ks.starts_with("namespace:")
+                        || ks.starts_with("block:")
+                    {
+                        keys.push(ks.into_owned());
+                    }
+                }
+            }
+            keys
+        };
+        if let Some(ref db) = self.db {
+            for k in &keys_to_delete {
+                let _ = db.delete(k);
+            }
+        }
+
+        self.sessions.write().unwrap().clear();
+        self.blocks.write().unwrap().clear();
+        self.namespaces.write().unwrap().clear();
+        self.kv_value_cache.write().unwrap().clear();
+        self.kv_store.clear();
+        self.block_id_map.write().unwrap().clear();
+        self.block_session_map.write().unwrap().clear();
+        let mut stats = self.stats.lock().unwrap();
+        stats.total_sessions = 0;
+        stats.total_blocks = 0;
+        stats.used_memory_bytes = 0;
+    }
+
+    /// Return the raw slot bytes for a generic KV key (None if absent).
+    pub fn get_raw_slot(&self, namespace_id: &str, key: &str) -> Option<Vec<u8>> {
+        let kv_key = format!("kv:{}:{}", namespace_id, key);
+        self.kv_value_cache
+            .read()
+            .unwrap()
+            .get(&kv_key)
+            .cloned()
+            .or_else(|| {
+                self.db
+                    .as_ref()
+                    .and_then(|db| db.get(&kv_key).ok().flatten())
+            })
+    }
+
     pub fn kv_exists(&self, namespace_id: &str, key: &str) -> Result<bool, String> {
         let namespace = {
             let namespaces = self.namespaces.read().unwrap();
@@ -964,6 +1501,38 @@ impl KVCacheEngine {
         }
 
         Ok(keys)
+    }
+
+    /// Enumerate every bare key in a namespace (for batch delete proposals).
+    /// Sources both the in-memory ORSet and the local RocksDB slot prefix.
+    pub fn enumerate_namespace_keys(&self, namespace_id: &str) -> Vec<String> {
+        let prefix = format!("kv:{}:", namespace_id);
+        let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        for full in self.kv_store.values() {
+            if let Some(bare) = full.strip_prefix(&prefix) {
+                out.insert(bare.to_string());
+            }
+        }
+
+        if let Some(ref db) = self.db {
+            for (k, _) in db
+                .iterator(rocksdb::IteratorMode::From(
+                    prefix.as_bytes(),
+                    rocksdb::Direction::Forward,
+                ))
+                .flatten()
+            {
+                let ks = String::from_utf8_lossy(&k);
+                if let Some(bare) = ks.strip_prefix(&prefix) {
+                    out.insert(bare.to_string());
+                } else {
+                    break;
+                }
+            }
+        }
+
+        out.into_iter().collect()
     }
 
     pub fn kv_remove_by_regex(&self, namespace_id: &str, pattern: &str) -> Result<usize, String> {
@@ -1199,5 +1768,120 @@ impl KVCacheEngine {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod replicate_tests {
+    use super::*;
+
+    fn engine() -> KVCacheEngine {
+        KVCacheEngine::new(64 * 1024 * 1024, 4096)
+    }
+
+    #[test]
+    fn apply_inline_twice_is_idempotent() {
+        let e = engine();
+        e.apply_create_namespace("ns", "n", "o", 1000).unwrap();
+        e.apply_kv_put("ns", "k", true, b"v1", "", 0, "o", 2000)
+            .unwrap();
+        // Re-apply identical command (leader optimistic + commit replay).
+        e.apply_kv_put("ns", "k", true, b"v1", "", 0, "o", 2000)
+            .unwrap();
+
+        let raw = e.get_raw_slot("ns", "k").unwrap();
+        let v: KVStoredValue = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v.data, b"v1");
+        assert_eq!(v.version, 2000);
+    }
+
+    #[test]
+    fn stale_version_does_not_regress() {
+        let e = engine();
+        e.apply_create_namespace("ns", "n", "o", 1000).unwrap();
+        e.apply_kv_put("ns", "k", true, b"new", "", 0, "o", 5000)
+            .unwrap();
+        // Older version must be ignored.
+        e.apply_kv_put("ns", "k", true, b"old", "", 0, "o", 3000)
+            .unwrap();
+
+        let raw = e.get_raw_slot("ns", "k").unwrap();
+        let v: KVStoredValue = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v.data, b"new");
+        assert_eq!(v.version, 5000);
+    }
+
+    #[test]
+    fn delete_makes_key_invisible() {
+        let e = engine();
+        e.apply_create_namespace("ns", "n", "o", 1000).unwrap();
+        e.apply_kv_put("ns", "a", true, b"x", "", 0, "o", 2000)
+            .unwrap();
+        e.apply_kv_put("ns", "b", true, b"y", "", 0, "o", 2001)
+            .unwrap();
+
+        e.apply_kv_delete_keys("ns", &["a".to_string()]).unwrap();
+        assert!(e.get_raw_slot("ns", "a").is_none());
+        assert!(e.get_raw_slot("ns", "b").is_some());
+
+        // Deleting an already-absent key is a no-op (idempotent replay).
+        e.apply_kv_delete_keys("ns", &["a".to_string()]).unwrap();
+        assert!(e.get_raw_slot("ns", "a").is_none());
+    }
+
+    #[test]
+    fn external_marker_roundtrip() {
+        let e = engine();
+        e.apply_create_namespace("ns", "n", "o", 1000).unwrap();
+        e.apply_kv_put("ns", "big", false, &[], "3,012345", 4096, "o", 7000)
+            .unwrap();
+
+        let raw = e.get_raw_slot("ns", "big").unwrap();
+        let marker = KVExternalRef::parse_marker(&raw).expect("must be a marker");
+        assert_eq!(marker.fid, "3,012345");
+        assert_eq!(marker.size, 4096);
+        assert_eq!(marker.version, 7000);
+
+        // Version guard works for markers too: older inline write is dropped.
+        e.apply_kv_put("ns", "big", true, b"stale", "", 0, "o", 6000)
+            .unwrap();
+        let raw2 = e.get_raw_slot("ns", "big").unwrap();
+        assert!(KVExternalRef::parse_marker(&raw2).is_some());
+    }
+
+    #[test]
+    fn create_namespace_is_idempotent() {
+        let e = engine();
+        e.apply_create_namespace("ns", "first", "o", 1000).unwrap();
+        // Same id, different name must not overwrite.
+        e.apply_create_namespace("ns", "second", "o", 2000).unwrap();
+        let ns = e.get_namespace("ns").unwrap();
+        assert_eq!(ns.name, "first");
+    }
+
+    #[test]
+    fn leader_block_cache_is_idempotent_and_counts_once() {
+        let e = engine();
+        e.apply_create_session("sess", "default", "o", "gpt", 2, 4, 64, "fp16", 0, "")
+            .unwrap();
+
+        let data = vec![7u8; 1000];
+        e.store_leader_block(50, "sess", 0, 8, &data, "1,abc", 0, PinMode::None)
+            .unwrap();
+        // Commit replay (apply_save_blocks) must not double count the cached
+        // block when store is called again.
+        e.store_leader_block(50, "sess", 0, 8, &data, "1,abc", 0, PinMode::None)
+            .unwrap();
+
+        let stats = e.stats.lock().unwrap();
+        assert_eq!(stats.total_blocks, 1);
+        assert_eq!(stats.used_memory_bytes, 1000);
+        assert_eq!(e.get_fid_by_block_id(50).as_deref(), Some("1,abc"));
+        assert_eq!(
+            e.get_session_by_block_id(50)
+                .map(|s| s.session_id)
+                .as_deref(),
+            Some("sess")
+        );
     }
 }

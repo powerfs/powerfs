@@ -63,6 +63,7 @@ rocksdb = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+regex = "1.10"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }

@@ -154,7 +154,85 @@ pub enum RaftCommand {
     SetPlacementStrategy {
         strategy: String,
     },
+
+    // ===== KV 强复制命令（issue #132，把 KV 做扎实）=====
+    /// Upsert one generic KV pair. Payload is inline bytes for small values
+    /// or an external volume fid for large values (never the large bytes).
+    KvPut {
+        namespace_id: String,
+        key: String,
+        owner_id: String,
+        payload: KvPayload,
+        /// Monotonic per-key version (unix millis at proposal time); stale
+        /// versions must not overwrite a newer applied value.
+        version: u128,
+    },
+    /// Delete generic KV keys. A single-key delete carries one entry;
+    /// remove-by-regex / remove-all carry the exact key set enumerated at
+    /// proposal time so every node deletes the identical batch.
+    KvDelete {
+        namespace_id: String,
+        keys: Vec<String>,
+    },
+    /// Create a namespace.
+    KvCreateNamespace {
+        namespace_id: String,
+        name: String,
+        owner_id: String,
+        version: u128,
+    },
+    /// Delete a namespace (and drop its keys).
+    KvDeleteNamespace {
+        namespace_id: String,
+        owner_id: String,
+    },
+    /// Create a PagedAttention session.
+    KvCreateSession {
+        session_id: String,
+        namespace_id: String,
+        owner_id: String,
+        model_name: String,
+        num_layers: u32,
+        num_heads: u32,
+        head_dim: u32,
+        dtype: String,
+        ttl_seconds: u64,
+        collection: String,
+    },
+    /// Delete a session.
+    KvDeleteSession {
+        session_id: String,
+    },
+    /// Persist block metadata + block_id→fid mapping (single block or a
+    /// batch; each entry is one block), after needles were written.
+    KvSaveBlocks {
+        blocks: Vec<KvBlockMeta>,
+    },
 }
+
+/// Inline bytes (small values) or an external volume needle (large values).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum KvPayload {
+    /// Raw bytes carried inside the raft command (< KV_INLINE_LIMIT).
+    Inline(Vec<u8>),
+    /// Large value already written to a volume needle; raft carries only the
+    /// SeaweedFS-style fid string and byte length, not the bytes.
+    External { fid: String, size: u64 },
+}
+
+/// Block metadata replicated per stored KV block.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KvBlockMeta {
+    pub block_id: u64,
+    pub session_id: String,
+    pub layer_id: u32,
+    pub num_tokens: u32,
+    pub fid: String,
+}
+
+/// Values at or below this size are inlined in the raft command; larger
+/// values are written to a volume needle and referenced by fid.
+pub const KV_INLINE_LIMIT: usize = 1024 * 1024; // 1 MiB
 
 /// Volume info for Raft serialization (serde-compatible)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -726,6 +804,13 @@ impl RaftNodeV2 {
     pub fn is_leader(&self) -> bool {
         // 通过 metrics 获取状态（同步快照）。
         self.raft.metrics().borrow_watched().state == ServerState::Leader
+    }
+
+    /// Current raft term (synchronous metrics snapshot). Used to build a
+    /// fencing token for replicated writes so a new leader — even one whose
+    /// wall clock is behind — always orders its writes after prior terms.
+    pub fn current_term(&self) -> u64 {
+        self.raft.metrics().borrow_watched().current_term
     }
 
     /// 启动 Raft 状态健康监控后台任务。

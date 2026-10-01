@@ -516,6 +516,31 @@ impl MasterNode {
             })
             .collect::<Vec<_>>();
 
+        // Collect the four classes of KV metadata commands for authoritative
+        // replay after restart (covers followers and snapshot-installed nodes).
+        let kv_commands = raft_v2
+            .scan_applied_entries()
+            .map_err(|e| PowerFsError::Internal(format!("Failed to scan applied entries: {}", e)))?
+            .into_iter()
+            .filter_map(|(idx, payload)| {
+                serde_json::from_slice::<crate::raft_v2::RaftCommand>(&payload)
+                    .ok()
+                    .map(|cmd| (idx, cmd))
+            })
+            .filter(|(_, cmd)| {
+                matches!(
+                    cmd,
+                    crate::raft_v2::RaftCommand::KvPut { .. }
+                        | crate::raft_v2::RaftCommand::KvDelete { .. }
+                        | crate::raft_v2::RaftCommand::KvCreateNamespace { .. }
+                        | crate::raft_v2::RaftCommand::KvDeleteNamespace { .. }
+                        | crate::raft_v2::RaftCommand::KvCreateSession { .. }
+                        | crate::raft_v2::RaftCommand::KvDeleteSession { .. }
+                        | crate::raft_v2::RaftCommand::KvSaveBlocks { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+
         // openraft is self-driven (internal tick + network threads); no run() loop needed.
 
         // 启动 Raft 状态健康监控 (方案 C: 假 Leader 时停止服务, 不退出进程).
@@ -568,6 +593,99 @@ impl MasterNode {
         );
 
         Self::restore_kv_sessions(&kv_cache, &kv_persist);
+
+        // Authoritative KV replay in raft-index order on top of whatever the
+        // local RocksDB (load_from_db) and kv_persist already restored.
+        // Every apply method is idempotent and version-guarded, so this
+        // converges to the committed state and also fills the in-memory
+        // ORSet/session/block mappings that local files cannot provide.
+        let replayed = kv_commands.len();
+        for (_idx, cmd) in kv_commands {
+            match cmd {
+                crate::raft_v2::RaftCommand::KvPut {
+                    namespace_id,
+                    key,
+                    owner_id,
+                    payload,
+                    version,
+                } => {
+                    let (is_inline, bytes, fid, size) = match payload {
+                        crate::raft_v2::KvPayload::Inline(b) => (true, b, String::new(), 0),
+                        crate::raft_v2::KvPayload::External { fid, size } => {
+                            (false, Vec::new(), fid, size)
+                        }
+                    };
+                    let _ = kv_cache.apply_kv_put(
+                        &namespace_id,
+                        &key,
+                        is_inline,
+                        &bytes,
+                        &fid,
+                        size,
+                        &owner_id,
+                        version,
+                    );
+                }
+                crate::raft_v2::RaftCommand::KvDelete { namespace_id, keys } => {
+                    let _ = kv_cache.apply_kv_delete_keys(&namespace_id, &keys);
+                }
+                crate::raft_v2::RaftCommand::KvCreateNamespace {
+                    namespace_id,
+                    name,
+                    owner_id,
+                    version,
+                } => {
+                    let _ =
+                        kv_cache.apply_create_namespace(&namespace_id, &name, &owner_id, version);
+                }
+                crate::raft_v2::RaftCommand::KvDeleteNamespace { namespace_id, .. } => {
+                    let _ = kv_cache.apply_delete_namespace(&namespace_id);
+                }
+                crate::raft_v2::RaftCommand::KvCreateSession {
+                    session_id,
+                    namespace_id,
+                    owner_id,
+                    model_name,
+                    num_layers,
+                    num_heads,
+                    head_dim,
+                    dtype,
+                    ttl_seconds,
+                    collection,
+                } => {
+                    let _ = kv_cache.apply_create_session(
+                        &session_id,
+                        &namespace_id,
+                        &owner_id,
+                        &model_name,
+                        num_layers,
+                        num_heads,
+                        head_dim,
+                        &dtype,
+                        ttl_seconds,
+                        &collection,
+                    );
+                }
+                crate::raft_v2::RaftCommand::KvDeleteSession { session_id } => {
+                    let _ = kv_cache.delete_session(&session_id);
+                }
+                crate::raft_v2::RaftCommand::KvSaveBlocks { blocks } => {
+                    let rep: Vec<powerfs_core::kv_cache::ReplicatedBlock> = blocks
+                        .iter()
+                        .map(|b| powerfs_core::kv_cache::ReplicatedBlock {
+                            block_id: b.block_id,
+                            session_id: b.session_id.clone(),
+                            layer_id: b.layer_id,
+                            num_tokens: b.num_tokens,
+                            fid: b.fid.clone(),
+                        })
+                        .collect();
+                    let _ = kv_cache.apply_save_blocks(&rep);
+                }
+                _ => {}
+            }
+        }
+        info!("Replayed {} KV raft entries on startup", replayed);
 
         let volume_client_pool = Arc::new(VolumeClientPool::new());
 
@@ -1213,6 +1331,11 @@ impl MasterNode {
         *self.raft_term.write().unwrap() = term;
     }
 
+    /// Current raft term (synchronous snapshot) for fencing versions.
+    pub fn current_term(&self) -> u64 {
+        self.raft_v2.current_term()
+    }
+
     pub fn raft_id(&self) -> u64 {
         self.raft_id
     }
@@ -1433,9 +1556,141 @@ impl MasterNode {
             RaftCommand::SetPlacementStrategy { strategy } => {
                 self.apply_set_placement_strategy(&strategy)?;
             }
+
+            // ===== KV 强复制命令 apply =====
+            RaftCommand::KvPut {
+                namespace_id,
+                key,
+                owner_id,
+                payload,
+                version,
+            } => {
+                let (is_inline, inline_bytes, fid, size) = match payload {
+                    crate::raft_v2::KvPayload::Inline(bytes) => (true, bytes, String::new(), 0u64),
+                    crate::raft_v2::KvPayload::External { fid, size } => {
+                        (false, Vec::new(), fid, size)
+                    }
+                };
+                self.kv_cache
+                    .apply_kv_put(
+                        &namespace_id,
+                        &key,
+                        is_inline,
+                        &inline_bytes,
+                        &fid,
+                        size,
+                        &owner_id,
+                        version,
+                    )
+                    .map_err(PowerFsError::Internal)?;
+            }
+            RaftCommand::KvDelete { namespace_id, keys } => {
+                self.kv_cache
+                    .apply_kv_delete_keys(&namespace_id, &keys)
+                    .map_err(PowerFsError::Internal)?;
+            }
+            RaftCommand::KvCreateNamespace {
+                namespace_id,
+                name,
+                owner_id,
+                version,
+            } => {
+                self.kv_cache
+                    .apply_create_namespace(&namespace_id, &name, &owner_id, version)
+                    .map_err(PowerFsError::Internal)?;
+            }
+            RaftCommand::KvDeleteNamespace {
+                namespace_id,
+                owner_id: _,
+            } => {
+                self.kv_cache
+                    .apply_delete_namespace(&namespace_id)
+                    .map_err(PowerFsError::Internal)?;
+            }
+            RaftCommand::KvCreateSession {
+                session_id,
+                namespace_id,
+                owner_id,
+                model_name,
+                num_layers,
+                num_heads,
+                head_dim,
+                dtype,
+                ttl_seconds,
+                collection,
+            } => {
+                self.kv_cache
+                    .apply_create_session(
+                        &session_id,
+                        &namespace_id,
+                        &owner_id,
+                        &model_name,
+                        num_layers,
+                        num_heads,
+                        head_dim,
+                        &dtype,
+                        ttl_seconds,
+                        &collection,
+                    )
+                    .map_err(PowerFsError::Internal)?;
+            }
+            RaftCommand::KvDeleteSession { session_id } => {
+                // delete_session errors if already absent; tolerate that.
+                let _ = self.kv_cache.delete_session(&session_id);
+            }
+            RaftCommand::KvSaveBlocks { blocks } => {
+                let rep: Vec<powerfs_core::kv_cache::ReplicatedBlock> = blocks
+                    .iter()
+                    .map(|b| powerfs_core::kv_cache::ReplicatedBlock {
+                        block_id: b.block_id,
+                        session_id: b.session_id.clone(),
+                        layer_id: b.layer_id,
+                        num_tokens: b.num_tokens,
+                        fid: b.fid.clone(),
+                    })
+                    .collect();
+                self.kv_cache
+                    .apply_save_blocks(&rep)
+                    .map_err(PowerFsError::Internal)?;
+            }
         }
 
         Ok(())
+    }
+
+    /// Authoritatively rebuild the four classes of KV state from the
+    /// committed raft log. Called when this node becomes leader: any state
+    /// left by a previously-failed optimistic apply is first discarded, then
+    /// only committed entries are replayed in raft-index order. All apply
+    /// methods are idempotent and version-guarded, so the result is exactly
+    /// the committed state. Returns the number of entries replayed.
+    pub async fn rebuild_kv_from_committed(&self) -> Result<usize> {
+        let entries = self
+            .raft_v2
+            .scan_applied_entries()
+            .map_err(|e| PowerFsError::Internal(format!("Failed to scan applied entries: {}", e)))?
+            .into_iter()
+            .filter_map(|(idx, payload)| {
+                serde_json::from_slice::<RaftCommand>(&payload)
+                    .ok()
+                    .map(|cmd| (idx, cmd))
+            })
+            .filter(|(_, cmd)| is_kv_replicated_cmd(cmd))
+            .collect::<Vec<_>>();
+
+        let count = entries.len();
+        self.kv_cache.reset_replicated_state();
+        for (_idx, cmd) in entries {
+            let entry = ApplyEntry {
+                index: 0,
+                command: cmd,
+            };
+            // Errors during authoritative rebuild must surface, not be
+            // silently dropped, otherwise the new leader could serve partial
+            // state.
+            self.apply_command(entry).await?;
+        }
+        Ok(count)
     }
 
     /// After allocating a file_key, check if we need to persist the advance
@@ -4188,6 +4443,75 @@ impl MasterNode {
             info!("Node liveness watcher started");
         }
 
+        // Leader-change watcher: when this node transitions to leader, discard
+        // any state left by a failed optimistic apply and rebuild the KV
+        // engine authoritatively from the committed raft log. This closes the
+        // correctness gap where an old leader's uncommitted ("phantom") entry
+        // could otherwise be served after a re-election.
+        {
+            let leader_master = Arc::clone(&self);
+            powerfs_common::spawn_supervised("master-kv-leader-reconcile", move || {
+                let leader_master = leader_master.clone();
+                async move {
+                    // Reconcile at most once per raft term. Watching the term
+                    // (rather than the is_leader boolean edge) is robust to
+                    // the role flapping while an election settles, where
+                    // is_leader flickers and would otherwise trigger a
+                    // redundant engine reset/replay every few seconds. Seed
+                    // with the current term so the first startup leader —
+                    // already built authoritatively by startup replay — is not
+                    // rebuilt needlessly.
+                    let mut reconciled_term: Option<u64> =
+                        Some(leader_master.raft_v2.current_term());
+
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        let is_leader = leader_master.raft_v2.is_leader();
+                        let term = leader_master.raft_v2.current_term();
+
+                        if is_leader && reconciled_term != Some(term) {
+                            let mut last_err = String::new();
+                            let mut ok = false;
+                            for attempt in 1..=3u32 {
+                                match leader_master.rebuild_kv_from_committed().await {
+                                    Ok(n) => {
+                                        info!(
+                                            "Reconciled KV state from committed raft log for new \
+                                             term {} ({} entries, attempt {})",
+                                            term, n, attempt
+                                        );
+                                        ok = true;
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        last_err = format!("{}", e);
+                                        warn!(
+                                            "KV reconcile attempt {}/3 failed for term {}: {}",
+                                            attempt, term, last_err
+                                        );
+                                        tokio::time::sleep(Duration::from_millis(200)).await;
+                                    }
+                                }
+                            }
+                            if ok {
+                                reconciled_term = Some(term);
+                            } else {
+                                // Leave the term unrecorded so the next tick
+                                // retries; don't poison the shared
+                                // raft-unavailable gate (that would reject
+                                // unrelated writes). Surface loudly.
+                                error!(
+                                    "KV reconcile failed after retries for term {}: {}",
+                                    term, last_err
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+            info!("KV leader-reconcile watcher started");
+        }
+
         let master_clone = self.clone();
         let kv_cache_clone = self.kv_cache.clone();
         let server_address = self.address;
@@ -4517,6 +4841,20 @@ impl MasterNode {
             _ => true,
         }
     }
+}
+
+/// True if a raft command belongs to the four replicated KV metadata classes.
+fn is_kv_replicated_cmd(cmd: &RaftCommand) -> bool {
+    matches!(
+        cmd,
+        RaftCommand::KvPut { .. }
+            | RaftCommand::KvDelete { .. }
+            | RaftCommand::KvCreateNamespace { .. }
+            | RaftCommand::KvDeleteNamespace { .. }
+            | RaftCommand::KvCreateSession { .. }
+            | RaftCommand::KvDeleteSession { .. }
+            | RaftCommand::KvSaveBlocks { .. }
+    )
 }
 
 /// Pure volume-selection logic extracted from [`MasterNode::select_writable_volume`].
