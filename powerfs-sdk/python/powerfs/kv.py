@@ -1,29 +1,103 @@
-import requests
+"""High-level Python client for PowerFS KV.
+
+This module provides:
+
+* :class:`KVClient` — Mooncake-style byte KV + PyTorch tensor storage plus the
+  PagedAttention session/block API, on top of the gRPC transport in
+  :mod:`powerfs.client`.
+* :class:`KVAdminClient` — namespace management and statistics.
+
+Return-code convention (kept for Mooncake API compatibility):
+``0`` success, ``-1`` generic error, ``-2`` not found, ``-3`` permission
+denied.
+"""
+
+from __future__ import annotations
+
 import json
-import hmac
-import hashlib
-import time
-import re
-import base64
-from typing import Optional, Dict, Any, List, Tuple, Union
-import numpy as np
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from powerfs.client import KVCacheClient, KVError, normalize_masters
+
+# Tensor metadata (dtype/shape) is stored alongside the raw bytes under this
+# companion key, so values remain raw-byte compatible with the CLI and Rust
+# SDK. Example: key "w" -> bytes, key "w.pymeta" -> JSON header.
+META_SUFFIX = ".pymeta"
 
 
 class ReplicateConfig:
-    def __init__(self):
+    """Mooncake-style replication options.
+
+    Note: replication topology is currently controlled by the collection the
+    session belongs to; these fields are accepted for API compatibility but
+    do not change per-key placement yet.
+    """
+
+    def __init__(self) -> None:
         self.replica_num = 1
         self.with_soft_pin = False
         self.preferred_segment = ""
 
 
+# ----------------------------------------------------------------------
+# helpers
+# ----------------------------------------------------------------------
+
+
+def _is_success(resp: Any) -> bool:
+    return bool(getattr(resp, "success", False))
+
+
+def _err_code(err: str) -> int:
+    low = (err or "").lower()
+    if "not found" in low:
+        return -2
+    if "permission" in low:
+        return -3
+    return -1
+
+
+# ----------------------------------------------------------------------
+# data client
+# ----------------------------------------------------------------------
+
+
 class KVClient:
-    def __init__(self):
-        self.base_url = ""
-        self.namespace = "default"
-        self.session_id = None
-        self.access_key = None
-        self.secret_key = None
-        self._registered_buffers = set()
+    """High-level KV client bound to a namespace.
+
+    Typical usage::
+
+        client = KVClient()
+        client.connect("10.0.0.1:9333,10.0.0.2:9333", namespace="default")
+        client.put("config", b'{"model": "llama"}')
+        code, value = client.get("config")
+    """
+
+    def __init__(self) -> None:
+        self._grpc = KVCacheClient()
+        self.namespace: str = "default"
+        self.owner_id: str = ""
+
+    # ------------------------------------------------------------------
+    # connection
+    # ------------------------------------------------------------------
+
+    def connect(
+        self,
+        masters: str | Sequence[str],
+        namespace: str = "default",
+        owner_id: str = "",
+        timeout: float = 10.0,
+    ) -> int:
+        """Connect to a PowerFS cluster (one address or a comma-separated
+        list). Returns ``0`` on success, ``-1`` on failure."""
+        try:
+            self._grpc.connect(masters, timeout=timeout)
+        except (KVError, ValueError):
+            return -1
+        self.namespace = namespace
+        self.owner_id = owner_id
+        return 0
 
     def setup(
         self,
@@ -35,346 +109,536 @@ class KVClient:
         rdma_devices: str = "",
         master_server_address: str = "",
     ) -> int:
-        try:
-            self.base_url = metadata_server.rstrip("/")
-            return 0
-        except Exception:
+        """Mooncake-compatible initializer.
+
+        Master gRPC addresses are taken from ``master_server_address`` (or
+        ``metadata_server`` as fallback; a comma-separated list is accepted).
+        The buffer-size / RDMA arguments are accepted for API compatibility.
+        """
+        masters = master_server_address or metadata_server
+        if not masters:
             return -1
-
-    def _sign_request(self, method: str, path: str, body: Optional[str] = None) -> Dict[str, str]:
-        if not self.access_key or not self.secret_key:
-            return {}
-
-        timestamp = str(int(time.time()))
-        content = f"{method}\n{path}\n{timestamp}\n{body or ''}"
-        signature = hmac.new(
-            self.secret_key.encode(),
-            content.encode(),
-            hashlib.sha256
-        ).hexdigest()
-
-        return {
-            "X-KV-Access-Key": self.access_key,
-            "X-KV-Timestamp": timestamp,
-            "X-KV-Signature": signature,
-        }
-
-    def _request(self, method: str, path: str, **kwargs) -> Tuple[int, Any]:
-        url = f"{self.base_url}{path}"
-        headers = kwargs.pop("headers", {})
-        headers.update(self._sign_request(method, path, kwargs.get("data")))
-
-        try:
-            response = requests.request(method, url, headers=headers, **kwargs)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("success", True):
-                    return 0, data.get("data")
-                else:
-                    error_msg = data.get("error", "Unknown error")
-                    if "not found" in error_msg.lower():
-                        return -2, error_msg
-                    elif "permission" in error_msg.lower():
-                        return -3, error_msg
-                    return -1, error_msg
-            elif response.status_code == 404:
-                return -2, "Not found"
-            elif response.status_code == 403:
-                return -3, "Permission denied"
-            return -1, f"HTTP error {response.status_code}"
-        except requests.exceptions.RequestException as e:
-            return -1, str(e)
-
-    def put(self, key: str, value: bytes, config: Optional[ReplicateConfig] = None) -> int:
-        path = f"/kv/put/{key}"
-        params = {"namespace": self.namespace}
-        if config and config.replica_num > 1:
-            params["replica_num"] = config.replica_num
-        if config and config.with_soft_pin:
-            params["soft_pin"] = "true"
-
-        code, _ = self._request("PUT", path, params=params, data=value)
-        return code
-
-    def get(self, key: str) -> Tuple[int, Optional[bytes]]:
-        path = f"/kv/get/{key}"
-        params = {"namespace": self.namespace}
-
-        code, data = self._request("GET", path, params=params)
-        if code == 0 and data is not None:
-            if isinstance(data, str):
-                return 0, base64.b64decode(data)
-            elif isinstance(data, bytes):
-                return 0, data
-        return code, None
-
-    def put_batch(self, keys: List[str], values: List[bytes]) -> List[int]:
-        path = "/kv/put_batch"
-        params = {"namespace": self.namespace}
-        encoded_values = [base64.b64encode(v).decode() for v in values]
-
-        code, results = self._request("POST", path, params=params, json={"keys": keys, "values": encoded_values})
-        if code == 0 and results:
-            return [0 if r else -1 for r in results]
-        return [-1] * len(keys)
-
-    def get_batch(self, keys: List[str]) -> Tuple[int, List[Optional[bytes]]]:
-        path = "/kv/get_batch"
-        params = {"namespace": self.namespace}
-
-        code, results = self._request("POST", path, params=params, json={"keys": keys})
-        if code == 0 and results:
-            decoded = []
-            for item in results:
-                if item is None:
-                    decoded.append(None)
-                elif isinstance(item, str):
-                    decoded.append(base64.b64decode(item))
-                else:
-                    decoded.append(None)
-            return 0, decoded
-        return code, [None] * len(keys)
-
-    def is_exist(self, key: str) -> int:
-        path = f"/kv/exists/{key}"
-        params = {"namespace": self.namespace}
-
-        code, data = self._request("GET", path, params=params)
-        if code == 0:
-            if data is True or data == 1:
-                return 1
-            elif data is False or data == 0:
-                return 0
-        return -1
-
-    def remove(self, key: str) -> int:
-        path = f"/kv/delete/{key}"
-        params = {"namespace": self.namespace}
-
-        code, _ = self._request("DELETE", path, params=params)
-        return code
-
-    def remove_by_regex(self, pattern: str) -> int:
-        path = "/kv/remove_by_regex"
-        params = {"namespace": self.namespace, "pattern": pattern}
-
-        code, _ = self._request("DELETE", path, params=params)
-        return code
-
-    def remove_all(self) -> int:
-        path = "/kv/remove_all"
-        params = {"namespace": self.namespace}
-
-        code, _ = self._request("DELETE", path, params=params)
-        return code
-
-    def register_buffer(self, ptr: int, size: int) -> int:
-        self._registered_buffers.add(ptr)
-        return 0
-
-    def unregister_buffer(self, ptr: int) -> int:
-        self._registered_buffers.discard(ptr)
-        return 0
-
-    def put_from(self, key: str, ptr: int, size: int) -> int:
-        if ptr not in self._registered_buffers:
-            return -1
-
-        try:
-            buf = np.frombuffer(np.ctypeslib.as_ctypes(np.empty(size, dtype=np.uint8)), dtype=np.uint8)
-            buf_ptr = buf.ctypes.data
-            if buf_ptr != ptr:
-                return -1
-
-            data = buf.tobytes()
-            return self.put(key, data)
-        except Exception:
-            return -1
-
-    def get_into(self, key: str, ptr: int, size: int) -> Tuple[int, int]:
-        if ptr not in self._registered_buffers:
-            return -1, 0
-
-        code, data = self.get(key)
-        if code != 0 or data is None:
-            return code, 0
-
-        try:
-            buf = np.frombuffer(np.ctypeslib.as_ctypes(np.empty(size, dtype=np.uint8)), dtype=np.uint8)
-            buf_ptr = buf.ctypes.data
-            if buf_ptr != ptr:
-                return -1, 0
-
-            copy_len = min(size, len(data))
-            buf[:copy_len] = np.frombuffer(data[:copy_len], dtype=np.uint8)
-            return 0, copy_len
-        except Exception:
-            return -1, 0
-
-    def batch_put_from(self, keys: List[str], ptrs: List[int], sizes: List[int]) -> List[int]:
-        results = []
-        for key, ptr, size in zip(keys, ptrs, sizes):
-            results.append(self.put_from(key, ptr, size))
-        return results
-
-    def batch_get_into(self, keys: List[str], ptrs: List[int], sizes: List[int]) -> List[int]:
-        results = []
-        for key, ptr, size in zip(keys, ptrs, sizes):
-            code, _ = self.get_into(key, ptr, size)
-            results.append(code)
-        return results
-
-    def put_tensor(self, key: str, tensor: Any, config: Optional[ReplicateConfig] = None) -> int:
-        try:
-            import torch
-            if isinstance(tensor, torch.Tensor):
-                data = tensor.cpu().numpy().tobytes()
-                return self.put(key, data)
-            else:
-                return -1
-        except ImportError:
-            return -2
-
-    def get_tensor(self, key: str) -> Tuple[int, Optional[Any]]:
-        try:
-            import torch
-            code, data = self.get(key)
-            if code != 0 or data is None:
-                return code, None
-            
-            return 0, torch.from_numpy(np.frombuffer(data))
-        except ImportError:
-            return -2, None
-
-    def batch_put_tensor(self, keys: List[str], tensors: List[Any]) -> List[int]:
-        results = []
-        for key, tensor in zip(keys, tensors):
-            results.append(self.put_tensor(key, tensor))
-        return results
-
-    def batch_get_tensor(self, keys: List[str]) -> List[Optional[Any]]:
-        results = []
-        for key in keys:
-            code, tensor = self.get_tensor(key)
-            results.append(tensor if code == 0 else None)
-        return results
-
-    def put_tensor_with_tp(self, key: str, tensor: Any, tp_rank: int, tp_size: int, split_dim: int) -> int:
-        try:
-            import torch
-            if not isinstance(tensor, torch.Tensor):
-                return -1
-
-            if tp_size == 1:
-                return self.put_tensor(key, tensor)
-
-            dim_size = tensor.shape[split_dim] // tp_size
-            start = tp_rank * dim_size
-            end = start + dim_size
-            if tp_rank == tp_size - 1:
-                end = tensor.shape[split_dim]
-
-            sliced = torch.narrow(tensor, split_dim, start, end - start)
-            shard_key = f"{key}_tp{tp_rank}"
-            return self.put_tensor(shard_key, sliced)
-        except ImportError:
-            return -2
-
-    def get_tensor_with_tp(self, key: str, tp_rank: int, tp_size: int) -> Tuple[int, Optional[Any]]:
-        try:
-            import torch
-            shard_key = f"{key}_tp{tp_rank}"
-            code, shard = self.get_tensor(shard_key)
-            if code != 0 or shard is None:
-                return code, None
-            return 0, shard
-        except ImportError:
-            return -2, None
-
-    def list_keys(self, prefix: Optional[str] = None) -> Tuple[int, List[str]]:
-        path = "/kv/list"
-        params = {"namespace": self.namespace}
-        if prefix:
-            params["prefix"] = prefix
-
-        code, data = self._request("GET", path, params=params)
-        if code == 0 and data:
-            return 0, data
-        return code, []
+        return self.connect(masters)
 
     def close(self) -> int:
-        self._registered_buffers.clear()
+        self._grpc.close()
         return 0
+
+    @property
+    def leader(self) -> Optional[str]:
+        return self._grpc.leader
+
+    def __enter__(self) -> "KVClient":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # byte KV
+    # ------------------------------------------------------------------
+
+    def put(
+        self, key: str, value: bytes, config: Optional[ReplicateConfig] = None
+    ) -> int:
+        try:
+            resp = self._grpc.kv_put(
+                self.namespace, key, value, owner_id=self.owner_id
+            )
+        except KVError:
+            return -1
+        return 0 if _is_success(resp) else _err_code(resp.error)
+
+    def get(self, key: str) -> Tuple[int, Optional[bytes]]:
+        try:
+            resp = self._grpc.kv_get_raw(self.namespace, key)
+        except KVError:
+            return -1, None
+
+        if not resp.success:
+            return _err_code(resp.error), None
+        if not resp.found:
+            return -2, None
+        return 0, resp.value
+
+    def put_batch(
+        self, keys: Sequence[str], values: Sequence[bytes]
+    ) -> List[int]:
+        if len(keys) != len(values):
+            return [-1] * len(keys)
+        try:
+            resp = self._grpc.kv_batch_put(
+                self.namespace, keys, values, owner_id=self.owner_id
+            )
+        except KVError:
+            return [-1] * len(keys)
+        if resp.error:
+            return [-1] * len(keys)
+        return [0 if ok else -1 for ok in resp.successes]
+
+    def get_batch(
+        self, keys: Sequence[str]
+    ) -> Tuple[int, List[Optional[bytes]]]:
+        try:
+            resp = self._grpc.kv_batch_get(self.namespace, keys)
+        except KVError:
+            return -1, [None] * len(keys)
+        if resp.error:
+            return -1, [None] * len(keys)
+        values: List[Optional[bytes]] = [
+            v if f else None for v, f in zip(resp.values, resp.found)
+        ]
+        return 0, values
+
+    def is_exist(self, key: str) -> int:
+        try:
+            resp = self._grpc.kv_exists(self.namespace, key)
+        except KVError:
+            return -1
+        if resp.error:
+            return _err_code(resp.error)
+        return 1 if resp.exists else 0
+
+    def remove(self, key: str) -> int:
+        """Delete a key; its tensor metadata companion (if any) is also
+        removed."""
+        try:
+            resp = self._grpc.kv_delete(self.namespace, key)
+            if not resp.success:
+                return _err_code(resp.error)
+            meta_resp = self._grpc.kv_delete(self.namespace, key + META_SUFFIX)
+            # Missing meta is the normal case; ignore its result.
+            _ = meta_resp
+            return 0
+        except KVError:
+            return -1
+
+    def remove_by_regex(self, pattern: str) -> int:
+        try:
+            resp = self._grpc.kv_remove_by_regex(self.namespace, pattern)
+        except KVError:
+            return -1
+        return 0 if _is_success(resp) else _err_code(resp.error)
+
+    def remove_all(self) -> int:
+        try:
+            resp = self._grpc.kv_remove_all(self.namespace)
+        except KVError:
+            return -1
+        return 0 if _is_success(resp) else _err_code(resp.error)
+
+    def list_keys(self, prefix: Optional[str] = None) -> Tuple[int, List[str]]:
+        try:
+            resp = self._grpc.kv_list(self.namespace, prefix or "")
+        except KVError:
+            return -1, []
+        if resp.error:
+            return _err_code(resp.error), []
+        # Hide internal tensor-meta companions from user-facing listings.
+        return 0, [k for k in resp.keys if not k.endswith(META_SUFFIX)]
+
+    # ------------------------------------------------------------------
+    # PagedAttention: sessions and blocks
+    # ------------------------------------------------------------------
+
+    def create_session(
+        self,
+        session_id: str,
+        model_name: str,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        dtype: str = "fp16",
+        ttl_seconds: int = 0,
+        collection: str = "",
+    ) -> int:
+        try:
+            resp = self._grpc.create_session(
+                session_id,
+                model_name,
+                num_layers,
+                num_heads,
+                head_dim,
+                dtype=dtype,
+                ttl_seconds=ttl_seconds,
+                owner_id=self.owner_id,
+                namespace_id=self.namespace,
+                collection=collection,
+            )
+        except KVError:
+            return -1
+        return 0 if resp.success else _err_code(resp.error)
+
+    def delete_session(self, session_id: str) -> int:
+        try:
+            resp = self._grpc.delete_session(session_id)
+        except KVError:
+            return -1
+        return 0 if resp.success else _err_code(resp.error)
+
+    def get_session(self, session_id: str) -> Dict[str, Any]:
+        """Return a session summary dict, or an empty dict if not found."""
+        try:
+            resp = self._grpc.get_session(session_id)
+        except KVError:
+            return {}
+        if not resp.exists:
+            return {}
+        return {
+            "session_id": resp.session_id,
+            "model_name": resp.model_name,
+            "num_layers": resp.num_layers,
+            "num_blocks": resp.num_blocks,
+            "total_tokens": resp.total_tokens,
+            "used_bytes": resp.used_bytes,
+        }
+
+    def list_sessions(self, prefix: str = "") -> List[str]:
+        try:
+            resp = self._grpc.list_sessions(prefix=prefix)
+        except KVError:
+            return []
+        return list(resp.session_ids)
+
+    def put_block(
+        self,
+        session_id: str,
+        layer_id: int,
+        num_tokens: int,
+        data: bytes,
+    ) -> int:
+        """Store one KV block; returns the block id, or ``-1`` on failure."""
+        try:
+            resp = self._grpc.put_block(
+                session_id, layer_id, num_tokens, data
+            )
+        except KVError:
+            return -1
+        return int(resp.block_id) if resp.success else -1
+
+    def get_block(self, block_id: int) -> Optional[Dict[str, Any]]:
+        """Return ``{block_id, layer_id, num_tokens, fid, data}`` or None."""
+        try:
+            resp = self._grpc.get_block(block_id)
+        except KVError:
+            return None
+        if not resp.found:
+            return None
+        return {
+            "block_id": resp.block_id,
+            "layer_id": resp.layer_id,
+            "num_tokens": resp.num_tokens,
+            "fid": resp.fid,
+            "data": resp.data,
+        }
+
+    def batch_put_blocks(
+        self, blocks: Sequence[Tuple[str, int, int, bytes]]
+    ) -> List[int]:
+        """Each item: ``(session_id, layer_id, num_tokens, data)``.
+
+        Returns block ids (``-1`` for failed items).
+        """
+        from powerfs.proto.master_pb2 import PutBlockRequest
+
+        reqs = [
+            PutBlockRequest(
+                session_id=sid,
+                layer_id=layer,
+                num_tokens=tokens,
+                data=data,
+            )
+            for sid, layer, tokens, data in blocks
+        ]
+        try:
+            resp = self._grpc.batch_put_blocks(reqs)
+        except KVError:
+            return [-1] * len(reqs)
+        return [
+            int(r.block_id) if r.success else -1 for r in resp.results
+        ]
+
+    def batch_get_blocks(
+        self, block_ids: Sequence[int]
+    ) -> List[Optional[Dict[str, Any]]]:
+        try:
+            resp = self._grpc.batch_get_blocks(block_ids)
+        except KVError:
+            return [None] * len(block_ids)
+        out: List[Optional[Dict[str, Any]]] = []
+        for r in resp.blocks:
+            if not r.found:
+                out.append(None)
+            else:
+                out.append(
+                    {
+                        "block_id": r.block_id,
+                        "layer_id": r.layer_id,
+                        "num_tokens": r.num_tokens,
+                        "fid": r.fid,
+                        "data": r.data,
+                    }
+                )
+        return out
+
+    # ------------------------------------------------------------------
+    # PyTorch tensors
+    # ------------------------------------------------------------------
+
+    def put_tensor(
+        self,
+        key: str,
+        tensor: Any,
+        config: Optional[ReplicateConfig] = None,
+    ) -> int:
+        """Store a torch tensor (any device): raw bytes + dtype/shape
+        metadata, so :meth:`get_tensor` restores shape and dtype."""
+        try:
+            import torch
+        except ImportError:
+            return -2
+
+        if not isinstance(tensor, torch.Tensor):
+            return -1
+
+        cpu = tensor.detach().contiguous().cpu()
+        # numpy (even 2.0) cannot export bfloat16; view as int16 to preserve
+        # the exact bits; get_tensor reconstructs with dtype=bfloat16.
+        if cpu.dtype == torch.bfloat16:
+            raw = cpu.view(torch.int16).numpy().tobytes()
+        else:
+            raw = cpu.numpy().tobytes()
+        header = json.dumps(
+            {"dtype": str(tensor.dtype).replace("torch.", ""),
+             "shape": list(tensor.shape)}
+        ).encode()
+
+        if self.put(key, raw) != 0:
+            return -1
+        if self.put(key + META_SUFFIX, header) != 0:
+            return -1
+        return 0
+
+    def get_tensor(self, key: str) -> Tuple[int, Optional[Any]]:
+        """Retrieve a tensor with original dtype/shape.
+
+        If no metadata is present (e.g. the value was written by the CLI), a
+        flat 1-D float32 view of the bytes is returned.
+        """
+        try:
+            import torch
+        except ImportError:
+            return -2, None
+
+        code, raw = self.get(key)
+        if code != 0 or raw is None:
+            return code, None
+
+        _, header_bytes = self.get(key + META_SUFFIX)
+        dtype = torch.float32
+        shape: Optional[List[int]] = None
+        if header_bytes is not None:
+            try:
+                header = json.loads(header_bytes.decode())
+                dtype = getattr(torch, str(header["dtype"]))
+                shape = [int(x) for x in header["shape"]]
+            except (ValueError, KeyError, AttributeError):
+                pass
+
+        # torch.frombuffer needs a writable buffer; bytearray(raw) is one.
+        # element_size check gives a clean error instead of a RuntimeError.
+        if len(raw) % dtype.itemsize != 0:
+            return -1, None
+        try:
+            tensor = torch.frombuffer(bytearray(raw), dtype=dtype)
+        except (RuntimeError, TypeError):
+            return -1, None
+
+        if shape is not None:
+            tensor = tensor.reshape(shape)
+        return 0, tensor
+
+    def batch_put_tensor(
+        self, keys: Sequence[str], tensors: Sequence[Any]
+    ) -> List[int]:
+        if len(keys) != len(tensors):
+            return [-1] * len(keys)
+        return [self.put_tensor(k, t) for k, t in zip(keys, tensors)]
+
+    def batch_get_tensor(
+        self, keys: Sequence[str]
+    ) -> List[Optional[Any]]:
+        out: List[Optional[Any]] = []
+        for key in keys:
+            code, tensor = self.get_tensor(key)
+            out.append(tensor if code == 0 else None)
+        return out
+
+    def put_tensor_with_tp(
+        self,
+        key: str,
+        tensor: Any,
+        tp_rank: int,
+        tp_size: int,
+        split_dim: int = 0,
+    ) -> int:
+        """Store this rank's shard of a tensor (tensor-parallel).
+
+        The shard is ``narrow(split_dim)`` to an even slice and stored under
+        ``"{key}_tp{rank}"`` with its own dtype/shape metadata.
+        """
+        try:
+            import torch
+        except ImportError:
+            return -2
+
+        if not isinstance(tensor, torch.Tensor):
+            return -1
+
+        if tp_size == 1:
+            return self.put_tensor(key, tensor)
+
+        dim_size = tensor.shape[split_dim] // tp_size
+        start = tp_rank * dim_size
+        end = start + dim_size
+        if tp_rank == tp_size - 1:
+            end = tensor.shape[split_dim]
+
+        shard = torch.narrow(tensor, split_dim, start, end - start)
+        return self.put_tensor(f"{key}_tp{tp_rank}", shard)
+
+    def get_tensor_with_tp(
+        self, key: str, tp_rank: int, tp_size: int
+    ) -> Tuple[int, Optional[Any]]:
+        """Retrieve this rank's shard previously stored via
+        :meth:`put_tensor_with_tp`."""
+        if tp_size == 1:
+            return self.get_tensor(key)
+        return self.get_tensor(f"{key}_tp{tp_rank}")
+
+    # ------------------------------------------------------------------
+    # stats
+    # ------------------------------------------------------------------
+
+    def stats(self) -> Dict[str, int]:
+        try:
+            resp = self._grpc.get_stats()
+        except KVError:
+            return {}
+        return {
+            "total_sessions": resp.total_sessions,
+            "total_blocks": resp.total_blocks,
+            "used_memory_bytes": resp.used_memory_bytes,
+            "max_memory_bytes": resp.max_memory_bytes,
+            "cache_hits": resp.cache_hits,
+            "cache_misses": resp.cache_misses,
+            "evictions": resp.evictions,
+        }
+
+
+# ----------------------------------------------------------------------
+# admin client
+# ----------------------------------------------------------------------
 
 
 class KVAdminClient:
-    def __init__(self):
-        self.base_url = ""
-        self.token = None
+    """Namespace management and statistics over gRPC.
 
-    def setup(self, base_url: str, token: Optional[str] = None) -> int:
-        self.base_url = base_url.rstrip("/")
-        self.token = token
+    Note: API-key creation/listing is a monitor (Web console) feature and is
+    intentionally not part of this client; use ``powerfs-cli`` or the monitor
+    for API keys.
+    """
+
+    def __init__(self) -> None:
+        self._grpc = KVCacheClient()
+
+    def connect(
+        self, masters: str | Sequence[str], timeout: float = 10.0
+    ) -> int:
+        try:
+            self._grpc.connect(masters, timeout=timeout)
+        except (KVError, ValueError):
+            return -1
         return 0
 
-    def _request(self, method: str, path: str, **kwargs) -> Tuple[int, Any]:
-        url = f"{self.base_url}{path}"
-        headers = kwargs.pop("headers", {})
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-
+    def setup(self, base_url: str, token: Optional[str] = None) -> int:
+        """Compatibility initializer; ``base_url`` is a master address (or a
+        comma-separated list) and ``token`` is ignored."""
         try:
-            response = requests.request(method, url, headers=headers, **kwargs)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("success", True):
-                return 0, data.get("data")
-            else:
-                return -1, data.get("error", "Unknown error")
-        except requests.exceptions.RequestException as e:
-            return -1, str(e)
+            normalize_masters(base_url)
+        except ValueError:
+            return -1
+        return self.connect(base_url)
 
-    def create_namespace(self, name: str) -> Tuple[int, Dict[str, Any]]:
-        path = "/api/kv/namespaces"
-        code, data = self._request("POST", path, json={"name": name})
-        return code, data if code == 0 else {}
+    def close(self) -> int:
+        self._grpc.close()
+        return 0
+
+    def create_namespace(
+        self, namespace_id: str, name: str, owner_id: str = ""
+    ) -> Tuple[int, Dict[str, Any]]:
+        try:
+            resp = self._grpc.create_namespace(
+                namespace_id, name, owner_id
+            )
+        except KVError:
+            return -1, {}
+        if not resp.success:
+            return _err_code(resp.error), {}
+        return 0, {"id": resp.namespace_id}
 
     def list_namespaces(self) -> Tuple[int, List[Dict[str, Any]]]:
-        path = "/api/kv/namespaces"
-        code, data = self._request("GET", path)
-        return code, data if code == 0 else []
+        try:
+            resp = self._grpc.list_namespaces()
+        except KVError:
+            return -1, []
+        if resp.error:
+            return _err_code(resp.error), []
+        return 0, [_namespace_dict(ns) for ns in resp.namespaces]
 
-    def get_namespace(self, namespace_id: str) -> Tuple[int, Dict[str, Any]]:
-        path = f"/api/kv/namespaces/{namespace_id}"
-        code, data = self._request("GET", path)
-        return code, data if code == 0 else {}
+    def get_namespace(
+        self, namespace_id: str
+    ) -> Tuple[int, Dict[str, Any]]:
+        try:
+            resp = self._grpc.get_namespace(namespace_id)
+        except KVError:
+            return -1, {}
+        if resp.error:
+            return _err_code(resp.error), {}
+        if not resp.found:
+            return -2, {}
+        return 0, _namespace_dict(resp.namespace)
 
-    def delete_namespace(self, namespace_id: str) -> int:
-        path = f"/api/kv/namespaces/{namespace_id}"
-        code, _ = self._request("DELETE", path)
-        return code
+    def delete_namespace(
+        self, namespace_id: str, owner_id: str = ""
+    ) -> int:
+        try:
+            resp = self._grpc.delete_namespace(namespace_id, owner_id)
+        except KVError:
+            return -1
+        return 0 if resp.success else _err_code(resp.error)
 
-    def create_api_key(self) -> Tuple[int, Dict[str, Any]]:
-        path = "/api/kv/keys"
-        code, data = self._request("POST", path)
-        return code, data if code == 0 else {}
+    def get_stats(self) -> Tuple[int, Dict[str, Any]]:
+        try:
+            resp = self._grpc.get_stats()
+        except KVError:
+            return -1, {}
+        return 0, {
+            "total_sessions": resp.total_sessions,
+            "total_blocks": resp.total_blocks,
+            "used_memory_bytes": resp.used_memory_bytes,
+            "max_memory_bytes": resp.max_memory_bytes,
+            "cache_hits": resp.cache_hits,
+            "cache_misses": resp.cache_misses,
+            "evictions": resp.evictions,
+        }
 
-    def list_api_keys(self) -> Tuple[int, List[Dict[str, Any]]]:
-        path = "/api/kv/keys"
-        code, data = self._request("GET", path)
-        return code, data if code == 0 else []
 
-    def delete_api_key(self, key_id: str) -> int:
-        path = f"/api/kv/keys/{key_id}"
-        code, _ = self._request("DELETE", path)
-        return code
-
-    def get_metrics(self) -> Tuple[int, Dict[str, Any]]:
-        path = "/api/metrics/kv"
-        code, data = self._request("GET", path)
-        return code, data if code == 0 else {}
-
-    def get_sessions(self) -> Tuple[int, List[Dict[str, Any]]]:
-        path = "/api/metrics/kv/sessions"
-        code, data = self._request("GET", path)
-        return code, data if code == 0 else []
+def _namespace_dict(ns: Any) -> Dict[str, Any]:
+    return {
+        "id": ns.id,
+        "name": ns.name,
+        "owner_id": ns.owner_id,
+        "created_at": ns.created_at,
+        "updated_at": ns.updated_at,
+    }

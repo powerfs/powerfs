@@ -26,9 +26,17 @@ impl KvCacheServiceImpl {
 
     fn get_volume_address(&self, volume_id: VolumeId) -> Option<String> {
         let nodes = self.get_volume_nodes(volume_id);
-        nodes
-            .first()
-            .map(|n| format!("{}:{}", n.address, n.grpc_port))
+        nodes.first().map(|n| {
+            // grpc_port is reused as the powerfs-net data port (890x) in
+            // data-plane deployments; the admin gRPC server (WriteNeedle)
+            // uses admin_grpc_port (8080). Fall back for older nodes.
+            let port = if n.admin_grpc_port > 0 {
+                n.admin_grpc_port
+            } else {
+                n.grpc_port
+            };
+            format!("{}:{}", n.address, port)
+        })
     }
 
     fn get_fid_locations(&self, fid_str: &str) -> Vec<Location> {
