@@ -1186,6 +1186,7 @@ service KVCacheService {
     rpc GetStats (GetStatsRequest) returns (GetStatsResponse);
     rpc GetReadHeat (GetReadHeatRequest) returns (GetReadHeatResponse);
     rpc GetBlockMeta (GetBlockMetaRequest) returns (GetBlockMetaResponse);
+    rpc RecordBlockAccess (RecordBlockAccessRequest) returns (RecordBlockAccessResponse);
     rpc CreateNamespace (CreateNamespaceRequest) returns (CreateNamespaceResponse);
     rpc ListNamespaces (ListNamespacesRequest) returns (ListNamespacesResponse);
     rpc GetNamespace (GetNamespaceRequest) returns (GetNamespaceResponse);
@@ -1362,6 +1363,9 @@ message GetStatsResponse {
     uint64 cache_hits = 5;
     uint64 cache_misses = 6;
     uint64 evictions = 7;
+    // Phase D.4: client-direct read attempts that failed before the client
+    // fell back to the Master GetBlock path.
+    uint64 failed_direct_reads = 8;
 }
 
 message GetReadHeatRequest {
@@ -1418,6 +1422,20 @@ message GetBlockMetaResponse {
     // empty when no reachable, client-compatible location exists and the
     // client should fall back to GetBlock.
     repeated BlockLocation locations = 5;
+}
+
+// Phase D.4: receipt from a client-direct read. Keeps Phase C read heat
+// accurate when reads bypass the Master; never used for GC protection.
+message RecordBlockAccessRequest {
+    uint64 block_id = 1;
+    bool success = 2;  // whether the direct volume read succeeded
+}
+
+message RecordBlockAccessResponse {
+    // Whether the receipt was accepted. Receipts are observation records,
+    // not state changes, so this is always true (unknown blocks are a
+    // no-op for read_count but failures are still counted).
+    bool success = 1;
 }
 
 message KVPutRequest {

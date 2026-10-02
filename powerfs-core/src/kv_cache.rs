@@ -211,6 +211,10 @@ pub struct KVCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    /// Phase D.4: failed client-direct read attempts (client then falls
+    /// back to the Master GetBlock path). Process-local counter, like
+    /// hits/evictions; not persisted.
+    pub failed_direct_reads: u64,
 }
 
 /// Per-block read-heat row (Phase C). Mirrors a proto BlockHeat.
@@ -788,6 +792,16 @@ impl KVCacheEngine {
         if let Some(b) = blocks.get_mut(&block_id) {
             b.read_count = b.read_count.saturating_add(1);
         }
+    }
+
+    /// Phase D.4: count one failed client-direct read attempt (RFC §5.5
+    /// "失败也上报，用于统计"). Does NOT touch read_count — a failed read
+    /// produced no useful load. Uses only the stats lock; no nesting with
+    /// blocks/sessions. Counted even when the block is unknown (the
+    /// failure event genuinely happened).
+    pub fn record_failed_direct_read(&self) {
+        let mut stats = self.stats.lock().unwrap();
+        stats.failed_direct_reads = stats.failed_direct_reads.saturating_add(1);
     }
 
     /// Build the read-heat snapshot in one blocks read-lock: per-block rows plus
@@ -2673,6 +2687,40 @@ mod replicate_tests {
         let b = blocks.iter().find(|x| x.block_id == 1).unwrap();
         assert_eq!(b.read_count, 2);
         assert!(b.resident);
+        let _ = e.delete_session("s");
+    }
+
+    #[test]
+    fn failed_direct_read_counter_semantics() {
+        // Phase D.4: failed direct reads increment failed_direct_reads
+        // only — never read_count or hits; counted even for unknown
+        // blocks (the failure genuinely happened).
+        let d = vec![1u8; 200];
+        let e = engine();
+        e.apply_create_session("s", "default", "o", "m", 2, 4, 64, "fp16", 0, "")
+            .unwrap();
+        e.store_leader_block(1, "s", 0, 8, &d, "1,0,1", 0, PinMode::None)
+            .unwrap();
+
+        // Two failed attempts (one on existing, one on unknown block).
+        e.record_failed_direct_read();
+        e.record_failed_direct_read();
+        let st = e.stats();
+        assert_eq!(st.failed_direct_reads, 2);
+        assert_eq!(st.hits, 0);
+        // Failed attempts produce no heat.
+        let (_, blocks) = e.read_heat(0);
+        let b = blocks.iter().find(|x| x.block_id == 1).unwrap();
+        assert_eq!(b.read_count, 0);
+
+        // A subsequent successful receipt counts heat exactly once and
+        // does not touch the failure counter.
+        e.record_block_read(1);
+        assert_eq!(e.stats().failed_direct_reads, 2);
+        let (_, blocks) = e.read_heat(0);
+        let b = blocks.iter().find(|x| x.block_id == 1).unwrap();
+        assert_eq!(b.read_count, 1);
+
         let _ = e.delete_session("s");
     }
 

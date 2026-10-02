@@ -689,6 +689,7 @@ impl KvCacheService for KvCacheServiceImpl {
             cache_hits: stats.hits,
             cache_misses: stats.misses,
             evictions: stats.evictions,
+            failed_direct_reads: stats.failed_direct_reads,
         }))
     }
 
@@ -790,6 +791,32 @@ impl KvCacheService for KvCacheServiceImpl {
             size_bytes: meta.size_bytes,
             locations,
         }))
+    }
+
+    async fn record_block_access(
+        &self,
+        request: Request<RecordBlockAccessRequest>,
+    ) -> Result<Response<RecordBlockAccessResponse>, Status> {
+        let req = request.into_inner();
+        if req.success {
+            // Direct read succeeded: count it through the SAME function the
+            // volume re-fetch path uses, keeping Phase C heat consistent.
+            // No-op when the block has since been deleted.
+            self.engine.record_block_read(req.block_id);
+        } else {
+            // Direct read failed: record the failed attempt for health
+            // statistics, but never read_count (no successful load). The
+            // client is expected to fall back to GetBlock, whose success
+            // will be counted exactly once through the existing path.
+            self.engine.record_failed_direct_read();
+            log::debug!(
+                "RECORD_BLOCK_ACCESS: block={} direct read failed; client should fall back to GetBlock",
+                req.block_id
+            );
+        }
+
+        // Receipts are observation records: always acknowledged.
+        Ok(Response::new(RecordBlockAccessResponse { success: true }))
     }
 
     async fn create_namespace(
