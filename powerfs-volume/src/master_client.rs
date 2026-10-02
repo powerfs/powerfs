@@ -36,6 +36,15 @@ pub struct MasterClient {
     client_cert_pem: String,
     /// Long-lived TLV client — manages connection, redirect, failover.
     tlv_client: Arc<TlvMasterClient>,
+    /// Transport type for data plane (u8: 0=TCP, 1=RDMA). Reported in heartbeat
+    /// so Master can populate GetBlockMeta location for Client-direct read.
+    /// Determined from volume config (rdma_device + require_rdma).
+    transport_type: u8,
+    /// Transport listen port (u64). Same as net_port for TCP; RDMA port if
+    /// separate. 0 = use net_port.
+    transport_port: u64,
+    /// RDMA device name (e.g. "mlx5_0"). Empty when transport_type=TCP.
+    rdma_device: String,
 }
 
 pub struct NewMasterClientParams<'a> {
@@ -56,6 +65,12 @@ pub struct NewMasterClientParams<'a> {
     pub client_cert_pem: &'a str,
     /// Optional transport (e.g. RDMA). None = TCP.
     pub transport: Option<Arc<dyn Transport>>,
+    /// Transport type for data plane (0=TCP, 1=RDMA). Reported in heartbeat.
+    pub transport_type: u8,
+    /// Transport listen port. 0 = use net_port.
+    pub transport_port: u64,
+    /// RDMA device name. Empty when TCP.
+    pub rdma_device: String,
 }
 
 impl MasterClient {
@@ -96,6 +111,9 @@ impl MasterClient {
             registration_token: params.registration_token.map(|s| s.to_string()),
             client_cert_pem: params.client_cert_pem.to_string(),
             tlv_client,
+            transport_type: params.transport_type,
+            transport_port: params.transport_port,
+            rdma_device: params.rdma_device.clone(),
         }
     }
 
@@ -147,6 +165,18 @@ impl MasterClient {
         // Client certificate (PEM) for production node authentication.
         if !self.client_cert_pem.is_empty() {
             let _ = enc.add_string(FieldId::ClientCert, &self.client_cert_pem);
+        }
+
+        // Phase D: transport capability for GetBlockMeta location.
+        // Master uses this to tell clients whether the data plane is RDMA.
+        // MUST be encoded AFTER RegistrationToken/ClientCert (master decodes
+        // those sequentially before volumes list) and BEFORE the per-volume
+        // records, because the master's TLV decoder iterates in insertion
+        // order and unknown trailing fields are skipped only per-record.
+        let _ = enc.add_u64(FieldId::TransportType, self.transport_type as u64);
+        let _ = enc.add_u64(FieldId::TransportPort, self.transport_port);
+        if !self.rdma_device.is_empty() {
+            let _ = enc.add_string(FieldId::RdmaDevice, &self.rdma_device);
         }
 
         for vol in volumes {

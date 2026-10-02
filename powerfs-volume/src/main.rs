@@ -709,6 +709,16 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         });
     }
 
+    // Phase D: transport capability for heartbeat / GetBlockMeta location.
+    let transport_type: u8 = match cfg.volume.transport.as_deref() {
+        Some("rdma") => 1,
+        // auto with rdma_device configured → prefer RDMA
+        Some("auto") if cfg.volume.rdma_device.is_some() => 1,
+        _ => 0,
+    };
+    let transport_port: u64 = net_port as u64;
+    let rdma_device: String = cfg.volume.rdma_device.clone().unwrap_or_default();
+
     let master_client = MasterClient::new(NewMasterClientParams {
         master_addresses: &master_addrs,
         master_net_port: volume_cfg.master_net_port,
@@ -720,6 +730,9 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         registration_token: volume_cfg.registration_token.as_deref(),
         client_cert_pem: &client_cert_pem,
         transport: Some(master_transport.clone()),
+        transport_type,
+        transport_port,
+        rdma_device,
     });
 
     let register = args.register_with_master.unwrap_or(true);
