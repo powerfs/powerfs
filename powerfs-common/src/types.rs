@@ -500,6 +500,17 @@ pub struct DataNodeInfo {
     /// 0.0 when not reported (pre-P5 nodes).
     #[serde(default)]
     pub memory_usage: f32,
+    /// Phase D: data-plane transport type (0=TCP, 1=RDMA). Reported via
+    /// heartbeat TLV TransportType. Defaults to TCP (0) for pre-D nodes.
+    #[serde(default)]
+    pub transport_type: u8,
+    /// Phase D: transport-specific listen port. Same as grpc_port/net_port
+    /// for TCP; may differ for RDMA. 0 = fallback to grpc_port.
+    #[serde(default)]
+    pub transport_port: u64,
+    /// Phase D: RDMA device name (e.g. "mlx5_0"). Empty when transport_type=0.
+    #[serde(default)]
+    pub rdma_device: String,
 }
 
 impl DataNodeInfo {
@@ -559,6 +570,9 @@ impl DataNodeInfo {
             state_since: 0,
             cpu_usage: 0.0,
             memory_usage: 0.0,
+            transport_type: 0, // TCP
+            transport_port: 0, // fallback to grpc_port
+            rdma_device: String::new(),
         }
     }
 }

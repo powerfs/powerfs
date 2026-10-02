@@ -1512,6 +1512,17 @@ pub enum FieldId {
     /// intent when the target dir entry already existed, so commit can
     /// DecrementNlink it and abort can restore it.
     ReplacedIno = 0xDA,
+
+    // ===== Phase D: Volume transport capability in heartbeat (0xDB-0xDD) =====
+    /// Transport type (u8): 0=TCP, 1=RDMA. Sent by volume in heartbeat so
+    /// Master knows the data-plane transport for GetBlockMeta location.
+    TransportType = 0xDB,
+    /// Transport-specific listen port (u64). TCP or RDMA port bound by the
+    /// volume's AutoTransport. If 0, master falls back to NetPort(0x9D).
+    TransportPort = 0xDC,
+    /// RDMA device name (string, e.g. "mlx5_0"). Only present when
+    /// TransportType=RDMA; empty when TCP.
+    RdmaDevice = 0xDD,
 }
 
 impl FieldId {
@@ -1647,6 +1658,9 @@ impl FieldId {
             0xD8 => Some(Self::RenameId),
             0xD9 => Some(Self::RenameSide),
             0xDA => Some(Self::ReplacedIno),
+            0xDB => Some(Self::TransportType),
+            0xDC => Some(Self::TransportPort),
+            0xDD => Some(Self::RdmaDevice),
             _ => None,
         }
     }

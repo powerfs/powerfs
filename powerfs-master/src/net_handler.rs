@@ -323,6 +323,24 @@ impl MasterNetHandler {
             String::new()
         };
 
+        // Phase D: transport capability (0=TCP, 1=RDMA; 0 port = fallback net_port).
+        // Absent on pre-D volumes; defaults to TCP.
+        let transport_type = if dec.has_field(FieldId::TransportType) {
+            dec.next_u64(FieldId::TransportType).unwrap_or(0) as u8
+        } else {
+            0
+        };
+        let transport_port = if dec.has_field(FieldId::TransportPort) {
+            dec.next_u64(FieldId::TransportPort).unwrap_or(0)
+        } else {
+            0
+        };
+        let rdma_device = if dec.has_field(FieldId::RdmaDevice) {
+            dec.next_string(FieldId::RdmaDevice).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
         info!(
             "NET_HEARTBEAT: node={}, ip={}, volumes={}, cpu={:.1}%, mem={:.1}%",
             node_id_str,
@@ -484,6 +502,13 @@ impl MasterNetHandler {
             .update_node_load_metrics(&node_id, cpu_usage, memory_usage);
         self.master
             .update_node_admin_grpc_port(&node_id, admin_grpc_port);
+        // Phase D: store transport capability for GetBlockMeta location.
+        self.master.update_node_transport_capability(
+            &node_id,
+            transport_type,
+            transport_port,
+            rdma_device,
+        );
 
         let leader = self.master.get_leader().await;
         let default_volume_size = powerfs_common::constants::DEFAULT_VOLUME_SIZE;

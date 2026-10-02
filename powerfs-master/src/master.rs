@@ -2811,6 +2811,24 @@ impl MasterNode {
         }
     }
 
+    /// 更新节点的 transport 能力 (心跳 TLV TransportType/TransportPort/RdmaDevice)。
+    /// 本地(非 Raft)易失更新, 与 load metrics 同性质; 节点重启后心跳重报。
+    /// transport_type: 0=TCP, 1=RDMA; transport_port: 0 = 回退 net_port。
+    pub fn update_node_transport_capability(
+        &self,
+        node_id: &NodeId,
+        transport_type: u8,
+        transport_port: u64,
+        rdma_device: String,
+    ) {
+        let mut topology = self.topology.write().unwrap();
+        if let Some(node) = topology.get_node_mut(node_id) {
+            node.transport_type = transport_type;
+            node.transport_port = transport_port;
+            node.rdma_device = rdma_device;
+        }
+    }
+
     pub async fn update_node_volumes(&self, params: UpdateNodeVolumesParams) -> Result<()> {
         if !self.is_leader().await {
             return Err(PowerFsError::NotLeader);
@@ -5653,5 +5671,49 @@ mod tests {
         let node = topo.get_node(&NodeId("test-node".to_string())).unwrap();
         assert!((node.cpu_usage - 0.75).abs() < 1e-6);
         assert!((node.memory_usage - 0.50).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_update_node_transport_capability() {
+        // Phase D.2: update_node_transport_capability is a local (non-Raft)
+        // topology update, mirroring update_node_load_metrics. Verify the
+        // new fields persist on an existing node and serde defaults keep
+        // legacy data deserializable (transport_type=0 = TCP).
+        use powerfs_common::types::Topology;
+        let mut topo = Topology::new();
+        let n = DataNodeInfo::new(
+            NodeId("test-node".to_string()),
+            "127.0.0.1".to_string(),
+            RackId("r1".to_string()),
+            DataCenterId("dc1".to_string()),
+            8080,
+            8081,
+            String::new(),
+        );
+        // Legacy default: TCP, port 0, no RDMA device.
+        assert_eq!(n.transport_type, 0);
+        assert_eq!(n.transport_port, 0);
+        assert_eq!(n.rdma_device, "");
+
+        topo.get_or_create_node(n);
+        {
+            if let Some(node) = topo.get_node_mut(&NodeId("test-node".to_string())) {
+                node.transport_type = 1;
+                node.transport_port = 8902;
+                node.rdma_device = "mlx5_0".to_string();
+            }
+        }
+        let node = topo.get_node(&NodeId("test-node".to_string())).unwrap();
+        assert_eq!(node.transport_type, 1);
+        assert_eq!(node.transport_port, 8902);
+        assert_eq!(node.rdma_device, "mlx5_0");
+
+        // Serde round-trip: serialize the updated node, deserialize, expect
+        // transport fields preserved.
+        let json = serde_json::to_string(node).unwrap();
+        let decoded: DataNodeInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.transport_type, 1);
+        assert_eq!(decoded.transport_port, 8902);
+        assert_eq!(decoded.rdma_device, "mlx5_0");
     }
 }

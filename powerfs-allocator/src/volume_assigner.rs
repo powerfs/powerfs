@@ -266,6 +266,9 @@ mod tests {
             state_since: 0,
             cpu_usage: 0.0,
             memory_usage: 0.0,
+            transport_type: 0,
+            transport_port: 0,
+            rdma_device: String::new(),
         }
     }
 
@@ -292,6 +295,9 @@ mod tests {
                 state_since: 0,
                 cpu_usage: 0.0,
                 memory_usage: 0.0,
+                transport_type: 0,
+                transport_port: 0,
+                rdma_device: String::new(),
             })
             .collect()
     }
