@@ -1,10 +1,11 @@
+use crate::client_auth::{log_auth_failure, ClientAuthenticator};
 use crate::server::VolumeServer;
 use log::{debug, error, info, warn};
-use powerfs_common::types::{NeedleId, VolumeId};
+use powerfs_common::types::{Fid, NeedleId, VolumeId};
 use powerfs_net::serialize::{TlvDecoder, TlvEncoder};
 use powerfs_net::{
-    FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_NOT_FOUND,
-    STATUS_ERR_NO_SPACE, STATUS_ERR_SERVER_ERROR, STATUS_OK,
+    ClientType, FieldId, MsgType, NetHandler, NetMessage, RequestContext, STATUS_ERR_NOT_FOUND,
+    STATUS_ERR_NO_SPACE, STATUS_ERR_PERMISSION_DENIED, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,13 +15,16 @@ pub struct VolumeNetHandler {
     pub volume_server: Arc<VolumeServer>,
     /// Maps session numeric client_id → UUID-based holder string
     client_id_map: Arc<Mutex<HashMap<u64, String>>>,
+    /// Phase D.5: verifies credentials presented by external KV clients.
+    authenticator: Arc<ClientAuthenticator>,
 }
 
 impl VolumeNetHandler {
-    pub fn new(volume_server: Arc<VolumeServer>) -> Self {
+    pub fn new(volume_server: Arc<VolumeServer>, authenticator: Arc<ClientAuthenticator>) -> Self {
         Self {
             volume_server,
             client_id_map: Arc::new(Mutex::new(HashMap::new())),
+            authenticator,
         }
     }
 
@@ -391,6 +395,178 @@ impl VolumeNetHandler {
             }
             Err(e) => {
                 error!("read_needle task failed: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Phase D.5: verify a KvClient's credentials on its first message.
+    ///
+    /// On success the connection (whose state lives in powerfs-net's
+    /// ClientConn) is marked authenticated; failure leaves it unmarked and
+    /// returns PERMISSION_DENIED. Internal failure details go to logs only,
+    /// never to the peer beyond a short reason.
+    async fn handle_authenticate(
+        &self,
+        msg: &NetMessage,
+        ctx: &mut RequestContext,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        // Fixed wire order (RegistrationToken then ClientCert); the client
+        // SDK and the E2E test client both encode it this way.
+        let token = if dec.has_field(FieldId::RegistrationToken) {
+            dec.next_string(FieldId::RegistrationToken)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let cert_pem = if dec.has_field(FieldId::ClientCert) {
+            dec.next_string(FieldId::ClientCert).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let peer_ip = ctx.client.address.ip();
+        let peer = peer_ip.to_string();
+
+        match self.authenticator.authenticate(&cert_pem, &token, peer_ip) {
+            Ok(()) => {
+                // The server path always supplies the connection handle.
+                let conn = match ctx.connection.as_ref() {
+                    Some(c) => c,
+                    None => {
+                        // Fail closed: without a handle we cannot persist the
+                        // authenticated state, so the peer must not proceed.
+                        error!(
+                            "CLIENT_AUTH: no connection handle in context for peer={}",
+                            peer
+                        );
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_SERVER_ERROR,
+                            Vec::new(),
+                            Vec::new(),
+                        ));
+                    }
+                };
+                conn.mark_authenticated();
+                info!("CLIENT_AUTH: accepted KvClient peer={}", peer);
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new(), Vec::new()))
+            }
+            Err(failure) => {
+                // Detailed reason is logged locally; the peer only sees a
+                // generic message (never local CA/configuration details).
+                log_auth_failure(&peer, &failure.reason);
+                let public = if failure.status == STATUS_ERR_SERVER_ERROR {
+                    "server configuration error"
+                } else {
+                    "authentication failed"
+                };
+                Ok(Self::build_response(
+                    msg,
+                    failure.status,
+                    public.as_bytes().to_vec(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
+    /// Phase D.5: direct needle read for an authenticated external KV client.
+    ///
+    /// The needle is addressed by a full fid string
+    /// (`volume_id,cookie,file_key`). The Volume verifies fid syntax and
+    /// volume ownership (the real cross-volume barrier) and existence; the
+    /// cookie is carried but not verifiable here (spec decision ⑤ — the
+    /// cookie authority is the Master's block_id→fid mapping). This path
+    /// does not touch read_count/hits.
+    async fn handle_direct_read_needle(
+        &self,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let mut dec = TlvDecoder::new(&msg.body);
+        let fid_str = if dec.has_field(FieldId::Fid) {
+            dec.next_string(FieldId::Fid).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let fid = match Fid::from_string(&fid_str) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("DIRECT_READ_NEEDLE: invalid fid {:?}: {}", fid_str, e);
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    b"invalid fid".to_vec(),
+                    Vec::new(),
+                ));
+            }
+        };
+
+        info!(
+            "DIRECT_READ_NEEDLE: volume_id={}, file_key={}",
+            fid.volume_id.0, fid.file_key
+        );
+
+        let storage_manager = self.volume_server.storage_manager.clone();
+
+        // Volume ownership gate: this node must host the addressed volume.
+        if storage_manager.get_volume(&fid.volume_id).is_none() {
+            warn!(
+                "DIRECT_READ_NEEDLE: volume {} not hosted on this node",
+                fid.volume_id.0
+            );
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_PERMISSION_DENIED,
+                b"volume not hosted on this node".to_vec(),
+                Vec::new(),
+            ));
+        }
+
+        let sm = storage_manager.clone();
+        let vid = fid.volume_id;
+        let nid = NeedleId(fid.file_key);
+
+        match tokio::task::spawn_blocking(
+            move || -> Result<Option<Vec<u8>>, powerfs_common::error::PowerFsError> {
+                match sm.get_volume(&vid) {
+                    Some(volume) => match volume.read_needle(&nid) {
+                        Ok(data) => Ok(Some(data.to_vec())),
+                        Err(powerfs_common::error::PowerFsError::NeedleNotFound(_)) => Ok(None),
+                        Err(e) => Err(e),
+                    },
+                    // Raced a volume removal: the block is unreachable here.
+                    None => Ok(None),
+                }
+            },
+        )
+        .await
+        {
+            Ok(Ok(Some(data))) => Ok(Self::build_response(msg, STATUS_OK, Vec::new(), data)),
+            Ok(Ok(None)) => Ok(Self::build_response(
+                msg,
+                STATUS_ERR_NOT_FOUND,
+                Vec::new(),
+                Vec::new(),
+            )),
+            Ok(Err(e)) => {
+                warn!("DIRECT_READ_NEEDLE: read error: {}", e);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+            Err(e) => {
+                error!("DIRECT_READ_NEEDLE: task failed: {}", e);
                 Ok(Self::build_response(
                     msg,
                     STATUS_ERR_SERVER_ERROR,
@@ -1019,6 +1195,56 @@ impl NetHandler for VolumeNetHandler {
             .msg_type()
             .ok_or_else(|| powerfs_net::NetError::Protocol("unknown message type".into()))?;
 
+        let is_kv_client = ctx.client.client_type == ClientType::KvClient;
+
+        // Phase D.5: connection-level gate for external KV clients.
+        if is_kv_client {
+            match msg_type {
+                // Health probe is always permitted and does not authenticate.
+                MsgType::Ping => {
+                    return Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new()));
+                }
+                MsgType::Authenticate => {
+                    return self.handle_authenticate(msg, ctx).await;
+                }
+                _ => {
+                    let authenticated = ctx
+                        .connection
+                        .as_ref()
+                        .map(|c| c.is_authenticated())
+                        .unwrap_or(false);
+                    if !authenticated {
+                        warn!(
+                            "NET_VOLUME: unauthenticated KvClient attempted {:?}",
+                            msg_type
+                        );
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_PERMISSION_DENIED,
+                            b"authentication required".to_vec(),
+                            Vec::new(),
+                        ));
+                    }
+                    // Authenticated connection: least privilege — the only
+                    // business message a KV client may use is DirectReadNeedle.
+                    // Write/delete/lease/StatFs and everything else is refused.
+                    if msg_type != MsgType::DirectReadNeedle {
+                        warn!(
+                            "NET_VOLUME: authenticated KvClient attempted forbidden {:?}",
+                            msg_type
+                        );
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_PERMISSION_DENIED,
+                            b"only DirectReadNeedle permitted for KV clients".to_vec(),
+                            Vec::new(),
+                        ));
+                    }
+                    return self.handle_direct_read_needle(msg).await;
+                }
+            }
+        }
+
         debug!(
             "NET_VOLUME: handling request {:?}, trace={}, client_id={}, seq={}",
             msg_type,
@@ -1049,6 +1275,33 @@ impl NetHandler for VolumeNetHandler {
             MsgType::LookupVolume => Ok(self.handle_lookup_volume(msg)),
             MsgType::StatFs => Ok(self.handle_statfs(msg)),
             MsgType::Ping => Ok(NetMessage::ok_response(msg, Vec::new(), Vec::new())),
+            MsgType::DirectReadNeedle => {
+                // KvClient requests are served (and only reachable) inside
+                // the gate above; anything reaching here is a non-Kv client.
+                warn!(
+                    "NET_VOLUME: DirectReadNeedle from non-Kv client type {:?}",
+                    ctx.client.client_type
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    b"direct read not allowed for this client type".to_vec(),
+                    Vec::new(),
+                ))
+            }
+            MsgType::Authenticate => {
+                // Non-Kv peers never pass the gate into the real handler.
+                warn!(
+                    "NET_VOLUME: Authenticate from non-Kv client type {:?}",
+                    ctx.client.client_type
+                );
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    b"authenticate not allowed for this client type".to_vec(),
+                    Vec::new(),
+                ))
+            }
             _ => {
                 warn!("NET_VOLUME: unsupported message type {:?}", msg_type);
                 Err(powerfs_net::NetError::UnknownMsgType(msg_type.as_u16()))

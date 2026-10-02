@@ -11,9 +11,11 @@ pub enum CertSubcommand {
     /// Fetch the master CA certificate and save it locally.
     InitCa(InitCaArgs),
     /// Request the master to sign a client certificate bound to specific
-    /// IP addresses + mount directories. The issued certificate is INVALID
-    /// if used from a different host (source IP not in --san-ip) or
-    /// mounted on a directory not in --mount-dir.
+    /// IP addresses. --mount-dir is OPTIONAL: repeat it to bind the cert
+    /// to mount directories (FUSE/kernel mount clients); omit it to issue
+    /// a non-mount client certificate (an external KV client uses the
+    /// cert to authenticate directly to volume servers). The issued
+    /// certificate is INVALID when used from a source IP not in --san-ip.
     SignClient(SignClientArgs),
     /// Request the master to sign a server certificate.
     SignServer(SignServerArgs),
@@ -62,9 +64,11 @@ pub struct SignClientArgs {
     #[arg(long = "san-ip", required = true)]
     san_ips: Vec<String>,
     /// Mount directory/directories the certificate is bound to. Repeat
-    /// this option for multiple mount directories. AT LEAST ONE IS
-    /// REQUIRED. Mounting on any other path will be rejected.
-    #[arg(long = "mount-dir", required = true)]
+    /// for multiple mount directories. OMIT to issue a non-mount client
+    /// certificate (e.g. an external KV client authenticating directly
+    /// to volume servers). When provided, mounting on any other path is
+    /// rejected.
+    #[arg(long = "mount-dir")]
     mount_dirs: Vec<String>,
     /// Output directory for `<client-name>.crt` + `<client-name>.key`.
     #[arg(short, long, default_value = ".")]
@@ -188,17 +192,17 @@ fn sign_client(args: &SignClientArgs) -> CommandResult {
         .into());
     }
     if args.mount_dirs.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "--mount-dir is required (repeat for multiple dirs)",
-        )
-        .into());
+        println!(
+            "Requesting master to sign a NON-MOUNT client certificate (KV direct-read): \
+name={} san_ips={:?} mount_dirs=[]",
+            args.client_name, args.san_ips
+        );
+    } else {
+        println!(
+            "Requesting master to sign client certificate: name={} san_ips={:?} mount_dirs={:?}",
+            args.client_name, args.san_ips, args.mount_dirs
+        );
     }
-
-    println!(
-        "Requesting master to sign client certificate: name={} san_ips={:?} mount_dirs={:?}",
-        args.client_name, args.san_ips, args.mount_dirs
-    );
 
     let req = SignClientRequestV2 {
         common_name: args.client_name.clone(),
@@ -242,20 +246,31 @@ fn sign_client(args: &SignClientArgs) -> CommandResult {
     println!();
     println!("Issuance metadata (san_ips / mount_dirs / client_name / fingerprint)");
     println!("has been persisted on the master as a binding record. The master");
-    println!("will REJECT the mount if the caller's source IP is not in san_ips");
-    println!("or if the mount-point Name differs from one of --mount-dir.");
-    println!();
-    println!("Deploy these files to the client node and mount:");
-    println!("  (FUSE)   powerfs-fuse --master <..> --mount-point <dir> \\");
-    println!("             --ca-crt   /etc/powerfs/certs/ca.crt \\");
-    println!("             --client-crt {} \\", cert_path.display());
-    println!("             --client-key {}", key_path.display());
-    println!("  (Kernel) mount -t powerfs -o 'master_addr=...,ca_crt=/etc/powerfs/certs/ca.crt,\\");
-    println!(
-        "             client_crt={},client_key={}' none <mount-point>",
-        cert_path.display(),
-        key_path.display()
-    );
+    println!("will REJECT use from a source IP not in san_ips.");
+
+    if args.mount_dirs.is_empty() {
+        println!();
+        println!("Use this cert/key with the cluster registration token to");
+        println!("authenticate a KV client connection against a volume server,");
+        println!("then read blocks by the fid returned by GetBlockMeta.");
+    } else {
+        println!("It will also reject the mount if the mount-point Name differs");
+        println!("from one of --mount-dir.");
+        println!();
+        println!("Deploy these files to the client node and mount:");
+        println!("  (FUSE)   powerfs-fuse --master <..> --mount-point <dir> \\");
+        println!("             --ca-crt   /etc/powerfs/certs/ca.crt \\");
+        println!("             --client-crt {} \\", cert_path.display());
+        println!("             --client-key {}", key_path.display());
+        println!(
+            "  (Kernel) mount -t powerfs -o 'master_addr=...,ca_crt=/etc/powerfs/certs/ca.crt,\\"
+        );
+        println!(
+            "             client_crt={},client_key={}' none <mount-point>",
+            cert_path.display(),
+            key_path.display()
+        );
+    }
 
     Ok(())
 }

@@ -122,6 +122,11 @@ pub enum ClientType {
     Volume = 0x04,
     Filer = 0x05,
     Master = 0x06,
+    /// Phase D.5: external KV client (inference process). Unlike the
+    /// internal types, connections of this type MUST complete the
+    /// Authenticate handshake (client cert + registration token) before
+    /// any business message is accepted.
+    KvClient = 0x07,
 }
 
 impl ClientType {
@@ -133,6 +138,7 @@ impl ClientType {
             0x04 => Some(Self::Volume),
             0x05 => Some(Self::Filer),
             0x06 => Some(Self::Master),
+            0x07 => Some(Self::KvClient),
             _ => None,
         }
     }
@@ -888,6 +894,21 @@ pub enum MsgType {
     /// the same `apply_config()` path used by the poller.
     DebugConfigChanged = 0x008A,
 
+    // ===== Phase D.5: external client authentication & direct read =====
+    /// KvClient → Volume: connection-level authentication.
+    /// Request TLV: RegistrationToken(0xD3) + ClientCert(0xD4 PEM).
+    /// Response: STATUS_OK marks the connection authenticated, or
+    /// STATUS_ERR_PERMISSION_DENIED with a reason.
+    Authenticate = 0x008B,
+
+    /// KvClient → Volume: authenticated direct needle read.
+    /// Request/response body mirrors ReadNeedle (fid TLV in, data out);
+    /// rejected with PERMISSION_DENIED on an unauthenticated connection,
+    /// a malformed fid, or a volume not hosted on this node. The cookie
+    /// segment is carried but not verified (see kv-volume-auth spec
+    /// decision ⑤). Does not count hits/read_count.
+    DirectReadNeedle = 0x008C,
+
     // ===== Capability (Cap) model — §13 Capability 模型 =====
     // Client → Filer: request caps for an open() call. Always succeeds
     // (open never blocks). Response carries granted caps + token + epoch.
@@ -1047,6 +1068,8 @@ impl MsgType {
             0x0088 => Some(Self::RevokeInodeLeaseAck),
             0x0089 => Some(Self::GetDebugConfig),
             0x008A => Some(Self::DebugConfigChanged),
+            0x008B => Some(Self::Authenticate),
+            0x008C => Some(Self::DirectReadNeedle),
             0x0091 => Some(Self::CapOpenGrant),
             0x0092 => Some(Self::CapRecallAck),
             0x0093 => Some(Self::CapRelease),
@@ -1930,6 +1953,12 @@ pub fn expected_resp_size(msg_type: u16) -> Option<(usize, usize)> {
 
         // FlushNeedles (0x006C) - flush barrier, response is status only
         0x006C => Some((256, 0)),
+
+        // Authenticate (0x008B) - status + short generic body
+        0x008B => Some((4 * 1024, 0)),
+
+        // DirectReadNeedle (0x008C) - data ≤ 2MB, same bounds as ReadNeedle
+        0x008C => Some((256 * 1024, 2 * 1024 * 1024)),
 
         // 其他消息类型无大小约束
         _ => None,

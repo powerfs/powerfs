@@ -4,8 +4,10 @@
 //! and metadata for observability and debugging.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
+use crate::client_conn::ClientConn;
 use crate::protocol::{ClientType, MsgType, NetMessage};
 
 /// Unique trace identifier for end-to-end request tracking
@@ -74,6 +76,11 @@ pub struct RequestContext {
     pub start_time: Instant,
     pub latency_ms: Option<u64>,
     pub metadata: std::collections::HashMap<String, String>,
+    /// Phase D.5: live connection this request arrived on, when resolved
+    /// through the connection manager. Lets business handlers read/mutate
+    /// connection-level state (e.g. mark the KvClient connection
+    /// authenticated). `None` for tests and paths that bypass the manager.
+    pub connection: Option<Arc<ClientConn>>,
 }
 
 impl RequestContext {
@@ -87,6 +94,7 @@ impl RequestContext {
             start_time: Instant::now(),
             latency_ms: None,
             metadata: std::collections::HashMap::new(),
+            connection: None,
         }
     }
 

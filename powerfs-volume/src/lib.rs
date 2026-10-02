@@ -1,3 +1,4 @@
+pub mod client_auth;
 pub mod io_stats;
 pub mod lease_persistence;
 pub mod master_client;

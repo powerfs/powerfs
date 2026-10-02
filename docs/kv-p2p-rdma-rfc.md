@@ -236,7 +236,7 @@ Client 直连 Volume 绕过 Master，需独立认证：
 
 1. **ClientCert TLV**：Client 连接时发送证书（现有机制）；
 2. **注册 token**：Volume 验证 token 有效性（新机制，Volume 侧新增缓存/验证）；
-3. **fid 校验**：Volume 验证 fid 格式与 volume_id 匹配，cookie 校验（防止跨 Volume 访问）。
+3. **fid 校验**：Volume 验证 fid 为合法三元组、`volume_id` 属本节点托管卷（防止跨 Volume 访问）、needle 存在。当前引擎 volume 侧不持久化 cookie（Master assign 生成的 cookie 仅存于 block_id→fid 映射、写入时不下发），故不做 cookie 比对，也不设形同虚设的假校验；cookie 贯通写入与持久化、volume 侧 cookie 校验列为后续硬化项。
 
 **认证流程**：
 ```
@@ -246,6 +246,8 @@ Volume ──本地验证 token（缓存）──→ accept/reject
 ```
 
 **信任模型**：集群级 token，无 block 级授权。读取权限由 Master 的 GetBlockMeta 控制（返回位置即授权）。
+
+**网络信任边界与残余风险**：上述门控以握手中客户端自报的 `ClientType` 为锚点，Volume 数据端口不做传输层对端认证。能与数据端口建立 TCP 连接的发起方若自报 Fuse/Volume 等内部类型，可不经 Authenticate 进入内部路径。因此部署必须把网络分段作为显式安全前提：数据端口不得向不可信网络发布，接入其所在网络的节点一律视为信任域成员。KvClient 即使认证成功也仅放行 DirectReadNeedle（只读最小权限，无法写/删/改租约）。数据端口全连接 mTLS 列为后续根本修复项。
 
 ### 5.9 单 listener 与 fallback 策略
 
