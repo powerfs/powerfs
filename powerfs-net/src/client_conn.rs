@@ -24,6 +24,7 @@ use crate::protocol::{ClientType, NetMessage};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
@@ -203,6 +204,13 @@ pub struct ClientConn {
     /// 携证请求通过校验后回填, 之前为 None.
     pub cert_fingerprint: RwLock<Option<String>>,
 
+    /// Phase D.5: connection-level authentication flag for KvClient.
+    /// Starts false; set true only after a successful Authenticate
+    /// handshake (client cert + registration token). Destroyed with the
+    /// connection — a reconnect must re-authenticate. Atomic so the
+    /// business handler can check it without taking a lock.
+    pub authenticated: AtomicBool,
+
     /// 连接状态
     pub state: RwLock<ConnState>,
     /// 客户端策略 (可动态修改)
@@ -250,6 +258,7 @@ impl ClientConn {
             features,
             route_hash,
             cert_fingerprint: RwLock::new(None),
+            authenticated: AtomicBool::new(false),
             state: RwLock::new(ConnState::Active),
             policy: RwLock::new(ClientPolicy::default()),
             stats: RwLock::new(ClientStats {
@@ -305,6 +314,17 @@ impl ClientConn {
     /// 读取本连接记录的证书 fingerprint (未记录时为 None)
     pub async fn cert_fingerprint(&self) -> Option<String> {
         self.cert_fingerprint.read().await.clone()
+    }
+
+    /// Phase D.5: whether this connection has passed the KvClient
+    /// Authenticate handshake.
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Acquire)
+    }
+
+    /// Mark the connection authenticated after a successful handshake.
+    pub fn mark_authenticated(&self) {
+        self.authenticated.store(true, Ordering::Release);
     }
 
     /// 主动断开连接
@@ -952,5 +972,20 @@ mod tests {
         let removed = registry.unregister(200, Some(&new_meta)).await;
         assert!(removed.is_some());
         assert!(registry.get(200).is_none());
+    }
+
+    /// Phase D.5: the KvClient authentication flag starts false and only
+    /// flips after an explicit mark; a fresh connection starts unmarked.
+    #[tokio::test]
+    async fn test_authentication_flag_lifecycle() {
+        let conn = make_conn(300);
+        assert!(!conn.is_authenticated());
+
+        conn.mark_authenticated();
+        assert!(conn.is_authenticated());
+
+        // A brand-new connection (reconnect) must re-authenticate.
+        let reconnect = make_conn(301);
+        assert!(!reconnect.is_authenticated());
     }
 }

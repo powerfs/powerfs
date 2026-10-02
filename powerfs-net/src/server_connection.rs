@@ -334,6 +334,7 @@ impl ServerConnectionManager {
         }
 
         let mut ctx = RequestContext::new(&client_info, msg);
+        ctx.connection = Some(conn.clone());
         let handler_bridge: Arc<dyn NextHandler> = Arc::new(HandlerBridge(handler));
         let result = self.pipeline.execute(&mut ctx, msg, handler_bridge).await;
 
@@ -363,6 +364,7 @@ impl ServerConnectionManager {
         };
 
         let mut ctx = RequestContext::new(&client_info, msg);
+        ctx.connection = Some(conn.clone());
         let result = handler.handle(&mut ctx, msg).await;
         conn.record_request(result.is_ok()).await;
         result

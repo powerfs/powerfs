@@ -64,3 +64,10 @@ axum = "0.6"
 serde_json = "1"
 prometheus = "0.13"
 lazy_static = "1.4"
+# Phase D.5: verify KvClient certificate chains against the cluster CA.
+# 0.16 performs signature verification via ring.
+x509-parser = "0.16"
+
+[dev-dependencies]
+# Phase D.5 tests generate a throwaway CA and signed leaf fixtures.
+rcgen = { version = "0.13", features = ["pem"] }

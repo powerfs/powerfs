@@ -523,12 +523,43 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         }
     };
 
+    // Phase D.5: build the external KV client authenticator from the
+    // locally installed CA certificate and cluster registration token.
+    // Fail fast: a node exposing the data port must be able to verify KV
+    // clients — a missing trust anchor or an empty token would otherwise
+    // either reject everyone or (worse) let empty credentials through.
+    let kv_authenticator = {
+        let ca_pem = match &volume_cfg.ca_crt {
+            Some(path) if !path.is_empty() => std::fs::read_to_string(path).map_err(|e| {
+                PowerFsError::InvalidRequest(format!("failed to read ca_crt '{path}': {e}"))
+            })?,
+            _ => {
+                return Err(PowerFsError::InvalidRequest(
+                    "ca_crt must be configured so KV clients can be authenticated".into(),
+                ))
+            }
+        };
+        let token = match &volume_cfg.registration_token {
+            Some(t) if !t.is_empty() => t.clone(),
+            _ => {
+                return Err(PowerFsError::InvalidRequest(
+                    "registration_token must be non-empty for KV client authentication".into(),
+                ))
+            }
+        };
+        let authenticator = powerfs_volume::client_auth::ClientAuthenticator::new(ca_pem, token)
+            .map_err(PowerFsError::InvalidRequest)?;
+        info!("VOLUME: KV client authenticator ready");
+        Arc::new(authenticator)
+    };
+
     // Start powerfs-net binary protocol server for Volume
     // (bind first so we can share its FlowController with the metrics server)
     let net_server = if net_port > 0 {
         let net_bind_addr = format!("{}:{}", ip, net_port);
         let net_handler = Arc::new(powerfs_volume::net_handler::VolumeNetHandler::new(
             Arc::new(volume_server.clone()),
+            kv_authenticator,
         ));
         let net_handler: Arc<dyn powerfs_net::NetHandler> = net_handler;
 
