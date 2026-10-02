@@ -101,6 +101,8 @@ impl KvCacheClient {
             layer_id,
             num_tokens,
             data,
+            // This client does not expose pinning; 0 == PinMode::None.
+            pin_mode: 0,
         };
 
         let resp = self.client.put_block(req).await?.into_inner();
