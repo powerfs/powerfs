@@ -1185,6 +1185,7 @@ service KVCacheService {
     rpc ListSessions (ListSessionsRequest) returns (ListSessionsResponse);
     rpc GetStats (GetStatsRequest) returns (GetStatsResponse);
     rpc GetReadHeat (GetReadHeatRequest) returns (GetReadHeatResponse);
+    rpc GetBlockMeta (GetBlockMetaRequest) returns (GetBlockMetaResponse);
     rpc CreateNamespace (CreateNamespaceRequest) returns (CreateNamespaceResponse);
     rpc ListNamespaces (ListNamespacesRequest) returns (ListNamespacesResponse);
     rpc GetNamespace (GetNamespaceRequest) returns (GetNamespaceResponse);
@@ -1385,6 +1386,38 @@ message BlockHeat {
 message GetReadHeatResponse {
     repeated SessionHeat sessions = 1;
     repeated BlockHeat top_blocks = 2;
+}
+
+// Phase D.3: client-direct block location metadata. GetBlockMeta returns
+// the fid and the volume data-plane endpoint, NEVER the data bytes.
+enum TransportType {
+    TCP = 0;
+    RDMA = 1;
+}
+
+message GetBlockMetaRequest {
+    uint64 block_id = 1;
+    // Client capability declaration; the Master filters locations so a
+    // client never receives a transport it cannot use.
+    bool supports_rdma = 2;
+    bool supports_tcp = 3;
+}
+
+message BlockLocation {
+    uint64 volume_id = 1;
+    string address = 2;           // IP:port of the powerfs-net data endpoint
+    TransportType transport = 3;  // transport actually bound on the node
+}
+
+message GetBlockMetaResponse {
+    bool found = 1;
+    uint64 block_id = 2;
+    string fid = 3;               // volume_id,cookie,file_key
+    uint64 size_bytes = 4;
+    // At most one entry today (single needle, single listener per node);
+    // empty when no reachable, client-compatible location exists and the
+    // client should fall back to GetBlock.
+    repeated BlockLocation locations = 5;
 }
 
 message KVPutRequest {
