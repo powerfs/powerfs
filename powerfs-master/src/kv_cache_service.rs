@@ -2,7 +2,7 @@ use crate::master::MasterNode;
 use crate::proto::powerfs::kv_cache_service_server::KvCacheService;
 use crate::proto::powerfs::*;
 use crate::proto::Location;
-use crate::raft_v2::{KvPayload, RaftCommand, KV_INLINE_LIMIT};
+use crate::raft_v2::{GcFid, KvPayload, RaftCommand, KV_INLINE_LIMIT};
 use crate::volume_client::VolumeClientPool;
 use powerfs_common::types::{DataNodeInfo, Fid, VolumeId};
 use powerfs_core::kv_cache::{KVCacheEngine, KVDtype, KVExternalRef};
@@ -46,6 +46,33 @@ impl KvCacheServiceImpl {
                 success: false,
                 error: format!("{}", e),
             },
+        }
+    }
+
+    /// Best-effort enqueue of needle fids whose markers failed to replicate
+    /// (reason = propose-fail). Must never block the client or turn a write
+    /// failure into another error: if raft is unavailable the orphan is only
+    /// logged; the committed candidate (when this succeeds) is reclaimed after
+    /// the next term reconciliation purges the uncommitted optimistic marker.
+    async fn enqueue_gc_best_effort(&self, fids: Vec<String>) {
+        if fids.is_empty() {
+            return;
+        }
+        let now = now_millis();
+        let entries = fids
+            .into_iter()
+            .map(|fid| GcFid {
+                fid,
+                enqueued_at: now,
+                reason: 2,
+            })
+            .collect();
+        if let Err(e) = self
+            .master
+            .propose_command(RaftCommand::KvGcEnqueue { entries })
+            .await
+        {
+            log::warn!("best-effort KV GC enqueue failed: {}", e);
         }
     }
 
@@ -183,6 +210,9 @@ impl KvCacheServiceImpl {
                         (0u32, tokens)
                     })
                     .unwrap_or((0, 0));
+                // Volume re-fetch succeeded: count this read (resident path is
+                // counted inside get_block_data).
+                self.engine.record_block_read(block_id);
                 GetBlockResponse {
                     found: true,
                     block_id,
@@ -427,7 +457,7 @@ impl KvCacheService for KvCacheServiceImpl {
             &req.data,
             &fid_str,
             0,
-            powerfs_core::kv_cache::PinMode::None,
+            powerfs_core::kv_cache::PinMode::from_u32(req.pin_mode),
         ) {
             eprintln!(
                 "[warn] block {} not cached in leader memory: {}",
@@ -452,12 +482,16 @@ impl KvCacheService for KvCacheServiceImpl {
                 error: String::new(),
                 fid: fid_str,
             })),
-            Err(e) => Ok(Response::new(PutBlockResponse {
-                success: false,
-                block_id,
-                error: format!("{}", e),
-                fid: fid_str,
-            })),
+            Err(e) => {
+                // Needle is durable but the mapping did not replicate: queue it.
+                self.enqueue_gc_best_effort(vec![fid_str.clone()]).await;
+                Ok(Response::new(PutBlockResponse {
+                    success: false,
+                    block_id,
+                    error: format!("{}", e),
+                    fid: fid_str,
+                }))
+            }
         }
     }
 
@@ -551,7 +585,7 @@ impl KvCacheService for KvCacheServiceImpl {
                 &b.data,
                 &fid_str,
                 0,
-                powerfs_core::kv_cache::PinMode::None,
+                powerfs_core::kv_cache::PinMode::from_u32(b.pin_mode),
             ) {
                 eprintln!(
                     "[warn] block {} not cached in leader memory: {}",
@@ -575,8 +609,12 @@ impl KvCacheService for KvCacheServiceImpl {
         }
 
         if !replicated.is_empty() {
+            let fids: Vec<String> = replicated.iter().map(|m| m.fid.clone()).collect();
             let cmd = RaftCommand::KvSaveBlocks { blocks: replicated };
             if let Err(e) = self.master.propose_command(cmd).await {
+                // The needles are durable but the batch mapping did not
+                // replicate: queue every written fid (reason = propose-fail).
+                self.enqueue_gc_best_effort(fids).await;
                 // Mark all previously-successful results as failed so the
                 // client doesn't assume durability.
                 let msg = format!("{}", e);
@@ -632,6 +670,39 @@ impl KvCacheService for KvCacheServiceImpl {
             cache_hits: stats.hits,
             cache_misses: stats.misses,
             evictions: stats.evictions,
+        }))
+    }
+
+    async fn get_read_heat(
+        &self,
+        request: Request<GetReadHeatRequest>,
+    ) -> Result<Response<GetReadHeatResponse>, Status> {
+        let req = request.into_inner();
+        let (sessions, blocks) = self.engine.read_heat(req.top_blocks as usize);
+
+        let sessions = sessions
+            .into_iter()
+            .map(|s| SessionHeat {
+                session_id: s.session_id,
+                namespace_id: s.namespace_id,
+                read_count: s.read_count,
+                block_count: s.block_count,
+            })
+            .collect();
+        let top_blocks = blocks
+            .into_iter()
+            .map(|b| BlockHeat {
+                block_id: b.block_id,
+                session_id: b.session_id,
+                namespace_id: b.namespace_id,
+                read_count: b.read_count,
+                resident: b.resident,
+            })
+            .collect();
+
+        Ok(Response::new(GetReadHeatResponse {
+            sessions,
+            top_blocks,
         }))
     }
 
@@ -739,11 +810,18 @@ impl KvCacheService for KvCacheServiceImpl {
         let req = request.into_inner();
         let version = fencing_version(self.master.current_term());
 
-        let payload = if req.value.len() <= KV_INLINE_LIMIT {
-            KvPayload::Inline(req.value.clone())
+        let (payload, external_fid) = if req.value.len() <= KV_INLINE_LIMIT {
+            (KvPayload::Inline(req.value.clone()), None)
         } else {
             match self.write_external(&req.value, "", &req.namespace_id).await {
-                Ok(p) => p,
+                Ok(p) => {
+                    let fid = if let KvPayload::External { fid, .. } = &p {
+                        Some(fid.clone())
+                    } else {
+                        None
+                    };
+                    (p, fid)
+                }
                 Err(e) => {
                     return Ok(Response::new(KvResponse {
                         success: false,
@@ -760,7 +838,12 @@ impl KvCacheService for KvCacheServiceImpl {
             payload,
             version,
         };
-        Ok(Response::new(self.propose_kv(cmd).await))
+        let resp = self.propose_kv(cmd).await;
+        if !resp.success {
+            self.enqueue_gc_best_effort(external_fid.into_iter().collect())
+                .await;
+        }
+        Ok(Response::new(resp))
     }
 
     async fn kv_get(
@@ -906,13 +989,21 @@ impl KvCacheService for KvCacheServiceImpl {
         let mut first_error = String::new();
 
         let term = self.master.current_term();
+        let mut orphan_fids: Vec<String> = Vec::new();
         for (key, value) in req.keys.iter().zip(req.values.iter()) {
             let version = fencing_version(term);
-            let payload = if value.len() <= KV_INLINE_LIMIT {
-                KvPayload::Inline(value.clone())
+            let (payload, external_fid) = if value.len() <= KV_INLINE_LIMIT {
+                (KvPayload::Inline(value.clone()), None)
             } else {
                 match self.write_external(value, "", &req.namespace_id).await {
-                    Ok(p) => p,
+                    Ok(p) => {
+                        let fid = if let KvPayload::External { fid, .. } = &p {
+                            Some(fid.clone())
+                        } else {
+                            None
+                        };
+                        (p, fid)
+                    }
                     Err(e) => {
                         successes.push(false);
                         if first_error.is_empty() {
@@ -931,12 +1022,18 @@ impl KvCacheService for KvCacheServiceImpl {
                 version,
             };
             let resp = self.propose_kv(cmd).await;
-            if !resp.success && first_error.is_empty() {
-                first_error = resp.error;
+            if !resp.success {
+                if first_error.is_empty() {
+                    first_error = resp.error;
+                }
+                if let Some(fid) = external_fid {
+                    orphan_fids.push(fid);
+                }
             }
             successes.push(resp.success);
         }
 
+        self.enqueue_gc_best_effort(orphan_fids).await;
         Ok(Response::new(KvBatchResponse {
             successes,
             error: first_error,

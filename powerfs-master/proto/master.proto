@@ -1184,6 +1184,7 @@ service KVCacheService {
     rpc BatchGet (BatchGetRequest) returns (BatchGetResponse);
     rpc ListSessions (ListSessionsRequest) returns (ListSessionsResponse);
     rpc GetStats (GetStatsRequest) returns (GetStatsResponse);
+    rpc GetReadHeat (GetReadHeatRequest) returns (GetReadHeatResponse);
     rpc CreateNamespace (CreateNamespaceRequest) returns (CreateNamespaceResponse);
     rpc ListNamespaces (ListNamespacesRequest) returns (ListNamespacesResponse);
     rpc GetNamespace (GetNamespaceRequest) returns (GetNamespaceResponse);
@@ -1296,6 +1297,9 @@ message PutBlockRequest {
     uint32 layer_id = 2;
     uint32 num_tokens = 3;
     bytes data = 4;
+    // 0=None (default LRU), 1=Soft (evict only after unpinned blocks),
+    // 2=Hard (never evict). In-memory only, not part of raft replication.
+    uint32 pin_mode = 5;
 }
 
 message PutBlockResponse {
@@ -1357,6 +1361,30 @@ message GetStatsResponse {
     uint64 cache_hits = 5;
     uint64 cache_misses = 6;
     uint64 evictions = 7;
+}
+
+message GetReadHeatRequest {
+    uint64 top_blocks = 1;  // 0 = return every block
+}
+
+message SessionHeat {
+    string session_id = 1;
+    string namespace_id = 2;
+    uint64 read_count = 3;
+    uint64 block_count = 4;
+}
+
+message BlockHeat {
+    uint64 block_id = 1;
+    string session_id = 2;
+    string namespace_id = 3;
+    uint64 read_count = 4;
+    bool resident = 5;
+}
+
+message GetReadHeatResponse {
+    repeated SessionHeat sessions = 1;
+    repeated BlockHeat top_blocks = 2;
 }
 
 message KVPutRequest {

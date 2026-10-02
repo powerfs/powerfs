@@ -2,7 +2,12 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{routing::get, Router, Server};
 use log::{error, info};
-use prometheus::{register_counter, register_gauge, Counter, Encoder, Gauge, TextEncoder};
+use powerfs_core::kv_cache::KVCacheEngine;
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::{Gauge as ProtoGauge, LabelPair, Metric, MetricFamily, MetricType};
+use prometheus::{
+    register, register_counter, register_gauge, Counter, Encoder, Gauge, TextEncoder,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -75,11 +80,102 @@ lazy_static::lazy_static! {
     ).unwrap();
 }
 
+/// Dynamic Prometheus collector for KV read heat (Phase C). On every scrape it
+/// reads a fresh engine snapshot and emits session/block read gauges, so there
+/// are no stale series after sessions or blocks are deleted and no permanent
+/// high-cardinality registry state.
+pub struct KvHeatCollector {
+    engine: Arc<KVCacheEngine>,
+    session_desc: Desc,
+    block_desc: Desc,
+}
+
+impl KvHeatCollector {
+    pub fn new(engine: Arc<KVCacheEngine>) -> Self {
+        Self {
+            session_desc: Desc::new(
+                "powerfs_kv_session_reads".to_string(),
+                "Total successful reads per KV session".to_string(),
+                vec!["session_id".to_string(), "namespace_id".to_string()],
+                std::collections::HashMap::new(),
+            )
+            .unwrap(),
+            block_desc: Desc::new(
+                "powerfs_kv_block_reads".to_string(),
+                "Total successful reads per KV block".to_string(),
+                vec![
+                    "block_id".to_string(),
+                    "session_id".to_string(),
+                    "namespace_id".to_string(),
+                ],
+                std::collections::HashMap::new(),
+            )
+            .unwrap(),
+            engine,
+        }
+    }
+}
+
+fn label_pair(name: &str, value: &str) -> LabelPair {
+    let mut p = LabelPair::new();
+    p.set_name(name.to_string());
+    p.set_value(value.to_string());
+    p
+}
+
+impl Collector for KvHeatCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        vec![&self.session_desc, &self.block_desc]
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        let (sessions, blocks) = self.engine.read_heat(0);
+
+        let mut smf = MetricFamily::new();
+        smf.set_name("powerfs_kv_session_reads".to_string());
+        smf.set_help("Total successful reads per KV session".to_string());
+        smf.set_field_type(MetricType::GAUGE);
+        for s in &sessions {
+            let mut m = Metric::new();
+            m.mut_label().push(label_pair("session_id", &s.session_id));
+            m.mut_label()
+                .push(label_pair("namespace_id", &s.namespace_id));
+            let mut g = ProtoGauge::new();
+            g.set_value(s.read_count as f64);
+            m.set_gauge(g);
+            smf.mut_metric().push(m);
+        }
+
+        let mut bmf = MetricFamily::new();
+        bmf.set_name("powerfs_kv_block_reads".to_string());
+        bmf.set_help("Total successful reads per KV block".to_string());
+        bmf.set_field_type(MetricType::GAUGE);
+        for b in &blocks {
+            let mut m = Metric::new();
+            m.mut_label()
+                .push(label_pair("block_id", &b.block_id.to_string()));
+            m.mut_label().push(label_pair("session_id", &b.session_id));
+            m.mut_label()
+                .push(label_pair("namespace_id", &b.namespace_id));
+            let mut g = ProtoGauge::new();
+            g.set_value(b.read_count as f64);
+            m.set_gauge(g);
+            bmf.mut_metric().push(m);
+        }
+
+        vec![smf, bmf]
+    }
+}
+
 pub async fn start_metrics_server(
     addr: &str,
     ca_manager: Arc<CaManager>,
     admin: Arc<AdminState>,
+    engine: Arc<KVCacheEngine>,
 ) -> Result<(), String> {
+    register(Box::new(KvHeatCollector::new(engine)))
+        .map_err(|e| format!("failed to register KV heat collector: {}", e))?;
+
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         // Health endpoint for Docker healthcheck. Returns 503 when the
