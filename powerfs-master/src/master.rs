@@ -537,6 +537,7 @@ impl MasterNode {
                         | crate::raft_v2::RaftCommand::KvCreateSession { .. }
                         | crate::raft_v2::RaftCommand::KvDeleteSession { .. }
                         | crate::raft_v2::RaftCommand::KvSaveBlocks { .. }
+                        | crate::raft_v2::RaftCommand::KvGcEnqueue { .. }
                 )
             })
             .collect::<Vec<_>>();
@@ -571,10 +572,15 @@ impl MasterNode {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("kv_engine");
+        let max_memory_bytes: u64 = std::env::var("POWERFS_KV_MAX_MEMORY_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(1024 * 1024 * 1024); // 1GB default
         let kv_cache = Arc::new(
             KVCacheEngine::new_with_db(
-                1024 * 1024 * 1024, // 1GB default
-                2 * 1024 * 1024,    // 2MB block
+                max_memory_bytes,
+                2 * 1024 * 1024, // 2MB block
                 kv_engine_path.to_str().unwrap_or("kv_engine"),
             )
             .map_err(|e| {
@@ -681,6 +687,17 @@ impl MasterNode {
                         })
                         .collect();
                     let _ = kv_cache.apply_save_blocks(&rep);
+                }
+                crate::raft_v2::RaftCommand::KvGcEnqueue { entries } => {
+                    let rep: Vec<powerfs_core::kv_cache::GcEntry> = entries
+                        .iter()
+                        .map(|e| powerfs_core::kv_cache::GcEntry {
+                            fid: e.fid.clone(),
+                            enqueued_at: e.enqueued_at,
+                            reason: e.reason,
+                        })
+                        .collect();
+                    let _ = kv_cache.apply_gc_enqueue(&rep);
                 }
                 _ => {}
             }
@@ -1651,6 +1668,19 @@ impl MasterNode {
                     .collect();
                 self.kv_cache
                     .apply_save_blocks(&rep)
+                    .map_err(PowerFsError::Internal)?;
+            }
+            RaftCommand::KvGcEnqueue { entries } => {
+                let rep: Vec<powerfs_core::kv_cache::GcEntry> = entries
+                    .iter()
+                    .map(|e| powerfs_core::kv_cache::GcEntry {
+                        fid: e.fid.clone(),
+                        enqueued_at: e.enqueued_at,
+                        reason: e.reason,
+                    })
+                    .collect();
+                self.kv_cache
+                    .apply_gc_enqueue(&rep)
                     .map_err(PowerFsError::Internal)?;
             }
         }
@@ -2718,6 +2748,30 @@ impl MasterNode {
         let topology = self.topology.read().unwrap();
         let node = topology.get_node(&vol.node_id)?;
         Some(format!("{}:{}", node.address, node.grpc_port))
+    }
+
+    /// Address of the volume's **admin gRPC** endpoint (VolumeService:
+    /// Write/Read/DeleteNeedle). Topology `grpc_port` historically holds the
+    /// powerfs-net data port (890x) used by the binary data plane, so prefer
+    /// the separately reported `admin_grpc_port` (8080); fall back to
+    /// `grpc_port` for older nodes that serve gRPC on the data port. GC must
+    /// use this — calling the gRPC VolumeService on the net data port yields
+    /// a transport/handshake failure.
+    pub fn get_volume_admin_address(&self, volume_id: u64) -> Option<String> {
+        let vol = self
+            .volumes
+            .read()
+            .unwrap()
+            .get(&VolumeId(volume_id))?
+            .clone();
+        let topology = self.topology.read().unwrap();
+        let node = topology.get_node(&vol.node_id)?;
+        let port = if node.admin_grpc_port > 0 {
+            node.admin_grpc_port
+        } else {
+            node.grpc_port
+        };
+        Some(format!("{}:{}", node.address, port))
     }
 
     /// Get all volume IDs hosted on `node_id`.
@@ -4512,6 +4566,133 @@ impl MasterNode {
             info!("KV leader-reconcile watcher started");
         }
 
+        // Orphan-needle GC (Phase A / issue #132): leader-only worker that
+        // reclaims volume needles whose KV markers/mappings were removed
+        // (overwrite/delete/session) or never replicated (propose-fail). Every
+        // candidate is re-checked against a live referenced-fid snapshot right
+        // before deletion, so a needle still in use (including a long in-flight
+        // read whose marker is intact) is never deleted. Failures are retained
+        // and retried on later ticks; GC never flips raft availability.
+        {
+            let gc_master = Arc::clone(&self);
+            powerfs_common::spawn_supervised("master-kv-gc", move || {
+                let gc_master = gc_master.clone();
+                async move {
+                    let interval_secs: u64 = std::env::var("POWERFS_KV_GC_INTERVAL_SECS")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|v| *v > 0)
+                        .unwrap_or(60);
+                    let grace_millis: u128 = std::env::var("POWERFS_KV_GC_GRACE_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|v| *v > 0)
+                        .unwrap_or(600) as u128
+                        * 1000;
+                    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+                    let mut reclaimed_total: u64 = 0;
+                    let mut skipped_total: u64 = 0;
+                    loop {
+                        ticker.tick().await;
+
+                        if !gc_master.is_leader().await || !gc_master.is_raft_available() {
+                            continue;
+                        }
+
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let due = gc_master.kv_cache.take_due_entries(now, grace_millis);
+                        if due.is_empty() {
+                            continue;
+                        }
+
+                        // One read-only, short-lived snapshot for the whole tick.
+                        let referenced = gc_master.kv_cache.snapshot_referenced_fids();
+                        let mut reclaimed = 0u64;
+                        let mut skipped = 0u64;
+                        let mut failed = 0u64;
+
+                        for entry in due {
+                            // Re-check liveness immediately before deletion.
+                            if referenced.contains(&entry.fid) {
+                                skipped += 1;
+                                continue;
+                            }
+
+                            let fid = match Fid::from_string(&entry.fid) {
+                                Ok(f) => f,
+                                Err(_) => {
+                                    // An unparseable fid can never be deleted;
+                                    // drop it instead of retrying forever.
+                                    warn!(
+                                        "KV_GC dropping candidate with invalid fid: {}",
+                                        entry.fid
+                                    );
+                                    gc_master.kv_cache.complete_gc(&entry.fid);
+                                    continue;
+                                }
+                            };
+                            let address = match gc_master.get_volume_admin_address(fid.volume_id.0)
+                            {
+                                Some(a) => a,
+                                None => {
+                                    warn!(
+                                        "KV_GC no volume address for {}, retry next tick",
+                                        entry.fid
+                                    );
+                                    failed += 1;
+                                    continue;
+                                }
+                            };
+
+                            match gc_master
+                                .volume_client_pool
+                                .delete_needle(&address, fid.volume_id.0, fid.file_key)
+                                .await
+                            {
+                                Ok(()) => {
+                                    gc_master.kv_cache.complete_gc(&entry.fid);
+                                    reclaimed += 1;
+                                }
+                                Err(e) => {
+                                    // A vanished volume/needle is the desired
+                                    // end state; treat not-found as success.
+                                    if e.to_lowercase().contains("not found") {
+                                        gc_master.kv_cache.complete_gc(&entry.fid);
+                                        reclaimed += 1;
+                                    } else {
+                                        warn!(
+                                            "KV_GC delete failed for fid {}: {} (retry next tick)",
+                                            entry.fid, e
+                                        );
+                                        failed += 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        reclaimed_total += reclaimed;
+                        skipped_total += skipped;
+                        if reclaimed > 0 || skipped > 0 || failed > 0 {
+                            info!(
+                                "KV_GC tick reclaimed={} skipped={} failed={} queue_len={} \
+                                 totals_reclaimed={} totals_skipped={}",
+                                reclaimed,
+                                skipped,
+                                failed,
+                                gc_master.kv_cache.gc_queue_len(),
+                                reclaimed_total,
+                                skipped_total
+                            );
+                        }
+                    }
+                }
+            });
+            info!("KV orphan GC worker started");
+        }
+
         let master_clone = self.clone();
         let kv_cache_clone = self.kv_cache.clone();
         let server_address = self.address;
@@ -4658,9 +4839,13 @@ impl MasterNode {
                         "Starting metrics + cert API server on {} (CA manager ready)",
                         metrics_addr
                     );
-                    if let Err(e) =
-                        crate::metrics::start_metrics_server(&metrics_addr, ca, admin_state.clone())
-                            .await
+                    if let Err(e) = crate::metrics::start_metrics_server(
+                        &metrics_addr,
+                        ca,
+                        admin_state.clone(),
+                        self.kv_cache.clone(),
+                    )
+                    .await
                     {
                         error!(
                             "Failed to start metrics/cert server on {}: {}",
@@ -4680,6 +4865,7 @@ impl MasterNode {
                                 &metrics_addr,
                                 ca,
                                 admin_state.clone(),
+                                self.kv_cache.clone(),
                             )
                             .await
                             {
@@ -4717,6 +4903,7 @@ impl MasterNode {
                                 &metrics_addr,
                                 ca,
                                 admin_state.clone(),
+                                self.kv_cache.clone(),
                             )
                             .await
                             {
@@ -4843,7 +5030,8 @@ impl MasterNode {
     }
 }
 
-/// True if a raft command belongs to the four replicated KV metadata classes.
+/// True if a raft command belongs to the replicated KV metadata classes or
+/// the orphan-needle GC candidate set (all must be replayed on rebuild).
 fn is_kv_replicated_cmd(cmd: &RaftCommand) -> bool {
     matches!(
         cmd,
@@ -4854,6 +5042,7 @@ fn is_kv_replicated_cmd(cmd: &RaftCommand) -> bool {
             | RaftCommand::KvCreateSession { .. }
             | RaftCommand::KvDeleteSession { .. }
             | RaftCommand::KvSaveBlocks { .. }
+            | RaftCommand::KvGcEnqueue { .. }
     )
 }
 

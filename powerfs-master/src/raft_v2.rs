@@ -208,6 +208,13 @@ pub enum RaftCommand {
     KvSaveBlocks {
         blocks: Vec<KvBlockMeta>,
     },
+    /// Enqueue orphan needles for deferred, guarded garbage collection. Only
+    /// the candidate set is replicated; the physical delete is idempotent and
+    /// driven by the leader GC worker after a grace period and a live-reference
+    /// recheck, so the completion is not replicated.
+    KvGcEnqueue {
+        entries: Vec<GcFid>,
+    },
 }
 
 /// Inline bytes (small values) or an external volume needle (large values).
@@ -233,6 +240,17 @@ pub struct KvBlockMeta {
 /// Values at or below this size are inlined in the raft command; larger
 /// values are written to a volume needle and referenced by fid.
 pub const KV_INLINE_LIMIT: usize = 1024 * 1024; // 1 MiB
+
+/// One orphan-needle GC candidate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GcFid {
+    /// SeaweedFS-style fid "volume_id,cookie,file_key".
+    pub fid: String,
+    /// Wall-clock millis at enqueue time, used to apply the grace period.
+    pub enqueued_at: u128,
+    /// Why it was enqueued: 0=overwrite, 1=delete, 2=propose-fail, 3=session-delete.
+    pub reason: u8,
+}
 
 /// Volume info for Raft serialization (serde-compatible)
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

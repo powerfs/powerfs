@@ -471,6 +471,7 @@ async fn kv_block(mut client: KvCacheClient, args: KvBlockArgs) -> super::Comman
                 layer_id,
                 num_tokens,
                 data: data_bytes,
+                pin_mode: 0,
             };
 
             let resp = svc.put_block(req).await.map_err(rpc_err)?.into_inner();
@@ -534,6 +535,7 @@ async fn kv_block(mut client: KvCacheClient, args: KvBlockArgs) -> super::Comman
                     layer_id,
                     num_tokens,
                     data,
+                    pin_mode: 0,
                 });
             }
 
