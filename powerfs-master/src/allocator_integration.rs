@@ -334,7 +334,7 @@ async fn run_cold_data_migration(
 
             // Write to target volume (auto-assign file_key=0).
             let new_needle_id = pool
-                .write_needle_return_key(&target_addr, to_volume, 0, &data)
+                .write_needle_return_key(&target_addr, to_volume, 0, 0, &data)
                 .await
                 .map_err(|e| format!("write needle to volume {} failed: {}", to_volume, e))?;
 

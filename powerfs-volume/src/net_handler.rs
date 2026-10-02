@@ -82,6 +82,9 @@ impl VolumeNetHandler {
         let holder_client_id = dec
             .next_string(FieldId::ClientId)
             .unwrap_or_else(|_| session_client_id.to_string());
+        // Optional trailing field (D.6): absent on older clients → 0.
+        // It MUST stay last because the decoder is strictly sequential.
+        let cookie = dec.next_u64(FieldId::Cookie).unwrap_or(0);
 
         // Auto-register UUID holder mapping when client sends a non-session holder
         self.register_holder(session_client_id, &holder_client_id)
@@ -152,7 +155,12 @@ impl VolumeNetHandler {
             let volume = storage_manager
                 .get_volume(&vid)
                 .ok_or_else(|| format!("volume not found: {}", volume_id))?;
-            match volume.write_needle(nid.0, bytes::Bytes::from(data)) {
+            let write_res = if cookie == 0 {
+                volume.write_needle(nid.0, bytes::Bytes::from(data))
+            } else {
+                volume.write_needle_with_cookie(nid.0, cookie, bytes::Bytes::from(data))
+            };
+            match write_res {
                 Ok(info) => {
                     let mut enc = TlvEncoder::new();
                     enc.add_u64(FieldId::FileKey, info.id.0);
@@ -477,17 +485,16 @@ impl VolumeNetHandler {
         }
     }
 
-    /// Phase D.5: direct needle read for an authenticated external KV client.
+    /// Phase D.5/D.6: direct needle read for an authenticated KV client.
     ///
-    /// The needle is addressed by a full fid string
-    /// (`volume_id,cookie,file_key`). The Volume verifies fid syntax and
-    /// volume ownership (the real cross-volume barrier) and existence; the
-    /// cookie is carried but not verifiable here (spec decision ⑤ — the
-    /// cookie authority is the Master's block_id→fid mapping). This path
-    /// does not touch read_count/hits.
+    /// Addressed by a full fid string (`volume_id,cookie,file_key`). Gates,
+    /// in order: fid syntax → volume ownership → persisted cookie equality
+    /// (constant-time capability check; legacy cookie=0 stays fail-closed)
+    /// → needle existence. This path does not touch read_count/hits.
     async fn handle_direct_read_needle(
         &self,
         msg: &NetMessage,
+        peer: String,
     ) -> Result<NetMessage, powerfs_net::NetError> {
         let mut dec = TlvDecoder::new(&msg.body);
         let fid_str = if dec.has_field(FieldId::Fid) {
@@ -534,28 +541,61 @@ impl VolumeNetHandler {
         let vid = fid.volume_id;
         let nid = NeedleId(fid.file_key);
 
+        enum DirectReadOutcome {
+            Data(Vec<u8>),
+            NotFound,
+            CookieMismatch,
+        }
+
         match tokio::task::spawn_blocking(
-            move || -> Result<Option<Vec<u8>>, powerfs_common::error::PowerFsError> {
-                match sm.get_volume(&vid) {
-                    Some(volume) => match volume.read_needle(&nid) {
-                        Ok(data) => Ok(Some(data.to_vec())),
-                        Err(powerfs_common::error::PowerFsError::NeedleNotFound(_)) => Ok(None),
-                        Err(e) => Err(e),
-                    },
+            move || -> Result<DirectReadOutcome, powerfs_common::error::PowerFsError> {
+                let volume = match sm.get_volume(&vid) {
+                    Some(v) => v,
                     // Raced a volume removal: the block is unreachable here.
-                    None => Ok(None),
+                    None => return Ok(DirectReadOutcome::NotFound),
+                };
+                // The persisted cookie is the capability check (D.6); it is
+                // read before the data so a tampered/guessed fid never
+                // reaches the payload. Deleted needles count as not found.
+                let persisted_cookie = match volume.read_needle_meta(fid.file_key) {
+                    Some(meta) if meta.deleted_at.is_none() => meta.cookie,
+                    _ => return Ok(DirectReadOutcome::NotFound),
+                };
+                if !crate::client_auth::constant_time_eq(
+                    &fid.cookie.to_be_bytes(),
+                    &persisted_cookie.to_be_bytes(),
+                ) {
+                    return Ok(DirectReadOutcome::CookieMismatch);
+                }
+                match volume.read_needle(&nid) {
+                    Ok(data) => Ok(DirectReadOutcome::Data(data.to_vec())),
+                    Err(powerfs_common::error::PowerFsError::NeedleNotFound(_)) => {
+                        Ok(DirectReadOutcome::NotFound)
+                    }
+                    Err(e) => Err(e),
                 }
             },
         )
         .await
         {
-            Ok(Ok(Some(data))) => Ok(Self::build_response(msg, STATUS_OK, Vec::new(), data)),
-            Ok(Ok(None)) => Ok(Self::build_response(
+            Ok(Ok(DirectReadOutcome::Data(data))) => {
+                Ok(Self::build_response(msg, STATUS_OK, Vec::new(), data))
+            }
+            Ok(Ok(DirectReadOutcome::NotFound)) => Ok(Self::build_response(
                 msg,
                 STATUS_ERR_NOT_FOUND,
                 Vec::new(),
                 Vec::new(),
             )),
+            Ok(Ok(DirectReadOutcome::CookieMismatch)) => {
+                log_auth_failure(&peer, "cookie mismatch");
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_PERMISSION_DENIED,
+                    b"invalid fid".to_vec(),
+                    Vec::new(),
+                ))
+            }
             Ok(Err(e)) => {
                 warn!("DIRECT_READ_NEEDLE: read error: {}", e);
                 Ok(Self::build_response(
@@ -663,6 +703,8 @@ impl VolumeNetHandler {
         let holder_client_id = dec
             .next_string(FieldId::ClientId)
             .unwrap_or_else(|_| session_client_id.to_string());
+        // Optional trailing cookie (D.6); strictly sequential decoder.
+        let cookie = dec.next_u64(FieldId::Cookie).unwrap_or(0);
 
         info!(
             "NET_BATCH_WRITE_NEEDLE: volume_id={}, file_key={}, inode={}, entries={}, has_lease={}, holder={}",
@@ -710,7 +752,12 @@ impl VolumeNetHandler {
         match tokio::task::spawn_blocking(
             move || -> Result<Option<bool>, powerfs_common::error::PowerFsError> {
                 if let Some(volume) = storage_manager.get_volume(&vid) {
-                    match volume.write_needle(file_key, bytes::Bytes::from(data)) {
+                    let write_res = if cookie == 0 {
+                        volume.write_needle(file_key, bytes::Bytes::from(data))
+                    } else {
+                        volume.write_needle_with_cookie(file_key, cookie, bytes::Bytes::from(data))
+                    };
+                    match write_res {
                         Ok(_) => Ok(Some(true)),
                         Err(e) => {
                             warn!("batch_write_needle failed: {}", e);
@@ -1240,7 +1287,9 @@ impl NetHandler for VolumeNetHandler {
                             Vec::new(),
                         ));
                     }
-                    return self.handle_direct_read_needle(msg).await;
+                    return self
+                        .handle_direct_read_needle(msg, ctx.client.address.ip().to_string())
+                        .await;
                 }
             }
         }

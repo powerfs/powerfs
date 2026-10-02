@@ -334,7 +334,10 @@ macro_rules! grpc_test_suite {
                         volume_id: 8,
                         file_key: 600,
                         data: b"meta test".to_vec(),
-                        cookie: 12345,
+                        // 0 = legacy write so this case runs identically on
+                        // needle and WAL engines; this test covers read_meta,
+                        // not cookie handling (that lives in direct_read_e2e).
+                        cookie: 0,
                         ttl: "7d".to_string(),
                     })
                     .await

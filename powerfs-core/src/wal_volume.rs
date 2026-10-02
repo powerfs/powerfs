@@ -182,6 +182,7 @@ impl WalVolume {
             ec_k: None,
             ec_m: None,
             ec_shards: Vec::new(),
+            cookie: 0,
         }
     }
 
@@ -324,6 +325,7 @@ impl WalVolume {
             ec_k: None,
             ec_m: None,
             ec_shards: Vec::new(),
+            cookie: 0,
         };
 
         self.refresh_used(&mut info_guard);

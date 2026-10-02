@@ -131,6 +131,7 @@ impl S3MasterClient {
                     transport_type: 0,
                     transport_port: 0,
                     rdma_device: String::new(),
+                    heartbeat_term: 0,
                 }
             })
             .collect();
@@ -228,6 +229,7 @@ impl S3MasterClient {
             transport_type: 0,
             transport_port: 0,
             rdma_device: String::new(),
+            heartbeat_term: 0,
         })
     }
 }

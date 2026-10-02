@@ -13,7 +13,7 @@ use powerfs_common::{
         VolumeState,
     },
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 fn backend_err(e: StorageBackendError) -> PowerFsError {
@@ -31,6 +31,10 @@ pub struct Volume {
     coalescer: Arc<WriteCoalescer>,
     /// Compact 正在进行时设为 true，阻止并发 write
     compacting: AtomicBool,
+    /// D.6: 历史最大 needle id（含已删除），随写入单调抬升，启动时从
+    /// RocksDB 两 CF 恢复。是 file_key 分配的权威高水位，防止 Master
+    /// 重启/切主后复用已分配的 block。
+    max_needle_id: AtomicU64,
 }
 
 /// Internal helper used by Drop and by unit tests that want a deterministic
@@ -158,6 +162,8 @@ impl Volume {
             next_file_key: 1,
         };
 
+        let recovered_max = index.max_needle_id_in_db()?;
+
         Ok(Volume {
             info: RwLock::new(info),
             index,
@@ -166,6 +172,7 @@ impl Volume {
             backend_volume_id,
             coalescer: Arc::new(WriteCoalescer::new(coalescer_config)),
             compacting: AtomicBool::new(false),
+            max_needle_id: AtomicU64::new(recovered_max),
         })
     }
 
@@ -178,6 +185,20 @@ impl Volume {
         drop(info);
         let needle_count = self.index.needle_count().unwrap_or(0);
         (used, total, needle_count)
+    }
+
+    /// D.6: 下一个可分配 file_key（权威高水位）。
+    ///
+    /// file_key 按 block 分配：needle id ∈ [file_key, file_key+BLOCK)，
+    /// file_key = 1 + n*BLOCK。返回历史最大 needle 所属 block 的下一个
+    /// block 起点；空卷（max=0）返回 1。随心跳上报给 Master。
+    pub fn next_file_key(&self) -> u64 {
+        let block = powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
+        let max = self.max_needle_id.load(Ordering::Relaxed);
+        if max == 0 {
+            return 1;
+        }
+        1 + ((max - 1) / block + 1) * block
     }
 
     /// 启动时同步 allocation CF：如果 RocksDB 中的分配状态与 needle 索引不一致，则更新
@@ -315,7 +336,7 @@ impl Volume {
             // No index entry yet — first write.  write_needle uses the
             // needle_id = file_key convention already; just pass `data` with
             // the full (possibly zero-padded) logical payload.
-            let write_res = self.write_needle_nowait(needle_id.0, data);
+            let write_res = self.write_needle_nowait(needle_id.0, 0, data);
             match write_res {
                 Ok(_ni) => Ok(()),
                 Err(e) => Err(e),
@@ -330,7 +351,7 @@ impl Volume {
                     // Race (index was deleted since dirty buffer was
                     // created).  Fall back to writing as a brand-new needle.
                     // compacting 已在入口等待，直接走 nowait。
-                    self.write_needle_nowait(needle_id.0, data)?;
+                    self.write_needle_nowait(needle_id.0, 0, data)?;
                     return Ok(());
                 }
             };
@@ -342,6 +363,18 @@ impl Volume {
     /// 并 truncate 数据文件，并发追加可能被截断且索引仍指向已失效偏移）。
     /// compact 自身的 coalescer flush 走 write_needle_nowait 以避免自死锁。
     pub fn write_needle(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
+        self.write_needle_with_cookie(file_key, 0, data)
+    }
+
+    /// Write with an explicit per-needle capability cookie (D.6). The
+    /// cookie is persisted in the RocksDB metadata and later verified by
+    /// the KV direct-read path. The legacy `write_needle` passes 0.
+    pub fn write_needle_with_cookie(
+        &self,
+        file_key: u64,
+        cookie: u64,
+        data: Bytes,
+    ) -> Result<NeedleInfo> {
         if self.compacting.load(Ordering::SeqCst) {
             for _ in 0..600 {
                 if !self.compacting.load(Ordering::SeqCst) {
@@ -355,13 +388,13 @@ impl Volume {
                 ));
             }
         }
-        self.write_needle_nowait(file_key, data)
+        self.write_needle_nowait(file_key, cookie, data)
     }
 
     /// 实际追加逻辑（不检查 compacting）。仅在以下场景直接调用：
     /// - write_needle（外部入口，已完成等待）
     /// - compact_inner 起始的 coalescer flush_all（此时 compacting=true 是自身）
-    fn write_needle_nowait(&self, file_key: u64, data: Bytes) -> Result<NeedleInfo> {
+    fn write_needle_nowait(&self, file_key: u64, cookie: u64, data: Bytes) -> Result<NeedleInfo> {
         let mut info_guard = self.info.write().unwrap();
         if info_guard.state != VolumeState::Available {
             return Err(PowerFsError::InvalidVolumeState(
@@ -461,6 +494,7 @@ impl Volume {
             ec_k: None,
             ec_m: None,
             ec_shards: Vec::new(),
+            cookie,
         };
 
         // 原子写入：同时更新 needles CF + allocation CF，返回更新后的统计
@@ -471,6 +505,9 @@ impl Volume {
         // 同步 info 中的 used 字段
         info_guard.used = new_stats.used_bytes;
         info_guard.modified_at = Utc::now();
+
+        // 抬升权威高水位（成功持久化之后），含删除/重试覆盖场景。
+        self.max_needle_id.fetch_max(actual_key, Ordering::Relaxed);
 
         Ok(needle_info)
     }
@@ -713,11 +750,11 @@ impl Volume {
         self.coalescer.flush_all(|id, vec, is_new| {
             let data = Bytes::from(vec);
             let res = if is_new {
-                self.write_needle_nowait(id.0, data).map(|_| ())
+                self.write_needle_nowait(id.0, 0, data).map(|_| ())
             } else {
                 match self.index.get(&id) {
                     Some(old) => self.append_needle_version(id, data, old),
-                    None => self.write_needle_nowait(id.0, data).map(|_| ()),
+                    None => self.write_needle_nowait(id.0, 0, data).map(|_| ()),
                 }
             };
             res.map_err(|_| ())
@@ -916,6 +953,8 @@ impl Volume {
             ec_k: base_info.ec_k,
             ec_m: base_info.ec_m,
             ec_shards: base_info.ec_shards.clone(),
+            // Preserve the existing capability across version appends.
+            cookie: base_info.cookie,
         };
 
         // 原子写入新 needle + 更新 allocation CF
@@ -925,6 +964,9 @@ impl Volume {
 
         info_guard.used = new_stats.used_bytes;
         info_guard.modified_at = Utc::now();
+
+        // 防御性抬升高水位（版本追加的 needle 通常已在历史水位内）。
+        self.max_needle_id.fetch_max(needle_id.0, Ordering::Relaxed);
 
         Ok(())
     }

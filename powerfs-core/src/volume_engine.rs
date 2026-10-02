@@ -155,6 +155,33 @@ impl VolumeEngine {
         }
     }
 
+    /// D.6: authoritative next-file-key high-water mark reported to Master.
+    /// Needle volume derives it from the max historical needle id (including
+    /// deleted); WAL volume reads its own internal next_file_key.
+    pub fn next_file_key(&self) -> u64 {
+        match self {
+            VolumeEngine::Needle(v) => v.next_file_key(),
+            VolumeEngine::Wal(v) => v.info().next_file_key,
+        }
+    }
+
+    /// D.6: write with a persisted capability cookie. WAL volumes have no
+    /// place to persist the cookie, so this is fail-closed — KV blocks are
+    /// only ever assigned to needle-format volumes.
+    pub fn write_needle_with_cookie(
+        &self,
+        file_key: u64,
+        cookie: u64,
+        data: Bytes,
+    ) -> Result<NeedleInfo> {
+        match self {
+            VolumeEngine::Needle(v) => v.write_needle_with_cookie(file_key, cookie, data),
+            VolumeEngine::Wal(_) => Err(PowerFsError::InvalidRequest(
+                "cookie capabilities are not supported on WAL volumes".to_string(),
+            )),
+        }
+    }
+
     pub fn read_needle(&self, needle_id: &NeedleId) -> Result<Bytes> {
         match self {
             VolumeEngine::Needle(v) => v.read_needle(needle_id),

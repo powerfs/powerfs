@@ -24,6 +24,7 @@ fn make_info(id: u64, vid: u64, size: u32, offset: u64) -> NeedleInfo {
         ec_k: None,
         ec_m: None,
         ec_shards: Vec::new(),
+        cookie: 0,
     }
 }
 

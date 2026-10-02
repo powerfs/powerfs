@@ -262,4 +262,48 @@ async fn e2e_kv_auth_and_direct_read() {
         resp.header.status, STATUS_ERR_PERMISSION_DENIED,
         "check 16: a new connection must re-authenticate"
     );
+
+    // ── 11. Cookie is a real capability (D.6): tampering the cookie
+    // segment of the otherwise valid fid is rejected.
+    let good_parts: Vec<&str> = good_fid.split(',').collect();
+    let orig_cookie: u64 = good_parts[1].parse().unwrap();
+    let tampered_cookie = orig_cookie.wrapping_add(1) | 1; // always != orig, non-zero
+    let tampered_fid = format!("{},{},{}", good_parts[0], tampered_cookie, good_parts[2]);
+    let resp = client
+        .send_request(MsgType::DirectReadNeedle, &direct_body(&tampered_fid), &[])
+        .await
+        .expect("direct read frame");
+    assert_eq!(
+        resp.header.status, STATUS_ERR_PERMISSION_DENIED,
+        "check 17: tampered cookie must be denied"
+    );
+
+    // ── 12. Legacy needle persisted with cookie=0 (written through the
+    // non-KV path). Supplying cookie=0 is the only accepted form...
+    let legacy_key = env("E2E_LEGACY_KEY");
+    let legacy_fid = format!("{},0,{}", good_parts[0], legacy_key);
+    let resp = client
+        .send_request(MsgType::DirectReadNeedle, &direct_body(&legacy_fid), &[])
+        .await
+        .expect("direct read frame");
+    assert_eq!(
+        resp.header.status, STATUS_OK,
+        "check 18: legacy cookie=0 fid must be readable (explicit unprotected)"
+    );
+    if let Ok(path) = std::env::var("E2E_LEGACY_FILE") {
+        let expected_legacy = std::fs::read(path).unwrap();
+        assert_eq!(resp.data, expected_legacy, "check 19: legacy bytes match");
+    }
+
+    // ...while presenting ANY non-zero cookie for the same legacy needle
+    // is rejected — no wildcard bypass.
+    let legacy_claim = format!("{},12345,{}", good_parts[0], legacy_key);
+    let resp = client
+        .send_request(MsgType::DirectReadNeedle, &direct_body(&legacy_claim), &[])
+        .await
+        .expect("direct read frame");
+    assert_eq!(
+        resp.header.status, STATUS_ERR_PERMISSION_DENIED,
+        "check 20: legacy needle with forged cookie must be denied"
+    );
 }

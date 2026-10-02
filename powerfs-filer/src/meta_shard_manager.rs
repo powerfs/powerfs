@@ -749,7 +749,9 @@ impl MetaShardManager {
                 );
             }
             let mut first_notification_logged = false;
-            while let Some(index) = apply_rx.recv().await {
+            while let Some(powerfs_raft::store::AppliedLog { index, term: _ }) =
+                apply_rx.recv().await
+            {
                 if !first_notification_logged {
                     info!(
                         "shard {}: apply loop received FIRST notification index={} (last_applied={}) — \

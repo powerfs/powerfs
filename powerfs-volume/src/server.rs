@@ -465,6 +465,7 @@ impl VolumeService for VolumeServer {
         let req = request.into_inner();
         let volume_id = VolumeId(req.volume_id);
         let file_key = req.file_key;
+        let cookie = req.cookie as u64;
         let data_size = req.data.len() as u64;
 
         debug!(
@@ -479,14 +480,21 @@ impl VolumeService for VolumeServer {
 
         match tokio::task::spawn_blocking(move || {
             if let Some(volume) = storage_manager.get_volume(&volume_id) {
-                let result = volume.write_needle(file_key, Bytes::from(req.data));
+                // Legacy requests (cookie=0) use the engine-agnostic path so
+                // WAL volumes keep working; cookie-bearing KV requests use the
+                // persisting path, which is fail-closed on WAL volumes.
+                let result = if cookie == 0 {
+                    volume.write_needle(file_key, Bytes::from(req.data))
+                } else {
+                    volume.write_needle_with_cookie(file_key, cookie, Bytes::from(req.data))
+                };
                 match result {
                     Ok(info) => Ok(Response::new(crate::proto::WriteNeedleResponse {
                         success: true,
                         volume_id: volume_id.0,
                         file_key: info.id.0,
                         offset: info.offset,
-                        cookie: 0,
+                        cookie: info.cookie as u32,
                     })),
                     Err(e) => {
                         warn!("write_needle failed: {}", e);
