@@ -2774,6 +2774,28 @@ impl MasterNode {
         Some(format!("{}:{}", node.address, port))
     }
 
+    /// Phase D.3: resolve the **data-plane** endpoint a client uses for a
+    /// direct needle read of `volume_id`. Returns `("ip:port", transport_type)`
+    /// where `transport_type` is 0=TCP / 1=RDMA (from the D.2 heartbeat).
+    ///
+    /// The port is the powerfs-net data listener: prefer the heartbeat's
+    /// `transport_port` (== net_port), falling back to `grpc_port` (which
+    /// add_node populates with the powerfs-net data port). This is NOT the
+    /// admin gRPC port (8080) — client-direct reads speak the binary TLV
+    /// data protocol, not gRPC.
+    pub fn get_volume_data_endpoint(&self, volume_id: u64) -> Option<(String, u8)> {
+        let vol = self
+            .volumes
+            .read()
+            .unwrap()
+            .get(&VolumeId(volume_id))?
+            .clone();
+        let topology = self.topology.read().unwrap();
+        let node = topology.get_node(&vol.node_id)?;
+        let port = data_endpoint_port(node.transport_port, node.grpc_port)?;
+        Some((format!("{}:{}", node.address, port), node.transport_type))
+    }
+
     /// Get all volume IDs hosted on `node_id`.
     pub fn volumes_on_node(&self, node_id: &str) -> Vec<u64> {
         let volumes = self.volumes.read().unwrap();
@@ -5153,6 +5175,21 @@ fn select_writable_volume_from(
     Some(pick)
 }
 
+/// Phase D.3: pick the powerfs-net data listener port advertised for a
+/// node. Prefer the D.2 heartbeat `transport_port`; fall back to
+/// `grpc_port` for pre-D nodes (add_node stores the powerfs-net data port
+/// there). Returns `None` when no usable port is known (malformed
+/// heartbeat with both zero) so no `ip:0` endpoint is ever advertised.
+/// Pure so every branch is unit-testable.
+fn data_endpoint_port(transport_port: u64, grpc_port: u32) -> Option<u64> {
+    let port = if transport_port > 0 {
+        transport_port
+    } else {
+        grpc_port as u64
+    };
+    (port > 0).then_some(port)
+}
+
 /// P5: Composite load score (0.0 idle - 1.0 saturated).
 ///
 /// Weighted blend: 40% cpu, 30% memory, 30% disk. When cpu/memory are 0
@@ -5715,5 +5752,15 @@ mod tests {
         assert_eq!(decoded.transport_type, 1);
         assert_eq!(decoded.transport_port, 8902);
         assert_eq!(decoded.rdma_device, "mlx5_0");
+    }
+
+    #[test]
+    fn test_data_endpoint_port() {
+        // Phase D.3: heartbeat transport_port wins; zero falls back to
+        // grpc_port (pre-D nodes); both zero yields None so no ip:0 is
+        // ever advertised.
+        assert_eq!(super::data_endpoint_port(8902, 8901), Some(8902));
+        assert_eq!(super::data_endpoint_port(0, 8901), Some(8901));
+        assert_eq!(super::data_endpoint_port(0, 0), None);
     }
 }

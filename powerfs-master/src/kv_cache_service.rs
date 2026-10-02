@@ -28,6 +28,25 @@ pub(crate) fn fencing_version(term: u64) -> u128 {
     ((term as u128) << 64) | (now_millis() & 0xFFFF_FFFF_FFFF_FFFF)
 }
 
+/// Phase D.3: decide whether a node's data-plane transport is usable by
+/// the client. Returns the proto `TransportType` discriminant to
+/// advertise, or `None` when the client cannot use the node's sole
+/// listener. Per RFC §5.9 each node binds exactly one listener
+/// (RDMA or TCP), so an unsupported transport yields no location rather
+/// than a synthetic fallback address; the client then falls back to the
+/// Master `GetBlock` path.
+pub(crate) fn select_location_transport(
+    node_transport: u8,
+    supports_rdma: bool,
+    supports_tcp: bool,
+) -> Option<i32> {
+    match node_transport {
+        1 if supports_rdma => Some(TransportType::Rdma as i32),
+        0 if supports_tcp => Some(TransportType::Tcp as i32),
+        _ => None,
+    }
+}
+
 pub struct KvCacheServiceImpl {
     pub engine: Arc<KVCacheEngine>,
     pub volume_client_pool: Arc<VolumeClientPool>,
@@ -706,6 +725,73 @@ impl KvCacheService for KvCacheServiceImpl {
         }))
     }
 
+    async fn get_block_meta(
+        &self,
+        request: Request<GetBlockMetaRequest>,
+    ) -> Result<Response<GetBlockMetaResponse>, Status> {
+        let req = request.into_inner();
+
+        let meta = match self.engine.get_block_meta(req.block_id) {
+            Some(meta) => meta,
+            None => {
+                return Ok(Response::new(GetBlockMetaResponse {
+                    found: false,
+                    block_id: req.block_id,
+                    fid: String::new(),
+                    size_bytes: 0,
+                    locations: Vec::new(),
+                }));
+            }
+        };
+
+        // Resolve at most one direct location. Any failure below — malformed
+        // fid, volume/node vanished from topology, client cannot use the
+        // node's sole listener — leaves locations empty while the block
+        // identity stands (found=true); the client then falls back to
+        // GetBlock, which surfaces the concrete error. No location is
+        // fabricated. read_count is intentionally untouched (RFC §5.3;
+        // direct reads are acknowledged via RecordBlockAccess, D.4).
+        let mut locations = Vec::new();
+        if let Ok(fid) = Fid::from_string(&meta.fid) {
+            if let Some((address, node_transport)) =
+                self.master.get_volume_data_endpoint(fid.volume_id.0)
+            {
+                if let Some(transport) =
+                    select_location_transport(node_transport, req.supports_rdma, req.supports_tcp)
+                {
+                    locations.push(BlockLocation {
+                        volume_id: fid.volume_id.0,
+                        address,
+                        transport,
+                    });
+                }
+            }
+        }
+
+        if locations.is_empty() {
+            // Block exists but no client-compatible direct endpoint is
+            // reachable (malformed fid, volume/node out of topology, zero
+            // port, or unsupported sole listener). The client is expected
+            // to fall back to GetBlock; log at debug for troubleshooting.
+            log::debug!(
+                "GET_BLOCK_META: block={} fid={} has no direct location \
+                 (supports_rdma={}, supports_tcp={}); client should fall back to GetBlock",
+                req.block_id,
+                meta.fid,
+                req.supports_rdma,
+                req.supports_tcp
+            );
+        }
+
+        Ok(Response::new(GetBlockMetaResponse {
+            found: true,
+            block_id: req.block_id,
+            fid: meta.fid,
+            size_bytes: meta.size_bytes,
+            locations,
+        }))
+    }
+
     async fn create_namespace(
         &self,
         request: Request<CreateNamespaceRequest>,
@@ -1073,5 +1159,45 @@ impl KvCacheService for KvCacheServiceImpl {
             found,
             error: String::new(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_location_transport;
+    use crate::proto::powerfs::TransportType;
+
+    #[test]
+    fn test_select_location_transport_matrix() {
+        // RDMA node: advertised whenever the client supports RDMA,
+        // regardless of TCP support.
+        assert_eq!(
+            select_location_transport(1, true, true),
+            Some(TransportType::Rdma as i32)
+        );
+        assert_eq!(
+            select_location_transport(1, true, false),
+            Some(TransportType::Rdma as i32)
+        );
+        // Single listener: RDMA node + no client RDMA -> no location
+        // (there is no co-located TCP listener to offer).
+        assert_eq!(select_location_transport(1, false, true), None);
+        assert_eq!(select_location_transport(1, false, false), None);
+
+        // TCP node: advertised whenever the client supports TCP.
+        assert_eq!(
+            select_location_transport(0, true, true),
+            Some(TransportType::Tcp as i32)
+        );
+        assert_eq!(
+            select_location_transport(0, false, true),
+            Some(TransportType::Tcp as i32)
+        );
+        assert_eq!(select_location_transport(0, true, false), None);
+        assert_eq!(select_location_transport(0, false, false), None);
+
+        // Unknown / future transport values never produce a location.
+        assert_eq!(select_location_transport(2, true, true), None);
+        assert_eq!(select_location_transport(255, true, true), None);
     }
 }
