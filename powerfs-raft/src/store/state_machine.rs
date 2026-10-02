@@ -29,6 +29,7 @@ use openraft::entry::RaftEntry;
 use openraft::storage::EntryResponder;
 use openraft::storage::RaftStateMachine;
 use openraft::type_config::TypeConfigExt;
+use openraft::vote::RaftLeaderId;
 use openraft::EntryPayload;
 use openraft::OptionalSend;
 use openraft::RaftSnapshotBuilder;
@@ -69,12 +70,22 @@ where
 ///
 /// 可选携带 `apply_notifier`：当 `apply()` 处理完一批 entries 后，通过 channel 发送
 /// 最新 applied log index，供上层（MasterNode）读取 `raft_state_data` CF 并 replay 业务命令。
+/// Notification emitted by [`RocksStateMachine::apply`] after a batch is
+/// durably applied. Carries the applied log `index` together with the Raft
+/// `term` of that entry, so upper layers can tell a stale (previous-leader)
+/// term entry from one proposed in the current term (D.6 AC-8 / Minor-3).
+#[derive(Debug, Clone, Copy)]
+pub struct AppliedLog {
+    pub index: u64,
+    pub term: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct RocksStateMachine {
     db: Arc<DB>,
     snapshot_dir: PathBuf,
-    /// 可选的 apply 通知 channel（发送最新 applied log index）。
-    apply_notifier: Option<mpsc::Sender<u64>>,
+    /// 可选的 apply 通知 channel（发送最新 applied log index + term）。
+    apply_notifier: Option<mpsc::Sender<AppliedLog>>,
 }
 
 impl RocksStateMachine {
@@ -99,7 +110,7 @@ impl RocksStateMachine {
     ///
     /// 当 `apply()` 处理完一批 entries 后，会通过此 channel 发送最新 applied log index。
     /// 上层（MasterNode）收到后可从 `raft_state_data` CF 读取 Normal entry payload 并 replay。
-    pub fn with_apply_notifier(mut self, tx: mpsc::Sender<u64>) -> Self {
+    pub fn with_apply_notifier(mut self, tx: mpsc::Sender<AppliedLog>) -> Self {
         self.apply_notifier = Some(tx);
         self
     }
@@ -231,6 +242,9 @@ where
     C::D: Serialize,
     C::Entry:
         RaftEntry<D = C::D> + AsRef<openraft::Entry<CommittedLidOf<C>, C::D, C::NodeId, C::Node>>,
+    // D.6 AC-8 / Minor-3: read the entry's Raft term to fence stale-term apply.
+    CommittedLidOf<C>: RaftLeaderId,
+    <CommittedLidOf<C> as RaftLeaderId>::Term: Into<u64>,
 {
     type SnapshotData = Cursor<Vec<u8>>;
 
@@ -250,6 +264,8 @@ where
         let mut last_applied_log: Option<LogIdOf<C>> = None;
         let mut last_membership: Option<StoredMembershipOf<C>> = None;
         let mut last_applied_index: Option<u64> = None;
+        // Term of the last applied entry in this batch, carried in the notify.
+        let mut last_applied_term: Option<u64> = None;
         let mut responses: Vec<(openraft::storage::ApplyResponder<C>, C::R)> = Vec::new();
         // Normal entry 的 (key, value) 对，循环结束后再写入 batch（避免跨 await 持有 ColumnFamily）。
         let mut normal_data: Vec<([u8; 8], Vec<u8>)> = Vec::new();
@@ -267,6 +283,7 @@ where
             }
             last_applied_log = Some(log_id.clone());
             last_applied_index = Some(index);
+            last_applied_term = Some(log_id.committed_leader_id().term().into());
 
             // 通过 AsRef 访问 entry.payload，区分 Blank / Normal / Membership。
             let payload = &entry.as_ref().payload;
@@ -330,13 +347,13 @@ where
 
         // 通知上层 MasterNode：有新的 applied entries 可供 replay。
         if let Some(tx) = &self.apply_notifier {
-            if let Some(idx) = last_applied_index {
+            if let (Some(idx), Some(term)) = (last_applied_index, last_applied_term) {
                 // 非阻塞发送：channel 满时丢弃通知（下次 apply 会再发）。
-                match tx.try_send(idx) {
+                match tx.try_send(AppliedLog { index: idx, term }) {
                     Ok(()) => {
                         debug!(
-                            "RocksStateMachine::apply: notified apply_index={} (entries={})",
-                            idx, total_entries
+                            "RocksStateMachine::apply: notified apply_index={} term={} (entries={})",
+                            idx, term, total_entries
                         );
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {

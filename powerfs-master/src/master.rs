@@ -829,6 +829,7 @@ impl MasterNode {
             for cmd in zone_commands {
                 let entry = ApplyEntry {
                     index: 0,
+                    term: 0,
                     command: cmd,
                 };
                 if let Err(e) = master.apply_command(entry).await {
@@ -892,13 +893,14 @@ impl MasterNode {
         // deserialize it into a `RaftCommand`, and replay it onto the in-memory state.
         let master_clone = master.clone();
         tokio::spawn(async move {
-            while let Some(index) = apply_rx.recv().await {
+            while let Some(crate::raft_v2::AppliedLog { index, term }) = apply_rx.recv().await {
                 match master_clone.raft_v2.read_applied_entry(index) {
                     Ok(Some(payload)) => {
                         match serde_json::from_slice::<crate::raft_v2::RaftCommand>(&payload) {
                             Ok(cmd) => {
                                 let entry = ApplyEntry {
                                     index,
+                                    term,
                                     command: cmd,
                                 };
                                 if let Err(e) = master_clone.apply_command(entry).await {
@@ -1397,6 +1399,7 @@ impl MasterNode {
         // Apply directly to local state machine for immediate visibility.
         let entry = ApplyEntry {
             index: 0,
+            term: self.current_term(),
             command: cmd.clone(),
         };
         self.apply_command(entry).await?;
@@ -1414,6 +1417,7 @@ impl MasterNode {
 
     /// Apply a committed Raft command to the state machine
     pub async fn apply_command(&self, entry: ApplyEntry) -> Result<()> {
+        let entry_term = entry.term;
         debug!(
             "Applying command at index {}: {:?}",
             entry.index, entry.command
@@ -1480,8 +1484,10 @@ impl MasterNode {
                 grpc_port,
                 net_port,
             } => {
-                self.apply_update_node_volumes(&node_id, &volumes, &ip, grpc_port, net_port)
-                    .await?;
+                self.apply_update_node_volumes(
+                    &node_id, &volumes, &ip, grpc_port, net_port, entry_term,
+                )
+                .await?;
             }
             RaftCommand::Heartbeat { node_id } => {
                 self.apply_heartbeat(&node_id).await?;
@@ -1713,6 +1719,7 @@ impl MasterNode {
         for (_idx, cmd) in entries {
             let entry = ApplyEntry {
                 index: 0,
+                term: 0,
                 command: cmd,
             };
             // Errors during authoritative rebuild must surface, not be
@@ -2060,8 +2067,19 @@ impl MasterNode {
         ip: &str,
         grpc_port: u32,
         net_port: u32,
+        // Raft term of the source log entry.
+        entry_term: u64,
     ) -> Result<()> {
         let nid = NodeId(node_id.to_string());
+
+        // D.6 AC-8 / Minor-3: only mark the node as reported for the current
+        // term when the applied entry actually belongs to the current term. An
+        // UpdateNodeVolumes entry left over from a previous leader's term can
+        // be consumed by the business apply loop just after a new leader is
+        // elected; using it to mark the node ready would reopen the stale
+        // high-water window.
+        let current_term = self.current_term();
+        let term_is_current = entry_term_is_current(entry_term, current_term);
 
         // Update topology
         {
@@ -2072,6 +2090,9 @@ impl MasterNode {
                 node.last_heartbeat = Utc::now();
                 node.state = NodeState::Healthy;
                 node.volume_count = volumes.len() as u32;
+                if term_is_current {
+                    node.heartbeat_term = current_term;
+                }
             }
         }
 
@@ -2091,6 +2112,9 @@ impl MasterNode {
                 existing.used = vol.used;
                 existing.state = state;
                 existing.modified_at = Utc::now();
+                // D.6: 权威高水位单调收敛（数据所在卷上报），防止 Master
+                // 重启/snapshot/切主后 next_file_key 回退导致 block 复用。
+                existing.next_file_key = existing.next_file_key.max(vol.next_file_key);
             } else {
                 // 新增 volume（首次注册）
                 volumes_map.insert(
@@ -2107,7 +2131,8 @@ impl MasterNode {
                         state,
                         created_at: Utc::now(),
                         modified_at: Utc::now(),
-                        next_file_key: 1,
+                        // 用卷上报的权威高水位；空卷上报 0 时保底为 1。
+                        next_file_key: vol.next_file_key.max(1),
                     },
                 );
             }
@@ -2866,6 +2891,7 @@ impl MasterNode {
                 used: v.used,
                 file_count: v.file_count,
                 collection: v.collection.clone(),
+                next_file_key: v.next_file_key,
             })
             .collect();
 
@@ -2893,6 +2919,8 @@ impl MasterNode {
                 used: 0,
                 file_count: 0,
                 collection: v.collection.0.clone(),
+                // Not part of topology-change comparison (cleared on both sides).
+                next_file_key: 0,
             })
             .collect();
 
@@ -2901,6 +2929,7 @@ impl MasterNode {
             .cloned()
             .map(|mut v| {
                 v.used = 0;
+                v.next_file_key = 0;
                 v
             })
             .collect();
@@ -2910,11 +2939,24 @@ impl MasterNode {
                 "HEARTBEAT_DEBUG: volumes unchanged for node={}, skipping propose, updating used locally",
                 params.node_id
             );
+            // D.6 AC-8: even on the local (non-Raft) convergence path, mark
+            // the node as reported this term so a freshly elected leader's
+            // very first heartbeat releases it for assignment.
+            let term = self.current_term();
+            {
+                let mut topology = self.topology.write().unwrap();
+                if let Some(node) = topology.get_node_mut(&params.node_id) {
+                    node.heartbeat_term = term;
+                }
+            }
             let mut volumes_map = self.volumes.write().unwrap();
             for vol in &short_volumes {
                 let vid = VolumeId(vol.volume_id);
                 if let Some(existing) = volumes_map.get_mut(&vid) {
                     existing.used = vol.used;
+                    // D.6: locally converge the high-water even when topology
+                    // is unchanged (monotonic; leader uses it for assignment).
+                    existing.next_file_key = existing.next_file_key.max(vol.next_file_key);
                 }
             }
             return Ok(());
@@ -3016,7 +3058,14 @@ impl MasterNode {
             self.maybe_advance_file_key(existing_vid.0, file_key).await;
 
             let volume_id = existing_vid;
-            let cookie = rand::random::<u32>() as u64;
+            // Cookie is the only unguessable element of a fid; it must be
+            // non-zero because DirectReadNeedle treats 0 as a legacy needle.
+            let cookie = loop {
+                let c = rand::random::<u32>();
+                if c != 0 {
+                    break c as u64;
+                }
+            };
             let fid = Fid {
                 volume_id,
                 cookie,
@@ -3061,7 +3110,27 @@ impl MasterNode {
             return Ok((fid, host_node));
         }
 
-        // No available volume in the pre-allocated pool
+        // No available volume in the pre-allocated pool. Distinguish a truly
+        // full pool from the brief post-election window where volume servers
+        // have not yet re-registered with the new leader. The latter returns
+        // a retriable Unavailable so clients retry once high-water marks are
+        // fresh, instead of possibly assigning a stale file key (D.6 AC-8).
+        let term = self.current_term();
+        let warming = {
+            let volumes = self.volumes.read().unwrap();
+            volume_pool_warming_from(&volumes, &collection_obj, &nodes, &excluded, term)
+        };
+        if warming {
+            warn!(
+                "Volume pool for collection {:?} is warming up after leadership change; returning Unavailable for retry",
+                collection_obj
+            );
+            return Err(PowerFsError::Unavailable(
+                "leader recently elected; waiting for volume servers to re-register, please retry"
+                    .to_string(),
+            ));
+        }
+
         warn!(
             "No available volume for collection {:?}. Pre-allocated volumes are full.",
             collection_obj
@@ -3092,7 +3161,8 @@ impl MasterNode {
         // Advance the round-robin counter so consecutive calls pick different
         // volumes, distributing write load across all writable volumes.
         let start_idx = self.volume_round_robin.fetch_add(1, Ordering::Relaxed) as usize;
-        select_writable_volume_from(&volumes, collection, nodes, mode, excluded, start_idx)
+        let term = self.current_term();
+        select_writable_volume_from(&volumes, collection, nodes, mode, excluded, start_idx, term)
     }
 
     /// 批量分配 stripe volumes
@@ -5101,7 +5171,17 @@ fn select_writable_volume_from(
     mode: &VolumeAllocationMode,
     excluded: &[u64],
     start_idx: usize,
+    current_term: u64,
 ) -> Option<(VolumeId, NodeId)> {
+    // A volume is allocatable only when its host node has heartbeated during
+    // the leader's current term. Right after an election, before the node's
+    // first heartbeat arrives, the leader's in-memory high-water mark may be
+    // stale, so we must not hand out file keys from that node (D.6 AC-8).
+    let node_ready = |node_id: &NodeId| {
+        nodes
+            .iter()
+            .any(|n| n.id == *node_id && n.heartbeat_term == current_term)
+    };
     // Build the candidate id list according to the allocation mode. `None`
     // means "scan all volumes" (Auto).
     let pinned: Option<&[u64]> = match mode {
@@ -5129,7 +5209,7 @@ fn select_writable_volume_from(
                 if vinfo.used >= vinfo.size {
                     continue;
                 }
-                if !nodes.iter().any(|n| n.id == vinfo.node_id) {
+                if !node_ready(&vinfo.node_id) {
                     continue;
                 }
                 candidates.push((VolumeId(*vid), vinfo.node_id.clone()));
@@ -5162,7 +5242,7 @@ fn select_writable_volume_from(
         if vinfo.used >= vinfo.size {
             continue;
         }
-        if !nodes.iter().any(|n| n.id == vinfo.node_id) {
+        if !node_ready(&vinfo.node_id) {
             continue;
         }
         candidates.push((*vid, vinfo.node_id.clone()));
@@ -5173,6 +5253,60 @@ fn select_writable_volume_from(
     }
     let pick = candidates[start_idx % candidates.len()].clone();
     Some(pick)
+}
+
+/// D.6 AC-8: detect the post-leadership-change warm-up window.
+///
+/// Returns `true` when at least one volume is structurally allocatable for the
+/// collection (right state, not full, host node known) but its host node has
+/// not yet heartbeated during the leader's `current_term`. In that state the
+/// leader's persisted high-water may be stale, so [`MasterNode::assign_volume`]
+/// returns a retriable `Unavailable` rather than risking file-key reuse. The
+/// check is intentionally conservative (ignores allocation-mode pinning): a
+/// false positive only causes one extra retry.
+fn volume_pool_warming_from(
+    volumes: &HashMap<VolumeId, VolumeInfo>,
+    collection: &Collection,
+    nodes: &[DataNodeInfo],
+    excluded: &[u64],
+    current_term: u64,
+) -> bool {
+    volumes.iter().any(|(vid, vinfo)| {
+        if excluded.contains(&vid.0) {
+            return false;
+        }
+        if vinfo.collection != *collection {
+            return false;
+        }
+        if !matches!(vinfo.state, VolumeState::Creating | VolumeState::Available) {
+            return false;
+        }
+        if vinfo.used >= vinfo.size {
+            return false;
+        }
+        // The host must be "ready": present in topology AND reported during
+        // the current term. A node that is entirely absent (a freshly elected
+        // leader before the first heartbeat has replayed it) or that reported
+        // only in an older term is not ready. In either case report the pool
+        // as warming so the caller returns a retriable Unavailable instead of
+        // handing out a potentially stale file key.
+        let host_ready = nodes
+            .iter()
+            .any(|n| n.id == vinfo.node_id && n.heartbeat_term == current_term);
+        !host_ready
+    })
+}
+
+/// D.6 AC-8 / Minor-3: decide whether applying an `UpdateNodeVolumes` entry
+/// may certify its host node for the leader's current term. The business
+/// apply loop can consume an `UpdateNodeVolumes` entry written by a previous
+/// leader *after* a new leader has been elected (the raft state-machine apply
+/// and the business apply loop are decoupled). Only an entry whose Raft term
+/// equals the current term may mark the node ready; a stale (older) term, a
+/// replay sentinel (`0`), or a future term all leave any prior
+/// `heartbeat_term` untouched. Pure so the fencing condition is testable.
+fn entry_term_is_current(entry_term: u64, current_term: u64) -> bool {
+    entry_term == current_term
 }
 
 /// Phase D.3: pick the powerfs-net data listener port advertised for a
@@ -5285,7 +5419,9 @@ mod tests {
     use powerfs_common::types::{DataCenterId, DiskType, NodeId, RackId, Ttl};
 
     fn node(id: &str) -> DataNodeInfo {
-        DataNodeInfo::new(
+        // Tests use term 1 as the "current" term; nodes must have reported in
+        // that term to be allocatable (D.6 AC-8).
+        let mut n = DataNodeInfo::new(
             NodeId(id.to_string()),
             "127.0.0.1".to_string(),
             RackId(String::new()),
@@ -5293,7 +5429,9 @@ mod tests {
             8080,
             8081,
             String::new(),
-        )
+        );
+        n.heartbeat_term = 1;
+        n
     }
 
     fn vol(vid: u64, collection: &str, node_id: &str, used: u64, size: u64) -> VolumeInfo {
@@ -5332,7 +5470,7 @@ mod tests {
         let nodes = vec![node("n1")];
         let mode = VolumeAllocationMode::default(); // Auto
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0, 1);
         assert_eq!(pick.map(|(v, _)| v.0), Some(1));
     }
 
@@ -5344,7 +5482,7 @@ mod tests {
             volume_ids: vec![2],
         };
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0, 1);
         assert_eq!(pick.map(|(v, _)| v.0), Some(2));
     }
 
@@ -5359,7 +5497,7 @@ mod tests {
             volume_ids: vec![2],
         };
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0, 1);
         assert!(pick.is_none(), "Manual must not fall back to auto-scan");
     }
 
@@ -5375,7 +5513,7 @@ mod tests {
             auto_count: 1,
         };
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0, 1);
         assert_eq!(pick.map(|(v, _)| v.0), Some(2));
     }
 
@@ -5388,7 +5526,7 @@ mod tests {
         let nodes = vec![node("n1")];
         let mode = VolumeAllocationMode::default();
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1], 0);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1], 0, 1);
         assert_eq!(pick.map(|(v, _)| v.0), Some(2));
     }
 
@@ -5400,7 +5538,7 @@ mod tests {
             volume_ids: vec![1],
         };
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1], 0);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[1], 0, 1);
         assert!(pick.is_none(), "blacklist must override Manual pin");
     }
 
@@ -5410,7 +5548,7 @@ mod tests {
         let nodes = vec![node("n1")]; // ghost not present
         let mode = VolumeAllocationMode::default();
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0, 1);
         assert!(pick.is_none());
     }
 
@@ -5421,7 +5559,7 @@ mod tests {
         let nodes = vec![node("n1")];
         let mode = VolumeAllocationMode::default();
         let coll = Collection("default".to_string());
-        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0);
+        let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0, 1);
         assert!(pick.is_none());
     }
 
@@ -5441,7 +5579,7 @@ mod tests {
 
         let mut seen = std::collections::HashSet::new();
         for i in 0..6 {
-            let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], i);
+            let pick = select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], i, 1);
             if let Some((vid, _)) = pick {
                 seen.insert(vid.0);
             }
@@ -5452,6 +5590,84 @@ mod tests {
             3,
             "round-robin must distribute across all volumes, got: {:?}",
             seen
+        );
+    }
+
+    // ========== D.6 AC-8: 切主收敛屏障 ==========
+
+    #[test]
+    fn test_assign_blocked_until_node_reports_in_term() {
+        let coll = Collection("default".to_string());
+        let mode = VolumeAllocationMode::default();
+        let volumes = build_volumes(&[(1, "default", "n1", 0, 100)]);
+
+        // Node reported only under the OLD term (e.g. a follower that just won
+        // the election and still holds a stale high-water mark). New term = 2.
+        let mut stale_node = node("n1");
+        stale_node.heartbeat_term = 1;
+        let nodes = vec![stale_node];
+
+        assert!(
+            select_writable_volume_from(&volumes, &coll, &nodes, &mode, &[], 0, 2).is_none(),
+            "must not assign from a node that has not reported in the current term"
+        );
+        assert!(
+            volume_pool_warming_from(&volumes, &coll, &nodes, &[], 2),
+            "pool should be detected as warming up"
+        );
+
+        // After the node heartbeats in term 2, allocation succeeds.
+        let mut fresh_node = node("n1");
+        fresh_node.heartbeat_term = 2;
+        let ready = vec![fresh_node];
+        let pick = select_writable_volume_from(&volumes, &coll, &ready, &mode, &[], 0, 2);
+        let (vid, _) = pick.expect("allocation must succeed once node reports in current term");
+        assert_eq!(vid, VolumeId(1));
+        assert!(
+            !volume_pool_warming_from(&volumes, &coll, &ready, &[], 2),
+            "pool must not be warming once node is current"
+        );
+    }
+
+    #[test]
+    fn test_warming_false_when_no_structural_volume() {
+        // Empty pool (no volumes) is "no capacity", not "warming up".
+        let coll = Collection("default".to_string());
+        let volumes: HashMap<VolumeId, VolumeInfo> = HashMap::new();
+        let nodes = vec![node("n1")];
+        assert!(!volume_pool_warming_from(&volumes, &coll, &nodes, &[], 1));
+    }
+
+    #[test]
+    fn test_warming_true_when_host_node_absent() {
+        // A writable volume exists, but the freshly elected leader has not yet
+        // received any heartbeat, so its host node is absent from topology.
+        // This must be "warming" (retriable Unavailable), not InvalidRequest.
+        let coll = Collection("default".to_string());
+        let volumes = build_volumes(&[(1, "default", "n1", 0, 100)]);
+        let nodes: Vec<DataNodeInfo> = Vec::new();
+        assert!(volume_pool_warming_from(&volumes, &coll, &nodes, &[], 2));
+    }
+
+    #[test]
+    fn test_stale_term_entry_does_not_mark_ready() {
+        // Minor-3: only an UpdateNodeVolumes entry whose term equals the
+        // current leader's term may certify its host node.
+        assert!(
+            entry_term_is_current(2, 2),
+            "current-term entry must certify the node"
+        );
+        assert!(
+            !entry_term_is_current(1, 2),
+            "an entry left over from a previous term must not mark ready"
+        );
+        assert!(
+            !entry_term_is_current(0, 2),
+            "replay sentinel term 0 must not mark ready"
+        );
+        assert!(
+            !entry_term_is_current(3, 2),
+            "a future-term entry must not mark ready"
         );
     }
 

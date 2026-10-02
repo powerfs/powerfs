@@ -162,6 +162,8 @@ message VolumeShortInfo {
     uint64 file_count = 9;
     uint32 compact_status = 10;
     uint64 append_offset = 11;
+    // D.6: authoritative next-file-key high-water mark from the data node.
+    uint64 next_file_key = 12;
 }
 
 message Location {

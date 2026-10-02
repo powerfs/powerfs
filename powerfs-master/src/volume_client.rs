@@ -124,6 +124,7 @@ impl VolumeClientPool {
         address: &str,
         volume_id: u64,
         file_key: u64,
+        cookie: u32,
         data: &[u8],
     ) -> Result<(), String> {
         let channel = match self.get_or_create_channel(address).await {
@@ -136,7 +137,7 @@ impl VolumeClientPool {
             volume_id,
             file_key,
             data: data.to_vec(),
-            cookie: 0,
+            cookie,
             ttl: "".to_string(),
         };
 
@@ -433,6 +434,7 @@ impl VolumeClientPool {
         address: &str,
         volume_id: u64,
         file_key: u64,
+        cookie: u32,
         data: &[u8],
     ) -> Result<u64, String> {
         let channel = match self.get_or_create_channel(address).await {
@@ -445,7 +447,7 @@ impl VolumeClientPool {
             volume_id,
             file_key,
             data: data.to_vec(),
-            cookie: 0,
+            cookie,
             ttl: "".to_string(),
         };
 

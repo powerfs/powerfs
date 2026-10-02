@@ -262,6 +262,32 @@ impl VolumeMetadata {
         Ok(result)
     }
 
+    /// 历史最大 needle id：needles + deleted 两 CF 中最大的 key。
+    ///
+    /// 已分配的 file block 即使 needle 被删也不回收复用（安全优先），所以
+    /// 高水位必须包含 deleted CF。只取每个 CF 的最后一个 key（RocksDB
+    /// 按 key 有序），无需反序列化 value。供 Volume 启动时初始化高水位。
+    pub fn max_needle_id_in_db(&self) -> Result<u64> {
+        fn last_key(db: &DB, cf: &ColumnFamily) -> Result<u64> {
+            let mut iter = db.iterator_cf(cf, rocksdb::IteratorMode::End);
+            match iter.next() {
+                Some(item) => {
+                    let (key, _) =
+                        item.map_err(|e| PowerFsError::Internal(format!("RocksDB iterator: {e}")))?;
+                    if key.len() == 8 {
+                        Ok(u64::from_be_bytes(key.as_ref().try_into().unwrap()))
+                    } else {
+                        Ok(0)
+                    }
+                }
+                None => Ok(0),
+            }
+        }
+        let live = last_key(&self.db, self.cf_needles())?;
+        let dead = last_key(&self.db, self.cf_deleted())?;
+        Ok(live.max(dead))
+    }
+
     /// 启动时重建 allocation 统计：扫描 needles CF + deleted CF
     /// 返回 (used_bytes, append_offset, active_count, deleted_count, garbage_bytes)
     ///
@@ -734,6 +760,7 @@ impl VolumeMetadata {
                 ec_k: None,
                 ec_m: None,
                 ec_shards: Vec::new(),
+                cookie: 0,
             };
 
             // 写入 RocksDB（后写覆盖先写，只保留最新版本）
@@ -915,6 +942,7 @@ mod tests {
             ec_k: None,
             ec_m: None,
             ec_shards: Vec::new(),
+            cookie: 0,
         };
 
         // 写入
@@ -955,6 +983,7 @@ mod tests {
             ec_k: None,
             ec_m: None,
             ec_shards: Vec::new(),
+            cookie: 0,
         };
 
         meta.write_needle_atomic(&info, 120, volume_size).unwrap();
@@ -997,6 +1026,7 @@ mod tests {
             ec_k: None,
             ec_m: None,
             ec_shards: Vec::new(),
+            cookie: 0,
         }
     }
 

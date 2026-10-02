@@ -136,7 +136,13 @@ impl KvCacheServiceImpl {
             .get_volume_address(fid.volume_id)
             .ok_or_else(|| "volume not found in topology".to_string())?;
         self.volume_client_pool
-            .write_needle(&addr, fid.volume_id.0, fid.file_key, data)
+            .write_needle(
+                &addr,
+                fid.volume_id.0,
+                fid.file_key,
+                fid.cookie as u32,
+                data,
+            )
             .await
             .map_err(|e| format!("failed to write to volume: {}", e))?;
         Ok(KvPayload::External {
@@ -453,7 +459,13 @@ impl KvCacheService for KvCacheServiceImpl {
         let block_id = self.engine.alloc_block_id();
         if let Err(e) = self
             .volume_client_pool
-            .write_needle(&volume_address, fid.volume_id.0, fid.file_key, &req.data)
+            .write_needle(
+                &volume_address,
+                fid.volume_id.0,
+                fid.file_key,
+                fid.cookie as u32,
+                &req.data,
+            )
             .await
         {
             return Ok(Response::new(PutBlockResponse {
@@ -583,7 +595,13 @@ impl KvCacheService for KvCacheServiceImpl {
             let block_id = self.engine.alloc_block_id();
             if let Err(e) = self
                 .volume_client_pool
-                .write_needle(&addr, fid.volume_id.0, fid.file_key, &b.data)
+                .write_needle(
+                    &addr,
+                    fid.volume_id.0,
+                    fid.file_key,
+                    fid.cookie as u32,
+                    &b.data,
+                )
                 .await
             {
                 responses.push(PutBlockResponse {

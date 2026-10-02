@@ -269,6 +269,7 @@ mod tests {
             transport_type: 0,
             transport_port: 0,
             rdma_device: String::new(),
+            heartbeat_term: 0,
         }
     }
 
@@ -298,6 +299,7 @@ mod tests {
                 transport_type: 0,
                 transport_port: 0,
                 rdma_device: String::new(),
+                heartbeat_term: 0,
             })
             .collect()
     }

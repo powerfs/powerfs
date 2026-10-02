@@ -208,13 +208,21 @@ fn test_lru_eviction() {
     assert!(stats.evictions > 0);
     assert!(stats.used_memory_bytes <= 5 * 1024 * 1024);
 
-    let mut found = 0;
+    // Phase C changed eviction to memory-only: evicted blocks keep their
+    // logical metadata (get_block stays Some, reads transparently re-fetch
+    // from the volume needle) but release their bytes (resident=false).
+    // Count RESIDENT blocks via get_block_data, which returns None once a
+    // block's bytes have been evicted — not via get_block, which only sees
+    // the retained metadata and would therefore count all 8.
+    let mut resident = 0;
     for id in &ids {
-        if engine.get_block(*id).is_some() {
-            found += 1;
+        if engine.get_block_data(*id).is_some() {
+            resident += 1;
         }
     }
-    assert!(found <= 5);
+    assert!(resident <= 5);
+    // Logical identity is retained even for evicted blocks.
+    assert!(ids.iter().all(|id| engine.get_block(*id).is_some()));
 }
 
 #[test]

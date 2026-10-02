@@ -30,6 +30,7 @@ use powerfs_raft::grpc::RaftServiceImpl;
 use powerfs_raft::network::Network;
 use powerfs_raft::protobuf::raft_service_server::RaftServiceServer;
 use powerfs_raft::store;
+pub(crate) use powerfs_raft::store::AppliedLog;
 use powerfs_raft::store::RocksStateMachine;
 use powerfs_raft::BasicNode;
 use powerfs_raft::MasterRequest;
@@ -52,6 +53,8 @@ pub struct Peer {
 #[derive(Debug, Clone)]
 pub struct ApplyEntry {
     pub index: u64,
+    /// Raft term of the source log entry (D.6 AC-8 / Minor-3).
+    pub term: u64,
     pub command: RaftCommand,
 }
 
@@ -261,6 +264,10 @@ pub struct RaftVolumeShortInfo {
     pub used: u64,
     pub file_count: u64,
     pub collection: String,
+    /// D.6: authoritative next-file-key high-water reported by the volume.
+    /// `#[serde(default)]` keeps old raft entries / snapshots decodable.
+    #[serde(default)]
+    pub next_file_key: u64,
 }
 
 impl RaftCommand {
@@ -282,6 +289,7 @@ impl From<&crate::proto::VolumeShortInfo> for RaftVolumeShortInfo {
             used: v.used,
             file_count: v.file_count,
             collection: v.collection.clone(),
+            next_file_key: v.next_file_key,
         }
     }
 }
@@ -459,7 +467,7 @@ impl RaftNodeV2 {
         address: String,
         peers: Vec<Peer>,
         storage_path: &str,
-    ) -> Result<(Self, mpsc::Receiver<u64>), String> {
+    ) -> Result<(Self, mpsc::Receiver<AppliedLog>), String> {
         let node_id = id.to_string();
 
         // 1) 创建 RocksDB 存储

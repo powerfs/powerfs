@@ -667,6 +667,7 @@ impl MasterService for MasterGrpcServer {
                         / powerfs_common::constants::FILE_KEY_BLOCK_SIZE,
                     compact_status: 0,
                     append_offset: 0,
+                    next_file_key: volume.next_file_key,
                 });
             }
 

@@ -452,6 +452,11 @@ pub struct NeedleInfo {
     pub ec_k: Option<usize>,
     pub ec_m: Option<usize>,
     pub ec_shards: Vec<EcShardInfo>,
+    /// Per-needle capability secret from Master assign (D.6). Persisted
+    /// metadata only (RocksDB); `0` means a legacy/unverified needle and
+    /// DirectReadNeedle stays fail-closed against it.
+    #[serde(default)]
+    pub cookie: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -511,6 +516,16 @@ pub struct DataNodeInfo {
     /// Phase D: RDMA device name (e.g. "mlx5_0"). Empty when transport_type=0.
     #[serde(default)]
     pub rdma_device: String,
+    /// D.6 (AC-8): Raft term of the most recent heartbeat the **master**
+    /// processed for this node. Local/volatile: it is neither reported by the
+    /// node nor part of the replicated topology payload. A freshly elected
+    /// leader only hands out file keys from a node once that node has
+    /// heartbeated during the leader's current term, closing the
+    /// post-election stale-high-water window (a follower's persisted
+    /// next_file_key can lag the leader by up to a batch). 0 = no heartbeat
+    /// seen yet.
+    #[serde(default)]
+    pub heartbeat_term: u64,
 }
 
 impl DataNodeInfo {
@@ -573,6 +588,7 @@ impl DataNodeInfo {
             transport_type: 0, // TCP
             transport_port: 0, // fallback to grpc_port
             rdma_device: String::new(),
+            heartbeat_term: 0,
         }
     }
 }

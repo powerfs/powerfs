@@ -1035,3 +1035,251 @@ fn test_l1_crash_recovery_empty_volume() {
     assert_eq!(volume2.count(), 0);
     assert_eq!(volume2.deleted_count(), 0);
 }
+
+// ============================================================================
+// Phase D.6: cookie persistence
+// ============================================================================
+
+#[test]
+fn test_write_needle_with_cookie_persists() {
+    let (_dir, volume) = create_test_volume(1, 100 * 1024 * 1024);
+
+    let cookie = 0xDEAD_BEEFu64;
+    let info = volume
+        .write_needle_with_cookie(100, cookie, Bytes::from("cap data"))
+        .unwrap();
+    assert_eq!(info.cookie, cookie);
+
+    // The persisted metadata is what DirectReadNeedle checks against.
+    let meta = volume.read_needle_meta(100).unwrap();
+    assert_eq!(meta.cookie, cookie);
+
+    // The legacy entry point still records cookie = 0.
+    volume.write_needle(101, Bytes::from("legacy")).unwrap();
+    assert_eq!(volume.read_needle_meta(101).unwrap().cookie, 0);
+}
+
+#[test]
+fn test_cookie_survives_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let backend = Arc::new(
+        LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+    );
+    let cookie = 0x1234_5678u64;
+    {
+        let volume = Volume::new(
+            VolumeId(1),
+            "node",
+            path,
+            100 * 1024 * 1024,
+            backend.clone(),
+        )
+        .unwrap();
+        volume
+            .write_needle_with_cookie(1, cookie, Bytes::from("durable cookie"))
+            .unwrap();
+    }
+
+    let reopened = Volume::new(VolumeId(1), "node", path, 100 * 1024 * 1024, backend).unwrap();
+    assert_eq!(reopened.read_needle_meta(1).unwrap().cookie, cookie);
+}
+
+#[test]
+fn test_legacy_needle_info_json_defaults_cookie() {
+    use powerfs_common::types::NeedleInfo;
+
+    // Old on-disk JSON has no cookie field at all.
+    let legacy_json = r#"{
+        "id": 7,
+        "volume_id": 1,
+        "data_size": 16,
+        "offset": 0,
+        "checksum": 0,
+        "checksum_algorithm": "CRC32C",
+        "verification_count": 0,
+        "created_at": "2026-10-01T00:00:00Z",
+        "ec_enabled": false,
+        "ec_shards": []
+    }"#;
+    let info: NeedleInfo = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(info.cookie, 0, "missing cookie must default to zero");
+
+    // Round-trip preserves an explicit cookie.
+    let info = NeedleInfo {
+        cookie: 0xCAFE_F00D,
+        ..serde_json::from_str::<NeedleInfo>(legacy_json).unwrap()
+    };
+    let again: NeedleInfo = serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+    assert_eq!(again.cookie, 0xCAFE_F00D);
+}
+
+#[test]
+fn test_cookie_preserved_through_compact() {
+    let (_dir, volume) = create_test_volume(1, 100 * 1024 * 1024);
+
+    let cookie = 0xABCD_1234u64;
+    volume
+        .write_needle_with_cookie(1, cookie, Bytes::from("survivor"))
+        .unwrap();
+    // Two more needles that we then delete: deleted ratio 2/3 > 30%,
+    // which makes compact actually run.
+    volume.write_needle(2, Bytes::from("gone 1")).unwrap();
+    volume.write_needle(3, Bytes::from("gone 2")).unwrap();
+    volume.delete_needle(&NeedleId(2)).unwrap();
+    volume.delete_needle(&NeedleId(3)).unwrap();
+
+    assert!(volume.should_compact());
+    volume.compact().unwrap();
+
+    // The survivor moved on disk but its capability is unchanged.
+    let meta = volume.read_needle_meta(1).unwrap();
+    assert_eq!(meta.cookie, cookie);
+    assert_eq!(
+        volume.read_needle(&NeedleId(1)).unwrap(),
+        Bytes::from("survivor")
+    );
+}
+
+#[test]
+fn test_compact_rewritten_needle_at_data_offset_survives() {
+    // Rendered-cluster D.6 scenario: volume was compacted empty (append
+    // offset back at VOLUME_DATA_OFFSET), then a fresh needle is written
+    // exactly at VOLUME_DATA_OFFSET, followed by other needles that are
+    // deleted, then compact again. The first-position needle must survive.
+    let (_dir, volume) = create_test_volume(1, 100 * 1024 * 1024);
+    use powerfs_common::constants::VOLUME_DATA_OFFSET;
+
+    // First generation: write + delete + compact empties the volume.
+    volume.write_needle(1, Bytes::from("gen1")).unwrap();
+    volume.delete_needle(&NeedleId(1)).unwrap();
+    volume.compact().unwrap();
+
+    // Rewrite needle 1 — lands at VOLUME_DATA_OFFSET.
+    volume
+        .write_needle_with_cookie(1, 0x1234_5678, Bytes::from("gen2-data"))
+        .unwrap();
+    assert_eq!(
+        volume.read_needle_meta(1).unwrap().offset,
+        VOLUME_DATA_OFFSET
+    );
+
+    // Other needles then 5 deletions.
+    for k in 2..=7 {
+        volume
+            .write_needle(k, Bytes::from(format!("n-{k}")))
+            .unwrap();
+    }
+    for k in 2..=6 {
+        volume.delete_needle(&NeedleId(k)).unwrap();
+    }
+
+    volume.compact().unwrap();
+
+    let meta = volume.read_needle_meta(1).expect("needle 1 must survive");
+    assert_eq!(meta.cookie, 0x1234_5678);
+    assert_eq!(meta.offset, VOLUME_DATA_OFFSET);
+    assert_eq!(
+        volume.read_needle(&NeedleId(1)).unwrap(),
+        Bytes::from("gen2-data")
+    );
+}
+
+#[test]
+fn test_repro_id1_loss_after_compact() {
+    // Reproduces the rendered-cluster D.6 failure: a needle whose first
+    // version was deleted (tombstone in deleted CF), rewritten, then several
+    // other needles deleted, then compact — the rewritten needle must survive.
+    let (_dir, volume) = create_test_volume(1, 100 * 1024 * 1024);
+
+    volume.write_needle(1, Bytes::from("v1")).unwrap();
+    volume.delete_needle(&NeedleId(1)).unwrap();
+    volume
+        .write_needle_with_cookie(1, 0xABCD_1234, Bytes::from("v2-data"))
+        .unwrap();
+
+    for k in 2..=7 {
+        volume
+            .write_needle(k, Bytes::from(format!("needle-{k}")))
+            .unwrap();
+    }
+    for k in 2..=6 {
+        volume.delete_needle(&NeedleId(k)).unwrap();
+    }
+
+    eprintln!("active before compact:");
+    for (id, info) in volume.list_needles().unwrap() {
+        eprintln!(
+            "  id={} offset={} deleted={:?}",
+            id.0, info.offset, info.deleted_at
+        );
+    }
+
+    volume.compact().unwrap();
+
+    let meta = volume
+        .read_needle_meta(1)
+        .expect("needle 1 must survive compact");
+    assert_eq!(meta.cookie, 0xABCD_1234);
+    assert_eq!(
+        volume.read_needle(&NeedleId(1)).unwrap(),
+        Bytes::from("v2-data")
+    );
+}
+
+// ============================================================================
+// D.6: file_key authoritative high-water mark (FR-6 / AC-8)
+// ============================================================================
+
+#[test]
+fn test_next_file_key_empty_is_one() {
+    let (_dir, volume) = create_test_volume(1, 100 * 1024 * 1024);
+    assert_eq!(volume.next_file_key(), 1);
+}
+
+#[test]
+fn test_next_file_key_block_formula() {
+    use powerfs_common::constants::FILE_KEY_BLOCK_SIZE as B;
+    let (_dir, volume) = create_test_volume(1, 1024 * 1024 * 1024);
+
+    // id 1 lives in block [1, B] → next = 1 + B
+    volume.write_needle(1, Bytes::from("a")).unwrap();
+    assert_eq!(volume.next_file_key(), 1 + B);
+
+    // id B is still inside the first block → unchanged
+    volume.write_needle(B, Bytes::from("b")).unwrap();
+    assert_eq!(volume.next_file_key(), 1 + B);
+
+    // id B+1 opens the second block → next = 1 + 2B
+    volume.write_needle(B + 1, Bytes::from("c")).unwrap();
+    assert_eq!(volume.next_file_key(), 1 + 2 * B);
+}
+
+#[test]
+fn test_next_file_key_survives_reopen_including_deleted() {
+    // The high-water must be recovered from RocksDB (needles + deleted) on
+    // restart, so Master never reuses an allocated block after failover.
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let block = powerfs_common::constants::FILE_KEY_BLOCK_SIZE;
+
+    {
+        let backend = Arc::new(
+            LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+        );
+        let volume = Volume::new(VolumeId(1), "node", path, 1024 * 1024 * 1024, backend).unwrap();
+        // Allocate the third block, then delete it (moves to deleted CF).
+        volume
+            .write_needle(1 + 2 * block, Bytes::from("high"))
+            .unwrap();
+        volume.delete_needle(&NeedleId(1 + 2 * block)).unwrap();
+        assert_eq!(volume.next_file_key(), 1 + 3 * block);
+    }
+
+    let backend2 = Arc::new(
+        LocalFsBackend::new(path, "node", "default", Some(100 * 1024 * 1024 * 1024)).unwrap(),
+    );
+    let reopened = Volume::new(VolumeId(1), "node", path, 1024 * 1024 * 1024, backend2).unwrap();
+    // Tombstone still counts: must not fall back to 1.
+    assert_eq!(reopened.next_file_key(), 1 + 3 * block);
+}

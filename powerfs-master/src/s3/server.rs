@@ -617,7 +617,7 @@ pub mod handlers {
 
         if let Err(e) = state
             .volume_client_pool
-            .write_needle(&node_address, fid.volume_id.0, fid.file_key, data)
+            .write_needle(&node_address, fid.volume_id.0, fid.file_key, 0, data)
             .await
         {
             eprintln!("Failed to write needle: {}", e);
@@ -1023,7 +1023,7 @@ pub mod handlers {
 
         if let Err(e) = state
             .volume_client_pool
-            .write_needle(&node_address, session.volume_id, file_key, data)
+            .write_needle(&node_address, session.volume_id, file_key, 0, data)
             .await
         {
             eprintln!("Failed to write needle: {}", e);

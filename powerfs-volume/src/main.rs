@@ -795,10 +795,13 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
                     .into_iter()
                     .map(|v| {
                         // 从 Volume 结构体获取真实统计 (used/needle_count)
-                        let (used, _total, needle_count) = storage_manager
+                        let (used, _total, needle_count, next_fk) = storage_manager
                             .get_volume(&v.id)
-                            .map(|vol| vol.get_stats())
-                            .unwrap_or((v.used, v.size, 0));
+                            .map(|vol| {
+                                let (u, t, c) = vol.get_stats();
+                                (u, t, c, vol.next_file_key())
+                            })
+                            .unwrap_or((v.used, v.size, 0, 1));
                         powerfs_master::proto::VolumeShortInfo {
                             volume_id: v.id.0,
                             size: v.size,
@@ -811,6 +814,7 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
                             file_count: needle_count,
                             compact_status: 0,
                             append_offset: 0,
+                            next_file_key: next_fk,
                         }
                     })
                     .collect();
@@ -850,10 +854,13 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
                     let proto_volumes: Vec<powerfs_master::proto::VolumeShortInfo> = volumes
                         .into_iter()
                         .map(|v| {
-                            let (used, _total, needle_count) = storage_manager
+                            let (used, _total, needle_count, next_fk) = storage_manager
                                 .get_volume(&v.id)
-                                .map(|vol| vol.get_stats())
-                                .unwrap_or((v.used, v.size, 0));
+                                .map(|vol| {
+                                    let (u, t, c) = vol.get_stats();
+                                    (u, t, c, vol.next_file_key())
+                                })
+                                .unwrap_or((v.used, v.size, 0, 1));
                             powerfs_master::proto::VolumeShortInfo {
                                 volume_id: v.id.0,
                                 size: v.size,
@@ -866,6 +873,7 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
                                 file_count: needle_count,
                                 compact_status: 0,
                                 append_offset: 0,
+                                next_file_key: next_fk,
                             }
                         })
                         .collect();

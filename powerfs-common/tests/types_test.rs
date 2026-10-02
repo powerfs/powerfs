@@ -497,6 +497,7 @@ fn test_data_node_info_url() {
         transport_type: 0,
         transport_port: 0,
         rdma_device: String::new(),
+        heartbeat_term: 0,
     };
     assert_eq!(node.url(), "192.168.1.1:8081");
 }

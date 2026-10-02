@@ -188,6 +188,7 @@ impl Needle {
             ec_k: None,
             ec_m: None,
             ec_shards: Vec::new(),
+            cookie: 0,
         }
     }
 }

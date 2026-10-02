@@ -22,6 +22,7 @@ pub mod log_store;
 pub mod state_machine;
 
 pub use log_store::RocksLogStore;
+pub use state_machine::AppliedLog;
 pub use state_machine::RocksStateMachine;
 
 use std::io;

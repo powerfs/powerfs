@@ -192,7 +192,9 @@ fn bytes_to_ip(bytes: &[u8]) -> Option<IpAddr> {
 
 /// Length-leak-resistant byte comparison: returns false on length
 /// mismatch without short-circuiting the XOR accumulation itself.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time byte equality (also used by DirectReadNeedle's cookie
+/// check, hence crate-visible).
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

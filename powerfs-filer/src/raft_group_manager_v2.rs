@@ -29,6 +29,7 @@ use powerfs_raft::multi_network::MultiGroupRouter;
 use powerfs_raft::multi_network::MultiNetworkFactory;
 use powerfs_raft::protobuf::raft_service_server::RaftServiceServer;
 use powerfs_raft::store;
+use powerfs_raft::store::AppliedLog;
 use powerfs_raft::store::RocksStateMachine;
 use powerfs_raft::BasicNode;
 use powerfs_raft::FilerRequest;
@@ -539,7 +540,7 @@ impl RaftGroupManagerV2 {
         self: &Arc<Self>,
         shard_id: ShardId,
         peers: Vec<Peer>,
-    ) -> Result<mpsc::Receiver<u64>, String> {
+    ) -> Result<mpsc::Receiver<AppliedLog>, String> {
         let group_id = shard_id.0.to_string();
 
         // 1) 创建 RocksDB 存储（每 shard 独立目录）

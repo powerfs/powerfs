@@ -186,6 +186,9 @@ impl MasterClient {
             let _ = enc.add_string(FieldId::Name, &vol.collection);
             let _ = enc.add_u64(FieldId::UsedSpace, vol.used);
             let _ = enc.add_u64(FieldId::FileCount, vol.file_count);
+            // D.6: authoritative high-water, encoded last per record so older
+            // masters (which stop after FileCount) skip it safely.
+            let _ = enc.add_u64(FieldId::NextFileKey, vol.next_file_key);
         }
         let body = enc.into_bytes();
 

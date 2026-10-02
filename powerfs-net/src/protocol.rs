@@ -1546,6 +1546,9 @@ pub enum FieldId {
     /// RDMA device name (string, e.g. "mlx5_0"). Only present when
     /// TransportType=RDMA; empty when TCP.
     RdmaDevice = 0xDD,
+    /// D.6: authoritative next-file-key high-water mark reported by the volume
+    /// in Heartbeat (u64). Lets Master converge after restart/snapshot/failover.
+    NextFileKey = 0xDE,
 }
 
 impl FieldId {
@@ -1684,6 +1687,7 @@ impl FieldId {
             0xDB => Some(Self::TransportType),
             0xDC => Some(Self::TransportPort),
             0xDD => Some(Self::RdmaDevice),
+            0xDE => Some(Self::NextFileKey),
             _ => None,
         }
     }

@@ -432,6 +432,8 @@ impl MasterNetHandler {
                 let collection = dec.next_string(FieldId::Name).unwrap_or_default();
                 let used = dec.next_u64(FieldId::UsedSpace).unwrap_or(0);
                 let file_count = dec.next_u64(FieldId::FileCount).unwrap_or(0);
+                // D.6: last per-record field; absent on older volumes → 0.
+                let next_file_key = dec.next_u64(FieldId::NextFileKey).unwrap_or(0);
 
                 volumes.push(VolumeShortInfo {
                     volume_id,
@@ -445,6 +447,7 @@ impl MasterNetHandler {
                     file_count,
                     compact_status: 0,
                     append_offset: 0,
+                    next_file_key,
                 });
             }
         }
