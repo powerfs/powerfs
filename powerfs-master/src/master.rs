@@ -3189,6 +3189,13 @@ impl MasterNode {
             .map(|c| c.excluded_volume_ids.clone())
             .unwrap_or_default();
 
+        // D.6 fencing: stripe assignment returns volume IDs to the caller, so
+        // a freshly elected leader must not hand out volumes whose host node
+        // has not yet heartbeated in the current term (its route/state may be
+        // stale). Same criterion as assign_volume / select_writable_volume.
+        let term = self.current_term();
+        let nodes = self.topology.read().unwrap().list_all_nodes();
+
         // Find available volumes from the pre-allocated pool
         {
             let volumes = self.volumes.read().unwrap();
@@ -3209,6 +3216,13 @@ impl MasterNode {
                 if vinfo.used >= vinfo.size {
                     continue;
                 }
+                // Fencing: the host node must have reported in the current term.
+                let host_ready = nodes
+                    .iter()
+                    .any(|n| n.id == vinfo.node_id && n.heartbeat_term == term);
+                if !host_ready {
+                    continue;
+                }
                 available_volumes.push(*vid);
             }
 
@@ -3220,6 +3234,18 @@ impl MasterNode {
             );
 
             if available_volumes.is_empty() {
+                // Distinguish "warming up after leadership change" (retriable)
+                // from a genuinely empty/full pool.
+                if volume_pool_warming_from(&volumes, &collection_obj, &nodes, &excluded, term) {
+                    warn!(
+                        "Stripe volume pool for collection {:?} is warming up after leadership change; returning Unavailable for retry",
+                        collection_obj
+                    );
+                    return Err(PowerFsError::Unavailable(
+                        "leader recently elected; waiting for volume servers to re-register, please retry"
+                            .to_string(),
+                    ));
+                }
                 return Err(PowerFsError::InvalidRequest(
                     "no available volume in the pre-allocated pool".to_string(),
                 ));
