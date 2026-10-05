@@ -2114,6 +2114,17 @@ impl LockArbiter {
     /// 2. 返回 recall_tasks 给调用方异步发送
     /// 3. 调用方等待所有 recall_ack 后调用 quiesce_complete
     pub fn quiesce(&self, inode: u64) -> Vec<RecallTask> {
+        self.quiesce_except(inode, None)
+    }
+
+    /// MC-108 Task 4: quiesce every holder *except* `exclude` (the migration
+    /// initiator). The initiator keeps its caps; its still-dirty pages are
+    /// merged into the migration snapshot via the dirty-block bitmap rather
+    /// than flushed through the ordinary inline path. All other holders are
+    /// fully revoked (retain = NONE), guaranteeing their final inline commits
+    /// land before the migration window opens. Excluded holders are never
+    /// added to the gather list, so `quiesce_complete` does not wait on them.
+    pub fn quiesce_except(&self, inode: u64, exclude: Option<&str>) -> Vec<RecallTask> {
         let mut locks = self.locks.lock().unwrap();
         Self::ensure_init_locked(&mut locks, inode);
         let lock_arr = locks.get_mut(&inode).unwrap();
@@ -2137,6 +2148,13 @@ impl LockArbiter {
                 };
 
                 for h in &mut lock.holders {
+                    // Skip the migration initiator: it retains its caps and
+                    // contributes dirty data through the BeginMigration
+                    // block merge, so it must neither be recalled nor counted
+                    // in gather_remaining (which would deadlock the wait).
+                    if exclude.is_some_and(|ex| ex == h.client_id.as_str()) {
+                        continue;
+                    }
                     let g = GatherEntry {
                         client_id: h.client_id.clone(),
                         sn: h.sn,
@@ -2163,8 +2181,9 @@ impl LockArbiter {
         }
 
         warn!(
-            "mdlock quiesce inode={} recall_tasks={}",
+            "mdlock quiesce_except inode={} exclude={:?} recall_tasks={}",
             inode,
+            exclude,
             all_recalls.len()
         );
         all_recalls

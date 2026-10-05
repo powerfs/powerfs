@@ -580,6 +580,7 @@ impl MetaCache {
         chunks: Vec<crate::shard_store::StoredFileChunk>,
         inline_data: Option<Vec<u8>>,
         is_append: bool,
+        inline_dirty_mask: Option<u32>,
     ) -> Result<(), String> {
         let mut tbl = self.inode_table.write().unwrap();
         let Some(existing) = tbl.get_mut(&inode) else {
@@ -652,6 +653,38 @@ impl MetaCache {
                         "stale_layout: inode {} has chunks/storage_mode={:?}, reject inline",
                         inode, existing.info.storage_mode
                     ));
+                } else if let Some(mask) = inline_dirty_mask {
+                    // MC-108 Task 5: 内核提交携带脏 4K 块位图 — 投影与
+                    // ShardStore apply 完全同语义的区间合并（共用纯函数），
+                    // disjoint 区间与并发写者共存，size max() 单调。
+                    let (merged, new_size) =
+                        crate::shard_store::ShardStore::merge_inline_dirty_blocks(
+                            existing.info.inline_data.as_deref(),
+                            existing.info.size,
+                            &data,
+                            size,
+                            mask,
+                        );
+                    log::info!(
+                        "MetaCache Inline-MERGE: inode {} size {}→{} mask=0x{:x} \
+                         existing_len={} client_len={} merged_len={}",
+                        inode,
+                        existing.info.size,
+                        new_size,
+                        mask,
+                        existing
+                            .info
+                            .inline_data
+                            .as_ref()
+                            .map(|d| d.len())
+                            .unwrap_or(0),
+                        data.len(),
+                        merged.len(),
+                    );
+                    existing.info.size = new_size;
+                    existing.info.blocks = new_size.div_ceil(512);
+                    existing.info.chunks = chunks;
+                    existing.info.inline_data = Some(merged);
                 } else {
                     // Inline overwrite (explicit): caller wants full replacement.
                     existing.info.size = size;

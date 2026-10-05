@@ -656,7 +656,7 @@ impl CapManager {
 
 /// 生成 cap token. 格式: `cap-{inode}-{short_client}-{sn}`.
 /// `short_client` 截断到 16 字符 (避免 client_id 含特殊字符时 token 过长).
-fn generate_token(inode: u64, client_id: &str, sn: u64) -> String {
+pub(crate) fn generate_token(inode: u64, client_id: &str, sn: u64) -> String {
     let short_client = if client_id.len() > 16 {
         &client_id[..16]
     } else {

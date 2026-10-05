@@ -1170,6 +1170,15 @@ pub const STATUS_ERR_STALE_LAYOUT: u16 = 13;
 /// transient flow-control signal, not a server fault: it must NOT be counted
 /// toward the CircuitBreaker failure counter.
 pub const STATUS_ERR_BUSY: u16 = 14;
+/// Stale migration epoch — the client's Inline→Flat migration was fenced by
+/// the Filer's authoritative migration state machine (MC-108 Task 4). The
+/// client's view (Inline with an old epoch, or an in-flight inline/chunks
+/// commit) is no longer authoritative during the Migrating window. The
+/// client must re-fetch the layout (GETATTR), adopt the current
+/// Migrating/Flat state and retry as Flat. Distinct from STALE_LAYOUT (13,
+/// "already Flat") so migration-window fences are separately observable.
+/// Classified as a client error — never trips the CircuitBreaker.
+pub const STATUS_ERR_STALE_EPOCH: u16 = 15;
 
 /// Returns `true` if the status code represents a **client-level error**
 /// (e.g., ENOENT, EEXIST, EACCES) rather than a server failure.
@@ -1201,6 +1210,7 @@ pub fn is_client_error(status: u16) -> bool {
             | STATUS_ERR_BAD_REQUEST
             | STATUS_ERR_STALE_LAYOUT
             | STATUS_ERR_BUSY
+            | STATUS_ERR_STALE_EPOCH
     )
 }
 
@@ -1549,6 +1559,39 @@ pub enum FieldId {
     /// D.6: authoritative next-file-key high-water mark reported by the volume
     /// in Heartbeat (u64). Lets Master converge after restart/snapshot/failover.
     NextFileKey = 0xDE,
+    /// Create request flags (u32 bitfield): bit0 = O_EXCL (fail if name exists).
+    /// Used by Create/BatchCreate so the Filer can apply POSIX exclusive
+    /// semantics atomically at Raft apply (MC-108 same-name create race).
+    CreateFlags = 0xDF,
+
+    // ===== MC-108 Task 4: Inline→Flat migration fence (0xE0-0xE2) =====
+    /// Migration epoch (u64). Carried in the MigrateInlineAlloc response so
+    /// clients can record the fencing epoch of the migration they drove, and
+    /// echoed by the Filer in subsequent layout responses. Monotonic per
+    /// inode; commits carrying an epoch older than the current one during
+    /// the Migrating window are rejected with STATUS_ERR_STALE_EPOCH.
+    MigrateEpoch = 0xE0,
+    /// Dirty-block bitmap (u32) accompanying an InlineData payload in a
+    /// MigrateInlineAlloc request. Bit i set ⇒ the i-th 4 KiB block of the
+    /// payload contains the initiator's own dirty bytes; only marked blocks
+    /// are merged into the Filer's authoritative inline snapshot, so an
+    /// initiator holding a disjoint region never zeroes another holder's
+    /// region. Inline payloads are ≤8 KiB ⇒ only bits 0..1 are used.
+    DirtyBitmap = 0xE1,
+    /// Migration-committed flag (u8, 0/1) in the MigrateInlineAlloc
+    /// response. 1 ⇒ the Filer itself materialized the needle from the
+    /// merged snapshot AND committed the Flat/Stripe layout; the client
+    /// must adopt the returned placement without writing the migration
+    /// needle itself. 0/absent ⇒ legacy alloc-only response.
+    MigrateCommitted = 0xE2,
+    /// MC-108 Task 5: migration-in-progress flag (u8, 0/1) in the
+    /// CapOpenGrant response. 1 ⇒ the inode is inside the Inline→Flat
+    /// Migrating window (Begin..Commit); a write-open would receive an
+    /// INLINE layout doomed to hit the migration fence. The kernel
+    /// retries the grant with backoff (≈2 s) and fails with -EAGAIN.
+    /// Cannot be a server-side error status: the kernel degrades open
+    /// grants to SHARED_WRITE on RPC errors instead of retrying.
+    MigrateInProgress = 0xE3,
 }
 
 impl FieldId {
@@ -1688,6 +1731,11 @@ impl FieldId {
             0xDC => Some(Self::TransportPort),
             0xDD => Some(Self::RdmaDevice),
             0xDE => Some(Self::NextFileKey),
+            0xDF => Some(Self::CreateFlags),
+            0xE0 => Some(Self::MigrateEpoch),
+            0xE1 => Some(Self::DirtyBitmap),
+            0xE2 => Some(Self::MigrateCommitted),
+            0xE3 => Some(Self::MigrateInProgress),
             _ => None,
         }
     }

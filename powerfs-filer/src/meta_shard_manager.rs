@@ -371,6 +371,48 @@ fn decide_format_action(
     }
 }
 
+/// Authoritative result of an atomic file create (MC-108).
+///
+/// The Raft apply thread on the parent shard decides whether the
+/// requester won the `(parent, name)` race or must adopt an existing
+/// inode. The handler/kernel uses `ino` + `storage_mode` to build the
+/// response (and, on the kernel side, to switch its placeholder inode
+/// to the authoritative one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AtomicCreateResult {
+    /// This requester won: inode record + dir entry were created.
+    Created {
+        ino: u64,
+        storage_mode: powerfs_layout::StorageMode,
+    },
+    /// Name already existed (non-exclusive create): adopt `ino`.
+    /// The requester's allocated inode was NOT linked and carries no
+    /// data; the caller must redirect all writes to this winner.
+    Existing {
+        ino: u64,
+        storage_mode: powerfs_layout::StorageMode,
+    },
+    /// Exclusive create lost, or the existing name is a different
+    /// file type (file vs directory/symlink).
+    AlreadyExists { ino: u64, type_mismatch: bool },
+}
+
+/// Per-entry result of `batch_create_file` (MC-108).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchCreateOutcome {
+    /// Authoritative inode the kernel must use: the requested inode if
+    /// this entry won, or the pre-existing winner inode if another client
+    /// won the same-name race.
+    pub ino: u64,
+    /// True iff `ino` is a pre-existing winner different from the
+    /// client-requested inode — the kernel must switch its placeholder
+    /// inode (and revalidate the layout) before writing any data.
+    pub adopted_existing: bool,
+    /// Placement tag of the authoritative inode (INLINE=0, FLAT=1,
+    /// STRIPE=2, WIDE_STRIPE=3).
+    pub placement_tag: u8,
+}
+
 impl MetaShardManager {
     pub fn new(
         raft_group_manager: Arc<RaftGroupManagerV2>,
@@ -888,6 +930,7 @@ impl MetaShardManager {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode,
+            migration: None,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
@@ -1422,22 +1465,26 @@ impl MetaShardManager {
     /// The inodes are pre-allocated by the client via AllocInodeBatch, so the
     /// Filer does NOT allocate — it uses the client-provided inode numbers.
     ///
-    /// For N entries on the same shard, Raft commits = 1 (not 2N).
+    /// MC-108: each entry is submitted as a single atomic
+    /// `CreateFileAtomic` command (inode record + dir entry, same-name
+    /// resolution at apply). When two clients race on the same name, the
+    /// loser entry's result carries the winner's inode in
+    /// `BatchCreateOutcome.ino` with `adopted_existing=true`; the loser
+    /// inode is never linked. The caller MUST encode the winner ino in the
+    /// response so the kernel can switch its placeholder before writing.
+    ///
+    /// For N entries on the same shard, Raft commits = 1.
     ///
     /// Each entry: (ino, parent_ino, name, mode, uid, gid, mtime, atime),
     /// mtime/atime in unix seconds (0 = server assigns current time).
-    /// Returns per-entry `Result<Option<u8>, String>`.
-    /// - `Ok(Some(tag))`: created, tag = TLV placement_tag (INLINE=0, FLAT=1,
-    ///   STRIPE=2, WIDE_STRIPE=3) from the predicted StorageMode.
-    /// - `Ok(None)`: idempotent retry (inode already existed, no new placement
-    ///   to report — the kernel already knows the layout from the prior create).
-    /// - `Err`: propose failed.
+    /// Returns per-entry `Result<BatchCreateOutcome, String>`.
     pub async fn batch_create_file(
         &self,
         entries: &[BatchCreateEntry],
-    ) -> Vec<Result<Option<u8>, String>> {
+    ) -> Vec<Result<BatchCreateOutcome, String>> {
         let n = entries.len();
-        let mut results: Vec<Result<Option<u8>, String>> = vec![Ok(None); n];
+        let mut results: Vec<Result<BatchCreateOutcome, String>> =
+            vec![Err("not processed".to_string()); n];
 
         if entries.is_empty() {
             return results;
@@ -1448,47 +1495,48 @@ impl MetaShardManager {
         let now = chrono::Utc::now().timestamp() as u64;
 
         // Verify shard exists.
-        {
+        let shard_store = {
             let stores = self.shard_stores.read().unwrap();
-            if stores.get(&shard_dir).is_none() {
-                let err = format!("shard {} not found", shard_dir.0);
-                return vec![Err(err); n];
+            match stores.get(&shard_dir) {
+                Some(s) => s.clone(),
+                None => {
+                    let err = format!("shard {} not found", shard_dir.0);
+                    return vec![Err(err); n];
+                }
             }
-        }
+        };
 
-        // Build InodeInfo + stage each create in MetaCache (immediate
-        // visibility for reads before Raft apply).
-        // Each entry carries its original index so we can backfill the
-        // per-entry placement tag into `results` after the Raft commit.
-        let mut infos: Vec<(usize, InodeInfo)> = Vec::with_capacity(n);
+        // Build InodeInfo per entry. NO MetaCache staging: a loser's
+        // staged inode would poison lookups of the winner. The atomic
+        // apply is authoritative; we poll it after commit below.
+        // `pending` = (idx, info, legacy_fallback).
+        let mut pending: Vec<(usize, InodeInfo, bool)> = Vec::with_capacity(n);
         for (idx, (ino, parent_ino, name, mode, uid, gid, mtime, atime)) in
             entries.iter().enumerate()
         {
-            // Validate: inode must not already exist.
-            // Idempotent: if inode exists with same parent+name, treat as
-            // success (retry from kernel after transient network error).
-            // Only fail if parent/name differ (genuine collision).
+            // Idempotent retry: the inode record already exists (previous
+            // flush that the kernel didn't get the response for).
             let shard_ino = self.shard_strategy.calculate_shard(*ino);
-            {
-                let stores = self.shard_stores.read().unwrap();
-                if let Some(s) = stores.get(&shard_ino) {
-                    if let Some(existing) = s.get_inode(*ino) {
-                        if existing.parent_inode == *parent_ino
-                            && existing.name == *name
-                            && existing.file_type == FileType::File
-                        {
-                            // Idempotent retry — same file, skip silently.
-                            // No placement to report: the kernel already holds
-                            // the layout from the prior create/GETATTR.
-                            results[idx] = Ok(None);
-                            continue;
-                        }
-                        results[idx] = Err(format!(
-                            "inode {} already exists with different parent/name (collision)",
-                            ino
-                        ));
+            if let Some(s) = self.shard_stores.read().unwrap().get(&shard_ino) {
+                if let Some(existing) = s.get_inode(*ino) {
+                    if existing.parent_inode == *parent_ino
+                        && existing.name == *name
+                        && existing.file_type == FileType::File
+                    {
+                        results[idx] = Ok(BatchCreateOutcome {
+                            ino: *ino,
+                            adopted_existing: false,
+                            placement_tag: Self::storage_mode_to_placement_tag(
+                                existing.storage_mode,
+                            ),
+                        });
                         continue;
                     }
+                    results[idx] = Err(format!(
+                        "inode {} already exists with different parent/name (collision)",
+                        ino
+                    ));
+                    continue;
                 }
             }
 
@@ -1526,68 +1574,143 @@ impl MetaShardManager {
                 compression_state: powerfs_layout::reliability::CompressionState::default(),
                 replica_chunks: Vec::new(),
                 storage_mode: self.predict_storage_mode(name, *parent_ino),
+                migration: None,
             };
 
-            self.meta_cache
-                .stage_create(info.clone(), *parent_ino, name);
-            infos.push((idx, info));
+            // The atomic command requires inode and dir entry to share a
+            // shard. Client-allocated inodes MUST come from the parent
+            // shard's range (AllocInodeBatch on shard_dir). Anything else
+            // is a client bug; fall back to the legacy two-command path so
+            // such an entry can still land, while logging loudly.
+            let legacy_fallback = shard_ino != shard_dir;
+            if legacy_fallback {
+                warn!(
+                    "batch_create: inode {} routes to shard {} but parent {} is on shard {}; using legacy non-atomic create for this entry",
+                    ino, shard_ino.0, parent_ino, shard_dir.0
+                );
+            }
+            pending.push((idx, info, legacy_fallback));
         }
 
-        if infos.is_empty() {
+        if pending.is_empty() {
             return results;
         }
 
-        // Build [CreateInode, AddDirEntry] * N commands and propose_many
-        // in a single Raft replication cycle.
-        let mut cmds: Vec<Vec<u8>> = Vec::with_capacity(infos.len() * 2);
-        for (_, info) in &infos {
-            cmds.push(
-                ShardCommand::CreateInode {
-                    info: Box::new(info.clone()),
-                }
-                .serialize(),
-            );
-            cmds.push(
-                ShardCommand::AddDirEntry {
-                    parent_inode: info.parent_inode,
-                    name: info.name.clone(),
-                    inode: info.inode,
-                }
-                .serialize(),
-            );
+        // One CreateFileAtomic per same-shard entry; legacy two-command
+        // pair only for the (never-expected) cross-shard fallback.
+        let mut cmds: Vec<Vec<u8>> = Vec::with_capacity(pending.len() * 2);
+        for (_, info, legacy_fallback) in &pending {
+            if *legacy_fallback {
+                cmds.push(
+                    ShardCommand::CreateInode {
+                        info: Box::new(info.clone()),
+                    }
+                    .serialize(),
+                );
+                cmds.push(
+                    ShardCommand::AddDirEntry {
+                        parent_inode: info.parent_inode,
+                        name: info.name.clone(),
+                        inode: info.inode,
+                    }
+                    .serialize(),
+                );
+            } else {
+                cmds.push(
+                    ShardCommand::CreateFileAtomic {
+                        info: Box::new(info.clone()),
+                        // Batch-optimistic creates are non-exclusive.
+                        exclusive: false,
+                    }
+                    .serialize(),
+                );
+            }
         }
 
-        match self.raft_group_manager.propose_many(shard_dir, cmds).await {
-            Ok(_) => {
-                for (idx, info) in &infos {
-                    // Backfill the predicted placement tag so the kernel
-                    // client can set its inode placement from the BatchCreate
-                    // response instead of blind-guessing Inline.
-                    let tag = Self::storage_mode_to_placement_tag(info.storage_mode);
-                    results[*idx] = Ok(Some(tag));
-                    info!(
-                        "batch_create: committed inode={} parent={} name={} to shard {} placement_tag={}",
-                        info.inode, info.parent_inode, info.name, shard_dir.0, tag
-                    );
-                }
+        if let Err(e) = self.raft_group_manager.propose_many(shard_dir, cmds).await {
+            warn!(
+                "batch_create: propose_many failed for shard {}: {}",
+                shard_dir.0, e
+            );
+            for (idx, _, _) in &pending {
+                results[*idx] = Err(e.clone());
             }
-            Err(e) => {
-                // Propose failed (lost leadership, network error, etc.)
-                // Invalidate staging and mark all entries as failed.
-                for (_, info) in &infos {
-                    self.meta_cache
-                        .invalidate_staging(info.inode, info.parent_inode, &info.name);
+            return results;
+        }
+
+        // Resolve each entry against the authoritative apply result.
+        // Entries applied in order; poll the winner dentry + inode record.
+        for (idx, info, _legacy_fallback) in &pending {
+            let requested = info.inode;
+            let parent_ino = info.parent_inode;
+            let name = info.name.clone();
+
+            let mut winner_ino: Option<u64> = None;
+            for _ in 0..2500 {
+                if let Some(ino) = shard_store.get_dir_entry_inode(parent_ino, &name) {
+                    winner_ino = Some(ino);
+                    break;
                 }
-                // Find the entries that were staged (infos) and mark them.
-                for (idx, (_, parent_ino, name, _, _, _, _, _)) in entries.iter().enumerate() {
-                    if infos
-                        .iter()
-                        .any(|(_, i)| i.parent_inode == *parent_ino && i.name == *name)
-                    {
-                        results[idx] = Err(e.clone());
+                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+            }
+            let winner_ino = match winner_ino {
+                Some(ino) => ino,
+                None => {
+                    results[*idx] =
+                        Err("batch create: timeout waiting for dir_entry apply".to_string());
+                    continue;
+                }
+            };
+
+            // The winner record normally lives on shard_dir (atomic
+            // path); a legacy cross-shard fallback entry keeps it on the
+            // inode's own shard. Select the right store, then poll.
+            let winner_shard = self.shard_strategy.calculate_shard(winner_ino);
+            let winner_store = if winner_shard == shard_dir {
+                shard_store.clone()
+            } else {
+                match self.shard_stores.read().unwrap().get(&winner_shard) {
+                    Some(ws) => ws.clone(),
+                    None => {
+                        results[*idx] = Err(format!(
+                            "batch create: winner shard {} not found",
+                            winner_shard.0
+                        ));
+                        continue;
                     }
                 }
+            };
+            let mut winner_info: Option<InodeInfo> = winner_store.get_inode(winner_ino);
+            for _ in 0..250 {
+                if winner_info.is_some() {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+                winner_info = winner_store.get_inode(winner_ino);
             }
+            let winner_info = match winner_info {
+                Some(wi) => wi,
+                None => {
+                    results[*idx] = Err(format!(
+                        "batch create: winner inode {} record missing after apply",
+                        winner_ino
+                    ));
+                    continue;
+                }
+            };
+
+            let adopted = winner_ino != requested;
+            if adopted {
+                info!(
+                    "batch_create: SAME-NAME RACE RESOLVED parent={} name={} requested_ino={} -> winner_ino={} (loser not linked)",
+                    parent_ino, name, requested, winner_ino
+                );
+            }
+            results[*idx] = Ok(BatchCreateOutcome {
+                ino: winner_ino,
+                adopted_existing: adopted,
+                placement_tag: Self::storage_mode_to_placement_tag(winner_info.storage_mode),
+            });
         }
 
         results
@@ -1864,6 +1987,7 @@ impl MetaShardManager {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
@@ -1932,6 +2056,7 @@ impl MetaShardManager {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         };
 
         // Propose ONLY CreateInode (no AddDirEntry — that's Phase B).
@@ -2922,6 +3047,7 @@ impl MetaShardManager {
                 compression_state: powerfs_layout::reliability::CompressionState::default(),
                 replica_chunks: Vec::new(),
                 storage_mode: powerfs_layout::StorageMode::Inline,
+                migration: None,
             });
         }
 
@@ -3023,30 +3149,18 @@ impl MetaShardManager {
         self.shard_strategy.clone()
     }
 
-    pub async fn create_file_with_shard(
+    /// Build the InodeInfo for a freshly allocated regular file.
+    fn build_file_inode_info(
         &self,
+        inode: u64,
         parent_inode: u64,
         name: &str,
-        // Legacy client-supplied shard hint. Ignored — the inode is now
-        // written to `calculate_shard(inode)` and the dir entry to
-        // `calculate_shard(parent_inode)`. Kept in the signature so FUSE
-        // clients that still pass `ShardId(parent)` do not break.
-        _shard_id: ShardId,
-        // P3.1: Real mode/uid/gid from the client, embedded directly into
-        // the CreateInode command so we eliminate the follow-up SetAttr
-        // propose. Eliminates one Raft round-trip per create().
         mode: u32,
         uid: u32,
         gid: u32,
-    ) -> Result<(u64, powerfs_layout::StorageMode), String> {
-        let t0 = std::time::Instant::now();
-
-        // Phase 3: Allocate inode within the parent directory's shard range
-        // (same as create_file). The _shard_id parameter is ignored.
-        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
-        let inode = self.alloc_inode_in_shard(parent_shard);
+    ) -> InodeInfo {
         let now = chrono::Utc::now().timestamp() as u64;
-        let info = InodeInfo {
+        InodeInfo {
             inode,
             name: name.to_string(),
             parent_inode,
@@ -3081,24 +3195,179 @@ impl MetaShardManager {
             // Layout-prediction: decide initial layout based on file name.
             // See docs/file-layout-prediction-design.md §3.2.
             storage_mode: self.predict_storage_mode(name, parent_inode),
+            migration: None,
+        }
+    }
+
+    /// Atomic regular-file create over Raft (MC-108).
+    ///
+    /// Unlike the legacy `CreateInode`+`AddDirEntry` pair, this submits a
+    /// single `CreateFileAtomic` command to the parent shard; the apply
+    /// thread resolves `(parent,name)` uniqueness and either links the new
+    /// inode or returns the existing winner. No MetaCache staging is used:
+    /// staging a loser would poison lookups of the winner, so instead we
+    /// wait for apply and return the authoritative winner inode/layout.
+    #[allow(clippy::too_many_arguments)] // signature mirrors create_file_with_shard
+    pub async fn create_file_atomic_with_shard(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        // Legacy client-supplied shard hint. Ignored; kept for signature
+        // compatibility with create_file_with_shard callers.
+        _shard_id: ShardId,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        exclusive: bool,
+    ) -> Result<AtomicCreateResult, String> {
+        let t0 = std::time::Instant::now();
+
+        // Allocate within the parent shard's range so that inode record and
+        // dir entry are owned by the SAME Raft group — the precondition for
+        // the single atomic command.
+        let parent_shard = self.shard_strategy.calculate_shard(parent_inode);
+        let inode = self.alloc_inode_in_shard(parent_shard);
+        if inode == 0 {
+            return Err(format!(
+                "atomic create: inode allocation failed on shard {}",
+                parent_shard.0
+            ));
+        }
+        let inode_shard = self.shard_strategy.calculate_shard(inode);
+        if inode_shard != parent_shard {
+            return Err(format!(
+                "atomic create: allocator returned inode {} routed to shard {} but parent {} is on shard {}",
+                inode, inode_shard.0, parent_inode, parent_shard.0
+            ));
+        }
+
+        let info = self.build_file_inode_info(inode, parent_inode, name, mode, uid, gid);
+        let requested_mode = info.storage_mode;
+
+        let cmd = ShardCommand::CreateFileAtomic {
+            info: Box::new(info),
+            exclusive,
+        };
+        self.raft_group_manager
+            .propose_many(parent_shard, vec![cmd.serialize()])
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                warn!(
+                    "create_file_atomic: propose FAILED for inode={} parent={} name={}: {}",
+                    inode, parent_inode, name, e
+                );
+                e
+            })?;
+
+        // Wait for apply on the authoritative store. Inode record and dir
+        // entry land in one WriteBatch, so observing the winner dir entry
+        // implies its inode record is durable as well. Poll up to 5s to
+        // absorb commit→apply scheduling latency.
+        let shard_store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores
+                .get(&parent_shard)
+                .ok_or_else(|| format!("shard {} not found", parent_shard.0))?
+                .clone()
         };
 
-        self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
-            .await?;
+        let mut winner_ino: Option<u64> = None;
+        for _ in 0..2500 {
+            if let Some(ino) = shard_store.get_dir_entry_inode(parent_inode, name) {
+                winner_ino = Some(ino);
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+        }
+        let winner_ino = winner_ino
+            .ok_or_else(|| "atomic create: timeout waiting for dir_entry apply".to_string())?;
 
-        log::info!(
-            "create_file_with_shard latency: total={}ms, inode={}, mode={:o}, uid={}, gid={}, storage_mode={:?}",
-            t0.elapsed().as_millis(),
+        // The winner's record is applied in the same batch; wait for it in
+        // case of an in-memory visibility hiccup (it must be present).
+        let mut winner_info: Option<InodeInfo> = shard_store.get_inode(winner_ino);
+        for _ in 0..250 {
+            if winner_info.is_some() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
+            winner_info = shard_store.get_inode(winner_ino);
+        }
+        let winner_info = winner_info.ok_or_else(|| {
+            format!(
+                "atomic create: winner inode {} record missing after apply",
+                winner_ino
+            )
+        })?;
+
+        let result = if winner_ino == inode {
+            AtomicCreateResult::Created {
+                ino: inode,
+                storage_mode: requested_mode,
+            }
+        } else {
+            let type_mismatch = winner_info.file_type != FileType::File;
+            if exclusive || type_mismatch {
+                AtomicCreateResult::AlreadyExists {
+                    ino: winner_ino,
+                    type_mismatch,
+                }
+            } else {
+                AtomicCreateResult::Existing {
+                    ino: winner_ino,
+                    storage_mode: winner_info.storage_mode,
+                }
+            }
+        };
+
+        info!(
+            "create_file_atomic: parent={} name={} requested_ino={} winner_ino={} exclusive={} outcome={:?} latency={}ms",
+            parent_inode,
+            name,
             inode,
-            mode,
-            uid,
-            gid,
-            info.storage_mode
+            winner_ino,
+            exclusive,
+            result,
+            t0.elapsed().as_millis()
         );
-        // 返回权威 storage_mode: 调用方 (net/gRPC create 响应) 必须按落盘
-        // 布局构造响应, 否则客户端盲信响应布局会与实际布局分叉 (例如文件名
-        // 规则预测为 Flat, 响应却回 Inline → 客户端 inline 提交被拒, 静默丢数).
-        Ok((inode, info.storage_mode))
+        Ok(result)
+    }
+
+    pub async fn create_file_with_shard(
+        &self,
+        parent_inode: u64,
+        name: &str,
+        // Legacy client-supplied shard hint. Ignored — the inode is now
+        // written to `calculate_shard(inode)` and the dir entry to
+        // `calculate_shard(parent_inode)`. Kept in the signature so FUSE
+        // clients that still pass `ShardId(parent)` do not break.
+        shard_id: ShardId,
+        // P3.1: Real mode/uid/gid from the client, embedded directly into
+        // the CreateInode command so we eliminate the follow-up SetAttr
+        // propose. Eliminates one Raft round-trip per create().
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(u64, powerfs_layout::StorageMode), String> {
+        // MC-108: every regular-file create goes through the atomic
+        // same-name-resolving Raft path. Non-exclusive callers transparently
+        // adopt the existing winner, preserving open(O_CREAT) semantics.
+        match self
+            .create_file_atomic_with_shard(parent_inode, name, shard_id, mode, uid, gid, false)
+            .await?
+        {
+            AtomicCreateResult::Created { ino, storage_mode }
+            | AtomicCreateResult::Existing { ino, storage_mode } => Ok((ino, storage_mode)),
+            AtomicCreateResult::AlreadyExists { ino, type_mismatch } => Err(format!(
+                "{} (ino={})",
+                if type_mismatch {
+                    "is a different file type"
+                } else {
+                    "already exists"
+                },
+                ino
+            )),
+        }
     }
 
     pub async fn delete_file_by_inode(
@@ -3849,6 +4118,7 @@ impl MetaShardManager {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         };
 
         self.propose_create_inode_and_direntry(info.clone(), parent_inode, name, inode)
@@ -4381,6 +4651,7 @@ impl MetaShardManager {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         };
 
         self.propose_create_inode_and_direntry(info, bucket_root_inode, key, inode)
@@ -4563,8 +4834,30 @@ impl MetaShardManager {
         chunks: Vec<crate::shard_store::StoredFileChunk>,
         inline_data: Option<Vec<u8>>,
         is_append: bool,
+        inline_dirty_mask: Option<u32>,
     ) -> Result<(), String> {
         let target_chunk_count = chunks.len();
+
+        // MC-108 Task 4 migration fence (pre-propose): reject any external
+        // size/chunks/inline commit while the authoritative shard store has a
+        // migration window open. Mirrors the apply-layer fence in
+        // `ShardStore::update_inode_size_chunks_atomic` so the caller gets a
+        // synchronous `stale_epoch` (mapped to STATUS_ERR_STALE_EPOCH) instead
+        // of the commit being silently dropped at apply time. The client
+        // re-fetches the Flat/Stripe layout and retries there.
+        {
+            let store = self.shard_stores.read().unwrap().get(&shard_id).cloned();
+            if let Some(store) = store {
+                if let Some(info) = store.get_inode(inode) {
+                    if let Some(m) = &info.migration {
+                        return Err(format!(
+                            "stale_epoch: inode {} is in Migrating window (epoch={})",
+                            inode, m.epoch
+                        ));
+                    }
+                }
+            }
+        }
 
         // T1.3 fix (2026-08-22): Clone chunks/inline_data BEFORE moving into
         // ShardCommand so we can project them into MetaCache after propose.
@@ -4622,6 +4915,7 @@ impl MetaShardManager {
             chunks_for_projection,
             inline_for_projection,
             is_append,
+            inline_dirty_mask,
         )?;
 
         let cmd = ShardCommand::UpdateInodeSizeChunks {
@@ -4630,6 +4924,7 @@ impl MetaShardManager {
             chunks,
             inline_data,
             is_append,
+            inline_dirty_mask,
         };
         self.propose_meta(shard_id, cmd.serialize()).await?;
 
@@ -4689,6 +4984,115 @@ impl MetaShardManager {
             );
         }
         Ok(())
+    }
+
+    /// Propose `BeginMigration` and wait for it to be applied on this leader.
+    ///
+    /// Unlike the hot inline-write path, migration correctness requires
+    /// strict apply confirmation: the leader must not materialize the needle
+    /// until the epoch fence + block merge are durable in Raft order. We
+    /// therefore always poll the authoritative shard store regardless of the
+    /// async-meta-persist setting.
+    ///
+    /// Returns `Some(epoch)` once the Migrating window for `epoch` is open and
+    /// durable; `None` if the inode was already Flat/Stripe with chunks (a
+    /// concurrent migration won — caller returns that allocation idempotently).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn begin_migration(
+        &self,
+        shard_id: ShardId,
+        inode: u64,
+        epoch: u64,
+        target_mode: u8,
+        allocs: Vec<(u64, u64)>,
+        stripe_size: u64,
+        initiator_size: u64,
+        initiator_blocks: Vec<(u32, Vec<u8>)>,
+    ) -> Result<Option<u64>, String> {
+        let cmd = ShardCommand::BeginMigration {
+            inode,
+            epoch,
+            target_mode,
+            allocs,
+            stripe_size,
+            initiator_size,
+            initiator_blocks,
+        };
+        self.propose_meta(shard_id, cmd.serialize()).await?;
+
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores
+                .get(&shard_id)
+                .cloned()
+                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
+        };
+        for _ in 0..100 {
+            if let Some(info) = store.get_inode(inode) {
+                if let Some(m) = &info.migration {
+                    if m.epoch == epoch {
+                        // MC-108 Task 5: Begin/Commit 只 apply 到 ShardStore,
+                        // MetaCache 必须同步 project —— get_inode 先查缓存,
+                        // 陈旧副本 (migration: None) 会让 CAP_OPEN 永远拿不到
+                        // Migrating 状态, 0xE3 拒授失效 (TR-5.3 运行时取证发现).
+                        self.meta_cache.cache_put_clean(info.clone());
+                        return Ok(Some(epoch));
+                    }
+                    // A different window now owns the inode.
+                    return Err(format!(
+                        "stale_epoch: inode {} migration window epoch {} (proposed {})",
+                        inode, m.epoch, epoch
+                    ));
+                }
+                if info.storage_mode.is_volume_backed() && !info.chunks.is_empty() {
+                    self.meta_cache.cache_put_clean(info.clone());
+                    return Ok(None);
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        Err(format!(
+            "begin_migration: timed out waiting for apply (inode={}, epoch={})",
+            inode, epoch
+        ))
+    }
+
+    /// Propose `CommitMigration` and wait until the window closes and the
+    /// Flat/Stripe chunks are applied.
+    pub async fn commit_migration(
+        &self,
+        shard_id: ShardId,
+        inode: u64,
+        epoch: u64,
+    ) -> Result<(), String> {
+        let cmd = ShardCommand::CommitMigration { inode, epoch };
+        self.propose_meta(shard_id, cmd.serialize()).await?;
+
+        let store = {
+            let stores = self.shard_stores.read().unwrap();
+            stores
+                .get(&shard_id)
+                .cloned()
+                .ok_or_else(|| format!("shard {} not found", shard_id.0))?
+        };
+        for _ in 0..100 {
+            if let Some(info) = store.get_inode(inode) {
+                if info.migration.is_none()
+                    && info.storage_mode.is_volume_backed()
+                    && !info.chunks.is_empty()
+                {
+                    // 同 begin_migration: 窗口关闭后同步 MetaCache, 防 CAP_OPEN
+                    // 读到陈旧 migration=Some 副本导致永久拒授.
+                    self.meta_cache.cache_put_clean(info.clone());
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        Err(format!(
+            "commit_migration: timed out waiting for apply (inode={}, epoch={})",
+            inode, epoch
+        ))
     }
 
     pub async fn get_filer_status(&self) -> FilerStatus {
@@ -5057,6 +5461,7 @@ impl MetaShardManager {
                     compression_state: powerfs_layout::reliability::CompressionState::default(),
                     replica_chunks: Vec::new(),
                     storage_mode: powerfs_layout::StorageMode::Inline,
+                    migration: None,
                 };
                 store.create_inode_atomic(inode_info, entry_orset.parent_ino, &entry_orset.name)?;
                 debug!(
@@ -6247,6 +6652,7 @@ mod tests {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         }
     }
 }

@@ -1606,8 +1606,24 @@ pub fn decode_batch_create_req(body: &[u8]) -> Result<(u64, Vec<BatchCreateEntry
     Ok((shard_id, entries))
 }
 
+/// One per-entry placement record in a BatchCreate response.
+#[derive(Debug, Clone)]
+pub struct BatchCreatePlacement {
+    /// Authoritative inode the client must use.
+    pub ino: u64,
+    /// Placement tag (0 inline / 1 flat / 2 stripe / 3 wide stripe).
+    pub placement_tag: u8,
+    /// MC-108: when this entry lost a same-name create race, `ino` is the
+    /// pre-existing WINNER inode and `winner_of_name` carries the name the
+    /// client originally requested — letting it map the winner back to its
+    /// local placeholder (the response entry's position alone is not enough
+    /// because failed entries are omitted from the response). `None` for
+    /// the normal case where `ino` is the client's own inode.
+    pub winner_of_name: Option<String>,
+}
+
 /// Encode a batch create response.
-/// Format: Count(u32) + [Entry(Ino u64 + Placement u8)] * n
+/// Format: Count(u32) + [Entry(Ino u64 + Placement u8 + optional Name)] * n
 ///
 /// The per-entry placement tags let the kernel client set its inode
 /// placement from the response instead of blind-guessing Inline, which
@@ -1615,21 +1631,34 @@ pub fn decode_batch_create_req(body: &[u8]) -> Result<(u64, Vec<BatchCreateEntry
 /// Older kernels only read Count and ignore the Entry fields (TLV skip).
 pub fn encode_batch_create_resp(
     flushed_count: u32,
-    placements: &[(u64, u8)],
+    placements: &[BatchCreatePlacement],
 ) -> Result<Vec<u8>, NetError> {
     let mut enc = TlvEncoder::new();
     enc.add_u32(FieldId::Count, flushed_count);
-    for (ino, tag) in placements {
+    for p in placements {
         let mut entry_enc = TlvEncoder::new();
-        entry_enc.add_u64(FieldId::Ino, *ino);
-        entry_enc.add_u8(FieldId::Placement, *tag);
+        entry_enc.add_u64(FieldId::Ino, p.ino);
+        entry_enc.add_u8(FieldId::Placement, p.placement_tag);
+        if let Some(name) = &p.winner_of_name {
+            entry_enc.add_string(FieldId::Name, name)?;
+        }
         enc.add_bytes(FieldId::Entry, &entry_enc.into_bytes())?;
     }
     Ok(enc.into_bytes())
 }
 
-/// Decode a batch create response: (flushed_count, Vec<(ino, placement_tag)>)
-pub fn decode_batch_create_resp(body: &[u8]) -> Result<(u32, Vec<(u64, u8)>), NetError> {
+/// Decoded batch-create placement entry. See `BatchCreatePlacement`.
+#[derive(Debug, Clone)]
+pub struct BatchCreatePlacementDecoded {
+    pub ino: u64,
+    pub placement_tag: u8,
+    pub winner_of_name: Option<String>,
+}
+
+/// Decode a batch create response: (flushed_count, placements).
+pub fn decode_batch_create_resp(
+    body: &[u8],
+) -> Result<(u32, Vec<BatchCreatePlacementDecoded>), NetError> {
     let mut dec = TlvDecoder::new(body);
     let flushed = dec.next_u32(FieldId::Count)?;
     let mut placements = Vec::new();
@@ -1637,7 +1666,13 @@ pub fn decode_batch_create_resp(body: &[u8]) -> Result<(u32, Vec<(u64, u8)>), Ne
         let mut ed = TlvDecoder::new(&entry_bytes);
         let ino = ed.next_u64(FieldId::Ino)?;
         let tag = ed.next_u8(FieldId::Placement).unwrap_or(0);
-        placements.push((ino, tag));
+        // Optional: absent on old servers / non-race entries.
+        let winner_of_name = ed.next_string(FieldId::Name).ok().map(|s| s.to_string());
+        placements.push(BatchCreatePlacementDecoded {
+            ino,
+            placement_tag: tag,
+            winner_of_name,
+        });
     }
     Ok((flushed, placements))
 }

@@ -93,6 +93,33 @@ pub struct FormatMarker {
 /// (tokens are NUL-free opaque strings from `powerfs-lease`).
 const LEASE_EPOCH_KEY: &[u8] = b"\x00epoch";
 
+/// MC-108 Task 4: persistent Inline→Flat/Stripe migration state.
+///
+/// Present (`Some`) iff the inode is in the **Migrating** window. During the
+/// window `storage_mode` is kept as `Inline` and `inline_data` is retained as
+/// the authoritative read source AND the materialization source, while
+/// `allocs` already pins the Flat/Stripe destination. The window ends in
+/// `ShardStore::commit_migration`, which materializes the snapshot (driven by
+/// the net handler), installs the chunks and clears this field.
+///
+/// Crash recovery: this whole struct is Raft-replicated (it is written by the
+/// `BeginMigration` command), so after a leader crash/restart the migration is
+/// re-entrant — the next migrate/getattr resumes materialization from the
+/// retained `inline_data` snapshot using the same `allocs`, then commits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MigrationState {
+    /// Monotonic fencing epoch allocated when the window opened.
+    pub epoch: u64,
+    /// Destination mode tag: 1 = Flat, 2 = Stripe.
+    pub target_mode: u8,
+    /// Pinned destination (volume_id, needle_id) pairs. Flat has one;
+    /// Stripe carries all stripe units (the snapshot occupies unit 0).
+    pub allocs: Vec<(u64, u64)>,
+    /// Stripe unit size (0 for Flat). Persisted so the resumed/committed
+    /// layout reconstructs the identical Stripe parameters.
+    pub stripe_size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InodeInfo {
     pub inode: u64,
@@ -158,6 +185,11 @@ pub struct InodeInfo {
     /// data fields, eliminating the inline→flat migration race condition.
     #[serde(default)]
     pub storage_mode: powerfs_layout::StorageMode,
+    /// MC-108 Task 4: `Some` while this inode is in the Inline→Flat/Stripe
+    /// Migrating window. `#[serde(default)]` keeps on-disk / replicated
+    /// records backward compatible (absent ⇒ no migration in flight).
+    #[serde(default)]
+    pub migration: Option<MigrationState>,
 }
 
 impl InodeInfo {
@@ -196,6 +228,7 @@ impl InodeInfo {
             compression_state: CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         }
     }
 }
@@ -254,6 +287,29 @@ pub enum FileType {
     File,
     Directory,
     Symlink,
+}
+
+/// Outcome of applying a `ShardCommand::CreateFileAtomic` (MC-108).
+///
+/// The apply thread of the parent (== inode) shard is the single
+/// uniqueness authority for `(parent_inode, name)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AtomicCreateOutcome {
+    /// Name was absent: the inode record and dir entry were written
+    /// atomically (single RocksDB WriteBatch).
+    Created,
+    /// Name already existed (non-exclusive create): the existing dir
+    /// entry is kept untouched and `winner_inode` is the authoritative
+    /// inode. The requesting (loser) inode record was NOT written.
+    Existing { winner_inode: u64 },
+    /// Name exists and either the create was exclusive or the existing
+    /// entry has a different file type (file vs dir/symlink). The loser
+    /// inode record was NOT written. `type_mismatch` lets the handler
+    /// map to EISDIR-style errors.
+    AlreadyExists {
+        winner_inode: u64,
+        type_mismatch: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +379,12 @@ pub struct ShardStore {
     stats: RwLock<ShardStats>,
     root_inodes: RwLock<HashMap<String, u64>>, // Persistent bucket->root_inode mapping
     next_inode: std::sync::Mutex<u64>, // 下一个可分配 inode（leader 单点分配 + CF_METADATA 持久化，§4 1.4）
+    /// MC-108: serializes the check-then-link critical section of
+    /// `create_file_resolve_existing`. Raft apply is already single
+    /// threaded per shard, but this lock makes same-name resolution
+    /// intrinsically atomic for ANY caller (OR-Set delta merges,
+    /// recovery, tests) instead of relying on that scheduling invariant.
+    create_resolve_lock: std::sync::Mutex<()>,
     // Phase 3.5.3: per-inode open 计数（内存追踪，filer 重启重置为 0；
     // fuse 端重新 open 时上报，grace_period 兜底重启窗口）
     open_counts: RwLock<HashMap<u64, u32>>,
@@ -432,6 +494,7 @@ impl ShardStore {
             }),
             root_inodes: RwLock::new(HashMap::new()),
             next_inode: std::sync::Mutex::new(inode_range.0),
+            create_resolve_lock: std::sync::Mutex::new(()),
             open_counts: RwLock::new(HashMap::new()),
             meta_cache: RwLock::new(None),
         };
@@ -979,6 +1042,7 @@ impl ShardStore {
                 chunks,
                 inline_data,
                 is_append,
+                inline_dirty_mask,
             } => {
                 if let Err(e) = self.update_inode_size_chunks_atomic(
                     inode,
@@ -986,6 +1050,7 @@ impl ShardStore {
                     chunks,
                     inline_data,
                     is_append,
+                    inline_dirty_mask,
                 ) {
                     log::error!(
                         "Shard {} apply UpdateInodeSizeChunks failed for inode {}: {}",
@@ -1016,6 +1081,42 @@ impl ShardStore {
                 ec_chunks,
             } => {
                 self.update_to_ec(inode, reliability, reliability_state, ec_chunks);
+            }
+            ShardCommand::BeginMigration {
+                inode,
+                epoch,
+                target_mode,
+                allocs,
+                stripe_size,
+                initiator_size,
+                initiator_blocks,
+            } => {
+                if let Err(e) = self.begin_migration(
+                    inode,
+                    epoch,
+                    target_mode,
+                    allocs,
+                    stripe_size,
+                    initiator_size,
+                    initiator_blocks,
+                ) {
+                    log::error!(
+                        "Shard {} apply BeginMigration failed for inode {}: {}",
+                        self.shard_id.0,
+                        inode,
+                        e
+                    );
+                }
+            }
+            ShardCommand::CommitMigration { inode, epoch } => {
+                if let Err(e) = self.commit_migration(inode, epoch) {
+                    log::error!(
+                        "Shard {} apply CommitMigration failed for inode {}: {}",
+                        self.shard_id.0,
+                        inode,
+                        e
+                    );
+                }
             }
             // ----- Decomposed inode + dir-entry commands -----
             // See `ShardCommand` doc for the rationale. Each handler calls
@@ -1053,6 +1154,40 @@ impl ShardStore {
                 }
                 // P3: Raft apply 完成，清除 MetaCache staging
                 if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_add_direntry(parent_inode, &name);
+                }
+            }
+            ShardCommand::CreateFileAtomic { info, exclusive } => {
+                let requested_ino = info.inode;
+                let parent_inode = info.parent_inode;
+                let name = info.name.clone();
+                match self.create_file_resolve_existing(*info, exclusive) {
+                    Ok(outcome) => {
+                        log::info!(
+                            "Shard {} apply CreateFileAtomic: ino={} parent={} name={} -> {:?}",
+                            self.shard_id.0,
+                            requested_ino,
+                            parent_inode,
+                            name,
+                            outcome
+                        );
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Shard {} apply CreateFileAtomic failed for inode {} parent={} name={}: {}",
+                            self.shard_id.0,
+                            requested_ino,
+                            parent_inode,
+                            name,
+                            e
+                        );
+                    }
+                }
+                // Whether this replica Won, lost, or was rejected, any
+                // staging placeholder for the requested inode/name is now
+                // resolved by the authoritative apply result.
+                if let Some(cache) = self.meta_cache.read().unwrap().as_ref() {
+                    cache.confirm_create_inode(requested_ino);
                     cache.confirm_add_direntry(parent_inode, &name);
                 }
             }
@@ -1534,6 +1669,7 @@ impl ShardStore {
             // on first write by LayoutPredictor or auto_promote fallback.
             // See docs/file-layout-prediction-design.md §3.1.
             storage_mode: powerfs_layout::StorageMode::Empty,
+            migration: None,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -1616,6 +1752,7 @@ impl ShardStore {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -1818,6 +1955,7 @@ impl ShardStore {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -2511,6 +2649,123 @@ impl ShardStore {
         self.bump_dir_version(parent_inode);
 
         Ok(())
+    }
+
+    /// Apply-side resolution for `CreateFileAtomic`. MUST run on the Raft
+    /// apply thread of the parent shard; apply is single-threaded per
+    /// shard, so the check-then-link sequence is race-free.
+    pub fn create_file_resolve_existing(
+        &self,
+        info: InodeInfo,
+        exclusive: bool,
+    ) -> Result<AtomicCreateOutcome, String> {
+        // File inodes are allocated from the parent shard's inode range,
+        // so CF_INODES and CF_DIR_ENTRIES for this create are both owned
+        // by this store. A misrouted command must not corrupt a foreign
+        // shard's CF_INODES.
+        if !self.contains_inode(info.inode) {
+            return Err(format!(
+                "CreateFileAtomic misrouted: inode {} outside shard {} range {:?}",
+                info.inode, self.shard_id.0, self.inode_range
+            ));
+        }
+
+        // Serialize the whole check-then-link decision (MC-108). The guard
+        // is held until the WriteBatch + in-memory maps are updated.
+        let _resolve_guard = self
+            .create_resolve_lock
+            .lock()
+            .expect("create_resolve_lock poisoned");
+
+        let parent_inode = info.parent_inode;
+        let name = info.name.clone();
+        let dir_key = format!("{}:{}", parent_inode, name);
+
+        // Single-threaded apply makes the in-memory map authoritative; it
+        // is replayed from RocksDB at startup and updated by every apply.
+        if let Some(winner_inode) = self.get_dir_entry_inode(parent_inode, &name) {
+            let type_mismatch = self
+                .get_inode(winner_inode)
+                .map(|w| w.file_type != info.file_type)
+                .unwrap_or(false);
+            if exclusive || type_mismatch {
+                log::info!(
+                    "Shard {} CreateFileAtomic rejected: ino={} parent={} name={} winner={} exclusive={} type_mismatch={}",
+                    self.shard_id.0,
+                    info.inode,
+                    parent_inode,
+                    name,
+                    winner_inode,
+                    exclusive,
+                    type_mismatch
+                );
+                return Ok(AtomicCreateOutcome::AlreadyExists {
+                    winner_inode,
+                    type_mismatch,
+                });
+            }
+            log::info!(
+                "Shard {} CreateFileAtomic resolved to existing winner: requested ino={} parent={} name={} winner={}",
+                self.shard_id.0,
+                info.inode,
+                parent_inode,
+                name,
+                winner_inode
+            );
+            return Ok(AtomicCreateOutcome::Existing { winner_inode });
+        }
+
+        // ---- Name absent: persist inode record + dir entry atomically ----
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+        let cf_dir_entries = self
+            .db
+            .cf_handle(CF_DIR_ENTRIES)
+            .ok_or_else(|| "CF_DIR_ENTRIES not found".to_string())?;
+
+        let inode_data =
+            serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(&cf_inodes, info.inode.to_be_bytes(), &inode_data);
+        batch.put_cf(
+            &cf_dir_entries,
+            dir_key.as_bytes(),
+            info.inode.to_be_bytes(),
+        );
+        self.db
+            .write(batch)
+            .map_err(|e| format!("batch create file: {}", e))?;
+
+        let is_file = matches!(info.file_type, FileType::File);
+        let is_dir = matches!(info.file_type, FileType::Directory);
+        let created_ino = info.inode;
+        {
+            let mut inodes = self.inodes.write().unwrap();
+            inodes.insert(created_ino, info);
+        }
+        {
+            let mut dir_entries = self.directory_entries.write().unwrap();
+            dir_entries
+                .entry(parent_inode)
+                .or_default()
+                .insert(name.clone(), created_ino);
+        }
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.inode_count += 1;
+            if is_file {
+                stats.file_count += 1;
+            }
+            if is_dir {
+                stats.dir_count += 1;
+            }
+        }
+        self.save_stats();
+        self.bump_dir_version(parent_inode);
+
+        Ok(AtomicCreateOutcome::Created)
     }
 
     pub fn remove_dir_entry(&self, parent_inode: u64, name: &str) -> Result<(), String> {
@@ -3343,8 +3598,59 @@ impl ShardStore {
         Ok((start, end))
     }
 
+    /// MC-108 Task 5: 客户端脏 4K 块位图 → 权威 inline 快照的纯合并函数。
+    /// ShardStore apply（Raft 状态机）与 MetaCache projection 共用，
+    /// 保证两者产出完全一致的状态。
+    ///
+    /// 语义:
+    /// - 合并缓冲长度 = max(existing.len(), client.len(), 两侧 size)
+    /// - 新 size = max(existing_size, client_size)（单调；收缩只走显式
+    ///   SetAttr 路径）
+    /// - 置位的 bit i 拷贝 client 块 [i*4K, (i+1)*4K) ∩ client 缓冲区间；
+    ///   client 缓冲之外的块内区域保留 existing 内容（陈旧快照永不
+    ///   清掉其他写者的数据）；重叠块按提交顺序 last-wins
+    /// - 未置位块保留 existing 内容；合并缓冲中的空隙为零（size 增长
+    ///   的零扩展）
+    pub fn merge_inline_dirty_blocks(
+        existing: Option<&[u8]>,
+        existing_size: u64,
+        client: &[u8],
+        client_size: u64,
+        dirty_mask: u32,
+    ) -> (Vec<u8>, u64) {
+        const BLOCK: usize = 4096;
+        let existing_len = existing.map(|d| d.len()).unwrap_or(0);
+        let merged_len = existing_len
+            .max(client.len())
+            .max(existing_size as usize)
+            .max(client_size as usize);
+        let mut merged = vec![0u8; merged_len];
+        if let Some(old) = existing {
+            merged[..old.len()].copy_from_slice(old);
+        }
+        for bit in 0..u32::BITS as usize {
+            let start = bit * BLOCK;
+            if start >= merged_len {
+                break;
+            }
+            if dirty_mask & (1u32 << bit) != 0 {
+                let end = (start + BLOCK).min(merged_len);
+                let cend = end.min(client.len());
+                if cend > start {
+                    merged[start..cend].copy_from_slice(&client[start..cend]);
+                }
+            }
+        }
+        let new_size = (existing_size as usize).max(client_size as usize) as u64;
+        (merged, new_size)
+    }
+
     /// 原子更新 inode 的 size + chunks（强一致，sync 写，§4 1.5 / §5.1 lease 协调）。
     /// close 时 sync 账本调用，保证数据账本全局强一致。
+    ///
+    /// MC-108 Task 5: `inline_dirty_mask` 为 Some(mask) 时按 4K 块区间合并
+    /// （disjoint 区间存活、重叠块按 Raft apply 顺序 last-wins），size 走
+    /// max() 单调守卫；None 保持旧整缓冲替换语义（powerfs-fuse 兼容）。
     pub fn update_inode_size_chunks_atomic(
         &self,
         inode: u64,
@@ -3352,6 +3658,7 @@ impl ShardStore {
         chunks: Vec<StoredFileChunk>,
         inline_data: Option<Vec<u8>>,
         is_append: bool,
+        inline_dirty_mask: Option<u32>,
     ) -> Result<(), String> {
         let cf_inodes = self
             .db
@@ -3375,6 +3682,23 @@ impl ShardStore {
             .get(&inode)
             .cloned()
             .ok_or_else(|| format!("update_inode_size_chunks: inode {} not found", inode))?;
+
+        // MC-108 Task 4: migration epoch fence. While an inode is in the
+        // Migrating window (`migration.is_some()`), every external inline /
+        // chunks commit is rejected. The only legal state transitions during
+        // the window are the internal `BeginMigration` / `CommitMigration`
+        // commands (separate ShardCommand variants, never routed through this
+        // function). A client still holding the pre-migration Inline layout
+        // gets STALE_EPOCH and must re-fetch the authoritative layout rather
+        // than racing the Filer's materialization.
+        if info.migration.is_some() {
+            return Err(format!(
+                "stale_epoch: inode {} is in Migrating window (epoch={}), \
+                 external size/chunks/inline commit rejected — re-fetch layout",
+                inode,
+                info.migration.as_ref().map(|m| m.epoch).unwrap_or(0)
+            ));
+        }
 
         // Track what actually changed before overwriting fields. This is critical
         // for mtime correctness: the FUSE release path calls this on every close,
@@ -3479,21 +3803,56 @@ impl ShardStore {
                 // refresh_work / dentry lease expiry and see FLAT.
                 // Skip the rest of the inline overwrite branch.
             } else if inline_data.is_some() {
-                log::info!(
-                    "Shard {} Overwrite: inode {} size={} inline_len={} (existing_inline_len={}) — \
-                     is_append=false, client buffer sent in overwrite mode",
-                    self.shard_id.0,
-                    inode,
-                    size,
-                    inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
-                    info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
-                );
-                // Inline overwrite: size + inline_data are authoritative as-is
-                // (caller explicitly wants to replace inline content).
-                info.size = size;
-                info.blocks = size.div_ceil(512);
-                info.chunks = chunks;
-                info.inline_data = inline_data;
+                // MC-108 Task 5: 区间合并 vs 旧整缓冲替换。
+                // Some(mask): 内核提交携带脏 4K 块位图 — 只合并标记块,
+                // disjoint 区间与并发写者的数据共存, size 走 max() 单调守卫。
+                // None: legacy 整缓冲替换 (powerfs-fuse / 旧内核)。
+                match inline_dirty_mask {
+                    Some(mask) => {
+                        let client = inline_data.as_ref().expect("checked is_some");
+                        let (merged, new_size) = Self::merge_inline_dirty_blocks(
+                            info.inline_data.as_deref(),
+                            info.size,
+                            client,
+                            size,
+                            mask,
+                        );
+                        log::info!(
+                            "Shard {} Inline-MERGE: inode {} size {}→{} mask=0x{:x} \
+                             existing_len={} client_len={} merged_len={} \
+                             (disjoint blocks merged, overlap last-wins)",
+                            self.shard_id.0,
+                            inode,
+                            info.size,
+                            new_size,
+                            mask,
+                            info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                            client.len(),
+                            merged.len(),
+                        );
+                        info.size = new_size;
+                        info.blocks = new_size.div_ceil(512);
+                        info.chunks = chunks;
+                        info.inline_data = Some(merged);
+                    }
+                    None => {
+                        log::info!(
+                            "Shard {} Overwrite: inode {} size={} inline_len={} (existing_inline_len={}) — \
+                             is_append=false, client buffer sent in overwrite mode",
+                            self.shard_id.0,
+                            inode,
+                            size,
+                            inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                            info.inline_data.as_ref().map(|d| d.len()).unwrap_or(0),
+                        );
+                        // Inline overwrite: size + inline_data are authoritative as-is
+                        // (caller explicitly wants to replace inline content).
+                        info.size = size;
+                        info.blocks = size.div_ceil(512);
+                        info.chunks = chunks;
+                        info.inline_data = inline_data;
+                    }
+                }
             } else {
                 // A7 fix (2026-08-22): Overwrite + inline_data=None = Flat
                 // sync. Protect against size regression: a stale sync from a
@@ -3642,6 +4001,252 @@ impl ShardStore {
             .map_err(|e| format!("put inode size/chunks: {}", e))?;
         inodes_guard.insert(inode, info);
         Ok(())
+    }
+
+    // ==================== MC-108 Task 4: migration state machine ====================
+
+    /// 4 KiB granularity for the initiator dirty-block bitmap merge.
+    pub const MIGRATE_BLOCK_SIZE: u64 = 4096;
+    /// Migration target tags persisted in `MigrationState.target_mode`.
+    pub const MIGRATE_TARGET_FLAT: u8 = 1;
+    pub const MIGRATE_TARGET_STRIPE: u8 = 2;
+
+    /// Apply `BeginMigration`: merge ONLY the initiator's marked 4 KiB blocks
+    /// into the retained inline snapshot, then persist the `Migrating` state
+    /// (epoch + pinned allocs). Runs single-threaded on the shard apply
+    /// thread, so it needs no extra locking beyond the inodes write lock.
+    #[allow(clippy::too_many_arguments)] // mirrors ShardCommand::BeginMigration fields 1:1
+    pub fn begin_migration(
+        &self,
+        inode: u64,
+        epoch: u64,
+        target_mode: u8,
+        allocs: Vec<(u64, u64)>,
+        stripe_size: u64,
+        initiator_size: u64,
+        initiator_blocks: Vec<(u32, Vec<u8>)>,
+    ) -> Result<(), String> {
+        if allocs.is_empty() {
+            return Err(format!("begin_migration: inode {} empty allocs", inode));
+        }
+        if !matches!(
+            target_mode,
+            Self::MIGRATE_TARGET_FLAT | Self::MIGRATE_TARGET_STRIPE
+        ) {
+            return Err(format!(
+                "begin_migration: inode {} invalid target_mode {}",
+                inode, target_mode
+            ));
+        }
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+
+        let mut inodes_guard = self.inodes.write().unwrap();
+        let mut info = inodes_guard
+            .get(&inode)
+            .cloned()
+            .ok_or_else(|| format!("begin_migration: inode {} not found", inode))?;
+
+        // Idempotent duplicate (same epoch) — no-op.
+        if let Some(existing) = &info.migration {
+            if existing.epoch == epoch {
+                log::info!(
+                    "Shard {} BeginMigration idempotent replay inode={} epoch={}",
+                    self.shard_id.0,
+                    inode,
+                    epoch
+                );
+                return Ok(());
+            }
+            return Err(format!(
+                "stale_epoch: inode {} already migrating with epoch {} (got {})",
+                inode, existing.epoch, epoch
+            ));
+        }
+        // Safety net: a volume-backed inode must never re-enter migration.
+        if info.storage_mode.is_volume_backed() || !info.chunks.is_empty() {
+            return Err(format!(
+                "already_migrated: inode {} is {:?} with {} chunks",
+                inode,
+                info.storage_mode,
+                info.chunks.len()
+            ));
+        }
+
+        // Block-merge only the initiator's marked blocks. Unmarked regions of
+        // the Filer snapshot are preserved byte-for-byte, so a holder with a
+        // disjoint dirty region can never zero another holder's region.
+        let mut buf = info.inline_data.clone().unwrap_or_default();
+        let mut max_end: u64 = info
+            .inline_data
+            .as_ref()
+            .map(|d| d.len() as u64)
+            .unwrap_or(0);
+        for (idx, bytes) in &initiator_blocks {
+            if bytes.is_empty() {
+                continue;
+            }
+            if (bytes.len() as u64) > Self::MIGRATE_BLOCK_SIZE {
+                return Err(format!(
+                    "begin_migration: inode {} block {} len {} > {}",
+                    inode,
+                    idx,
+                    bytes.len(),
+                    Self::MIGRATE_BLOCK_SIZE
+                ));
+            }
+            let start = (*idx as u64) * Self::MIGRATE_BLOCK_SIZE;
+            let end = start + bytes.len() as u64;
+            if (buf.len() as u64) < end {
+                buf.resize(end as usize, 0u8);
+            }
+            buf[start as usize..end as usize].copy_from_slice(bytes);
+            if end > max_end {
+                max_end = end;
+            }
+        }
+        let merged_size = info.size.max(initiator_size).max(max_end);
+        if (buf.len() as u64) < merged_size {
+            buf.resize(merged_size as usize, 0u8);
+        }
+
+        info.size = merged_size;
+        info.blocks = merged_size.div_ceil(512);
+        info.inline_data = Some(buf);
+        info.version = info.version.wrapping_add(1);
+        info.migration = Some(MigrationState {
+            epoch,
+            target_mode,
+            allocs: allocs.clone(),
+            stripe_size,
+        });
+
+        let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .put_cf_opt(cf_inodes, inode.to_be_bytes(), &data, &write_opts)
+            .map_err(|e| format!("put begin_migration: {}", e))?;
+        inodes_guard.insert(inode, info);
+        log::info!(
+            "Shard {} BeginMigration OK inode={} epoch={} target={} allocs={} size={}",
+            self.shard_id.0,
+            inode,
+            epoch,
+            target_mode,
+            allocs.len(),
+            merged_size
+        );
+        Ok(())
+    }
+
+    /// Apply `CommitMigration`: install Flat/Stripe chunks from the persisted
+    /// allocs, clear the retained inline snapshot and exit the Migrating
+    /// window. The needle content is already durable (leader materialized it
+    /// before proposing). Idempotent: a second commit after a completed
+    /// migration is a successful no-op.
+    pub fn commit_migration(&self, inode: u64, epoch: u64) -> Result<(), String> {
+        let cf_inodes = self
+            .db
+            .cf_handle(CF_INODES)
+            .ok_or_else(|| "CF_INODES not found".to_string())?;
+
+        let mut inodes_guard = self.inodes.write().unwrap();
+        let mut info = inodes_guard
+            .get(&inode)
+            .cloned()
+            .ok_or_else(|| format!("commit_migration: inode {} not found", inode))?;
+
+        let state = match info.migration.clone() {
+            Some(s) if s.epoch == epoch => s,
+            Some(other) => {
+                return Err(format!(
+                    "stale_epoch: inode {} commit epoch {} != window epoch {}",
+                    inode, epoch, other.epoch
+                ));
+            }
+            None => {
+                // Already committed (idempotent) or never migrating.
+                if info.storage_mode.is_volume_backed() && !info.chunks.is_empty() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "commit_migration: inode {} has no migration in progress",
+                    inode
+                ));
+            }
+        };
+
+        let snapshot = info.inline_data.clone().unwrap_or_default();
+        let snap_len = snapshot.len() as u64;
+        let (vid, nid) =
+            state.allocs.first().copied().ok_or_else(|| {
+                format!("commit_migration: inode {} persisted allocs empty", inode)
+            })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let chunk = StoredFileChunk {
+            offset: 0,
+            size: snap_len,
+            needle_id: nid,
+            volume_id: vid,
+            crc32: 0,
+            mtime: now,
+            is_reference: false,
+        };
+        // The snapshot (≤8 KiB) always occupies stripe unit 0; subsequent
+        // writes fan out to the other persisted stripe units via the normal
+        // Flat/Stripe chunk path.
+        info.chunks = vec![chunk];
+        info.fid = Some(format!("{},0,{}", vid, nid));
+        info.volume_id = Some(vid);
+        info.size = info.size.max(snap_len);
+        info.blocks = info.size.div_ceil(512);
+        info.inline_data = None;
+        info.storage_mode = if state.target_mode == Self::MIGRATE_TARGET_STRIPE {
+            powerfs_layout::StorageMode::Stripe
+        } else {
+            powerfs_layout::StorageMode::Flat
+        };
+        info.migration = None;
+        info.version = info.version.wrapping_add(1);
+
+        let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db
+            .put_cf_opt(cf_inodes, inode.to_be_bytes(), &data, &write_opts)
+            .map_err(|e| format!("put commit_migration: {}", e))?;
+        inodes_guard.insert(inode, info);
+        log::info!(
+            "Shard {} CommitMigration OK inode={} epoch={} -> {} vid={} needle={:#x} snap_len={}",
+            self.shard_id.0,
+            inode,
+            epoch,
+            if state.target_mode == Self::MIGRATE_TARGET_STRIPE {
+                "Stripe"
+            } else {
+                "Flat"
+            },
+            vid,
+            nid,
+            snap_len
+        );
+        Ok(())
+    }
+
+    /// Read-side accessor for a migration in progress (used by the net
+    /// handler to resume/report the window). `None` ⇒ not migrating.
+    pub fn get_migration(&self, inode: u64) -> Option<MigrationState> {
+        self.inodes
+            .read()
+            .unwrap()
+            .get(&inode)
+            .and_then(|i| i.migration.clone())
     }
 
     /// P3: Set an extended attribute on an inode (persisted to RocksDB).
@@ -3872,6 +4477,15 @@ impl ShardStore {
                 if let Some(s) = size {
                     info.size = s;
                     info.blocks = s.div_ceil(512);
+                    // MC-108 Task 5: SetAttrData 是显式 truncate 路径（无条件
+                    // 设 size），必须同步截断 inline 缓冲——否则 max() 守卫下
+                    // 的后续 re-extend 会把截断前的旧字节当存活数据露出。
+                    if let Some(d) = &mut info.inline_data {
+                        let s_usize = s as usize;
+                        if s_usize < d.len() {
+                            d.truncate(s_usize);
+                        }
+                    }
                 }
                 let now = chrono::Utc::now().timestamp() as u64;
                 info.ctime = now;
@@ -3953,6 +4567,7 @@ impl ShardStore {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         };
 
         let cf_inodes = self.db.cf_handle(CF_INODES).unwrap();
@@ -4182,6 +4797,7 @@ mod tests {
             compression_state: powerfs_layout::reliability::CompressionState::default(),
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
+            migration: None,
         }
     }
 
@@ -4606,5 +5222,802 @@ mod tests {
             ShardStore::new(ShardId(0), (0, 1_000_000), tmp_dir.to_str().unwrap()).unwrap();
         assert_eq!(reopened.read_format_marker().unwrap().fsid, "fsid-persist");
         assert!(reopened.get_inode(POSIX_ROOT_INODE).is_some());
+    }
+
+    /// MC-108 TR-1.1: 50 concurrent creates of the SAME name resolve to
+    /// exactly one winner inode. The apply-side uniqueness authority must
+    /// (a) link exactly one dentry, (b) never write a loser inode record,
+    /// (c) hand every loser the same winner inode.
+    #[test]
+    fn test_mc108_concurrent_same_name_create_single_winner() {
+        let store = make_store(); // inode range [1000, 2000)
+        const N: u64 = 50;
+        let base: u64 = 1900;
+
+        let outcomes: Vec<AtomicCreateOutcome> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for i in 0..N {
+                let store = &store;
+                handles.push(s.spawn(move || {
+                    let info = make_inode(base + i, 1, "race");
+                    store.create_file_resolve_existing(info, false).unwrap()
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let created_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, AtomicCreateOutcome::Created))
+            .count();
+        assert_eq!(created_count, 1, "exactly one create must win");
+        assert_eq!(
+            outcomes.len() as u64,
+            N,
+            "all 50 threads must report an outcome"
+        );
+
+        let winner = store
+            .get_dir_entry_inode(1, "race")
+            .expect("dentry race must exist");
+        assert!(
+            winner >= base && winner < base + N,
+            "winner must be one of the requesters"
+        );
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            let ino = base + i as u64;
+            match outcome {
+                AtomicCreateOutcome::Created => assert_eq!(ino, winner),
+                AtomicCreateOutcome::Existing { winner_inode } => {
+                    assert_eq!(*winner_inode, winner, "every loser adopts the same winner");
+                    assert_ne!(ino, winner);
+                }
+                other => panic!("unexpected outcome: {:?}", other),
+            }
+        }
+
+        // Loser inode records exist nowhere — not in memory, not in RocksDB.
+        for ino in base..base + N {
+            if ino == winner {
+                assert!(store.get_inode(ino).is_some(), "winner record must exist");
+                assert!(
+                    store.verify_inode_in_db(ino),
+                    "winner record must be durable"
+                );
+            } else {
+                assert!(
+                    store.get_inode(ino).is_none(),
+                    "loser {} must not exist in memory",
+                    ino
+                );
+                assert!(
+                    !store.verify_inode_in_db(ino),
+                    "loser {} must never be written to RocksDB",
+                    ino
+                );
+            }
+        }
+
+        // Repeated create after the race is an idempotent Existing adopt.
+        let again = store
+            .create_file_resolve_existing(make_inode(1500, 1, "race"), false)
+            .unwrap();
+        assert_eq!(
+            again,
+            AtomicCreateOutcome::Existing {
+                winner_inode: winner
+            }
+        );
+        assert!(
+            store.get_inode(1500).is_none(),
+            "late loser must also stay unlinked"
+        );
+    }
+
+    /// MC-108 TR-1.1: O_EXCL semantics and file-vs-directory type mismatch.
+    #[test]
+    fn test_mc108_atomic_create_exclusive_and_type_mismatch() {
+        let store = make_store();
+
+        // First creator wins.
+        assert_eq!(
+            store
+                .create_file_resolve_existing(make_inode(1500, 1, "f"), false)
+                .unwrap(),
+            AtomicCreateOutcome::Created
+        );
+        // Non-exclusive same-name create adopts the winner.
+        assert_eq!(
+            store
+                .create_file_resolve_existing(make_inode(1501, 1, "f"), false)
+                .unwrap(),
+            AtomicCreateOutcome::Existing { winner_inode: 1500 }
+        );
+        assert!(store.get_inode(1501).is_none());
+        // Exclusive same-name create loses with EEXIST (no type mismatch).
+        assert_eq!(
+            store
+                .create_file_resolve_existing(make_inode(1502, 1, "f"), true)
+                .unwrap(),
+            AtomicCreateOutcome::AlreadyExists {
+                winner_inode: 1500,
+                type_mismatch: false
+            }
+        );
+        assert!(store.get_inode(1502).is_none());
+
+        // File create over an existing DIRECTORY name (non-exclusive) is a
+        // type mismatch → AlreadyExists{type_mismatch=true} (→ EISDIR).
+        store
+            .create_inode_atomic(make_dir_inode(1510, 1, "d"), 1, "d")
+            .unwrap();
+        assert_eq!(
+            store
+                .create_file_resolve_existing(make_inode(1511, 1, "d"), false)
+                .unwrap(),
+            AtomicCreateOutcome::AlreadyExists {
+                winner_inode: 1510,
+                type_mismatch: true
+            }
+        );
+        assert!(store.get_inode(1511).is_none());
+        // Exclusive over a directory is still plain EEXIST.
+        assert_eq!(
+            store
+                .create_file_resolve_existing(make_inode(1512, 1, "d"), true)
+                .unwrap(),
+            AtomicCreateOutcome::AlreadyExists {
+                winner_inode: 1510,
+                type_mismatch: true
+            }
+        );
+        assert!(store.get_inode(1512).is_none());
+    }
+
+    // ==================== MC-108 Task 4: migration state machine (TR-4.1) ====================
+
+    /// Insert an Inline inode carrying `data` as the authoritative Filer
+    /// snapshot (the post-quiesce state the migrator materializes from).
+    fn make_inline_file(store: &ShardStore, inode: u64, name: &str, data: Vec<u8>, size: u64) {
+        let mut info = make_inode(inode, 1, name);
+        info.size = size;
+        info.blocks = size.div_ceil(512);
+        info.inline_data = Some(data);
+        assert_eq!(
+            store.create_file_resolve_existing(info, false).unwrap(),
+            AtomicCreateOutcome::Created
+        );
+    }
+
+    fn flat_chunk(vid: u64, nid: u64, len: u64) -> StoredFileChunk {
+        StoredFileChunk {
+            offset: 0,
+            size: len,
+            needle_id: nid,
+            volume_id: vid,
+            crc32: 0,
+            mtime: 0,
+            is_reference: false,
+        }
+    }
+
+    /// Assert the committed chunk location/length (mtime is wall-clock and
+    /// intentionally not compared).
+    fn assert_chunk_at(chunks: &[StoredFileChunk], vid: u64, nid: u64, len: u64) {
+        assert_eq!(chunks.len(), 1, "expected exactly one chunk");
+        let c = &chunks[0];
+        assert_eq!(c.volume_id, vid);
+        assert_eq!(c.needle_id, nid);
+        assert_eq!(c.offset, 0);
+        assert_eq!(c.size, len);
+        assert!(!c.is_reference);
+    }
+
+    const T4_VID: u64 = 7;
+    const T4_NID: u64 = 0x1000;
+    const T4_EPOCH: u64 = 10;
+
+    /// Happy path: Begin (snapshot retained, mode stays Inline) → Commit
+    /// installs the Flat chunk from the persisted alloc and clears inline.
+    /// Commit is idempotent.
+    #[test]
+    fn test_mc108_t4_begin_commit_flat_migration() {
+        let store = make_store();
+        let mut data = vec![0xAAu8; 4096];
+        data.extend(std::iter::repeat_n(0xBBu8, 4096));
+        make_inline_file(&store, 1600, "m1", data.clone(), 8192);
+
+        store
+            .begin_migration(
+                1600,
+                T4_EPOCH,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(T4_VID, T4_NID)],
+                0,
+                8192,
+                vec![],
+            )
+            .unwrap();
+
+        // Window open: mode is still Inline, snapshot retained, destination
+        // pinned, chunks not yet installed.
+        let mid = store.get_inode(1600).unwrap();
+        let m = mid
+            .migration
+            .clone()
+            .expect("Migrating window must be open");
+        assert_eq!(m.epoch, T4_EPOCH);
+        assert_eq!(m.target_mode, ShardStore::MIGRATE_TARGET_FLAT);
+        assert_eq!(m.allocs, vec![(T4_VID, T4_NID)]);
+        assert_eq!(mid.storage_mode, powerfs_layout::StorageMode::Inline);
+        assert_eq!(mid.inline_data.as_ref().unwrap().len(), 8192);
+        assert!(mid.chunks.is_empty());
+        assert_eq!(store.get_migration(1600).as_ref().unwrap().epoch, T4_EPOCH);
+
+        store.commit_migration(1600, T4_EPOCH).unwrap();
+
+        let done = store.get_inode(1600).unwrap();
+        assert_eq!(done.storage_mode, powerfs_layout::StorageMode::Flat);
+        assert!(done.migration.is_none());
+        assert!(done.inline_data.is_none());
+        assert_chunk_at(&done.chunks, T4_VID, T4_NID, 8192);
+        assert_eq!(done.size, 8192);
+        assert_eq!(done.fid.as_deref(), Some("7,0,4096"));
+        assert_eq!(done.volume_id, Some(T4_VID));
+
+        // Idempotent re-commit after completion.
+        store.commit_migration(1600, T4_EPOCH).unwrap();
+    }
+
+    /// The epoch fence rejects EVERY external inline/chunks commit while the
+    /// window is open (both pre-propose callers route through this apply
+    /// primitive), and the retained snapshot stays untouched.
+    #[test]
+    fn test_mc108_t4_window_rejects_external_commits() {
+        let store = make_store();
+        let data = vec![0xCCu8; 8192];
+        make_inline_file(&store, 1601, "m2", data.clone(), 8192);
+
+        store
+            .begin_migration(
+                1601,
+                T4_EPOCH,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(T4_VID, T4_NID)],
+                0,
+                8192,
+                vec![],
+            )
+            .unwrap();
+
+        // Stale inline overwrite rejected.
+        let err = store
+            .update_inode_size_chunks_atomic(1601, 8192, vec![], Some(vec![0u8; 8192]), false, None)
+            .unwrap_err();
+        assert!(err.contains("stale_epoch"), "got: {err}");
+
+        // Stale flat-chunks commit rejected as well.
+        let err = store
+            .update_inode_size_chunks_atomic(
+                1601,
+                8192,
+                vec![flat_chunk(T4_VID, 0x9999, 8192)],
+                None,
+                false,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("stale_epoch"), "got: {err}");
+
+        // Snapshot byte-for-byte intact after the rejected attempts.
+        let mid = store.get_inode(1601).unwrap();
+        assert_eq!(mid.inline_data.as_ref().unwrap(), &data);
+        assert!(mid.chunks.is_empty());
+
+        // Window closes → external Flat commits succeed again.
+        store.commit_migration(1601, T4_EPOCH).unwrap();
+        store
+            .update_inode_size_chunks_atomic(
+                1601,
+                8192,
+                vec![flat_chunk(T4_VID, T4_NID, 8192)],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+    }
+
+    /// MC-108 Task 5 / TR-5.1: 双写者 disjoint 区间提交全部存活。
+    /// A 写块0（携带陈旧块1快照），B 写块1（携带陈旧块0快照）——
+    /// 旧整缓冲替换会互相清块，区间合并后两块都必须存活。
+    #[test]
+    fn test_mc108_t5_disjoint_merge_both_survive() {
+        let store = make_store();
+        let mut base = vec![0xAAu8; 4096];
+        base.extend_from_slice(&vec![0xBBu8; 4096]);
+        make_inline_file(&store, 1620, "t5a", base, 8192);
+
+        // A: 写块0=0xCC, 快照中块1仍是 0xBB
+        let mut a_buf = vec![0xCCu8; 4096];
+        a_buf.extend_from_slice(&vec![0xBBu8; 4096]);
+        store
+            .update_inode_size_chunks_atomic(1620, 8192, vec![], Some(a_buf), false, Some(0b01))
+            .unwrap();
+
+        // B: 写块1=0xDD, 快照中块0仍是 0xAA —— 若整缓冲替换会清掉 A 的块0
+        let mut b_buf = vec![0xAAu8; 4096];
+        b_buf.extend_from_slice(&vec![0xDDu8; 4096]);
+        store
+            .update_inode_size_chunks_atomic(1620, 8192, vec![], Some(b_buf), false, Some(0b10))
+            .unwrap();
+
+        let info = store.get_inode(1620).unwrap();
+        let d = info.inline_data.as_ref().unwrap();
+        assert_eq!(d[..4096], vec![0xCCu8; 4096], "A 的块0 必须存活");
+        assert_eq!(d[4096..], vec![0xDDu8; 4096], "B 的块1 必须存活");
+        assert_eq!(info.size, 8192);
+    }
+
+    /// MC-108 Task 5 / TR-5.1: 重叠块按提交顺序 last-wins。
+    #[test]
+    fn test_mc108_t5_overlap_last_wins() {
+        let store = make_store();
+        make_inline_file(&store, 1621, "t5b", vec![0x11u8; 8192], 8192);
+
+        let first = vec![0x22u8; 8192];
+        store
+            .update_inode_size_chunks_atomic(1621, 8192, vec![], Some(first), false, Some(0b11))
+            .unwrap();
+        let second = vec![0x33u8; 8192];
+        store
+            .update_inode_size_chunks_atomic(1621, 8192, vec![], Some(second), false, Some(0b11))
+            .unwrap();
+
+        let info = store.get_inode(1621).unwrap();
+        assert_eq!(info.inline_data.as_ref().unwrap(), &vec![0x33u8; 8192]);
+        assert_eq!(info.size, 8192);
+    }
+
+    /// MC-108 Task 5 / TR-5.1: size max() 单调守卫——陈旧客户端的小 size
+    /// 不得收缩已增长的服务端 size。
+    #[test]
+    fn test_mc108_t5_size_monotonic_max() {
+        let store = make_store();
+        make_inline_file(&store, 1622, "t5c", vec![0x44u8; 8192], 8192);
+
+        // 陈旧提交: size=4096 (mask=0b01 只写块0)
+        let mut stale = vec![0x55u8; 4096];
+        stale.extend_from_slice(&vec![0x44u8; 4096]);
+        store
+            .update_inode_size_chunks_atomic(1622, 4096, vec![], Some(stale), false, Some(0b01))
+            .unwrap();
+
+        let info = store.get_inode(1622).unwrap();
+        assert_eq!(info.size, 8192, "size 不得回退");
+        assert_eq!(
+            info.inline_data.as_ref().unwrap()[..4096],
+            vec![0x55u8; 4096]
+        );
+    }
+
+    /// MC-108 Task 5 / TR-5.1: extend-only (mask=Some(0)) —— size 零扩展，
+    /// 既有内容保留（旧整替换会用客户端快照清掉他人并发写入）。
+    #[test]
+    fn test_mc108_t5_extend_only_zero_fill() {
+        let store = make_store();
+        make_inline_file(&store, 1623, "t5d", vec![0x66u8; 4096], 4096);
+
+        // 客户端 fallocate 扩展到 8192: 快照(4096)+零洞, mask=0 (无字节写入)
+        let mut buf = vec![0x66u8; 4096];
+        buf.extend_from_slice(&vec![0u8; 4096]);
+        store
+            .update_inode_size_chunks_atomic(1623, 8192, vec![], Some(buf), false, Some(0))
+            .unwrap();
+
+        let info = store.get_inode(1623).unwrap();
+        let d = info.inline_data.as_ref().unwrap();
+        assert_eq!(info.size, 8192);
+        assert_eq!(d[..4096], vec![0x66u8; 4096]);
+        assert_eq!(d[4096..], vec![0u8; 4096]);
+    }
+
+    /// MC-108 Task 5 / TR-5.1: mask=None 保持旧整缓冲替换语义
+    /// (powerfs-fuse 兼容, 行为不回归)。
+    #[test]
+    fn test_mc108_t5_legacy_none_full_replace() {
+        let store = make_store();
+        make_inline_file(&store, 1624, "t5e", vec![0x77u8; 8192], 8192);
+
+        store
+            .update_inode_size_chunks_atomic(
+                1624,
+                4096,
+                vec![],
+                Some(vec![0x88u8; 4096]),
+                false,
+                None,
+            )
+            .unwrap();
+
+        let info = store.get_inode(1624).unwrap();
+        assert_eq!(info.inline_data.as_ref().unwrap(), &vec![0x88u8; 4096]);
+        assert_eq!(info.size, 4096, "legacy 语义: size 以客户端为准");
+    }
+
+    /// MC-108 Task 5 / TR-5.1: SetAttrData 显式 truncate 同步截断 inline
+    /// 缓冲, 防止 max() 守卫下 re-extend 泄露截断前字节。
+    #[test]
+    fn test_mc108_t5_setattr_data_truncates_inline() {
+        let store = make_store();
+        let mut secret = vec![0x99u8; 8192];
+        secret[8100] = 0xAB; // 截断点后应消失的字节
+        make_inline_file(&store, 1625, "t5f", secret, 8192);
+
+        store.setattr_data(1625, Some(4096));
+        let info = store.get_inode(1625).unwrap();
+        assert_eq!(info.size, 4096);
+        assert_eq!(info.inline_data.as_ref().unwrap().len(), 4096);
+
+        // re-extend (fallocate): 缓冲区外零扩展, 旧字节不得复活
+        let mut buf = info.inline_data.clone().unwrap();
+        buf.extend_from_slice(&vec![0u8; 4096]);
+        store
+            .update_inode_size_chunks_atomic(1625, 8192, vec![], Some(buf), false, Some(0))
+            .unwrap();
+        let info = store.get_inode(1625).unwrap();
+        let d = info.inline_data.as_ref().unwrap();
+        assert_eq!(info.size, 8192);
+        assert_eq!(d[8100], 0, "截断前的字节不得在 re-extend 后复活");
+    }
+
+    /// MC-108 Task 5 / TR-5.1: 纯合并函数边界——无服务端快照、尾部
+    /// 部分块、client 短于合并长度。
+    #[test]
+    fn test_mc108_t5_merge_pure_fn_edges() {
+        // 1) 服务端空 + 客户端只写块1: 块0 零洞
+        let mut client = vec![0u8; 4096];
+        client.extend_from_slice(&vec![0xDDu8; 100]);
+        let (merged, size) = ShardStore::merge_inline_dirty_blocks(None, 0, &client, 4196, 0b10);
+        assert_eq!(size, 4196);
+        assert_eq!(merged.len(), 4196);
+        assert!(merged[..4096].iter().all(|&b| b == 0));
+        assert_eq!(&merged[4096..4196], &vec![0xDDu8; 100][..]);
+
+        // 2) 尾部部分块: client 短于块边界, 未覆盖区域保留 existing
+        let existing = vec![0xEEu8; 8192];
+        let client2 = vec![0xFFu8; 4200]; // 块1 只写 104 字节
+        let (merged, size) =
+            ShardStore::merge_inline_dirty_blocks(Some(&existing), 8192, &client2, 4200, 0b10);
+        assert_eq!(size, 8192);
+        // 块0 未置脏: 保留 existing, 陈旧 client 快照不清掉它
+        assert_eq!(&merged[..4096], &vec![0xEEu8; 4096][..]);
+        // 块1 置脏: 仅 client 覆盖到的 104 字节生效
+        assert_eq!(&merged[4096..4200], &vec![0xFFu8; 104][..]);
+        assert_eq!(&merged[4200..], &vec![0xEEu8; 8192 - 4200][..]);
+
+        // 3) size 单调: existing_size > client_size
+        let (_, size) = ShardStore::merge_inline_dirty_blocks(
+            Some(&vec![0u8; 100]),
+            500,
+            &vec![0u8; 50],
+            50,
+            0,
+        );
+        assert_eq!(size, 500);
+    }
+
+    /// Begin is idempotent on the same epoch (Raft replay / duplicate RPC),
+    /// but a second window with a different epoch is refused.
+    #[test]
+    fn test_mc108_t4_begin_idempotent_same_epoch_rejects_other() {
+        let store = make_store();
+        make_inline_file(&store, 1602, "m3", vec![1u8; 4096], 4096);
+
+        let args = (
+            ShardStore::MIGRATE_TARGET_FLAT,
+            vec![(T4_VID, T4_NID)],
+            0u64,
+            4096u64,
+            Vec::<(u32, Vec<u8>)>::new(),
+        );
+        store
+            .begin_migration(
+                1602,
+                T4_EPOCH,
+                args.0,
+                args.1.clone(),
+                args.2,
+                args.3,
+                args.4.clone(),
+            )
+            .unwrap();
+        // Duplicate (e.g. Raft log replay) — no-op success.
+        store
+            .begin_migration(
+                1602,
+                T4_EPOCH,
+                args.0,
+                args.1.clone(),
+                args.2,
+                args.3,
+                args.4.clone(),
+            )
+            .unwrap();
+        let m = store.get_inode(1602).unwrap().migration.unwrap();
+        assert_eq!(m.allocs, vec![(T4_VID, T4_NID)]);
+
+        // A newer/older foreign epoch must never replace the open window.
+        let err = store
+            .begin_migration(1602, T4_EPOCH + 1, args.0, args.1, args.2, args.3, args.4)
+            .unwrap_err();
+        assert!(err.contains("stale_epoch"), "got: {err}");
+        assert_eq!(store.get_migration(1602).unwrap().epoch, T4_EPOCH);
+    }
+
+    /// A Commit carrying the wrong epoch is refused while the window stays
+    /// Migrating; once committed Flat, re-entering migration is forbidden
+    /// (no Flat→Inline regression).
+    #[test]
+    fn test_mc108_t4_commit_epoch_fence_and_no_regression() {
+        let store = make_store();
+        make_inline_file(&store, 1603, "m4", vec![2u8; 4096], 4096);
+
+        store
+            .begin_migration(
+                1603,
+                T4_EPOCH,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(T4_VID, T4_NID)],
+                0,
+                4096,
+                vec![],
+            )
+            .unwrap();
+
+        let err = store.commit_migration(1603, T4_EPOCH + 1).unwrap_err();
+        assert!(err.contains("stale_epoch"), "got: {err}");
+        // Still Migrating, still Inline: the bad commit changed nothing.
+        let mid = store.get_inode(1603).unwrap();
+        assert!(mid.migration.is_some());
+        assert_eq!(mid.storage_mode, powerfs_layout::StorageMode::Inline);
+
+        store.commit_migration(1603, T4_EPOCH).unwrap();
+
+        // Flat inode can never re-enter an Inline→Flat window.
+        let err = store
+            .begin_migration(
+                1603,
+                T4_EPOCH + 1,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(8, 0x2000)],
+                0,
+                4096,
+                vec![],
+            )
+            .unwrap_err();
+        assert!(err.contains("already_migrated"), "got: {err}");
+        // Original Flat layout preserved.
+        let done = store.get_inode(1603).unwrap();
+        assert_chunk_at(&done.chunks, T4_VID, T4_NID, 4096);
+
+        // Commit without any window on a never-migrating inode is an error.
+        make_inline_file(&store, 1604, "m4b", vec![3u8; 16], 16);
+        let err = store.commit_migration(1604, 1).unwrap_err();
+        assert!(err.contains("no migration in progress"), "got: {err}");
+    }
+
+    /// Only the initiator's marked 4 KiB blocks overwrite the snapshot;
+    /// unmarked regions survive byte-for-byte, marked blocks win, and the
+    /// merged size is max(snapshot, block end, initiator i_size).
+    #[test]
+    fn test_mc108_t4_initiator_block_merge_semantics() {
+        let store = make_store();
+
+        // Case A: disjoint regions — holder A owns block 0, initiator block 1.
+        let mut snap = vec![0xAAu8; 4096];
+        snap.extend(std::iter::repeat_n(0u8, 4096));
+        make_inline_file(&store, 1610, "m5", snap, 8192);
+        store
+            .begin_migration(
+                1610,
+                T4_EPOCH,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(T4_VID, T4_NID)],
+                0,
+                8192,
+                vec![(1u32, vec![0xBBu8; 4096])],
+            )
+            .unwrap();
+        let merged = store.get_inode(1610).unwrap();
+        let md = merged.inline_data.as_ref().unwrap();
+        assert!(
+            md[0..4096].iter().all(|&b| b == 0xAA),
+            "holder region zeroed"
+        );
+        assert!(
+            md[4096..8192].iter().all(|&b| b == 0xBB),
+            "initiator block missing"
+        );
+        assert_eq!(merged.size, 8192);
+        store.commit_migration(1610, T4_EPOCH).unwrap();
+
+        // Case B: marked block overwrites the snapshot, unmarked retained.
+        let mut snap2 = vec![0xAAu8; 4096];
+        snap2.extend(std::iter::repeat_n(0xCCu8, 4096));
+        make_inline_file(&store, 1611, "m6", snap2, 8192);
+        store
+            .begin_migration(
+                1611,
+                T4_EPOCH,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(T4_VID, T4_NID + 1)],
+                0,
+                8192,
+                vec![(0u32, vec![0xDDu8; 4096])],
+            )
+            .unwrap();
+        let md2 = store.get_inode(1611).unwrap().inline_data.unwrap();
+        assert!(md2[0..4096].iter().all(|&b| b == 0xDD));
+        assert!(md2[4096..8192].iter().all(|&b| b == 0xCC));
+
+        // Case C: initiator i_size extends a hole beyond snapshot/blocks.
+        let snap3 = vec![0xEEu8; 4096];
+        make_inline_file(&store, 1612, "m7", snap3, 4096);
+        store
+            .begin_migration(
+                1612,
+                T4_EPOCH,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(T4_VID, T4_NID + 2)],
+                0,
+                10000,
+                vec![],
+            )
+            .unwrap();
+        let ext = store.get_inode(1612).unwrap();
+        assert_eq!(ext.size, 10000);
+        let ed = ext.inline_data.unwrap();
+        assert_eq!(ed.len(), 10000);
+        assert!(ed[0..4096].iter().all(|&b| b == 0xEE));
+        assert!(
+            ed[4096..10000].iter().all(|&b| b == 0),
+            "hole must zero-fill"
+        );
+    }
+
+    /// Stripe destination tag/units persist; the snapshot occupies unit 0.
+    #[test]
+    fn test_mc108_t4_stripe_target_commits() {
+        let store = make_store();
+        make_inline_file(&store, 1613, "m8", vec![7u8; 3000], 3000);
+        let allocs = vec![(1u64, 10u64), (2, 20), (3, 30), (4, 40)];
+        store
+            .begin_migration(
+                1613,
+                T4_EPOCH,
+                ShardStore::MIGRATE_TARGET_STRIPE,
+                allocs.clone(),
+                64 * 1024 * 1024,
+                3000,
+                vec![],
+            )
+            .unwrap();
+        let m = store.get_migration(1613).unwrap();
+        assert_eq!(m.target_mode, ShardStore::MIGRATE_TARGET_STRIPE);
+        assert_eq!(m.stripe_size, 64 * 1024 * 1024);
+
+        store.commit_migration(1613, T4_EPOCH).unwrap();
+        let done = store.get_inode(1613).unwrap();
+        assert_eq!(done.storage_mode, powerfs_layout::StorageMode::Stripe);
+        assert_chunk_at(&done.chunks, 1, 10, 3000);
+        assert!(done.inline_data.is_none());
+    }
+
+    /// Argument validation on the apply primitive.
+    #[test]
+    fn test_mc108_t4_begin_validates_arguments() {
+        let store = make_store();
+        make_inline_file(&store, 1620, "m9", vec![1u8; 128], 128);
+
+        let err = store
+            .begin_migration(
+                1620,
+                1,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![],
+                0,
+                128,
+                vec![],
+            )
+            .unwrap_err();
+        assert!(err.contains("empty allocs"), "got: {err}");
+
+        let err = store
+            .begin_migration(1620, 1, 99, vec![(T4_VID, T4_NID)], 0, 128, vec![])
+            .unwrap_err();
+        assert!(err.contains("invalid target_mode"), "got: {err}");
+
+        let err = store
+            .begin_migration(
+                1620,
+                1,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(T4_VID, T4_NID)],
+                0,
+                128,
+                vec![(0u32, vec![0u8; 4097])],
+            )
+            .unwrap_err();
+        assert!(err.contains("> 4096"), "got: {err}");
+
+        let err = store
+            .begin_migration(
+                9999,
+                1,
+                ShardStore::MIGRATE_TARGET_FLAT,
+                vec![(T4_VID, T4_NID)],
+                0,
+                128,
+                vec![],
+            )
+            .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    /// TR-4.3 deterministic core: the open Migrating window (epoch, pinned
+    /// allocs, merged snapshot) is Raft/RocksDB replicated. A leader crash
+    /// between Begin and Commit → reopen → the window is re-entrant and a
+    /// resumed Commit finishes the migration with intact data.
+    #[test]
+    fn test_mc108_t4_window_survives_reopen_and_resumes() {
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        let mut snap = vec![0xAAu8; 4096];
+        snap.extend(std::iter::repeat_n(0u8, 4096));
+
+        {
+            let store = ShardStore::new(ShardId(1), (1000, 2000), &path).unwrap();
+            make_inline_file(&store, 1630, "m10", snap.clone(), 8192);
+            store
+                .begin_migration(
+                    1630,
+                    T4_EPOCH,
+                    ShardStore::MIGRATE_TARGET_FLAT,
+                    vec![(T4_VID, T4_NID)],
+                    0,
+                    8192,
+                    vec![(1u32, vec![0xBBu8; 4096])],
+                )
+                .unwrap();
+            // Simulated leader crash: drop without Commit.
+        }
+
+        // New leader opens the same shard.
+        let reopened = ShardStore::new(ShardId(1), (1000, 2000), &path).unwrap();
+        let m = reopened
+            .get_migration(1630)
+            .expect("half-open window must survive restart");
+        assert_eq!(m.epoch, T4_EPOCH);
+        assert_eq!(m.allocs, vec![(T4_VID, T4_NID)]);
+        assert_eq!(m.target_mode, ShardStore::MIGRATE_TARGET_FLAT);
+
+        let info = reopened.get_inode(1630).unwrap();
+        assert_eq!(info.storage_mode, powerfs_layout::StorageMode::Inline);
+        let d = info.inline_data.as_ref().unwrap();
+        assert!(d[0..4096].iter().all(|&b| b == 0xAA));
+        assert!(d[4096..8192].iter().all(|&b| b == 0xBB));
+        assert!(info.chunks.is_empty());
+
+        // Resume: same-epoch Commit completes materialization switch.
+        reopened.commit_migration(1630, T4_EPOCH).unwrap();
+        let done = reopened.get_inode(1630).unwrap();
+        assert_eq!(done.storage_mode, powerfs_layout::StorageMode::Flat);
+        assert!(done.migration.is_none());
+        assert_chunk_at(&done.chunks, T4_VID, T4_NID, 8192);
+        assert!(done.inline_data.is_none());
     }
 }

@@ -8,7 +8,7 @@ use crate::cap_manager::{CapManager, CapRevoker, CapSet, RecallTimeoutPenalty};
 use crate::inode_lease_manager::InodeLeaseManager;
 use crate::inode_notifier::InodeNotifier;
 use crate::lock_arbiter::LockType;
-use crate::meta_shard_manager::{MetaShardManager, POSIX_ROOT_INODE};
+use crate::meta_shard_manager::{AtomicCreateResult, MetaShardManager, POSIX_ROOT_INODE};
 use crate::raft_group_manager_v2::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
@@ -22,8 +22,8 @@ use powerfs_net::serialize::{decode_setattr_req, EntryInfo, TlvDecoder, TlvEncod
 use powerfs_net::server_connection::ServerConnectionManager;
 use powerfs_net::{
     ClientType, FieldId, MsgType, NetError, NetHandler, NetMessage, NetResult, RequestContext,
-    STATUS_ERR_BAD_REQUEST, STATUS_ERR_NOT_FOUND, STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR,
-    STATUS_OK,
+    STATUS_ERR_ALREADY_EXISTS, STATUS_ERR_BAD_REQUEST, STATUS_ERR_IS_DIR, STATUS_ERR_NOT_FOUND,
+    STATUS_ERR_REDIRECT, STATUS_ERR_SERVER_ERROR, STATUS_OK,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -201,6 +201,15 @@ pub struct FilerNetHandler {
     pub io_trace_aggregator: Arc<crate::readahead_trace::IoTraceAggregator>,
     /// C-0.2: Filer-side fingerprint index for write dedup
     pub fingerprint_index: Arc<crate::fingerprint_index::FingerprintIndex>,
+    /// MC-108 Task 4: Filer→Volume client used to materialize the
+    /// authoritative inline snapshot into the destination needle while an
+    /// inode is in the Migrating window. `None` in transport-less tests.
+    volume_client: Option<Arc<crate::tlv_volume_client::TlvVolumeClient>>,
+    /// MC-108 Task 4: per-inode serialization for the migration critical
+    /// section. Only one request drives quiesce→Begin→materialize→Commit per
+    /// inode; concurrent migrators wait on the inner mutex and then observe
+    /// (and idempotently return) the committed Flat/Stripe layout.
+    migration_locks: tokio::sync::Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// P2.5: Inline 模式硬上限 (Placement::Inline 的 max_size 不可超过此值)
@@ -336,6 +345,8 @@ impl FilerNetHandler {
             version_counter: Self::init_version_counter(),
             io_trace_aggregator: Arc::new(crate::readahead_trace::IoTraceAggregator::new()),
             fingerprint_index: Arc::new(crate::fingerprint_index::FingerprintIndex::default()),
+            volume_client: None,
+            migration_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -364,6 +375,8 @@ impl FilerNetHandler {
             version_counter: Self::init_version_counter(),
             io_trace_aggregator: Arc::new(crate::readahead_trace::IoTraceAggregator::new()),
             fingerprint_index: Arc::new(crate::fingerprint_index::FingerprintIndex::default()),
+            volume_client: None,
+            migration_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -468,6 +481,83 @@ impl FilerNetHandler {
         self.cap_mgr = Arc::new(rebuilt);
         self.server_conn_mgr = Some(conn_mgr);
         self
+    }
+
+    /// MC-108 Task 4: wire the Filer→Volume client used to materialize the
+    /// inline migration snapshot into the destination needle during Migrating.
+    #[must_use]
+    pub fn with_volume_client(
+        mut self,
+        client: Arc<crate::tlv_volume_client::TlvVolumeClient>,
+    ) -> Self {
+        self.volume_client = Some(client);
+        self
+    }
+
+    /// MC-108 Task 4: acquire the per-inode migration critical-section lock.
+    /// The returned Arc is cloned from the registry; hold its `.lock()` guard
+    /// across the whole quiesce→Begin→materialize→Commit sequence.
+    async fn migration_lock(&self, inode: u64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.migration_locks.lock().await;
+        map.entry(inode)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// MC-108 Task 4: resolve a volume_id to its data-plane server address
+    /// using the currently registered zones.
+    fn volume_addr_for(&self, volume_id: u64) -> Option<String> {
+        self.zones
+            .read()
+            .unwrap()
+            .iter()
+            .flat_map(|z| z.volumes.iter())
+            .find(|v| v.volume_id == volume_id)
+            .map(|v| v.addr.clone())
+    }
+
+    /// MC-108 Task 4: quiesce every cap holder except the migration initiator
+    /// (which merges its dirty blocks through BeginMigration), dispatch the
+    /// recall notifications, and block until all other holders have flushed
+    /// and ACKed (or the arbiter force-reclaims them after recall_timeout).
+    ///
+    /// `exclude=None` is used for clients that do not ship an inline snapshot
+    /// (legacy FUSE): then the initiator is also recalled so the authoritative
+    /// snapshot is complete before the window opens.
+    async fn quiesce_for_migration(&self, inode: u64, exclude: Option<&str>) -> bool {
+        let arbiter = self.cap_mgr.arbiter();
+        let tasks = arbiter.quiesce_except(inode, exclude);
+        for t in &tasks {
+            let token = crate::cap_manager::generate_token(inode, &t.client_id, t.sn);
+            if let Err(e) = self.cap_mgr.recall_holder(
+                inode,
+                &t.client_id,
+                &token,
+                t.caps_to_recall,
+                t.retained_caps,
+                t.new_epoch,
+            ) {
+                warn!(
+                    "MIGRATE_QUESCE: recall push failed inode={} holder={}: {}",
+                    inode, t.client_id, e
+                );
+            }
+        }
+        // Wait for gathers to settle. quiesce_complete() also runs the
+        // arbiter's per-recall timeout, so an unresponsive holder is
+        // force-reclaimed rather than blocking migration forever.
+        for _ in 0..400 {
+            if arbiter.quiesce_complete(inode) {
+                return true;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        warn!(
+            "MIGRATE_QUIESCE: inode={} timed out waiting for holders (continuing; \
+             epoch fence will reject any late inline commit)",
+            inode
+        );
+        false
     }
 
     /// §13: attach a recall-timeout penalty hook to the cap manager.
@@ -2158,10 +2248,13 @@ impl FilerNetHandler {
         let _ = dec.next_u64(FieldId::Cookie).ok();
         let _ = dec.next_u64(FieldId::FileKey).ok();
         let _ = dec.next_u64(FieldId::Size).ok();
+        // MC-108: optional O_EXCL flag (bit0). Absent on old clients = 0.
+        let create_flags = dec.next_u32(FieldId::CreateFlags).unwrap_or(0);
+        let exclusive = (create_flags & 0x1) != 0;
 
         info!(
-            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}, client_id={}",
-            parent_ino, name, mode, uid, gid, client_id
+            "FILER_NET_CREATE: parent_ino={}, name={}, mode={:o}, uid={}, gid={}, client_id={}, exclusive={}",
+            parent_ino, name, mode, uid, gid, client_id, exclusive
         );
 
         let shard_id = self.shard_strategy.calculate_shard(parent_ino);
@@ -2254,22 +2347,84 @@ impl FilerNetHandler {
 
         match self
             .meta_shard_manager
-            // P3.1: Pass mode/uid/gid directly into create_file_with_shard so
-            // they're embedded in the CreateInode command. The old code ran a
-            // separate setattr() propose for these fields, which added one
-            // Raft submit per create. With mode/u32 cast (next_u32 already
-            // returned u32 → cast to u64 by caller, so reverse here).
-            .create_file_with_shard(
+            // MC-108: atomic create resolves same-name races at Raft
+            // apply. Result distinguishes winner / existing-winner /
+            // EEXIST so the kernel never writes to an orphaned loser inode.
+            .create_file_atomic_with_shard(
                 parent_ino,
                 &name,
                 shard_id,
                 mode as u32,
                 uid as u32,
                 gid as u32,
+                exclusive,
             )
             .await
         {
-            Ok((ino, storage_mode)) => {
+            Ok(AtomicCreateResult::AlreadyExists {
+                ino: winner_ino,
+                type_mismatch,
+            }) => {
+                let is_dir = self
+                    .meta_shard_manager
+                    .get_inode(winner_ino)
+                    .map(|w| matches!(w.file_type, FileType::Directory))
+                    .unwrap_or(false);
+                // POSIX: O_CREAT (non-excl) over an existing directory is
+                // EISDIR; O_EXCL always loses with EEXIST.
+                let status = if !exclusive && type_mismatch && is_dir {
+                    STATUS_ERR_IS_DIR
+                } else {
+                    STATUS_ERR_ALREADY_EXISTS
+                };
+                warn!(
+                    "FILER_NET_CREATE: rejected parent={} name={} winner_ino={} exclusive={} type_mismatch={} -> status={}",
+                    parent_ino, name, winner_ino, exclusive, type_mismatch, status
+                );
+                Ok(Self::build_response(msg, status, Vec::new()))
+            }
+            Ok(AtomicCreateResult::Existing { ino, .. }) => {
+                // MC-108 same-name race: this client's allocated inode lost
+                // and is NOT linked. Adopt the pre-existing winner: return
+                // its authoritative layout. We MUST NOT allocate/set_chunks
+                // here — that would overwrite the winner's data layout and
+                // orphan the other client's writes.
+                let winner = match self.meta_shard_manager.get_inode(ino) {
+                    Some(w) => w,
+                    None => {
+                        warn!(
+                            "FILER_NET_CREATE: existing winner inode {} vanished after apply",
+                            ino
+                        );
+                        return Ok(Self::build_response(
+                            msg,
+                            STATUS_ERR_SERVER_ERROR,
+                            Vec::new(),
+                        ));
+                    }
+                };
+                if flat_alloc.is_some() || stripe_alloc.is_some() {
+                    warn!(
+                        "FILER_NET_CREATE: loser inode adopt for name={} winner={}; pre-allocated needle/stripe leaked (acceptable)",
+                        name, ino
+                    );
+                }
+                let setattr_shard = self.shard_strategy.calculate_shard(ino);
+                info!(
+                    "FILER_NET_CREATE: adopting existing winner inode={} parent={} name={} storage_mode={:?} size={} chunks={}",
+                    ino, parent_ino, name, winner.storage_mode, winner.size, winner.chunks.len()
+                );
+                let mut enc = TlvEncoder::new();
+                enc.add_u64(FieldId::Ino, ino);
+                enc.add_u32(FieldId::Mode, winner.mode);
+                enc.add_string(FieldId::Name, &name)?;
+                enc.add_u64(FieldId::ShardId, setattr_shard.0);
+                // Authoritative winner layout (inline data / flat chunks /
+                // stripe) exactly like LOOKUP encodes it.
+                Self::encode_chunks_fields(&mut enc, &winner)?;
+                Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+            }
+            Ok(AtomicCreateResult::Created { ino, storage_mode }) => {
                 // P3.1: SetAttr propose for mode/uid/gid is ELIMINATED.
                 // The values are already baked into the CreateInode Raft log
                 // entry via InodeInfo { mode, uid, gid }. This saves ~40ms of
@@ -3127,29 +3282,40 @@ impl FilerNetHandler {
 
         let mut flushed: u32 = 0;
         let mut any_ok = false;
-        // Per-entry (ino, placement_tag) for the response. Idempotent-retry
-        // entries (Ok(None)) are counted as flushed but carry no tag — the
-        // kernel already holds their layout from the prior create/GETATTR.
-        let mut placements: Vec<(u64, u8)> = Vec::with_capacity(entries.len());
+        // Per-entry (ino, placement_tag) for the response.
+        // MC-108: on a same-name race the outcome ino is the WINNER inode
+        // (different from the client's placeholder). The kernel decoder
+        // switches its placeholder to this inode before issuing writes, so
+        // no wire-format change is needed — winner pairs are simply
+        // included alongside the requester's own pairs.
+        let mut placements: Vec<powerfs_net::serialize::BatchCreatePlacement> =
+            Vec::with_capacity(entries.len());
         for (i, result) in results.iter().enumerate() {
             let (ino, parent_ino, name, _, _, _, _, _) = &entries[i];
             match result {
-                Ok(Some(tag)) => {
+                Ok(outcome) => {
                     flushed += 1;
                     any_ok = true;
-                    placements.push((*ino, *tag));
-                    debug!(
-                        "FILER_NET_BATCH_CREATE: created ino={} parent={} name={} placement_tag={}",
-                        ino, parent_ino, name, tag
-                    );
-                }
-                Ok(None) => {
-                    flushed += 1;
-                    any_ok = true;
-                    debug!(
-                        "FILER_NET_BATCH_CREATE: idempotent retry ino={} parent={} name={}",
-                        ino, parent_ino, name
-                    );
+                    placements.push(powerfs_net::serialize::BatchCreatePlacement {
+                        ino: outcome.ino,
+                        placement_tag: outcome.placement_tag,
+                        winner_of_name: if outcome.adopted_existing {
+                            Some(name.clone())
+                        } else {
+                            None
+                        },
+                    });
+                    if outcome.adopted_existing {
+                        info!(
+                            "FILER_NET_BATCH_CREATE: SAME-NAME RACE requested ino={} -> winner ino={} parent={} name={} placement_tag={}",
+                            ino, outcome.ino, parent_ino, name, outcome.placement_tag
+                        );
+                    } else {
+                        debug!(
+                            "FILER_NET_BATCH_CREATE: created ino={} parent={} name={} placement_tag={}",
+                            ino, parent_ino, name, outcome.placement_tag
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -3577,14 +3743,28 @@ impl FilerNetHandler {
         let size = dec.next_u64(FieldId::Size).unwrap_or(0);
         let client_id = dec.next_string(FieldId::ClientId).unwrap_or_default();
 
-        // 解码 FileLayout (chunks), 无 layout 字段时返回空 chunks
-        let layout = powerfs_layout::codec::decode_file_layout(&mut dec).unwrap_or(FileLayout {
-            placement: Placement::Flat,
-            reliability: Reliability::SingleReplica,
-            reliability_state: ReliabilityState::default(),
-            compression: CompressionState::default(),
-            encoding: ChunkEncoding::PerChunk { chunks: Vec::new() },
-        });
+        // 解码 FileLayout (chunks), 无 layout 字段时返回空 chunks.
+        // MC-108 防线: decode_file_layout Err = 协议级解析失败 (如 Inline
+        // placement 缺 InlineMaxSize — 编码端把非 FileLayout 字段插进
+        // FileLayout 字段块会触发). 此时绝不能静默降级为空 Flat 默认继续
+        // 执行 — 那会用 chunks=[] / inline=None 覆盖权威布局, 造成数据
+        // 无服务端副本. 拒绝请求, 让客户端重试 (dirty 保留在客户端).
+        let layout = match powerfs_layout::codec::decode_file_layout(&mut dec) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(
+                    "FILER_NET_UPDATE_SIZE_CHUNKS: file layout decode failed for inode {}: {} — rejecting",
+                    inode, e
+                );
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, &format!("file layout decode failed: {}", e));
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_SERVER_ERROR,
+                    enc.into_bytes(),
+                ));
+            }
+        };
 
         let chunks: Vec<crate::shard_store::StoredFileChunk> = match &layout.encoding {
             ChunkEncoding::PerChunk { chunks } => chunks
@@ -3619,6 +3799,15 @@ impl FilerNetHandler {
         // existing data instead of overwriting (cross-client concurrent
         // append support). Absent → false (overwrite, backward compatible).
         let is_append = dec.next_u8(FieldId::IsAppend).unwrap_or(0) != 0;
+
+        // MC-108 Task 5: dirty 4K-block bitmap accompanying inline_data
+        // (kernel inline commits). Decoded with a fresh cursor-independent
+        // decoder: the sequential cursor above may have already skipped
+        // past 0xE1 while looking for IsAppend. Absent → None (legacy
+        // full-buffer replace semantics for powerfs-fuse clients).
+        let inline_dirty_mask = TlvDecoder::new(&msg.body)
+            .next_u32(FieldId::DirtyBitmap)
+            .ok();
 
         // 安全检查: inline_data 不应超过 8KB (Placement::Inline 的硬上限)
         if let Some(d) = &inline_data {
@@ -3666,6 +3855,7 @@ impl FilerNetHandler {
                 chunks,
                 inline_data.clone(),
                 is_append,
+                inline_dirty_mask,
             )
             .await
         {
@@ -3729,6 +3919,17 @@ impl FilerNetHandler {
                 warn!("FILER_NET_UPDATE_SIZE_CHUNKS failed: {}", e);
                 if e.contains("not_leader") || e.contains("redirect") {
                     Ok(self.build_err_redirect_or_server(msg, shard_id, &e).await)
+                } else if e.contains("stale_epoch") {
+                    // MC-108 Task 4: commit raced an open migration window. The
+                    // client must re-fetch the Flat/Stripe layout and retry
+                    // there rather than overwrite the Migrating inline state.
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, &e);
+                    Ok(Self::build_response(
+                        msg,
+                        powerfs_net::STATUS_ERR_STALE_EPOCH,
+                        enc.into_bytes(),
+                    ))
                 } else if e.contains("stale_layout") {
                     // STALE_INLINE_REJECT: client submitted inline_data for an
                     // inode already migrated to Flat/Stripe. Return distinct
@@ -3830,30 +4031,90 @@ impl FilerNetHandler {
         }
     }
 
-    /// P2.5c: handle_migrate_inline_alloc — Inline → Flat 迁移分配.
+    /// MC-108 Task 4: encode a migrate-allocation response.
     ///
-    /// 客户端 write 累计超 max_size×1.5 时调用. Filer 仅分配 (volume_id,
-    /// needle_id), **不修改 inode 元数据** (保留 inline_data 用于 crash
-    /// safety). 客户端拿到分配后把数据放入 chunk_cache, close 时 flush +
-    /// sync_size_chunks_on_close 原子完成切换 (inline_data=None + Flat chunks).
+    /// `committed=true` means the Filer already materialized the inline
+    /// snapshot into `pairs[0]` and committed the Flat/Stripe layout, so the
+    /// client must NOT write the needle itself (it only adopts the layout and
+    /// turns its migrated pages clean). `committed=false` is the legacy first
+    /// allocation (Empty-state file): the client writes the needle as usual.
+    fn build_migrate_alloc_response(
+        &self,
+        msg: &NetMessage,
+        is_stripe: bool,
+        pairs: &[(u64, u64)],
+        stripe_size: u64,
+        committed: bool,
+        epoch: u64,
+    ) -> NetResult<NetMessage> {
+        let mut enc = TlvEncoder::new();
+        if is_stripe {
+            enc.add_u32(FieldId::StripeCount, pairs.len() as u32);
+            enc.add_u64(FieldId::StripeSize, stripe_size);
+            for (vid, nid) in pairs {
+                enc.add_u64(FieldId::VolumeId, *vid);
+                enc.add_u64(FieldId::FileKey, *nid);
+            }
+        } else {
+            let (vid, nid) = pairs.first().copied().unwrap_or((0, 0));
+            enc.add_u64(FieldId::VolumeId, vid);
+            enc.add_u64(FieldId::FileKey, nid);
+        }
+        enc.add_u64(FieldId::MigrateEpoch, epoch);
+        enc.add_u8(FieldId::MigrateCommitted, u8::from(committed));
+        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+    }
+
+    /// MC-108 Task 4: migrate-inline-alloc state machine.
     ///
-    /// crash safety: 若客户端在分配后崩溃, Filer 仍有 inline_data, 文件仍可
-    /// 作为 Inline 读; 分配的 needle_id 泄漏 (可接受, 同 CREATE 失败).
+    /// Two distinct cases:
     ///
-    /// TLV 编码: Request = ShardId + Ino
-    ///           Response = VolumeId + FileKey(needle_id) / Name=error
+    /// 1. **First allocation** (Empty/predicted file, no authoritative inline
+    ///    snapshot): quiesce all holders to prove nobody holds dirty inline
+    ///    data, allocate the destination, and return it with
+    ///    `MigrateCommitted=0`. The client writes the needle itself; no
+    ///    Migrating state is entered (nothing to move).
+    ///
+    /// 2. **Real Inline→Flat/Stripe migration** (authoritative `inline_data`
+    ///    present): serialize per inode, quiesce every holder except the
+    ///    initiator, propose `BeginMigration` (which merges ONLY the
+    ///    initiator's dirty 4 KiB blocks and opens the durable epoch fence),
+    ///    materialize the authoritative snapshot into the destination needle
+    ///    with the Filer's internal credentials, then propose
+    ///    `CommitMigration`. Returns the layout with `MigrateCommitted=1` and
+    ///    the epoch; the client adopts Flat/Stripe without writing a needle.
+    ///
+    /// Re-entrant: a half-open `Migrating` state (Filer/leader crashed after
+    /// Begin) is detected under the lock and resumed from the retained
+    /// snapshot + persisted allocs, never re-allocated.
     async fn handle_migrate_inline_alloc(&self, msg: &NetMessage) -> NetResult<NetMessage> {
         let mut dec = TlvDecoder::new(&msg.body);
         let _shard_id_raw = dec.next_u64(FieldId::ShardId).unwrap_or(0);
         let inode = dec.next_u64(FieldId::Ino).unwrap_or(0);
-        // Desired allocation mode: 0 = Flat (default, legacy), 1 = Stripe.
-        // Sent by clients that detected binary content on the first write of
-        // an Empty-state file (no filename-based prediction matched).
+        // Desired allocation mode: 0 = Flat (default), 1 = Stripe.
         let desired_stripe = dec.next_u8(FieldId::DesiredMode).unwrap_or(0) == 1;
+        // MC-108 Task 4: initiator identity + dirty snapshot. Legacy FUSE
+        // clients send neither; then the initiator is also quiesced and only
+        // the authoritative post-flush snapshot is used.
+        let initiator = dec.next_string(FieldId::ClientId).unwrap_or_default();
+        let initiator_snapshot: Option<Vec<u8>> = dec.next_bytes(FieldId::InlineData).ok();
+        let dirty_bitmap = dec.next_u32(FieldId::DirtyBitmap).unwrap_or(0);
+        let initiator_size = dec.next_u64(FieldId::Size).unwrap_or(0);
 
         info!(
-            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id(raw)={}, inode={}, desired_stripe={}",
-            _shard_id_raw, inode, desired_stripe
+            "FILER_NET_MIGRATE_INLINE_ALLOC: shard_id(raw)={}, inode={}, desired_stripe={}, \
+             initiator={:?}, snap={}, bitmap={:#x}, isize={}",
+            _shard_id_raw,
+            inode,
+            desired_stripe,
+            if initiator.is_empty() {
+                None
+            } else {
+                Some(initiator.as_str())
+            },
+            initiator_snapshot.as_ref().map(|s| s.len()).unwrap_or(0),
+            dirty_bitmap,
+            initiator_size
         );
 
         // inode-level write → route by calculate_shard(inode)
@@ -3862,116 +4123,65 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
-        // A6 FIX: 幂等化迁移分配。
-        // 如果 inode 已经有 chunks（已被另一客户端迁移过，且 release sync 成功写回），
-        // 或已经设置了 fid，则直接返回现有 (volume_id, needle_id)，绝不重新分配。
-        // 否则双客户端并发 migrate 会得到两套不同的 fid → 数据写到两个独立 Volume 文件，
-        // 后 sync 的那个覆盖前一个的 chunks 元数据 → 先写的客户端数据永久丢失。
+        // Fast idempotent path: already volume-backed with chunks. Return the
+        // existing allocation with MigrateCommitted=1 so a client that raced a
+        // completed migration adopts it without writing another needle.
         if let Some(info) = self.meta_shard_manager.get_inode(inode) {
-            // storage_mode is volume_backed (Flat/Stripe). If chunks/fid exist,
-            // this is an idempotent reuse (file already allocated). If not,
-            // this is the first allocation for a Flat/Stripe file (either
-            // predicted as Stripe at create, or Flat mode's first write).
-            if info.storage_mode.is_volume_backed() {
-                info!(
-                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} storage_mode={:?} — \
-                     volume-backed mode, checking for existing allocation",
-                    inode, info.storage_mode
-                );
-            }
-            // Case 1: chunks 非空 → 已完成一次迁移并 sync，复用现有 chunk 位置。
-            // Stripe 文件有多个 chunks, 需全部返回; Flat 文件仅首个。
             if !info.chunks.is_empty() {
                 let is_stripe = info.chunks.len() > 1
                     || matches!(info.storage_mode, powerfs_layout::StorageMode::Stripe);
                 if is_stripe {
+                    let pairs: Vec<(u64, u64)> = info
+                        .chunks
+                        .iter()
+                        .map(|c| (c.volume_id, c.needle_id))
+                        .collect();
                     info!(
-                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE (Stripe) — \
-                         returning {} chunks",
+                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE (Stripe {} chunks)",
                         inode,
-                        info.chunks.len()
+                        pairs.len()
                     );
-                    let mut enc = TlvEncoder::new();
-                    enc.add_u32(FieldId::StripeCount, info.chunks.len() as u32);
-                    enc.add_u64(
-                        FieldId::StripeSize,
+                    return self.build_migrate_alloc_response(
+                        msg,
+                        true,
+                        &pairs,
                         powerfs_layout::policy::PlacementPolicy::default().default_stripe_size,
+                        true,
+                        info.version,
                     );
-                    for c in &info.chunks {
-                        enc.add_u64(FieldId::VolumeId, c.volume_id);
-                        enc.add_u64(FieldId::FileKey, c.needle_id);
-                    }
-                    return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
                 }
                 let first = &info.chunks[0];
                 info!(
-                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE — \
-                     chunks already exist, returning volume_id={} needle_id={:#x} \
-                     (chunks={}, fid={:?})",
-                    inode,
-                    first.volume_id,
-                    first.needle_id,
-                    info.chunks.len(),
-                    info.fid
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE vid={} needle={:#x}",
+                    inode, first.volume_id, first.needle_id
                 );
-                let mut enc = TlvEncoder::new();
-                enc.add_u64(FieldId::VolumeId, first.volume_id);
-                enc.add_u64(FieldId::FileKey, first.needle_id);
-                return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
+                return self.build_migrate_alloc_response(
+                    msg,
+                    false,
+                    &[(first.volume_id, first.needle_id)],
+                    0,
+                    true,
+                    info.version,
+                );
             }
-            // Case 2: fid 已设置（但 chunks 还空，罕见边界） → 从 fid 解析
+            // fid set but chunks empty (rare boundary) → parse and reuse.
             if let Some(fid) = &info.fid {
                 let parts: Vec<&str> = fid.split(',').collect();
                 if parts.len() >= 3 {
                     if let (Ok(vid), Ok(nid)) = (parts[0].parse::<u64>(), parts[2].parse::<u64>()) {
-                        info!(
-                            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} IDEMPOTENT REUSE — \
-                             fid already set, returning volume_id={} needle_id={:#x}",
-                            inode, vid, nid
+                        return self.build_migrate_alloc_response(
+                            msg,
+                            false,
+                            &[(vid, nid)],
+                            0,
+                            true,
+                            info.version,
                         );
-                        let mut enc = TlvEncoder::new();
-                        enc.add_u64(FieldId::VolumeId, vid);
-                        enc.add_u64(FieldId::FileKey, nid);
-                        return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
                     }
                 }
             }
-            // Case 3: info.volume_id 存在但 fid 为空的极端边界
-            if let (Some(vid), true) = (info.volume_id, info.chunks.is_empty()) {
-                // volume_id 已知但 fid 字符串未设置，这种情况不应发生；
-                // 为安全起见仍分配新值（极端退化场景）
-                warn!(
-                    "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} has volume_id={} but no chunks/fid string — \
-                     falling back to fresh allocation", inode, vid
-                );
-            }
-            // 无 inline_data 且无 chunks/fid：通常是新建空文件，正常分配即可
-            if info.inline_data.is_none() && info.chunks.is_empty() && info.fid.is_none() {
-                if info.storage_mode.is_volume_backed() {
-                    // storage_mode=Flat/Stripe but no chunks/fid.
-                    // This is the NORMAL first-allocation path:
-                    //   - Flat mode: create sets Flat, first write allocates Volume
-                    //   - Stripe mode (layout prediction): create predicts Stripe,
-                    //     first write allocates Volume (no actual migration needed)
-                    // Only log at info level, not error.
-                    info!(
-                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} storage_mode={:?} — \
-                         first allocation (no inline_data, no chunks yet)",
-                        inode, info.storage_mode
-                    );
-                } else {
-                    warn!(
-                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode {} has no inline_data and no chunks — \
-                         may already be migrated or never written, allocating anyway",
-                        inode
-                    );
-                }
-            }
         } else {
-            warn!(
-                "FILER_NET_MIGRATE_INLINE_ALLOC: inode {} not found, returning error",
-                inode
-            );
+            warn!("FILER_NET_MIGRATE_INLINE_ALLOC: inode {} not found", inode);
             let mut enc = TlvEncoder::new();
             let _ = enc.add_string(FieldId::Name, &format!("inode {} not found", inode));
             return Ok(Self::build_response(
@@ -3981,110 +4191,366 @@ impl FilerNetHandler {
             ));
         }
 
-        // === Fresh allocation ===
-        // Branch on desired mode: Stripe (binary content detected by client)
-        // allocates N volumes; Flat (text or legacy) allocates a single volume.
-        if desired_stripe {
-            let policy = powerfs_layout::policy::PlacementPolicy::default();
-            let stripe_count = policy.default_stripe_count;
-            let stripe_size = policy.default_stripe_size;
-            let allocs = match self.alloc_for_stripe_file(stripe_count) {
-                Some(v) if !v.is_empty() => v,
-                _ => {
-                    warn!(
-                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} stripe allocation failed \
-                         (no zones/volumes), falling back to Flat",
-                        inode
-                    );
-                    // Fall back to Flat single-volume allocation
-                    return self.alloc_flat_and_respond(msg, inode, false);
-                }
+        // Serialize the migration critical section per inode so two
+        // concurrent migrators cannot open two windows / allocate two needles.
+        let mlock = self.migration_lock(inode).await;
+        let _guard = mlock.lock().await;
+
+        // Re-read authoritative state after acquiring the lock.
+        let mut info = match self.meta_shard_manager.get_inode(inode) {
+            Some(i) => i,
+            None => {
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_string(FieldId::Name, &format!("inode {} not found", inode));
+                return Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_NOT_FOUND,
+                    enc.into_bytes(),
+                ));
+            }
+        };
+        // Another request may have committed while we waited on the lock.
+        if !info.chunks.is_empty() {
+            let first = &info.chunks[0];
+            let is_stripe = info.chunks.len() > 1
+                || matches!(info.storage_mode, powerfs_layout::StorageMode::Stripe);
+            let pairs: Vec<(u64, u64)> = if is_stripe {
+                info.chunks
+                    .iter()
+                    .map(|c| (c.volume_id, c.needle_id))
+                    .collect()
+            } else {
+                vec![(first.volume_id, first.needle_id)]
             };
-            info!(
-                "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} FRESH Stripe allocation count={} size={} \
-                 (inode NOT modified, inline_data preserved for crash safety)",
-                inode,
-                allocs.len(),
-                stripe_size
+            return self.build_migrate_alloc_response(
+                msg,
+                is_stripe,
+                &pairs,
+                powerfs_layout::policy::PlacementPolicy::default().default_stripe_size,
+                true,
+                info.version,
             );
-
-            // Stats: Stripe migration from Empty/Inline counts as real migration.
-            if let Some(info) = self.meta_shard_manager.get_inode(inode) {
-                if info.storage_mode.is_volume_backed() {
-                    self.meta_shard_manager
-                        .layout_migration_stats()
-                        .record_first_alloc(true);
-                } else {
-                    self.meta_shard_manager
-                        .layout_migration_stats()
-                        .record_real_migration(true);
-                }
-            }
-
-            let mut enc = TlvEncoder::new();
-            enc.add_u32(FieldId::StripeCount, allocs.len() as u32);
-            enc.add_u64(FieldId::StripeSize, stripe_size);
-            for (vid, nid) in &allocs {
-                enc.add_u64(FieldId::VolumeId, *vid);
-                enc.add_u64(FieldId::FileKey, *nid);
-            }
-            return Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()));
         }
 
-        // Flat allocation (default / legacy / text content)
-        self.alloc_flat_and_respond(msg, inode, false)
-    }
+        // ===== Case 1: first allocation (nothing inline to move) =====
+        // Gated by a full quiesce: "no inline_data, allocating anyway" is
+        // allowed ONLY after every holder has been recalled/flushed, proving
+        // no client holds dirty inline data that would later be lost.
+        //
+        // MC-108 fix: the quiesce itself makes stale INLINE holders flush
+        // their dirty inline onto the server (UPDATE_SIZE_CHUNKS via the
+        // kernel wb worker during cap recall). Re-read after the quiesce:
+        // if inline content appeared, this is a real Inline→Flat migration
+        // and MUST fall through to Case 2 so the flushed content is
+        // materialized into the needle. First-alloc with the flushed
+        // content dropped would lose it permanently — the stale client's
+        // later inline commit is rejected by STALE_INLINE_REJECT (file
+        // already Flat), so the needle is the only chance to keep it.
+        if info.inline_data.is_none() {
+            self.quiesce_for_migration(inode, None).await;
+            info = match self.meta_shard_manager.get_inode(inode) {
+                Some(i) => i,
+                None => {
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, &format!("inode {} not found", inode));
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_NOT_FOUND,
+                        enc.into_bytes(),
+                    ));
+                }
+            };
+        }
+        if info.inline_data.is_none() {
+            if desired_stripe {
+                let policy = powerfs_layout::policy::PlacementPolicy::default();
+                match self.alloc_for_stripe_file(policy.default_stripe_count) {
+                    Some(allocs) if !allocs.is_empty() => {
+                        self.meta_shard_manager
+                            .layout_migration_stats()
+                            .record_first_alloc(true);
+                        return self.build_migrate_alloc_response(
+                            msg,
+                            true,
+                            &allocs,
+                            policy.default_stripe_size,
+                            false,
+                            0,
+                        );
+                    }
+                    _ => {
+                        // fall through to Flat below
+                    }
+                }
+            }
+            let (vid, nid) = match self.alloc_for_new_file() {
+                Some(v) => v,
+                None => {
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(FieldId::Name, "zone not registered");
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        enc.into_bytes(),
+                    ));
+                }
+            };
+            self.meta_shard_manager
+                .layout_migration_stats()
+                .record_first_alloc(false);
+            return self.build_migrate_alloc_response(msg, false, &[(vid, nid)], 0, false, 0);
+        }
 
-    /// Allocate a single (volume_id, needle_id) for Flat-mode migration and
-    /// build the response. Shared by the Flat path and the Stripe fallback.
-    fn alloc_flat_and_respond(
-        &self,
-        msg: &NetMessage,
-        inode: u64,
-        _is_stripe_fallback: bool,
-    ) -> NetResult<NetMessage> {
-        let (volume_id, needle_id) = match self.alloc_for_new_file() {
-            Some(v) => v,
-            None => {
-                warn!("FILER_NET_MIGRATE_INLINE_ALLOC: zone not registered, cannot allocate");
+        // ===== Case 2: real Inline→Flat/Stripe migration =====
+        // The initiator is excluded from recall only when it identified itself
+        // AND shipped a dirty snapshot; its marked blocks are merged in Begin.
+        let exclude: Option<&str> = if !initiator.is_empty() && initiator_snapshot.is_some() {
+            Some(initiator.as_str())
+        } else {
+            None
+        };
+
+        // Either resume a half-open window (crash recovery) or open a new one.
+        let (epoch, target_mode, allocs, stripe_size): (u64, u8, Vec<(u64, u64)>, u64) =
+            match &info.migration {
+                Some(m) => {
+                    info!(
+                        "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} RESUME window epoch={} target={}",
+                        inode, m.epoch, m.target_mode
+                    );
+                    (m.epoch, m.target_mode, m.allocs.clone(), m.stripe_size)
+                }
+                None => {
+                    // 1) Quiesce all other holders (their inline commits must
+                    //    land in Raft before Begin).
+                    self.quiesce_for_migration(inode, exclude).await;
+
+                    // 2) Allocate the pinned destination (Flat or Stripe).
+                    let (target_mode, allocs, stripe_size) = if desired_stripe {
+                        let policy = powerfs_layout::policy::PlacementPolicy::default();
+                        match self.alloc_for_stripe_file(policy.default_stripe_count) {
+                            Some(v) if !v.is_empty() => (
+                                crate::shard_store::ShardStore::MIGRATE_TARGET_STRIPE,
+                                v,
+                                policy.default_stripe_size,
+                            ),
+                            _ => match self.alloc_for_new_file() {
+                                Some(v) => (
+                                    crate::shard_store::ShardStore::MIGRATE_TARGET_FLAT,
+                                    vec![v],
+                                    0,
+                                ),
+                                None => {
+                                    let mut enc = TlvEncoder::new();
+                                    let _ = enc.add_string(FieldId::Name, "zone not registered");
+                                    return Ok(Self::build_response(
+                                        msg,
+                                        STATUS_ERR_SERVER_ERROR,
+                                        enc.into_bytes(),
+                                    ));
+                                }
+                            },
+                        }
+                    } else {
+                        match self.alloc_for_new_file() {
+                            Some(v) => (
+                                crate::shard_store::ShardStore::MIGRATE_TARGET_FLAT,
+                                vec![v],
+                                0,
+                            ),
+                            None => {
+                                let mut enc = TlvEncoder::new();
+                                let _ = enc.add_string(FieldId::Name, "zone not registered");
+                                return Ok(Self::build_response(
+                                    msg,
+                                    STATUS_ERR_SERVER_ERROR,
+                                    enc.into_bytes(),
+                                ));
+                            }
+                        }
+                    };
+
+                    // 3) Monotonic epoch derived from current version.
+                    let epoch = self
+                        .meta_shard_manager
+                        .get_inode(inode)
+                        .map(|i| i.version.wrapping_add(1).max(1))
+                        .unwrap_or(1);
+
+                    // 4) Extract the initiator's marked 4 KiB dirty blocks.
+                    let mut blocks: Vec<(u32, Vec<u8>)> = Vec::new();
+                    if let Some(snap) = initiator_snapshot.as_ref() {
+                        for b in 0..32u32 {
+                            if dirty_bitmap & (1u32 << b) == 0 {
+                                continue;
+                            }
+                            let start = b as usize * 4096;
+                            if start >= snap.len() {
+                                continue;
+                            }
+                            let end = (start + 4096).min(snap.len());
+                            blocks.push((b, snap[start..end].to_vec()));
+                        }
+                    }
+                    let isize = if initiator_size > 0 {
+                        initiator_size
+                    } else {
+                        initiator_snapshot
+                            .as_ref()
+                            .map(|s| s.len() as u64)
+                            .unwrap_or(0)
+                    };
+
+                    // 5) Open the durable window (merge + epoch fence).
+                    match self
+                        .meta_shard_manager
+                        .begin_migration(
+                            shard_id,
+                            inode,
+                            epoch,
+                            target_mode,
+                            allocs.clone(),
+                            stripe_size,
+                            isize,
+                            blocks,
+                        )
+                        .await
+                    {
+                        Ok(Some(ep)) => (ep, target_mode, allocs, stripe_size),
+                        Ok(None) => {
+                            // A concurrent migration committed first — return
+                            // that layout idempotently.
+                            let cur = self.meta_shard_manager.get_inode(inode);
+                            if let Some(cur) = cur {
+                                if !cur.chunks.is_empty() {
+                                    let first = &cur.chunks[0];
+                                    return self.build_migrate_alloc_response(
+                                        msg,
+                                        false,
+                                        &[(first.volume_id, first.needle_id)],
+                                        0,
+                                        true,
+                                        cur.version,
+                                    );
+                                }
+                            }
+                            let mut enc = TlvEncoder::new();
+                            let _ = enc.add_string(FieldId::Name, "concurrent migration");
+                            return Ok(Self::build_response(
+                                msg,
+                                powerfs_net::STATUS_ERR_STALE_EPOCH,
+                                enc.into_bytes(),
+                            ));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "FILER_NET_MIGRATE_INLINE_ALLOC: BeginMigration failed: {}",
+                                e
+                            );
+                            let status = if e.contains("stale_epoch") {
+                                powerfs_net::STATUS_ERR_STALE_EPOCH
+                            } else {
+                                STATUS_ERR_SERVER_ERROR
+                            };
+                            let mut enc = TlvEncoder::new();
+                            let _ = enc.add_string(FieldId::Name, &e);
+                            return Ok(Self::build_response(msg, status, enc.into_bytes()));
+                        }
+                    }
+                }
+            };
+
+        // 3) Materialize the authoritative (post-merge) snapshot into the
+        //    destination needle using Filer-internal credentials.
+        let snapshot = self
+            .meta_shard_manager
+            .get_inode(inode)
+            .and_then(|i| i.inline_data)
+            .unwrap_or_default();
+        let (vid, nid) = allocs.first().copied().unwrap_or((0, 0));
+        if !snapshot.is_empty() {
+            let vc = match self.volume_client.as_ref() {
+                Some(v) => v.clone(),
+                None => {
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(
+                        FieldId::Name,
+                        "filer volume client unavailable for migration materialize",
+                    );
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        enc.into_bytes(),
+                    ));
+                }
+            };
+            let addr = match self.volume_addr_for(vid) {
+                Some(a) => a,
+                None => {
+                    let mut enc = TlvEncoder::new();
+                    let _ = enc.add_string(
+                        FieldId::Name,
+                        &format!("no volume server addr for volume_id={}", vid),
+                    );
+                    return Ok(Self::build_response(
+                        msg,
+                        STATUS_ERR_SERVER_ERROR,
+                        enc.into_bytes(),
+                    ));
+                }
+            };
+            if let Err(e) = vc.write_needle(&addr, vid, nid, &snapshot).await {
+                // Window stays open; a later request (or a restart) resumes.
+                warn!(
+                    "FILER_NET_MIGRATE_INLINE_ALLOC: materialize needle failed inode={} epoch={}: {}",
+                    inode, epoch, e
+                );
                 let mut enc = TlvEncoder::new();
-                let _ = enc.add_string(FieldId::Name, "zone not registered");
+                let _ = enc.add_string(FieldId::Name, &e);
                 return Ok(Self::build_response(
                     msg,
                     STATUS_ERR_SERVER_ERROR,
                     enc.into_bytes(),
                 ));
             }
-        };
-
-        info!(
-            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} FRESH allocation volume_id={}, needle_id={:#x} \
-             (inode NOT modified, inline_data preserved for crash safety)",
-            inode, volume_id, needle_id
-        );
-
-        // Record layout migration statistics.
-        // Distinguish real migrations (storage_mode was Inline/Empty → layout changed)
-        // from first allocations (storage_mode was already Flat/Stripe, predicted at create).
-        if let Some(info) = self.meta_shard_manager.get_inode(inode) {
-            let is_stripe = matches!(info.storage_mode, powerfs_layout::StorageMode::Stripe);
-            if info.storage_mode.is_volume_backed() {
-                // Flat/Stripe predicted at create — first Volume allocation, not a migration
-                self.meta_shard_manager
-                    .layout_migration_stats()
-                    .record_first_alloc(is_stripe);
-            } else {
-                // Inline/Empty → Flat/Stripe — real layout migration
-                self.meta_shard_manager
-                    .layout_migration_stats()
-                    .record_real_migration(is_stripe);
-            }
         }
 
-        let mut enc = TlvEncoder::new();
-        enc.add_u64(FieldId::VolumeId, volume_id);
-        enc.add_u64(FieldId::FileKey, needle_id);
-        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+        // 4) Atomic switch to Flat/Stripe via Raft.
+        if let Err(e) = self
+            .meta_shard_manager
+            .commit_migration(shard_id, inode, epoch)
+            .await
+        {
+            warn!(
+                "FILER_NET_MIGRATE_INLINE_ALLOC: CommitMigration failed: {}",
+                e
+            );
+            let status = if e.contains("stale_epoch") {
+                powerfs_net::STATUS_ERR_STALE_EPOCH
+            } else {
+                STATUS_ERR_SERVER_ERROR
+            };
+            let mut enc = TlvEncoder::new();
+            let _ = enc.add_string(FieldId::Name, &e);
+            return Ok(Self::build_response(msg, status, enc.into_bytes()));
+        }
+
+        self.meta_shard_manager
+            .layout_migration_stats()
+            .record_real_migration(
+                target_mode == crate::shard_store::ShardStore::MIGRATE_TARGET_STRIPE,
+            );
+
+        let is_stripe = target_mode == crate::shard_store::ShardStore::MIGRATE_TARGET_STRIPE;
+        info!(
+            "FILER_NET_MIGRATE_INLINE_ALLOC: inode={} COMMITTED epoch={} stripe={} allocs={} snap={}",
+            inode,
+            epoch,
+            is_stripe,
+            allocs.len(),
+            snapshot.len()
+        );
+        self.build_migrate_alloc_response(msg, is_stripe, &allocs, stripe_size, true, epoch)
     }
 
     /// P3: Handle SetXattr request — persist an extended attribute on an inode via Raft.
@@ -5015,6 +5481,18 @@ impl FilerNetHandler {
             return Ok(redirect);
         }
 
+        // MC-108 Task 5: Migrating 窗口拒授新写 cap. 窗口内 open 拿到的
+        // INLINE 布局注定撞迁移栅栏（stale_epoch 拒绝 external commit）。
+        // 响应携带 MigrateInProgress=1 + granted=NONE，内核有界重试至窗口
+        // 关闭（≈2s 后 -EAGAIN）。不能用服务端错误码：内核对 cap RPC 失败
+        // 一律降级 SHARED_WRITE 不重试（审计确认）。
+        let mut migrating = false;
+        if is_write_open {
+            if let Some(info) = self.meta_shard_manager.get_inode(inode) {
+                migrating = info.migration.is_some();
+            }
+        }
+
         // Stage 4: 填充双向 client_id 映射 (string ↔ u64).
         // net 层用 u64 连接 ID (ctx.client.client_id), cap manager 用
         // string client_id (消息 body). recall/upgrade push 需 string→u64,
@@ -5039,24 +5517,41 @@ impl FilerNetHandler {
 
         // **open_grant always succeeds** — this is the core Cap model
         // invariant. No blocking, no EAGAIN, no queueing.
-        let result = self.cap_mgr.open_grant(inode, &client_id, is_write_open);
+        // MC-108 Task 5 例外: Migrating 窗口内写打开不授予 caps（内核凭
+        // MigrateInProgress 标志重试），且跳过 recall 派发（窗口关闭后由
+        // 重试的 grant 正常走 arbiter）。
+        let result = if migrating {
+            // 窗口内不授 cap、不派 recall —— 内核凭 MigrateInProgress 重试
+            crate::cap_manager::OpenGrantResult {
+                granted_caps: CapSet::NONE,
+                token: String::new(),
+                epoch: 0,
+                duration_ms: 0,
+                sn: 0,
+                recall_tasks: Vec::new(),
+            }
+        } else {
+            self.cap_mgr.open_grant(inode, &client_id, is_write_open)
+        };
 
         // Dispatch recall tasks asynchronously (fire-and-forget). The
         // revoker pushes CapRecallNotify to the recalled holders; open
         // returns immediately without waiting for ACK.
-        for task in &result.recall_tasks {
-            if let Err(e) = self.cap_mgr.recall_holder(
-                inode,
-                &task.holder,
-                &task.token,
-                task.caps_to_recall,
-                task.retained_caps,
-                task.new_epoch,
-            ) {
-                warn!(
-                    "CAP_OPEN_GRANT: recall push failed for holder={} inode={}: {}",
-                    task.holder, inode, e
-                );
+        if !migrating {
+            for task in &result.recall_tasks {
+                if let Err(e) = self.cap_mgr.recall_holder(
+                    inode,
+                    &task.holder,
+                    &task.token,
+                    task.caps_to_recall,
+                    task.retained_caps,
+                    task.new_epoch,
+                ) {
+                    warn!(
+                        "CAP_OPEN_GRANT: recall push failed for holder={} inode={}: {}",
+                        task.holder, inode, e
+                    );
+                }
             }
         }
 
@@ -5067,19 +5562,15 @@ impl FilerNetHandler {
         let _ = enc.add_u64(FieldId::CapEpoch, result.epoch);
         let _ = enc.add_u64(FieldId::CapSn, result.sn);
         let _ = enc.add_u64(FieldId::LeaseDuration, result.duration_ms);
-
+        if migrating {
+            let _ = enc.add_u8(FieldId::MigrateInProgress, 1);
+        }
+        let resp_bytes = enc.into_bytes();
         info!(
-            "CAP_OPEN_GRANT: inode={} client={} write_open={} caps={:?} epoch={} sn={} recalls={}",
-            inode,
-            client_id,
-            is_write_open,
-            result.granted_caps,
-            result.epoch,
-            result.sn,
-            result.recall_tasks.len()
+            "CAP_OPEN_GRANT: inode={} client={} migrating={}",
+            inode, client_id, migrating
         );
-
-        Ok(Self::build_response(msg, STATUS_OK, enc.into_bytes()))
+        Ok(Self::build_response(msg, STATUS_OK, resp_bytes))
     }
 
     /// P0-1: Handle CapAcquire (incremental cap upgrade request).

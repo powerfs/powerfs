@@ -695,6 +695,11 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             // 2s later force-reclaim timeout. MUST chain AFTER
             // with_client_health so cloned cap_mgr keeps penalty.
             let base = base.with_server_connection(net_manager.clone());
+            // MC-108 Task 4: Filer materializes the inline migration
+            // snapshot into the destination needle during the Migrating
+            // window using internal credentials (clients no longer write the
+            // migration needle themselves).
+            let base = base.with_volume_client(volume_client_pool.clone());
             if let Some(shard0_store) = meta_shard_manager.try_get_shard_store(ShardId(0)) {
                 let persistence = powerfs_filer::RaftLeasePersistence::new(
                     raft_group_manager.clone(),

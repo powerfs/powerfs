@@ -175,6 +175,16 @@ pub enum ShardCommand {
         inline_data: Option<Vec<u8>>,
         #[serde(default)]
         is_append: bool,
+        /// MC-108 Task 5: dirty 4K-block bitmap accompanying inline_data
+        /// (bit i set ⇒ i-th 4 KiB block holds the client's own dirty bytes).
+        /// Some(mask) ⇒ the Filer merges only the marked blocks into its
+        /// authoritative inline snapshot (disjoint regions from concurrent
+        /// writers survive; overlapping blocks resolve last-wins by Raft
+        /// apply order) and keeps size monotonic via max(). None ⇒ legacy
+        /// full-buffer replace (powerfs-fuse clients). Inline ≤ 8 KiB ⇒
+        /// only bits 0..1 are meaningful.
+        #[serde(default)]
+        inline_dirty_mask: Option<u32>,
     },
     /// P3: Set an extended attribute on an inode (persisted via Raft).
     /// Used for `powerfs.placement` xattr on directories.
@@ -203,6 +213,42 @@ pub enum ShardCommand {
         reliability: powerfs_layout::reliability::Reliability,
         reliability_state: powerfs_layout::reliability::ReliabilityState,
         ec_chunks: Vec<crate::shard_store::StoredFileChunk>,
+    },
+
+    /// MC-108 Task 4: open the Inline→Flat/Stripe migration window.
+    ///
+    /// Proposed by the leader *after* cap quiesce has flushed every other
+    /// inline holder, so the Raft log ordering guarantees their inline
+    /// commits are applied first. Apply then (1) block-merges ONLY the
+    /// initiator's dirty 4 KiB blocks (`initiator_blocks`) into the retained
+    /// `inline_data` (unmarked regions are never zeroed), and (2) persists
+    /// `MigrationState { epoch, allocs, .. }` while keeping `storage_mode` =
+    /// Inline and retaining `inline_data` as the materialization source.
+    /// Idempotent on `(inode, epoch)`.
+    BeginMigration {
+        inode: u64,
+        epoch: u64,
+        /// 1 = Flat, 2 = Stripe.
+        target_mode: u8,
+        allocs: Vec<(u64, u64)>,
+        stripe_size: u64,
+        /// Initiator's authoritative file size (i_size); merged size =
+        /// max(existing size, block end, this).
+        initiator_size: u64,
+        /// `(block_index, 4096 bytes)` — only these blocks overwrite the
+        /// Filer snapshot. Disjoint-region safe.
+        initiator_blocks: Vec<(u32, Vec<u8>)>,
+    },
+    /// MC-108 Task 4: close the migration window. Apply verifies the inode is
+    /// Migrating with the matching `epoch`, installs the chunks built from
+    /// the persisted allocs + retained snapshot length, sets storage_mode to
+    /// the Flat/Stripe target, clears `inline_data` and `migration`. The
+    /// needle itself is materialized by the leader (from the retained
+    /// snapshot via the internal volume client) BEFORE this is proposed, so
+    /// on commit the data is already durable. Re-entrant after a crash.
+    CommitMigration {
+        inode: u64,
+        epoch: u64,
     },
 
     // ----- Decomposed inode + dir-entry commands (P? inode-sharding fix) -----
@@ -234,6 +280,26 @@ pub enum ShardCommand {
         parent_inode: u64,
         name: String,
         inode: u64,
+    },
+    /// Atomically create a regular file: write BOTH the inode record
+    /// (`CF_INODES`) and the parent dir entry (`CF_DIR_ENTRIES`) in one
+    /// Raft-applied command on the parent shard. Regular-file inodes are
+    /// allocated from the parent shard's inode range, so both column
+    /// families are owned by the same store and the apply thread can
+    /// resolve `(parent,name)` uniqueness atomically (MC-108: previously
+    /// `CreateInode`+`AddDirEntry` from two clients could both link, and
+    /// the unconditional dentry put orphaned the loser's inode+data).
+    ///
+    /// Apply semantics (the uniqueness authority):
+    /// - name absent  → write inode record + dir entry → Created
+    /// - name present, `exclusive=false` → no overwrite; Existing(winner)
+    /// - name present, `exclusive=true`  → AlreadyExists(winner)
+    /// - name present with a different file type → AlreadyExists(winner)
+    ///   (handler maps to EEXIST/EISDIR); the loser inode is NEVER written.
+    CreateFileAtomic {
+        info: Box<crate::shard_store::InodeInfo>,
+        #[serde(default)]
+        exclusive: bool,
     },
     /// Remove the inode record from `CF_INODES` on `calculate_shard(inode)`.
     /// Pairs with `RemoveDirEntry`. Order on delete: `RemoveDirEntry` first
