@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
-use crate::meta_shard_manager::MetaShardManager;
+use crate::meta_shard_manager::{InodeSizeChunksUpdate, MetaShardManager};
 use crate::raft_group_manager_v2::ShardId;
 use crate::shard_strategy::ShardStrategy;
 
@@ -680,8 +680,16 @@ impl FilerMetaService for FilerMetaServiceImpl {
         match self
             .meta_shard_manager
             .update_inode_size_chunks_atomic(
-                shard_id, req.inode, req.size, chunks, None, false,
-                None, /* inline_dirty_mask: gRPC 管理面无 inline 提交 */
+                shard_id,
+                req.inode,
+                InodeSizeChunksUpdate {
+                    size: req.size,
+                    chunks,
+                    inline_data: None,
+                    is_append: false,
+                    /* gRPC 管理面无 inline 提交 */
+                    inline_dirty_mask: None,
+                },
             )
             .await
         {

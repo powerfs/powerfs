@@ -8,7 +8,9 @@ use crate::cap_manager::{CapManager, CapRevoker, CapSet, RecallTimeoutPenalty};
 use crate::inode_lease_manager::InodeLeaseManager;
 use crate::inode_notifier::InodeNotifier;
 use crate::lock_arbiter::LockType;
-use crate::meta_shard_manager::{AtomicCreateResult, MetaShardManager, POSIX_ROOT_INODE};
+use crate::meta_shard_manager::{
+    AtomicCreateResult, InodeSizeChunksUpdate, MetaShardManager, POSIX_ROOT_INODE,
+};
 use crate::raft_group_manager_v2::ShardId;
 use crate::shard_store::{FileType, InodeInfo};
 use crate::shard_strategy::ShardStrategy;
@@ -3851,11 +3853,13 @@ impl FilerNetHandler {
             .update_inode_size_chunks_atomic(
                 shard_id,
                 inode,
-                size,
-                chunks,
-                inline_data.clone(),
-                is_append,
-                inline_dirty_mask,
+                InodeSizeChunksUpdate {
+                    size,
+                    chunks,
+                    inline_data: inline_data.clone(),
+                    is_append,
+                    inline_dirty_mask,
+                },
             )
             .await
         {
