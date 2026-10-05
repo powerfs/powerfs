@@ -19,6 +19,24 @@ use crate::volume_router::VolumeRouter;
 // POSIX 根 inode (固定为 1，inode 0 保留给虚拟根)
 pub const POSIX_ROOT_INODE: u64 = 1;
 
+/// Payload of an inode size/chunks/inline commit.
+///
+/// Grouped into one struct to keep
+/// [`MetaShardManager::update_inode_size_chunks_atomic`] under
+/// clippy's argument-count limit and to make the Raft-command boundary
+/// explicit: shard/inode identify the target, this type carries the
+/// data. `inline_dirty_mask` is the MC-108 Task 5 4K dirty-block bitmap
+/// (None = legacy whole-buffer replace, used by the FUSE/management
+/// paths; Some = block-wise range merge at apply time).
+#[derive(Debug, Clone)]
+pub struct InodeSizeChunksUpdate {
+    pub size: u64,
+    pub chunks: Vec<StoredFileChunk>,
+    pub inline_data: Option<Vec<u8>>,
+    pub is_append: bool,
+    pub inline_dirty_mask: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 struct LeaseInfo {
     inode: u64,
@@ -4830,12 +4848,15 @@ impl MetaShardManager {
         &self,
         shard_id: ShardId,
         inode: u64,
-        size: u64,
-        chunks: Vec<crate::shard_store::StoredFileChunk>,
-        inline_data: Option<Vec<u8>>,
-        is_append: bool,
-        inline_dirty_mask: Option<u32>,
+        update: InodeSizeChunksUpdate,
     ) -> Result<(), String> {
+        let InodeSizeChunksUpdate {
+            size,
+            chunks,
+            inline_data,
+            is_append,
+            inline_dirty_mask,
+        } = update;
         let target_chunk_count = chunks.len();
 
         // MC-108 Task 4 migration fence (pre-propose): reject any external

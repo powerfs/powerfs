@@ -105,7 +105,13 @@ jobs:
 
           # This workflow only needs the 'kernel' submodule (rfs_tester and
           # s3-tests belong to other test suites). Local submodule gitdir first
-          # (hardlinks), https with retries as fallback.
+          # (hardlinks); network fallback tries the PRIVATE kernel repo by
+          # exact gitlink SHA, then the public URL from .gitmodules (which
+          # only carries released refs). The parent repo is private, so
+          # development gitlinks (feature-branch submodule commits) exist in
+          # powerfs-kernel-private first and are not on the public repo —
+          # fetching the .gitmodules URL alone fails with "upload-pack: not
+          # our ref" until the kernel commit is released.
           KERNEL_SHA=$(git ls-tree HEAD kernel | awk '{print $3}')
           if [ -d "$LOCAL_KERNEL_GITDIR" ] \
              && git -C "$LOCAL_KERNEL_GITDIR" cat-file -e "${KERNEL_SHA}^{commit}" 2>/dev/null; then
@@ -117,13 +123,26 @@ jobs:
             git -c protocol.file.allow=always submodule update --init --force kernel
           else
             echo "=== Local kernel submodule missing ${KERNEL_SHA:0:7} — network with retries ==="
-            for attempt in 1 2 3 4 5; do
-              if git submodule update --init --depth 1 --force kernel; then SUB_OK=1; break; fi
-              wait_s=$((attempt * 15))
-              echo "submodule update attempt ${attempt}/5 failed; retrying in ${wait_s}s..."
-              sleep $wait_s
+            PRIVATE_KERNEL_URL="git@github.com:powerfs/powerfs-kernel-private.git"
+            PUBLIC_KERNEL_URL="https://github.com/powerfs/powerfs-kernel.git"
+            SUB_OK=0
+            for KERNEL_URL in "$PRIVATE_KERNEL_URL" "$PUBLIC_KERNEL_URL"; do
+              echo "--- kernel submodule source: $KERNEL_URL ---"
+              git config submodule.kernel.url "$KERNEL_URL"
+              # No --depth: the gitlink SHA is usually a feature-branch tip,
+              # not the remote HEAD; a full fetch is more reliable than
+              # shallow-by-SHA (objects are largely cached on this runner).
+              for attempt in 1 2 3; do
+                if git submodule update --init --force kernel; then
+                  SUB_OK=1
+                  break 2
+                fi
+                wait_s=$((attempt * 15))
+                echo "submodule update from $KERNEL_URL attempt ${attempt}/3 failed; retrying in ${wait_s}s..."
+                sleep $wait_s
+              done
             done
-            [ "${SUB_OK:-0}" = "1" ] || { echo "::error::kernel submodule update failed after 5 attempts"; exit 1; }
+            [ "${SUB_OK:-0}" = "1" ] || { echo "::error::kernel submodule update failed after private+public attempts"; exit 1; }
           fi
           echo "Checked out: $(git log --oneline -1) | kernel: $(git -C kernel log --oneline -1)"
 

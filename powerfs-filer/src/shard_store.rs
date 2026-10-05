@@ -5678,7 +5678,7 @@ mod tests {
     fn test_mc108_t5_merge_pure_fn_edges() {
         // 1) 服务端空 + 客户端只写块1: 块0 零洞
         let mut client = vec![0u8; 4096];
-        client.extend_from_slice(&vec![0xDDu8; 100]);
+        client.extend_from_slice(&[0xDDu8; 100]);
         let (merged, size) = ShardStore::merge_inline_dirty_blocks(None, 0, &client, 4196, 0b10);
         assert_eq!(size, 4196);
         assert_eq!(merged.len(), 4196);
@@ -5698,13 +5698,8 @@ mod tests {
         assert_eq!(&merged[4200..], &vec![0xEEu8; 8192 - 4200][..]);
 
         // 3) size 单调: existing_size > client_size
-        let (_, size) = ShardStore::merge_inline_dirty_blocks(
-            Some(&vec![0u8; 100]),
-            500,
-            &vec![0u8; 50],
-            50,
-            0,
-        );
+        let (_, size) =
+            ShardStore::merge_inline_dirty_blocks(Some(&[0u8; 100]), 500, &[0u8; 50], 50, 0);
         assert_eq!(size, 500);
     }
 
