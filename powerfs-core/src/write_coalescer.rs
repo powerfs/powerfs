@@ -352,27 +352,77 @@ impl WriteCoalescer {
         inner.dirty_bytes_total
     }
 
+    /// MC-108 Task 8 (FR-9): remove and return the dirty entries of the
+    /// given ids, doing nothing else. The caller is responsible for
+    /// materialising them and — crucially — MUST call this while holding
+    /// the volume's per-needle lock, so that "remove from coalescer" and
+    /// "append to backend + publish in index" are one atomic step wrt
+    /// concurrent blob RMW / full writes. Entries not present are skipped.
+    pub(super) fn take_specific(&self, needle_ids: &[NeedleId]) -> Vec<(NeedleId, DirtyEntry)> {
+        let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
+        let mut out = Vec::new();
+        for k in needle_ids {
+            if let Some(v) = inner.entries.remove(k) {
+                inner.dirty_bytes_total = inner.dirty_bytes_total.saturating_sub(v.merged.len());
+                out.push((k.clone(), v));
+            }
+        }
+        out
+    }
+
+    /// MC-108 Task 8 (FR-9): snapshot ids whose deadline has elapsed
+    /// without removing them. The volume then locks each needle in turn
+    /// and re-checks via [`WriteCoalescer::take_specific`]; entries flushed
+    /// or invalidated in between simply yield nothing there.
+    pub(super) fn expired_ids(&self) -> Vec<NeedleId> {
+        let inner = self.inner.lock().expect("coalescer mutex poisoned");
+        let now = Instant::now();
+        inner
+            .entries
+            .iter()
+            .filter(|(_, e)| now >= e.flush_after)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// Snapshot all currently dirty ids without removing anything.
+    pub(super) fn dirty_ids(&self) -> Vec<NeedleId> {
+        let inner = self.inner.lock().expect("coalescer mutex poisoned");
+        inner.entries.keys().cloned().collect()
+    }
+
+    /// Remove and return every dirty entry (locked section only). Used by
+    /// shutdown flush and compaction; see [`WriteCoalescer::take_specific`]
+    /// for the locking contract.
+    pub(super) fn take_all(&self) -> Vec<(NeedleId, DirtyEntry)> {
+        let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
+        let taken = std::mem::take(&mut inner.entries);
+        inner.dirty_bytes_total = 0;
+        taken.into_iter().collect()
+    }
+
     /// Iterate every dirty entry, remove it, and run `op((id, merged,
     /// is_new_needle))` on it.  Returns the number of entries flushed.
     ///
     /// This is the only path that flushes entries without simultaneously
     /// replacing them with a newer partial write.  It is idempotent – once
     /// `flush_all` returns, `dirty_entry_count()` is 0.
+    ///
+    /// Note: entry removal and `op` are NOT atomic here (the coalescer
+    /// mutex is released before `op` runs). Callers that need the
+    /// remove→materialise sequence serialised per needle (the write path)
+    /// must use [`WriteCoalescer::take_all`] under their own per-needle
+    /// locks.
     pub fn flush_all<F: FnMut(NeedleId, Vec<u8>, bool) -> Result<(), ()>>(
         &self,
         mut op: F,
     ) -> usize {
-        // We take the whole map out under the lock, then release it before
-        // calling into user code – flush op can do heavy I/O and we do not
-        // want to hold the coalescer mutex while that happens.
-        let mut entries = {
-            let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
-            let taken = std::mem::take(&mut inner.entries);
-            inner.dirty_bytes_total = 0;
-            taken
+        let total = {
+            let inner = self.inner.lock().expect("coalescer mutex poisoned");
+            inner.entries.len()
         };
-        let total = entries.len();
-        for (id, entry) in entries.drain() {
+        let taken = self.take_all();
+        for (id, entry) in taken {
             let _ = op(id, entry.merged, entry.is_new_needle);
         }
         total
@@ -386,28 +436,18 @@ impl WriteCoalescer {
         &self,
         mut op: F,
     ) -> usize {
-        let now = Instant::now();
-        let expired: Vec<(NeedleId, DirtyEntry)> = {
-            let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
-            let ids: Vec<NeedleId> = inner
-                .entries
-                .iter()
-                .filter(|(_, e)| now >= e.flush_after)
-                .map(|(k, _)| k.clone())
-                .collect();
-            let mut out = Vec::with_capacity(ids.len());
-            for k in &ids {
-                if let Some(v) = inner.entries.remove(k) {
-                    inner.dirty_bytes_total =
-                        inner.dirty_bytes_total.saturating_sub(v.merged.len());
-                    out.push((k.clone(), v));
-                }
+        let mut ids = self.expired_ids();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.dedup();
+        let mut n = 0;
+        for id in ids {
+            // Re-take one id at a time under whatever per-needle lock the
+            // caller holds around this method (see Volume); an entry can
+            // disappear legitimately between snapshot and take.
+            for (id, e) in self.take_specific(&[id]) {
+                let _ = op(id, e.merged, e.is_new_needle);
+                n += 1;
             }
-            out
-        };
-        let n = expired.len();
-        for (id, e) in expired {
-            let _ = op(id, e.merged, e.is_new_needle);
         }
         n
     }
@@ -428,18 +468,7 @@ impl WriteCoalescer {
         needle_ids: &[NeedleId],
         mut op: F,
     ) -> usize {
-        let taken: Vec<(NeedleId, DirtyEntry)> = {
-            let mut inner = self.inner.lock().expect("coalescer mutex poisoned");
-            let mut out = Vec::new();
-            for k in needle_ids {
-                if let Some(v) = inner.entries.remove(k) {
-                    inner.dirty_bytes_total =
-                        inner.dirty_bytes_total.saturating_sub(v.merged.len());
-                    out.push((k.clone(), v));
-                }
-            }
-            out
-        };
+        let taken = self.take_specific(needle_ids);
         let n = taken.len();
         for (id, e) in taken {
             let _ = op(id, e.merged, e.is_new_needle);

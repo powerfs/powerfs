@@ -14,7 +14,66 @@ use powerfs_common::{
     },
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+
+/// Number of stripes in [`NeedleLocks`]. Must be a power of two-ish value
+/// large enough that unrelated needles essentially never collide; 256 keeps
+/// the lock array ~2 KiB while bounding worst-case false sharing.
+const NEEDLE_LOCK_BUCKETS: usize = 256;
+
+/// MC-108 Task 8 (FR-9): striped per-needle critical sections.
+///
+/// `write_needle_blob` partial writes historically performed their
+/// "index lookup / backend read → merge into coalescer" RMW without any
+/// per-needle mutual exclusion, while a full `write_needle` unconditionally
+/// invalidated the coalescer entry. Two concurrent first writers of disjoint
+/// 4 KiB regions (e.g. two clients right after an Inline→Flat migration,
+/// where the Filer also materialises a full snapshot) could therefore base
+/// their merged buffers on a stale/empty needle and silently wipe each
+/// other's region when their entry was later flushed.
+///
+/// All three mutating paths now serialise per needle under one of these
+/// striped locks:
+/// 1. blob partial write (slow-path RMW + coalescer record),
+/// 2. full `write_needle` / `write_needle_with_cookie` (invalidate + append),
+/// 3. coalescer entry flush (first append / version append).
+///
+/// Striping (instead of one global lock) keeps disjoint needles fully
+/// parallel (NFR-1); hash collisions only widen the critical section to a
+/// few unrelated needles.
+///
+/// Lock order (must stay acyclic): `needle lock → info.write → coalescer
+/// mutex`. Coalescer entry removal never holds the needle lock and user
+/// flush closures are invoked only after the coalescer lock is dropped.
+pub(super) struct NeedleLocks {
+    buckets: Box<[Mutex<()>]>,
+}
+
+impl NeedleLocks {
+    pub(super) fn new(bucket_count: usize) -> Self {
+        let mut buckets = Vec::with_capacity(bucket_count);
+        for _ in 0..bucket_count {
+            buckets.push(Mutex::new(()));
+        }
+        Self {
+            buckets: buckets.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    fn bucket_index(&self, id: &NeedleId) -> usize {
+        // Fibonacci hashing spreads consecutive (block-allocated) needle ids.
+        let h = id.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (h as usize) % self.buckets.len()
+    }
+
+    /// Acquire the per-needle critical section.
+    pub(super) fn lock(&self, id: &NeedleId) -> MutexGuard<'_, ()> {
+        self.buckets[self.bucket_index(id)]
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+}
 
 fn backend_err(e: StorageBackendError) -> PowerFsError {
     PowerFsError::Storage(e.to_string())
@@ -27,8 +86,10 @@ pub struct Volume {
     backend: Arc<dyn StorageBackend>,
     backend_volume_id: u64,
     /// Write-back coalescing buffer for per-Needle partial over-writes.
-    /// See the [`crate::write_coalescer` docs for design & rationale.
+    /// See the [`crate::write_coalescer`] docs for design & rationale.
     coalescer: Arc<WriteCoalescer>,
+    /// MC-108 Task 8 (FR-9): per-needle RMW/flush serialization.
+    needle_locks: NeedleLocks,
     /// Compact 正在进行时设为 true，阻止并发 write
     compacting: AtomicBool,
     /// D.6: 历史最大 needle id（含已删除），随写入单调抬升，启动时从
@@ -171,6 +232,7 @@ impl Volume {
             backend,
             backend_volume_id,
             coalescer: Arc::new(WriteCoalescer::new(coalescer_config)),
+            needle_locks: NeedleLocks::new(NEEDLE_LOCK_BUCKETS),
             compacting: AtomicBool::new(false),
             max_needle_id: AtomicU64::new(recovered_max),
         })
@@ -310,27 +372,19 @@ impl Volume {
     /// storage backend + RocksDB index.  `is_new_needle` decides whether we
     /// call `write_needle` (first version) or `append_needle_version`
     /// (existing id with a version already on disk).
-    fn flush_coalescer_entry(
+    ///
+    /// MC-108 Task 8 (FR-9): the caller MUST already hold this needle's
+    /// stripe lock ([`Volume::needle_locks`]), so that "entry removed from
+    /// the coalescer → backend append → index publish" is atomic wrt
+    /// concurrent blob RMW and full writes. Acquiring the lock here would
+    /// deadlock (std mutex is not reentrant); all flush funnels through
+    /// [`Volume::flush_needle_ids_atomic`] which wraps this function.
+    fn flush_coalescer_entry_locked(
         &self,
         needle_id: NeedleId,
         merged: Vec<u8>,
         is_new_needle: bool,
     ) -> Result<()> {
-        // 外部刷盘（后台 coalescer 线程 / 强制 flush）若撞上 compact，等待其完成：
-        // compact 会 truncate 数据文件，期间追加可能被截断丢失。
-        if self.compacting.load(Ordering::SeqCst) {
-            for _ in 0..600 {
-                if !self.compacting.load(Ordering::SeqCst) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            if self.compacting.load(Ordering::SeqCst) {
-                return Err(PowerFsError::Internal(
-                    "Volume is compacting, retry later".to_string(),
-                ));
-            }
-        }
         let data = Bytes::from(merged);
         if is_new_needle {
             // No index entry yet — first write.  write_needle uses the
@@ -388,6 +442,16 @@ impl Volume {
                 ));
             }
         }
+        // MC-108 Task 8 (FR-9): serialise the full overwrite (which
+        // invalidates any dirty coalescer entry and appends a brand-new
+        // needle version) against blob RMW and flush of the same needle.
+        // file_key == 0 means the id is auto-assigned inside nowait and has
+        // never been published, so nobody can race it — skip locking.
+        let _needle_guard = if file_key != 0 {
+            Some(self.needle_locks.lock(&NeedleId(file_key)))
+        } else {
+            None
+        };
         self.write_needle_nowait(file_key, cookie, data)
     }
 
@@ -988,6 +1052,15 @@ impl Volume {
         let data_offset = offset as usize;
         let data_size = std::cmp::min(size as usize, data.len());
 
+        // MC-108 Task 8 (FR-9): the whole "observe current state (dirty
+        // buffer vs index+backend) → merge incoming region" sequence runs
+        // inside the per-needle critical section. It is therefore atomic
+        // wrt a concurrent full `write_needle` (invalidate + append) and a
+        // concurrent coalescer flush of the same needle: whoever observes a
+        // needle version also merges on top of exactly that version, and
+        // the next observer necessarily sees the merged successor.
+        let _needle_guard = self.needle_locks.lock(&needle_id);
+
         // ---- Coalescer fast-path: first check if we already have a dirty buffer
         // for this needle_id; if yes, skip the backend RMW completely and
         // merge straight into RAM.
@@ -1003,7 +1076,7 @@ impl Volume {
                 data_offset + data_size,
                 None,
             ) {
-                self.flush_coalescer_entry(fid, merged, is_new)?;
+                self.flush_coalescer_entry_locked(fid, merged, is_new)?;
             }
             return Ok(());
         }
@@ -1050,7 +1123,7 @@ impl Volume {
             full_size_hint,
             existing_data,
         ) {
-            self.flush_coalescer_entry(fid, merged, is_new)?;
+            self.flush_coalescer_entry_locked(fid, merged, is_new)?;
         }
         Ok(())
     }
@@ -1197,15 +1270,59 @@ impl Volume {
         &self.coalescer
     }
 
+    /// MC-108 Task 8 (FR-9): materialise the given dirty ids such that each
+    /// entry's "remove from coalescer → append to backend → publish in
+    /// index" sequence happens atomically under the per-needle lock.
+    ///
+    /// Ids are sorted/deduped and the locks are taken strictly one at a
+    /// time, which is deadlock-free even when concurrent callers drain
+    /// overlapping id sets. An entry that disappears between the id
+    /// snapshot and the take was simply materialised by someone else first.
+    fn flush_needle_ids_atomic(&self, mut ids: Vec<NeedleId>) -> usize {
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.dedup();
+        let mut flushed = 0;
+        for id in ids {
+            // Mirror flush_coalescer_entry's compact gate: appends while a
+            // compaction is truncating the data file can be lost.
+            if self.compacting.load(Ordering::SeqCst) {
+                for _ in 0..600 {
+                    if !self.compacting.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if self.compacting.load(Ordering::SeqCst) {
+                    log::error!(
+                        "flush_needle_ids_atomic: skip needle {} during ongoing compaction",
+                        id.0
+                    );
+                    continue;
+                }
+            }
+            let _guard = self.needle_locks.lock(&id);
+            for (fid, entry) in self.coalescer.take_specific(std::slice::from_ref(&id)) {
+                match self.flush_coalescer_entry_locked(fid, entry.merged, entry.is_new_needle) {
+                    Ok(()) => flushed += 1,
+                    Err(e) => {
+                        log::error!(
+                            "flush_needle_ids_atomic: materialise needle {} failed: {e}",
+                            id.0
+                        )
+                    }
+                }
+            }
+        }
+        flushed
+    }
+
     /// Synchronously flush every currently-dirty merged entry in the
     /// coalescer to the backend + RocksDB index.  Returns the number of
     /// entries that were materialised.
     ///
     /// Called automatically by [`Drop`] – see below.
     pub fn flush_all_dirty(&self) -> usize {
-        self.coalescer.flush_all(|id, vec, is_new| {
-            self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
-        })
+        self.flush_needle_ids_atomic(self.coalescer.dirty_ids())
     }
 
     /// Flush only those dirty entries whose deadline has elapsed.  Returns
@@ -1218,30 +1335,14 @@ impl Volume {
     /// method must be called periodically by the background maintenance
     /// thread to do the actual flushing.
     pub fn flush_expired_dirty(&self) -> usize {
-        self.coalescer.flush_expired(|id, vec, is_new| {
-            self.flush_coalescer_entry(id, vec, is_new).map_err(|_| ())
-        })
+        self.flush_needle_ids_atomic(self.coalescer.expired_ids())
     }
 
     /// 轻量级 flush barrier：将指定 needle 从 coalescer 物化到后端数据文件。
     /// 由 kernel 的 fsync/release 路径通过 FlushNeedles RPC 调用。
     /// 不 fsync WAL（由后台统一维护线程负责）。
     pub fn flush_specific_needles(&self, needle_ids: &[NeedleId]) -> Result<usize> {
-        let n = self
-            .coalescer
-            .flush_specific(needle_ids, |id, vec, is_new| {
-                let log_id = id.clone();
-                if let Err(e) = self.flush_coalescer_entry(id, vec, is_new) {
-                    log::error!(
-                        "flush_specific_needles: materialise needle {:?} failed: {}",
-                        log_id,
-                        e
-                    );
-                    return Err(());
-                }
-                Ok(())
-            });
-        Ok(n)
+        Ok(self.flush_needle_ids_atomic(needle_ids.to_vec()))
     }
 }
 
@@ -1255,22 +1356,9 @@ impl Drop for Volume {
         if dirty == 0 {
             return;
         }
-        // SAFETY: the closure below calls `flush_coalescer_entry` through a
-        // raw pointer so we do not create a conflicting shared borrow with
-        // `&mut self` in Drop.  `self` is guaranteed to be alive for the
-        // entire duration of `flush_all`.
-        let self_ptr: *const Volume = &*self;
-        let flushed = self.coalescer.flush_all(|id, vec, is_new| {
-            let slf = unsafe { &*self_ptr };
-            let needle_ident = id.0;
-            slf.flush_coalescer_entry(id, vec, is_new).map_err(|e| {
-                log::error!(
-                    "Volume drop: flush needle_id={} failed: {}",
-                    needle_ident,
-                    e
-                );
-            })
-        });
+        // flush_all_dirty takes &self; re-borrowing through &mut self in Drop
+        // is sound because no other reference to self exists here.
+        let flushed = self.flush_all_dirty();
         let vid = self
             .info
             .read()
@@ -1472,5 +1560,268 @@ mod tests {
         assert_eq!(vol.coalescer().dirty_entry_count(), 0);
         let got = vol.read_needle(&NeedleId(7)).unwrap();
         assert_eq!(&got[0..16], b"hi_there_1234567");
+    }
+
+    /// Distinct, non-zero fill byte for each block index (N <= 255).
+    fn t8_block_byte(blk: usize) -> u8 {
+        (blk as u8).wrapping_add(1)
+    }
+
+    /// MC-108 TR-8.1 (FR-9): many concurrent writers of disjoint 4 KiB
+    /// regions of one brand-new needle must all survive. Mid-run forced
+    /// fsyncs (`flush_specific_needles`) deliberately create the
+    /// "coalescer entry removed → physical append in flight" window that
+    /// previously let a concurrent writer rebuild the needle from a stale
+    /// (empty) baseline and overwrite other regions.
+    #[test]
+    fn mc108_t8_concurrent_disjoint_blob_writes_all_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CoalescerConfig {
+            min_pending_writes: 32,
+            deadline: Duration::from_micros(500),
+            ..CoalescerConfig::default()
+        };
+        let vol = make_volume(&dir, cfg);
+        const N: usize = 100;
+        const BS: usize = 4096;
+        const ROUNDS: usize = 4;
+        let file_key = 4_242_001u64;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let vol: &Volume = &vol;
+
+        std::thread::scope(|scope| {
+            for blk in 0..N {
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let payload = vec![t8_block_byte(blk); BS];
+                    barrier.wait();
+                    for round in 0..ROUNDS {
+                        vol.write_needle_blob(
+                            file_key,
+                            (blk * BS) as i64,
+                            BS as i32,
+                            Bytes::from(payload.clone()),
+                            0,
+                        )
+                        .unwrap();
+                        // Every block fsyncs on a different round to keep a
+                        // constant stream of entry-removal/flush windows.
+                        if round == blk % ROUNDS {
+                            vol.flush_specific_needles(&[NeedleId(file_key)]).unwrap();
+                        }
+                    }
+                });
+            }
+        });
+
+        vol.flush_all_dirty();
+        let got = vol.read_needle(&NeedleId(file_key)).unwrap();
+        assert_eq!(got.len(), N * BS, "needle length must cover all blocks");
+        for blk in 0..N {
+            let start = blk * BS;
+            assert!(
+                got[start..start + BS]
+                    .iter()
+                    .all(|&b| b == t8_block_byte(blk)),
+                "block {blk} was lost/corrupted by a concurrent partial write"
+            );
+        }
+    }
+
+    /// MC-108 TR-8.1: engine-level reproduction of the TR-4.2 migration
+    /// race. The Filer materialises the authoritative snapshot (block0 =
+    /// 0xAA, block1 = zero) with a FULL write_needle during the migration
+    /// quiesce window, i.e. BEFORE the clients are released. After the
+    /// commit, two clients concurrently blob-write disjoint 4 KiB blocks
+    /// and fsync. Both RMWs start from the Filer's materialised version;
+    /// without per-needle serialisation their flush order can still wipe
+    /// one region (the losing side re-creates the entry from a backend
+    /// state that the winning flush has not published yet).
+    ///
+    /// (The clients' own stale-snapshot FULL writes seen in the raw TR-4.2
+    /// trace are removed separately on the kernel side by honouring the
+    /// MigrateCommitted flag — they must never reach this engine.)
+    #[test]
+    fn mc108_t8_full_materialise_vs_concurrent_blob_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CoalescerConfig {
+            min_pending_writes: 32,
+            deadline: Duration::from_micros(200),
+            ..CoalescerConfig::default()
+        };
+        let vol = make_volume(&dir, cfg);
+        const BS: usize = 4096;
+        const TOTAL: usize = BS * 2;
+        const ROUNDS: usize = 64;
+        let vol: &Volume = &vol;
+
+        for round in 0..ROUNDS {
+            let file_key = 9_000_001u64 + round as u64;
+            let mut snapshot = vec![0u8; TOTAL];
+            snapshot[..BS].fill(0xAA);
+            // F: authoritative materialisation happens first (quiesce).
+            vol.write_needle(file_key, Bytes::from(snapshot)).unwrap();
+
+            // Both clients start exactly together, right after commit.
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|scope| {
+                // A: client blob write of block0 (same content as snapshot).
+                {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        std::thread::sleep(Duration::from_nanos((round as u64 * 71) % 500));
+                        vol.write_needle_blob(
+                            file_key,
+                            0,
+                            BS as i32,
+                            Bytes::from(vec![0xAA; BS]),
+                            0,
+                        )
+                        .unwrap();
+                        vol.flush_specific_needles(&[NeedleId(file_key)]).unwrap();
+                    });
+                }
+                // B: the ONLY writer of block1.
+                {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        std::thread::sleep(Duration::from_nanos((round as u64 * 113) % 500));
+                        vol.write_needle_blob(
+                            file_key,
+                            BS as i64,
+                            BS as i32,
+                            Bytes::from(vec![0xBB; BS]),
+                            0,
+                        )
+                        .unwrap();
+                        vol.flush_specific_needles(&[NeedleId(file_key)]).unwrap();
+                    });
+                }
+            });
+
+            vol.flush_all_dirty();
+            let got = vol.read_needle(&NeedleId(file_key)).unwrap();
+            assert_eq!(got.len(), TOTAL, "round {round}: length regressed");
+            assert!(
+                got[..BS].iter().all(|&b| b == 0xAA),
+                "round {round}: block0 (AA) lost"
+            );
+            assert!(
+                got[BS..].iter().all(|&b| b == 0xBB),
+                "round {round}: block1 (BB) lost"
+            );
+        }
+    }
+
+    /// MC-108 TR-8.2 (FR-9): per-needle locks must not deadlock against
+    /// compaction (which drains the coalescer and rewrites/truncates the
+    /// data file under the `compacting` flag) and data must stay intact
+    /// when blob writes, fsyncs and compactions run concurrently.
+    ///
+    /// Writers retry the documented "compacting, retry later" error; any
+    /// *other* error is a failure. Every payload byte is non-zero, so a
+    /// lost/zeroed region (including torn flushes around truncation) is
+    /// detected after the final drain.
+    #[test]
+    fn mc108_t8_compaction_concurrent_with_blob_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = CoalescerConfig {
+            min_pending_writes: 8,
+            deadline: Duration::from_micros(300),
+            ..CoalescerConfig::default()
+        };
+        let vol = make_volume(&dir, cfg);
+        const NEEDLES: usize = 8;
+        const NBLK: usize = 4;
+        const BS: usize = 4096;
+        const TOTAL: usize = NBLK * BS;
+
+        // Baseline: materialise full non-zero needles so compaction has
+        // live versions to rewrite.
+        for n in 0..NEEDLES {
+            let fk = 7_700_001u64 + n as u64;
+            for b in 0..NBLK {
+                let byte = t8_block_byte(n * NBLK + b);
+                vol.write_needle_blob(
+                    fk,
+                    (b * BS) as i64,
+                    BS as i32,
+                    Bytes::from(vec![byte; BS]),
+                    0,
+                )
+                .unwrap();
+            }
+        }
+        vol.flush_all_dirty();
+
+        let vol: &Volume = &vol;
+        std::thread::scope(|scope| {
+            // Compactor: hammer compact() back-to-back.
+            scope.spawn(move || {
+                for _ in 0..15 {
+                    match vol.compact() {
+                        Ok(_) => {}
+                        Err(PowerFsError::Internal(msg)) if msg.contains("already compacting") => {}
+                        Err(e) => panic!("unexpected compact error: {e:?}"),
+                    }
+                }
+            });
+            // Writers: overwrite random blocks with non-zero bytes and
+            // fsync every few rounds, racing the truncation windows.
+            for w in 0..4usize {
+                scope.spawn(move || {
+                    for round in 0..30usize {
+                        let n = (w + round) % NEEDLES;
+                        let b = (w * 3 + round) % NBLK;
+                        let fk = 7_700_001u64 + n as u64;
+                        let byte =
+                            1u8.wrapping_add((w as u8).wrapping_mul(53).wrapping_add(round as u8));
+                        let byte = if byte == 0 { 1 } else { byte };
+                        let payload = Bytes::from(vec![byte; BS]);
+                        // Retry through compaction rejection.
+                        let mut attempts = 0;
+                        loop {
+                            match vol.write_needle_blob(
+                                fk,
+                                (b * BS) as i64,
+                                BS as i32,
+                                payload.clone(),
+                                0,
+                            ) {
+                                Ok(()) => break,
+                                Err(PowerFsError::Internal(msg))
+                                    if msg.contains("compacting") && attempts < 600 =>
+                                {
+                                    attempts += 1;
+                                    std::thread::sleep(Duration::from_millis(10));
+                                }
+                                Err(e) => panic!("unexpected blob write error: {e:?}"),
+                            }
+                        }
+                        if round % 3 == 0 {
+                            let _ = vol.flush_specific_needles(&[NeedleId(fk)]);
+                        }
+                    }
+                });
+            }
+        });
+
+        // Drain whatever remains and verify no block was zeroed/lost.
+        vol.flush_all_dirty();
+        for n in 0..NEEDLES {
+            let fk = 7_700_001u64 + n as u64;
+            let got = vol.read_needle(&NeedleId(fk)).unwrap();
+            assert_eq!(got.len(), TOTAL, "needle {n}: length corrupted by compact");
+            for (i, &byte) in got.iter().enumerate() {
+                assert_ne!(
+                    byte,
+                    0,
+                    "needle {n} block {}: zero hole after concurrent compact/write",
+                    i / BS
+                );
+            }
+        }
     }
 }

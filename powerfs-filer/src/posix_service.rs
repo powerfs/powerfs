@@ -766,7 +766,10 @@ impl PosixMetaService for PosixMetaServiceImpl {
 
         match self
             .meta_shard_manager
-            .update_inode_size_chunks_atomic(shard_id, req.inode, req.size, chunks, None, false)
+            .update_inode_size_chunks_atomic(
+                shard_id, req.inode, req.size, chunks, None, false,
+                None, /* inline_dirty_mask: gRPC 管理面无 inline 提交 */
+            )
             .await
         {
             Ok(_) => Ok(Response::new(UpdateInodeSizeChunksResponse {
