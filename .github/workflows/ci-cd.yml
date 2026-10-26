@@ -84,6 +84,9 @@ jobs:
         sudo apt-get install -y protobuf-compiler libfuse-dev fuse3 pkg-config libssl-dev libibverbs-dev
         sudo chmod 666 /dev/fuse
 
+    - name: Topology consistency check
+      run: ./scripts/check-topology-sync.sh
+
     - name: Format Check
       run: |
         source "$HOME/.cargo/env"

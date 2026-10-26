@@ -110,6 +110,7 @@
 
 ### P4：防回归
 
+- **已完成部分**：`scripts/check-topology-sync.sh` 校验 `docker/topology.env` 与主 compose 的地址集合、网段、网关一致，已接入 CI `quality` job
 - CI 增加 IP 字面量 lint（白名单：rendered 产物、测试 fixtures）
 - 文档只保留单源路径；删除“手工改 compose/config”的指引
 
