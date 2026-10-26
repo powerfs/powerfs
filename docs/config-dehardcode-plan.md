@@ -106,13 +106,19 @@
 - `docker exec fuse-2`: echo → 写 fuse-2 mount → cat fuse-1 mount → 一致 ✅（跨容器一致性）
 - `check-topology-sync.sh`: 17 addresses, 172.30.0.0/16 ✅
 
-### P3：脚本接入单源
+### P3：脚本接入单源（进行中）
 
-- `scripts/generate-certs.sh` 从 `cluster.toml` / rendered 证书清单读取 IP，删除硬编码数组
-  - **已完成部分**：新增 `docker/topology.env` 作为 legacy Docker 拓扑唯一来源，`generate-certs.sh` 优先加载该文件（缺省值保留为兜底）；改节点 IP 只需改这一处
-  - **待完成**：`MASTER_API`、VM 脚本（54 个）尚未接入
-- `docker/run-fuse-client.sh` 已参数化（name/ip 由参数传入），无需改动
-- VM 54 个脚本统一 `kernel/vm/cluster.env`，删除各自默认值
+- `scripts/generate-certs.sh` **✅ 已完成** — 新增 `--from-cluster` 模式（commit `684a8bd8`）：
+  - 自动启用条件：cluster.toml + rendered compose 同时存在 **且** 用户未显式传 `--topology`/`--master-api`
+  - ADMIN_TOKEN ← cluster.toml `admin_token`
+  - MASTER_API ← rendered compose 首 master ipv4_address + 9300
+  - 存储节点 id+ip ← rendered compose awk 扫 `role-N:` + 首个 `ipv4_address:`（`found_ip` flag 防 monitor/s3 污染）
+  - fuse 客户端 ← cluster.toml `[client.*]` 段 type="fuse" 的 name + ip
+  - legacy 路径（host/three 显式传参）**完全保留**，不受影响
+  - topology.env 继续是 legacy 路径来源
+- `docker/topology.env` 注释已更新：P3 后 from-cluster 优先 cluster.toml，legacy 才读 topology.env
+- kernel client from-cluster 路径（段名 → sign_client 第一个参数）**待完善**（cluster.toml 默认注释掉 kernel client 声明，不阻断）
+- VM 54 脚本统一 `kernel/vm/cluster.env`，删除各自默认值 — **待实施**
 
 ### P1-3：端到端验证（已完成，2026-10-26）
 
