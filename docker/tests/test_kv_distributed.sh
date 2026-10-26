@@ -3,6 +3,12 @@
 set -e
 
 DOCKER_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PROJECT_ROOT=$(cd "$DOCKER_DIR/.." && pwd)
+POWERFS_HOME="${POWERFS_HOME:-$PROJECT_ROOT/.powerfs}"
+COMPOSE_FILE="${COMPOSE_FILE:-$POWERFS_HOME/rendered/docker-compose.yml}"
+CLUSTER_NAME=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$POWERFS_HOME/cluster.toml" 2>/dev/null | head -1)
+CLUSTER_NAME="${CLUSTER_NAME:-powerfs}"
+PFIX="${CLUSTER_NAME}-"   # 容器名前缀
 
 echo "========================================"
 echo "    PowerFS KV Distributed Test"

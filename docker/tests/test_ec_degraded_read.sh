@@ -35,12 +35,20 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 DOCKER_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 PROJECT_DIR=$(cd "$DOCKER_DIR/.." && pwd)
 
+# ---- 声明式渲染 compose (powerfs-ctl render 产物) ----
+PROJECT_ROOT="$PROJECT_DIR"
+POWERFS_HOME="${POWERFS_HOME:-$PROJECT_ROOT/.powerfs}"
+COMPOSE_FILE="${COMPOSE_FILE:-$POWERFS_HOME/rendered/docker-compose.yml}"
+CLUSTER_NAME=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$POWERFS_HOME/cluster.toml" 2>/dev/null | head -1)
+CLUSTER_NAME="${CLUSTER_NAME:-powerfs}"
+PFIX="${CLUSTER_NAME}-"   # 容器名前缀
+
 EC_DATA_SHARDS="${EC_DATA_SHARDS:-4}"
 EC_PARITY_SHARDS="${EC_PARITY_SHARDS:-2}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-10}"
 TEST_FILE_SIZE_MB="${TEST_FILE_SIZE_MB:-8}"
 FUSE_CONTAINER="fuse-1"
-FILER_CONTAINER="filer-1"
+FILER_CONTAINER="${PFIX}filer-1"
 MOUNT_POINT="/mnt/powerfs"
 TEST_DIR="${MOUNT_POINT}/ec_test"
 TESTUTIL="/app/powerfs-testutil"
@@ -307,9 +315,9 @@ build_and_image() {
         --bin powerfs-testutil 2>&1 | tail -5
     log_ok "二进制编译完成"
 
+    # 本函数上方已跑过 cargo build, 镜像构建走统一入口并跳过重复编译
     log_info "重建 Docker 镜像..."
-    cd "$DOCKER_DIR"
-    docker compose build 2>&1 | tail -5
+    bash "$DOCKER_DIR/build_test_images.sh" --skip-rust 2>&1 | tail -5
     log_ok "Docker 镜像构建完成"
 }
 
@@ -323,22 +331,18 @@ start_cluster() {
     export POWERFS_EC_MIN_FILE_SIZE=0
     export POWERFS_SCRUBBER_MAX_INODES=50
 
-    cd "$DOCKER_DIR"
-    docker compose down --remove-orphans 2>/dev/null || true
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
 
     # 使用 start-cluster.sh 启动 (它处理了服务依赖顺序和健康检查)
     bash "$DOCKER_DIR/scripts/start-cluster.sh" 2>&1 | tail -30
 
-    # 额外启动 volume-4/5/6 (start-cluster.sh 只启动 volume-1/2/3)
-    log_info "启动 volume-4/5/6..."
-    docker compose up -d --no-deps volume-4 volume-5 volume-6 2>&1
-
+    # 渲染 compose 的 ha profile 已含 6 个 volume, bootstrap 全量拉起, 无需额外启动
     # 等待 volume-4/5/6 注册到 master
-    log_info "等待 volume-4/5/6 注册..."
+    log_info "等待 volume-4/5/6 就绪..."
     local retries=0
     while [ $retries -lt 30 ]; do
         local ready=0
-        for vol in volume-4 volume-5 volume-6; do
+        for vol in "${PFIX}volume-4" "${PFIX}volume-5" "${PFIX}volume-6"; do
             docker inspect -f '{{.State.Running}}' "$vol" 2>/dev/null | grep -q true && ready=$((ready + 1))
         done
         if [ $ready -eq 3 ]; then
@@ -357,8 +361,7 @@ start_cluster() {
 
 stop_cluster() {
     log_info "停止集群..."
-    cd "$DOCKER_DIR"
-    docker compose down --remove-orphans 2>/dev/null || true
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
     log_ok "集群已停止"
 }
 
@@ -623,7 +626,7 @@ main() {
 
     # 确认 volume 数量 >= data+parity
     local volume_count
-    volume_count=$(docker ps --format '{{.Names}}' | grep -c '^volume-' || true)
+    volume_count=$(docker ps --format '{{.Names}}' | grep -c "^${PFIX}volume-" || true)
     local total_shards=$((EC_DATA_SHARDS + EC_PARITY_SHARDS))
     log_info "运行中的 volume 容器: ${volume_count}, EC 需要: ${total_shards}"
     if [ "$volume_count" -lt "$total_shards" ]; then

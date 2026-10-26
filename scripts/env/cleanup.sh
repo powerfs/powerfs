@@ -131,11 +131,18 @@ cleanup_docker() {
     log_info "Cleaning up Docker environment..."
     
     if command -v docker &> /dev/null; then
-        cd "$PROJECT_ROOT/docker"
+        # P2: 手工 compose 已删除，按当前渲染集群项目名清理
+        if [ -f "$PROJECT_ROOT/.powerfs/cluster.toml" ]; then
+            local name
+            name=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$PROJECT_ROOT/.powerfs/cluster.toml" | head -1)
+            if [ -n "$name" ] && [ -d "$PROJECT_ROOT/.powerfs/rendered" ]; then
+                cd "$PROJECT_ROOT/.powerfs/rendered"
+                docker compose down -v 2>/dev/null || true
+            fi
+        fi
         
-        # Stop and remove containers
-        docker compose -f docker-compose.test.yml down -v 2>/dev/null || true
-        docker compose -f docker-compose.yml down -v 2>/dev/null || true
+        # 独立测试拓扑 compose 仍然保留
+        cd "$PROJECT_ROOT/docker"
         docker compose -f docker-compose.crdt-test.yml down -v 2>/dev/null || true
         
         # Remove powerfs images

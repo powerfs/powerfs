@@ -66,6 +66,10 @@ services:
       - ../../target/release/powerfs-master:/app/powerfs-master:ro
     environment:
       - REDIS_URL=redis://redis:6379
+      # EC 分片参数（docker/tests EC 场景需在启动时覆盖，如 POWERFS_EC_DATA_SHARDS=2）。
+      # 默认值与 powerfs-master 二进制内默认一致，不改变默认部署行为。
+      - POWERFS_EC_DATA_SHARDS=${POWERFS_EC_DATA_SHARDS:-4}
+      - POWERFS_EC_PARITY_SHARDS=${POWERFS_EC_PARITY_SHARDS:-2}
     command: /app/powerfs-master --config /app/config/master.toml
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://{{ master_ips[i] }}:9300/healthz || exit 1"]
@@ -111,6 +115,11 @@ services:
       - ../certs:/etc/powerfs/certs:ro
       - ./config/filer-{{ i + 1 }}.toml:/app/config/filer.toml:ro
       - ../../target/release/powerfs-filer:/app/powerfs-filer:ro
+    environment:
+      # scrubber/EC 阈值（docker/tests EC 场景覆盖用），默认值与 powerfs-filer 二进制一致
+      - POWERFS_SCRUBBER_SCAN_INTERVAL=${POWERFS_SCRUBBER_SCAN_INTERVAL:-30}
+      - POWERFS_SCRUBBER_MAX_INODES=${POWERFS_SCRUBBER_MAX_INODES:-50}
+      - POWERFS_EC_MIN_FILE_SIZE=${POWERFS_EC_MIN_FILE_SIZE:-0}
     command: /app/powerfs-filer --config /app/config/filer.toml
     depends_on:
       - master-1

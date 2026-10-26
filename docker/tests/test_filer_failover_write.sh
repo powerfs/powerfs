@@ -27,6 +27,14 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 DOCKER_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 PROJECT_DIR=$(cd "$DOCKER_DIR/.." && pwd)
 
+# ---- 声明式渲染 compose (powerfs-ctl render 产物) ----
+PROJECT_ROOT="$PROJECT_DIR"
+POWERFS_HOME="${POWERFS_HOME:-$PROJECT_ROOT/.powerfs}"
+COMPOSE_FILE="${COMPOSE_FILE:-$POWERFS_HOME/rendered/docker-compose.yml}"
+CLUSTER_NAME=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$POWERFS_HOME/cluster.toml" 2>/dev/null | head -1)
+CLUSTER_NAME="${CLUSTER_NAME:-powerfs}"
+PFIX="${CLUSTER_NAME}-"   # 容器名前缀
+
 FUSE_CONTAINER="fuse-1"
 MOUNT_POINT="/mnt/powerfs"
 TEST_DIR="${MOUNT_POINT}/filer_failover_test"
@@ -260,9 +268,7 @@ start_cluster() {
 
 stop_cluster() {
     log_info "停止集群..."
-    cd "$DOCKER_DIR"
-    docker compose down --remove-orphans 2>/dev/null || true
-    cd "$SCRIPT_DIR"
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
 }
 
 # ============================================================================
@@ -333,10 +339,8 @@ test_scenario_2_leader_failure_write() {
     alive_before=$(find_alive_filers)
     log_detail "停止前存活 Filers: $alive_before"
 
-    # 停止 Leader Filer
-    cd "$DOCKER_DIR"
-    docker compose stop "$leader" 2>/dev/null
-    cd "$SCRIPT_DIR"
+    # 停止 Leader Filer (compose 服务名不带容器前缀)
+    docker compose -f "$COMPOSE_FILE" stop "$leader" 2>/dev/null
     log_ok "已停止 Leader: $leader"
 
     # 核心验证: 选举期间立即写入 (不等选举完成)
@@ -357,9 +361,7 @@ test_scenario_2_leader_failure_write() {
         write_ok=false
         test_fail "场景2" "故障期间写入失败 (EIO), 重试+轮换未生效"
         # 尝试恢复集群状态
-        cd "$DOCKER_DIR"
-        docker compose start "$leader" 2>/dev/null
-        cd "$SCRIPT_DIR"
+        docker compose -f "$COMPOSE_FILE" start "$leader" 2>/dev/null
         wait_for_leader_election 30 || true
         return 1
     fi
@@ -401,9 +403,7 @@ test_scenario_2_leader_failure_write() {
 
     # 恢复停止的 Filer
     log_info "恢复 Filer: $leader"
-    cd "$DOCKER_DIR"
-    docker compose start "$leader" 2>/dev/null
-    cd "$SCRIPT_DIR"
+    docker compose -f "$COMPOSE_FILE" start "$leader" 2>/dev/null
     sleep 5
     wait_for_leader_election 30 || true
     # 等待 Raft 日志追平: 恢复的 Filer 需要从新 Leader 拉取缺失的日志条目,
@@ -454,9 +454,7 @@ test_scenario_3_recovery_and_refailover() {
         return 0
     fi
     log_info "二次故障切换: 停止 Leader $leader2"
-    cd "$DOCKER_DIR"
-    docker compose stop "$leader2" 2>/dev/null
-    cd "$SCRIPT_DIR"
+    docker compose -f "$COMPOSE_FILE" stop "$leader2" 2>/dev/null
 
     # 选举期间再次写入
     if write_file_expect_success 2 "second_failover"; then
@@ -468,9 +466,7 @@ test_scenario_3_recovery_and_refailover() {
         wait_for_leader_election 30 || true
 
         # 恢复
-        cd "$DOCKER_DIR"
-        docker compose start "$leader2" 2>/dev/null
-        cd "$SCRIPT_DIR"
+        docker compose -f "$COMPOSE_FILE" start "$leader2" 2>/dev/null
         sleep 5
         wait_for_leader_election 30 || true
         # 等待 Raft 日志追平, 确保二次故障期间写入的元数据已同步到所有节点
@@ -496,9 +492,7 @@ test_scenario_3_recovery_and_refailover() {
     else
         test_fail "场景3" "二次故障期间写入失败"
         # 恢复
-        cd "$DOCKER_DIR"
-        docker compose start "$leader2" 2>/dev/null
-        cd "$SCRIPT_DIR"
+        docker compose -f "$COMPOSE_FILE" start "$leader2" 2>/dev/null
         wait_for_leader_election 30 || true
         return 1
     fi
@@ -518,9 +512,7 @@ test_scenario_4_rapid_create_during_failover() {
     fi
     log_info "停止 Leader $leader 后立即创建 10 个小文件"
 
-    cd "$DOCKER_DIR"
-    docker compose stop "$leader" 2>/dev/null
-    cd "$SCRIPT_DIR"
+    docker compose -f "$COMPOSE_FILE" stop "$leader" 2>/dev/null
 
     local success_count=0
     local fail_count=0
@@ -548,9 +540,7 @@ test_scenario_4_rapid_create_during_failover() {
 
     # 等待选举 + 恢复
     wait_for_leader_election 30 || true
-    cd "$DOCKER_DIR"
-    docker compose start "$leader" 2>/dev/null
-    cd "$SCRIPT_DIR"
+    docker compose -f "$COMPOSE_FILE" start "$leader" 2>/dev/null
     sleep 5
     wait_for_leader_election 30 || true
     # 等待 Raft 日志追平, 确保快速创建的小文件元数据已同步

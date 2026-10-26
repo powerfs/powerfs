@@ -1,317 +1,38 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Thin wrapper: bring up the canonical PowerFS backend.
+#
+# P2 起主 compose 在仓库中不再手工维护，集群声明单一来源是
+# <home>/cluster.toml —— 启动路径统一走 `powerfs-ctl bootstrap`
+# （渲染 compose → 选主 → CA 签发 → 全服务 up → 健康门禁）。
+#
+# 用法：
+#   ./docker/scripts/start-cluster.sh              # 使用默认 $REPO_ROOT/.powerfs
+#   POWERFS_HOME=/path/to/home ./docker/scripts/start-cluster.sh
+#
+# EC 场景（docker/tests）需先 export 环境变量，bootstrap 时模板已暴露透传：
+#   export POWERFS_EC_DATA_SHARDS=2
+#   export POWERFS_EC_PARITY_SHARDS=1
+#   export POWERFS_SCRUBBER_SCAN_INTERVAL=10
+#   export POWERFS_SCRUBBER_MAX_INODES=50
+#   export POWERFS_EC_MIN_FILE_SIZE=0
+set -euo pipefail
 
-set +e
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+HOME_DIR="${POWERFS_HOME:-$REPO_ROOT/.powerfs}"
+CTL="$REPO_ROOT/target/release/powerfs-ctl"
 
-BUILD_IMAGES=false
-SPDK_FEATURE=""
+[ -x "$CTL" ] || { echo "error: $CTL missing — cargo build --release -p powerfs-ctl" >&2; exit 1; }
+[ -f "$HOME_DIR/cluster.toml" ] || { echo "error: $HOME_DIR/cluster.toml missing — powerfs-ctl --home $HOME_DIR init" >&2; exit 1; }
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --build|-b)
-            BUILD_IMAGES=true
-            shift
-            ;;
-        --spdk)
-            SPDK_FEATURE="--features spdk"
-            shift
-            ;;
-        --spdk-stub)
-            SPDK_FEATURE="--features spdk-stub"
-            shift
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
-
-DOCKER_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-PROJECT_DIR=$(cd "$DOCKER_DIR/.." && pwd)
-HOST_IP=$(hostname -I | awk '{print $1}')
-
-echo "========================================"
-echo "    Starting PowerFS Multi-Node Cluster"
-echo "========================================"
-echo ""
-echo "Host IP: $HOST_IP"
-echo ""
-
-# Stop any existing containers first
-echo "Stopping existing containers..."
-cd "$DOCKER_DIR"
-docker compose down --remove-orphans 2>/dev/null || true
-echo "[OK] Old containers stopped"
-
-# Create FUSE mount directories
-mkdir -p /tmp/powerfs/fuse1
-mkdir -p /tmp/powerfs/fuse2
-echo "[OK] FUSE mount directories created"
-
-if [ "$BUILD_IMAGES" = true ]; then
-    echo "[1/8] Building Docker images..."
-    cd "$DOCKER_DIR"
-    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
-
-    echo "  Building Rust binaries..."
-    cd "$PROJECT_DIR"
-    source "$HOME/.cargo/env" 2>/dev/null || true
-    cargo build --release --bin powerfs-master --bin powerfs-filer --bin powerfs-s3 --bin powerfs-volume --bin powerfs-monitor --bin powerfs-fuse $SPDK_FEATURE 2>&1 | tail -5
-    echo "  [OK] Binaries built"
-
-    echo "  Building Docker image..."
-    cd "$DOCKER_DIR"
-    docker compose build 2>&1 | tail -5
-    echo "[OK] Images built"
-else
-    echo "[1/8] Using existing Docker images..."
-    echo "  Use --build or -b flag to rebuild images"
-    echo "[OK] Using existing images"
+# 可选：先 seed CA 从 docker/certs-default（兼容 CI runner / VM 客户端已签的证书）
+CERTS_DEFAULT="$REPO_ROOT/docker/certs-default"
+if [ -f "$CERTS_DEFAULT/ca.crt" ] && [ ! -f "$HOME_DIR/rendered/certs/ca.crt" ]; then
+    echo "seeding master CA from docker/certs-default"
+    mkdir -p "$HOME_DIR/rendered/certs"
+    cp "$CERTS_DEFAULT/ca.crt" "$CERTS_DEFAULT/ca.key" \
+       "$CERTS_DEFAULT/client_registry.json" "$HOME_DIR/rendered/certs/"
 fi
 
-echo ""
-echo "[2/8] Starting Redis..."
-cd "$DOCKER_DIR"
-docker compose up -d redis
-
-echo "  Waiting for redis to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if docker exec redis redis-cli ping 2>/dev/null | grep -q PONG; then
-        echo "  [OK] Redis ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-if [ $timeout -eq 0 ]; then
-    echo "  [WARNING] Redis may not be ready, continuing..."
-fi
-
-echo ""
-echo "[3/8] Starting Master nodes..."
-docker compose up -d --no-deps master-1
-
-echo "  Waiting for master-1 to be ready..."
-timeout=60
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 9333 >/dev/null 2>&1; then
-        echo "  [OK] master-1 ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-if [ $timeout -eq 0 ]; then
-    echo "  [WARNING] master-1 may not be ready, continuing..."
-fi
-
-docker compose up -d --no-deps master-2
-
-echo "  Waiting for master-2 to be ready..."
-timeout=60
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 9336 >/dev/null 2>&1; then
-        echo "  [OK] master-2 ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-if [ $timeout -eq 0 ]; then
-    echo "  [WARNING] master-2 failed to start"
-fi
-
-docker compose up -d --no-deps master-3
-
-echo "  Waiting for master-3 to be ready..."
-timeout=60
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 9337 >/dev/null 2>&1; then
-        echo "  [OK] master-3 ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-if [ $timeout -eq 0 ]; then
-    echo "  [WARNING] master-3 failed to start"
-fi
-
-echo ""
-echo "[4/8] Starting Volume nodes..."
-docker compose up -d --no-deps volume-1 volume-2 volume-3
-
-echo "  Waiting for volumes to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    ready=0
-    nc -z localhost 8080 >/dev/null 2>&1 && ready=$((ready + 1))
-    nc -z localhost 8081 >/dev/null 2>&1 && ready=$((ready + 1))
-    nc -z localhost 8082 >/dev/null 2>&1 && ready=$((ready + 1))
-    if [ $ready -ge 2 ]; then
-        echo "  [OK] $ready volume(s) ready (gRPC)"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo "  Verifying volume powerfs-net ports..."
-for pair in "8901:volume-1" "8902:volume-2" "8903:volume-3"; do
-    port="${pair%%:*}"
-    name="${pair##*:}"
-    if nc -z localhost "$port" >/dev/null 2>&1; then
-        echo "  [OK] $name net_port=$port ready"
-    else
-        echo "  [WARNING] $name net_port=$port not ready (powerfs-net listener)"
-    fi
-done
-
-echo ""
-echo "[5/8] Starting Filer..."
-docker compose up -d --no-deps filer-1 filer-2
-
-echo "  Waiting for Filer-1 to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 8888 >/dev/null 2>&1; then
-        echo "  [OK] Filer-1 ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo "  Waiting for Filer-2 to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 8898 >/dev/null 2>&1; then
-        echo "  [OK] Filer-2 ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo "  Starting Filer-3..."
-docker compose up -d --no-deps filer-3
-
-echo "  Waiting for Filer-3 to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 8908 >/dev/null 2>&1; then
-        echo "  [OK] Filer-3 ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo ""
-echo "[6/8] Starting S3 Backend..."
-docker compose up -d --no-deps s3
-
-echo "  Waiting for S3 backend to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 9000 >/dev/null 2>&1; then
-        echo "  [OK] S3 backend ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo ""
-echo "[7/8] Starting Monitor..."
-docker compose up -d --no-deps monitor
-
-echo "  Waiting for monitor to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 8083 >/dev/null 2>&1; then
-        echo "  [OK] monitor ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo ""
-echo "[8/8] Starting Frontend..."
-docker compose up -d --no-deps frontend
-
-echo "  Waiting for frontend to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if nc -z localhost 8084 >/dev/null 2>&1; then
-        echo "  [OK] frontend ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo ""
-echo "========================================"
-echo "    Cluster Started Successfully!"
-echo "========================================"
-echo ""
-echo "Service Addresses (accessible from other nodes):"
-echo "  Redis:           $HOST_IP:6379"
-echo "  Master 1:        $HOST_IP:9333"
-echo "  Master 2:        $HOST_IP:9336"
-echo "  Master 3:        $HOST_IP:9337"
-echo "  Volume 1:        $HOST_IP:8080 (gRPC), $HOST_IP:8901 (powerfs-net)"
-echo "  Volume 2:        $HOST_IP:8081 (gRPC), $HOST_IP:8902 (powerfs-net)"
-echo "  Volume 3:        $HOST_IP:8082 (gRPC), $HOST_IP:8903 (powerfs-net)"
-echo "  Filer:           $HOST_IP:9001"
-echo "  S3 Backend:      $HOST_IP:9000"
-echo "  Monitor API:     $HOST_IP:8083"
-echo "  Monitor UI:      http://$HOST_IP:8084"
-echo ""
-
-echo "[9/9] Starting FUSE clients..."
-docker compose up -d --no-deps fuse-1 fuse-2
-
-echo "  Waiting for fuse-1 to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if docker exec fuse-1 test -d /mnt/powerfs 2>/dev/null; then
-        echo "  [OK] fuse-1 ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo "  Waiting for fuse-2 to be ready..."
-timeout=30
-while [ $timeout -gt 0 ]; do
-    if docker exec fuse-2 test -d /mnt/powerfs 2>/dev/null; then
-        echo "  [OK] fuse-2 ready"
-        break
-    fi
-    sleep 1
-    timeout=$((timeout - 1))
-done
-
-echo ""
-echo "  FUSE mount points:"
-echo "    Fuse-1: /tmp/powerfs/fuse1 (host) -> /mnt/powerfs (container)"
-echo "    Fuse-2: /tmp/powerfs/fuse2 (host) -> /mnt/powerfs (container)"
-echo ""
-echo "S3 Compatible Endpoint:"
-echo "  http://$HOST_IP:9000"
-echo "  Access Key: powerfs"
-echo "  Secret Key: powerfs123"
-echo ""
-echo "To stop the cluster, run:"
-echo "  docker/scripts/stop-cluster.sh"
-echo ""
-echo "To check health status, run:"
-echo "  docker/scripts/health-check.sh"
+echo "bootstrap: cluster.toml → rendered compose → quorum → up"
+POWERFS_HOME="$HOME_DIR" "$CTL" bootstrap
+echo "done"

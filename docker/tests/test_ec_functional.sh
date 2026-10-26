@@ -26,11 +26,20 @@ set -euo pipefail
 # ============================================================================
 # 配置
 # ============================================================================
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+DOCKER_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+PROJECT_ROOT=$(cd "$DOCKER_DIR/.." && pwd)
+POWERFS_HOME="${POWERFS_HOME:-$PROJECT_ROOT/.powerfs}"
+COMPOSE_FILE="${COMPOSE_FILE:-$POWERFS_HOME/rendered/docker-compose.yml}"
+CLUSTER_NAME=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$POWERFS_HOME/cluster.toml" 2>/dev/null | head -1)
+CLUSTER_NAME="${CLUSTER_NAME:-powerfs}"
+PFIX="${CLUSTER_NAME}-"   # 容器名前缀
+
 FUSE_CONTAINER="fuse-1"
 MOUNT_POINT="/mnt/powerfs"
 TEST_DIR="${MOUNT_POINT}/ec_functional_test"
 TESTUTIL="/app/powerfs-testutil"
-FILER_CONTAINERS=("filer-1" "filer-2" "filer-3")
+FILER_CONTAINERS=("${PFIX}filer-1" "${PFIX}filer-2" "${PFIX}filer-3")
 
 EC_DATA_SHARDS="${EC_DATA_SHARDS:-4}"
 EC_PARITY_SHARDS="${EC_PARITY_SHARDS:-2}"
@@ -800,7 +809,7 @@ main() {
 
     # 确认 volume 数量 >= data+parity
     local volume_count total_shards
-    volume_count=$(docker ps --format '{{.Names}}' | grep -c '^volume-' || true)
+    volume_count=$(docker ps --format '{{.Names}}' | grep -c "^${PFIX}volume-" || true)
     total_shards=$((EC_DATA_SHARDS + EC_PARITY_SHARDS))
     log_info "运行中的 volume 容器: ${volume_count}, EC 需要: ${total_shards}"
     if [ "$volume_count" -lt "$total_shards" ]; then

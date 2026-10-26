@@ -35,9 +35,17 @@ stop_local_env() {
 
 stop_docker_env() {
     log_info "Stopping Docker test environment..."
+
+    # P2: 手工 compose 已删除，渲染集群由 powerfs-ctl 管理
+    cd "$PROJECT_ROOT"
+    if [ -d "$PROJECT_ROOT/.powerfs/rendered" ]; then
+        cd "$PROJECT_ROOT/.powerfs/rendered"
+        docker compose down 2>/dev/null || true
+    fi
     
+    # 独立测试拓扑（crdt-test 等）仍在 docker/ 下
     cd "$PROJECT_ROOT/docker"
-    docker compose -f docker-compose.test.yml down 2>/dev/null || true
+    docker compose -f docker-compose.crdt-test.yml down 2>/dev/null || true
     
     log_success "Docker environment stopped"
 }

@@ -85,7 +85,27 @@ jobs:
         sudo chmod 666 /dev/fuse
 
     - name: Topology consistency check
-      run: ./scripts/check-topology-sync.sh
+      run: |
+        source "$HOME/.cargo/env"
+        # P2: the repo no longer carries a hand-written compose. Render the
+        # canonical topology from powerfs-ctl init defaults into a temp home,
+        # declare the two fuse fixture clients (IPs sourced from
+        # topology.env — the legacy cert-fixture source), then verify
+        # topology.env and the rendered compose did not drift apart.
+        cargo build --release -p powerfs-ctl
+        TMP_HOME=$(mktemp -d)
+        ./target/release/powerfs-ctl --home "$TMP_HOME" init
+        source docker/topology.env
+        for i in 0 1; do
+          cat >> "$TMP_HOME/cluster.toml" <<EOF
+
+        [client.${THREE_FUSE_IDS[$i]}]
+        type = "fuse"
+        ip = "${THREE_FUSE_IPS[$i]}"
+        EOF
+        done
+        ./target/release/powerfs-ctl --home "$TMP_HOME" config render
+        ./scripts/check-topology-sync.sh "$TMP_HOME/rendered/docker-compose.yml" "$TMP_HOME/cluster.toml"
 
     - name: Format Check
       run: |
