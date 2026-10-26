@@ -43,8 +43,25 @@ organization = "PowerFS"
 validity_days = 3650
 
 # Pre-declared clients (optional). `powerfs-ctl client enroll NAME` also works.
+# FUSE clients are NOT part of the rendered compose — declare them here and
+# `bootstrap` will sign their certs + render client-<name>.toml; start them
+# with `docker/run-fuse-client.sh <name> <ip>` (container keeps <name>, so
+# `docker exec fuse-1 ...` test scripts keep working).
 # [client.kernel-default]
 # type = "kernel"
+#
+# FUSE client example (uncomment + fix the IP to match your subnet):
+# [client.fuse-1]
+# type = "fuse"
+# ip = "172.30.0.41"
+# # Optional per-client knobs (defaults: verbose/container/force_mount=false,
+# # request_timeout_secs=10, no admin_port/log_file):
+# verbose = true
+# container = true
+# admin_port = 9998          # legacy: no longer binds an HTTP endpoint
+# log_file = "/var/log/powerfs-fuse.log"
+# force_mount = true         # render filer/volume fallback addresses
+# request_timeout_secs = 10
 "#;
 
 pub async fn run(home: &Home, force: bool) -> Result<(), String> {

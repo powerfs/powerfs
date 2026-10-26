@@ -1,6 +1,6 @@
 # 配置去硬编码优化方案
 
-> 状态：P1 已完成（含端到端验证）；P2 前置阻塞 #1（证书命名）#2（FUSE 每客户端参数）#5（项目名派生）已解，余 #3/#4
+> 状态：P1 已完成（含端到端验证）；P2 前置阻塞 #1（证书命名）#2（FUSE 每客户端参数）#3（fuse 服务退役路径）#5（项目名派生）已解，余 #4
 > 日期：2026-10-26
 > 关联 issue：private 库「config: eliminate hardcoded IPs and duplicated config files」
 
@@ -119,7 +119,7 @@
 
 1. ~~**证书命名两套不统一**~~ **已完成**：统一为 `volume-N`（与 `powerfs-ctl` 声明式路径一致）。改动覆盖 `docker/topology.env`、`generate-certs.sh`、`docker/config/**`（含 rdma/rdma-host/kernel-test 及 master 参考段）、`powerfs-ctl` 之外的 CLI 生成器/测试/文档，并重新签发 `docker/certs-default/` 整套证书（CA 不变，registry 重建为干净夹具）。已实测：legacy 三 master + 6 volume 以新名注册、mTLS 通过、FUSE IO 校验一致；旧 `volume-server-N` 僵尸节点经 `manage node-remove` 清理；声明式 bootstrap + FUSE IO 回归通过
 2. ~~**FUSE 每客户端参数**~~ **已完成**：`[client.<name>]` schema 扩展 `admin_port`/`verbose`/`container`/`log_file`/`force_mount`/`request_timeout_secs` 六个字段，`fuse.toml.j2` 按客户端渲染（`force_mount=true` 时自动带出 filer/volume 兜底地址），`client enroll`/`bootstrap` 产出的 `client-<name>.toml` 覆盖静态 `fuse-1/2.toml` 全部键。已实测：uni 集群 bootstrap 渲染出全部字段、FUSE 挂载 + 4MiB IO md5 一致、`request_timeout_secs=5` 生效。发现两项运行时惰键（另行跟踪，不影响渲染对齐）：`admin_port` 仅打警告日志（客户端已无 HTTP 端点，统计走 master `fuse-stats`）；`log_file` 读入后未接日志后端（`_log_file` 未使用）
-3. **主 compose 含 fuse-1/fuse-2 服务**：渲染模板不含（设计上由 `client enroll` + `run-fuse-client.sh` 管理），直接替换需同步 README 与脚本
+3. ~~**主 compose 含 fuse-1/fuse-2 服务**~~ **已完成（退役方式确定并演练）**：渲染 compose 永不包含 fuse 服务（客户端生命周期独立于后端，避免 `compose down -v` 强杀挂载进程）；fuse 客户端经 cluster.toml `[client.*]` 声明（`powerfs-ctl init` 模板已加带注释示例）→ bootstrap 自动 enroll + 渲染 `client-<name>.toml` → `docker/run-fuse-client.sh <name> <ip>` 启动同名容器。`docker exec fuse-1` / `docker restart fuse-1` 类测试脚本零改动。README legacy compose 段已加退役说明；默认 home `.powerfs/cluster.toml` 已声明 fuse-1/2（172.30.0.41/42，verbose/container/force_mount 与静态配置对齐，惰键 admin_port/log_file 不带入新单源）。已实测：uni 集群声明 `[client.fuse-1]` 后 bootstrap 自动签发+渲染，`run-fuse-client.sh fuse-1` 启动、`docker exec fuse-1` 4MiB IO md5 一致、`docker restart` 后重挂载正常
 4. **CI runner 恢复路径**：nightly 用 `cd docker && docker compose up -d` 恢复后端；若静态配置改为渲染产物，runner 需先生成 `.powerfs/rendered`，须与 workflow 同批修改并演练
 5. **compose 项目名与容器名固定**：`DockerComposeDriver` 未传 `-p`，项目名取目录名（恒为 `rendered`），模板 `container_name` 也写死 `master-1`/`redis`/…。两个 home 并存时会共享 `rendered_*` 卷/网络并撞容器名——首轮 live 验证即因复用旧 3 节点 raft 卷而选不出 leader。~~需由 `cluster.name` 派生项目名与容器前缀~~ **已完成**：渲染 compose 声明 top-level `name: <cluster.name>`，容器名统一 `<cluster>-<svc>` 前缀，`cluster.name` 增加 compose 项目名规则校验（`[a-z0-9][a-z0-9_-]*`），`run-fuse-client.sh` 默认网络名改为从 cluster.toml 派生；monitor 宿主端口改为可选 `cluster.monitor_host_port`（缺省不发布，避免多集群撞 8083）。已实测 powerfs(HA) 与 powerfs-uni(simple) 双集群并存，FUSE IO 正常
 
