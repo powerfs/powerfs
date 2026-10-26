@@ -1,6 +1,6 @@
 # 配置去硬编码优化方案
 
-> 状态：P1 已完成（含端到端验证）；P2 前置阻塞 #1（证书命名）#2（FUSE 每客户端参数）#3（fuse 服务退役路径）#4（CI runner 恢复路径）#5（项目名派生）全部已解，P2 可实施
+> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3（脚本接入单源）、P4（防回归）待实施
 > 日期：2026-10-26
 > 关联 issue：private 库「config: eliminate hardcoded IPs and duplicated config files」
 
@@ -87,11 +87,24 @@
 - 对齐 `powerfs-ctl render` 与仓库 compose 的差异：logging 锚点已具备；dedicated fuse 服务按设计**不进入**渲染 compose（由 `client enroll` + 启动脚本管理），需在文档中明确
 - 主 compose 与静态 config 的挂载路径改为 rendered 产物前，必须先适配 CI nightly 的“后端恢复”路径（`cd docker && docker compose -f docker-compose.yml up -d`），否则 runner 上无 rendered 目录会直接失败
 
-### P2：主部署改为渲染产物
+### P2：主部署改为渲染产物 ✅ 已完成（commit `78fe585b` + `cbb6bfaa` + `a0af91a6`）
 
-- 删除 `docker/config/` 静态副本，`docker/docker-compose.yml` 由 `powerfs-ctl config render` 生成
-- CI/运维脚本先执行 render，再 compose up
-- 保留 test/rdma/simple/kernel-test/crdt-test 独立 compose（不同拓扑），但参数化 IP 并共享基础片段
+仓库内手工 compose / 静态 config 全部清零，唯一路径 = `cluster.toml → powerfs-ctl bootstrap`。
+
+- 删除 `docker/docker-compose.yml`、`docker-compose.test.yml`、`docker/config/` 主拓扑 17 份副本、8 个手写 compose 驱动脚本、`scripts/start-fuse-clients.sh`（已被 `docker/run-fuse-client.sh` 取代）
+- 重写 `docker/scripts/start-cluster.sh` / `stop-cluster.sh` 为薄封装：调 `powerfs-ctl bootstrap` / `powerfs-ctl down`
+- 模板暴露 `POWERFS_EC_DATA_SHARDS / PARITY_SHARDS`（master）和 `POWERFS_SCRUBBER_SCAN_INTERVAL / MAX_INODES / EC_MIN_FILE_SIZE`（filer）环境变量——docker/tests EC 场景 export 后 bootstrap 即可
+- CI `check-topology-sync.sh` + `ci-cd.yml` quality job：从 `docker/topology.env` 派生 fuse 客户端声明 → 临时 home render → 校验 rendered compose + cluster.toml 与 topology.env 一致
+- 全部 `docker/tests/*.sh` 容器名前缀适配（parse cluster.toml → PFIX，`docker compose -f "$COMPOSE_FILE"` 显式指定渲染路径）
+
+保留独立测试拓扑（按 plan）：`docker-compose.{kernel-test,rdma,crdt-test,simple}.yml` + `docker/config/{kernel-test,crdt-test,rdma,rdma-host}/` 四个子目录。
+
+**Cold-start 端到端验证**（2026-10-26，self-hosted runner 本机）：
+- 停集群 → 删 15 个 docker volumes → 删 fuse 容器 → 删 powerfs_powerfs-network
+- `docker/restore-backend.sh` 从零 bootstrap：term=1, commit_index=11, 15 证书全签, fuse-1/2 启动, CA 匹配 certs-default
+- `docker exec fuse-1`: dd 4MiB + sync + md5 ✅
+- `docker exec fuse-2`: echo → 写 fuse-2 mount → cat fuse-1 mount → 一致 ✅（跨容器一致性）
+- `check-topology-sync.sh`: 17 addresses, 172.30.0.0/16 ✅
 
 ### P3：脚本接入单源
 
