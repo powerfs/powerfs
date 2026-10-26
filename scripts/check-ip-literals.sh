@@ -32,7 +32,7 @@ case "${1:-}" in
     --update)  MODE="update" ;;
     --verbose) VERBOSE=1 ;;
     --help|-h)
-        sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+        sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
         exit 0 ;;
     "") ;;
     *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
