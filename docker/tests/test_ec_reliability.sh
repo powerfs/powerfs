@@ -30,6 +30,14 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 DOCKER_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 PROJECT_DIR=$(cd "$DOCKER_DIR/.." && pwd)
 
+# ---- 声明式渲染 compose (powerfs-ctl render 产物) ----
+PROJECT_ROOT="$PROJECT_DIR"
+POWERFS_HOME="${POWERFS_HOME:-$PROJECT_ROOT/.powerfs}"
+COMPOSE_FILE="${COMPOSE_FILE:-$POWERFS_HOME/rendered/docker-compose.yml}"
+CLUSTER_NAME=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$POWERFS_HOME/cluster.toml" 2>/dev/null | head -1)
+CLUSTER_NAME="${CLUSTER_NAME:-powerfs}"
+PFIX="${CLUSTER_NAME}-"   # 容器名前缀
+
 EC_DATA_SHARDS="${EC_DATA_SHARDS:-4}"
 EC_PARITY_SHARDS="${EC_PARITY_SHARDS:-2}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-10}"
@@ -40,10 +48,10 @@ TEST_DIR="${MOUNT_POINT}/ec_reliability_test"
 TESTUTIL="/app/powerfs-testutil"
 
 # Filer 容器 (Raft 组)
-FILERS=("filer-1" "filer-2" "filer-3")
+FILERS=("${PFIX}filer-1" "${PFIX}filer-2" "${PFIX}filer-3")
 
 # Volume 容器
-VOLUMES=("volume-1" "volume-2" "volume-3" "volume-4" "volume-5" "volume-6")
+VOLUMES=("${PFIX}volume-1" "${PFIX}volume-2" "${PFIX}volume-3" "${PFIX}volume-4" "${PFIX}volume-5" "${PFIX}volume-6")
 
 # 颜色
 RED='\033[0;31m'
@@ -382,36 +390,16 @@ start_cluster() {
     export POWERFS_EC_MIN_FILE_SIZE=0
     export POWERFS_SCRUBBER_MAX_INODES=50
 
-    cd "$DOCKER_DIR"
-    docker compose down --remove-orphans 2>/dev/null || true
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
     bash "$DOCKER_DIR/scripts/start-cluster.sh" 2>&1 | tail -30
-
-    # 启动 volume-4/5/6 (start-cluster.sh 可能只启动 volume-1/2/3)
-    log_info "启动 volume-4/5/6..."
-    docker compose up -d --no-deps volume-4 volume-5 volume-6 2>&1 || true
-
-    # 等待 volume-4/5/6 注册
-    local retries=0
-    while [ $retries -lt 30 ]; do
-        local ready=0
-        for vol in volume-4 volume-5 volume-6; do
-            container_running "$vol" && ready=$((ready + 1))
-        done
-        if [ $ready -eq 3 ]; then
-            break
-        fi
-        retries=$((retries + 1))
-        sleep 2
-    done
-    sleep 5  # 等待拓扑同步
+    # 渲染 compose 的 ha profile 已含 6 个 volume，bootstrap 全量拉起
 
     wait_fuse_ready
 }
 
 stop_cluster() {
     log_info "停止集群..."
-    cd "$DOCKER_DIR"
-    docker compose down --remove-orphans 2>/dev/null || true
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
     log_ok "集群已停止"
 }
 

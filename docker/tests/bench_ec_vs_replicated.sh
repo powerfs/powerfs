@@ -39,6 +39,14 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 DOCKER_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
 PROJECT_DIR=$(cd "$DOCKER_DIR/.." && pwd)
 
+# ---- 声明式渲染 compose (powerfs-ctl render 产物) ----
+PROJECT_ROOT="$PROJECT_DIR"
+POWERFS_HOME="${POWERFS_HOME:-$PROJECT_ROOT/.powerfs}"
+COMPOSE_FILE="${COMPOSE_FILE:-$POWERFS_HOME/rendered/docker-compose.yml}"
+CLUSTER_NAME=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$POWERFS_HOME/cluster.toml" 2>/dev/null | head -1)
+CLUSTER_NAME="${CLUSTER_NAME:-powerfs}"
+PFIX="${CLUSTER_NAME}-"   # 容器名前缀
+
 EC_DATA_SHARDS="${EC_DATA_SHARDS:-4}"
 EC_PARITY_SHARDS="${EC_PARITY_SHARDS:-2}"
 SCAN_INTERVAL="${SCAN_INTERVAL:-10}"
@@ -46,7 +54,7 @@ FILE_SIZE_MB="${FILE_SIZE_MB:-32}"
 FIO_RUNTIME="${FIO_RUNTIME:-10}"
 
 FUSE_CONTAINER="fuse-1"
-FILER_CONTAINER="filer-1"
+FILER_CONTAINER="${PFIX}filer-1"
 MOUNT_POINT="/mnt/powerfs"
 TEST_DIR="${MOUNT_POINT}/bench_dir"
 TESTUTIL="/app/powerfs-testutil"
@@ -122,10 +130,11 @@ build_and_image() {
         --bin powerfs-testutil 2>&1 | tail -5
     log_ok "二进制编译完成"
 
-    log_info "重建 Docker 镜像..."
-    cd "$DOCKER_DIR"
-    docker compose build 2>&1 | tail -5
-    log_ok "Docker 镜像构建完成"
+    # 渲染 compose 以 bind-mount 二进制为主，镜像构建只在需要 baked-in 场景
+    # 保留 build_test_images.sh 入口，cargo build 已在上方完成
+    log_info "确保 Docker 镜像 (powerfs:latest) 可用..."
+    bash "$DOCKER_DIR/build_test_images.sh" --skip-rust 2>&1 | tail -5
+    log_ok "Docker 镜像可用"
 }
 
 start_cluster() {
@@ -137,34 +146,16 @@ start_cluster() {
     export POWERFS_EC_MIN_FILE_SIZE=0
     export POWERFS_SCRUBBER_MAX_INODES=50
 
-    cd "$DOCKER_DIR"
-    docker compose down --remove-orphans 2>/dev/null || true
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
     bash "$DOCKER_DIR/scripts/start-cluster.sh" 2>&1 | tail -30
+    # 渲染 compose 的 ha profile 已含 6 个 volume，bootstrap 全量拉起
 
-    log_info "启动 volume-4/5/6..."
-    docker compose up -d --no-deps volume-4 volume-5 volume-6 2>&1
-
-    local retries=0
-    while [ $retries -lt 30 ]; do
-        local ready=0
-        for vol in volume-4 volume-5 volume-6; do
-            docker inspect -f '{{.State.Running}}' "$vol" 2>/dev/null | grep -q true && ready=$((ready + 1))
-        done
-        if [ $ready -eq 3 ]; then
-            log_ok "volume-4/5/6 已就绪"
-            break
-        fi
-        retries=$((retries + 1))
-        sleep 2
-    done
-    sleep 5
     wait_fuse_ready
 }
 
 stop_cluster() {
     log_info "停止集群..."
-    cd "$DOCKER_DIR"
-    docker compose down --remove-orphans 2>/dev/null || true
+    docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
     log_ok "集群已停止"
 }
 
