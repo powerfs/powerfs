@@ -11,7 +11,7 @@ RDMA 验证（#76）过程中，临时 `docker rm -f` 一个 volume 节点后触
    分配速度远超 Drop 释放速度，内存高速增长后被系统压力杀掉（非 cgroup OOM）。
 2. **master 对 volume 节点增删没有统一闭环**：
    - `last_heartbeat` 只写不读，**无 liveness 检测**，死节点永不摘除
-     （现存僵尸节点 volume-server-2/3）。
+     （现存僵尸节点 volume-2/3）。
    - `NodeState::Unavailable`（心跳超时）/`Maintenance` 枚举已存在但无人置位；
      维护模式只影响 allocator 新分配，**不进入下发给 filer 的拓扑**。
    - `apply_remove_node` 只删 node、**不删其名下 volume 路由**；且未接到

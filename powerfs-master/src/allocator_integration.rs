@@ -12,7 +12,7 @@
 //! the filer) is delegated to the [`MigrationExecutor`] trait. This module
 //! ships a [`LoggingExecutor`] that records each action and completes it
 //! immediately — exercising the full decision pipeline end-to-end on a real
-//! cluster **without** depending on volume-server cold-data tracking or filer
+//! cluster **without** depending on volume server cold-data tracking or filer
 //! needle→inode reverse lookup, which are prerequisites for real migration
 //! (plan §5.2 stage 3).
 //!

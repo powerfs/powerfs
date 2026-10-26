@@ -299,7 +299,7 @@ nm powerfs.ko | grep write_predict
 docker ps --format 'table {{.Names}}\t{{.Status}}'
 
 # Master 注册状态 (3 volume + 1 filer 全部 OK 才算正常)
-docker logs master-1 --tail 50 | grep -iE 'registered filer|node=volume-server'
+docker logs master-1 --tail 50 | grep -iE 'registered filer|node=volume-'
 
 # RDMA 队列参数生效验证
 docker logs filer-1 2>&1 | grep -iE 'RdmaTransport.*buf_num|MrPool.*registered'

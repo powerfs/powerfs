@@ -866,7 +866,7 @@ class MasterServiceServicer(object):
 
     def RemoveDataNode(self, request, context):
         """Permanently remove a data (volume) node and all its volume routes / zone
-        references (string node_id, e.g. "volume-server-1"). Refuses a healthy
+        references (string node_id, e.g. "volume-1"). Refuses a healthy
         node that still serves volumes unless `force=true`.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)

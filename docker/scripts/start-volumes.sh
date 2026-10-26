@@ -155,7 +155,7 @@ try:
         ip = s.get('ip', s.get('Ip', '?'))
         np = s.get('net_port', s.get('NetPort', '?'))
         vid = s.get('id', s.get('Id', '?'))
-        print(f'  volume-server: id={vid} ip={ip} net_port={np}')
+        print(f'  volume: id={vid} ip={ip} net_port={np}')
 except:
     print('  (无法解析拓扑 JSON, 原始输出:)')
     print(sys.stdin.read())

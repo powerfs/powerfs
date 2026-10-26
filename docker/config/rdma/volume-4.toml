@@ -14,7 +14,7 @@ net_port = 8901
 data_dir = "/data"
 master_addresses = ["172.30.0.11:9333", "172.30.0.12:9333", "172.30.0.13:9333"]
 master_net_port = 9334
-node_id = "volume-server-4"
+node_id = "volume-4"
 max_volume_size = 107374182400
 initial_volume_count = 4
 advertise_addr = "172.30.0.24"
@@ -25,5 +25,5 @@ registration_token = "powerfs-cluster-test"  # 节点注册认证令牌 (必须�
 
 # Certificate paths for production node authentication
 ca_crt = "/etc/powerfs/certs/ca.crt"
-client_crt = "/etc/powerfs/certs/volume-server-4.crt"
-client_key = "/etc/powerfs/certs/volume-server-4.key"
+client_crt = "/etc/powerfs/certs/volume-4.crt"
+client_key = "/etc/powerfs/certs/volume-4.key"

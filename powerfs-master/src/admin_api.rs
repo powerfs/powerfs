@@ -548,12 +548,8 @@ mod tests {
             ("GET", "/masters", ""),
             ("POST", "/masters", r#"{"id":4,"addr":"10.0.0.4:9335"}"#),
             ("DELETE", "/masters/2?force=true", ""),
-            (
-                "POST",
-                "/nodes/volume-server-1/maintenance",
-                r#"{"enabled":true}"#,
-            ),
-            ("DELETE", "/nodes/volume-server-1", ""),
+            ("POST", "/nodes/volume-1/maintenance", r#"{"enabled":true}"#),
+            ("DELETE", "/nodes/volume-1", ""),
         ] {
             let app = admin_router().with_state(MockOps::ha(true).arced());
             let (status, _) =
@@ -751,7 +747,7 @@ mod tests {
         let (status, _) = status_of(
             app.oneshot(req(
                 "POST",
-                "/nodes/volume-server-2/maintenance",
+                "/nodes/volume-2/maintenance",
                 Some(TOKEN),
                 r#"{"enabled":true}"#,
             ))
@@ -762,7 +758,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             *mock.maintenance_calls.lock().unwrap(),
-            vec![("volume-server-2".to_string(), true)]
+            vec![("volume-2".to_string(), true)]
         );
     }
 
@@ -772,7 +768,7 @@ mod tests {
         let (status, _) = status_of(
             app.oneshot(req(
                 "POST",
-                "/nodes/volume-server-2/maintenance",
+                "/nodes/volume-2/maintenance",
                 Some(TOKEN),
                 "{}",
             ))
@@ -788,20 +784,15 @@ mod tests {
         let mock = MockOps::ha(true);
         let app = admin_router().with_state(mock.arced());
         let (status, _) = status_of(
-            app.oneshot(req(
-                "DELETE",
-                "/nodes/volume-server-2?force=true",
-                Some(TOKEN),
-                "",
-            ))
-            .await
-            .unwrap(),
+            app.oneshot(req("DELETE", "/nodes/volume-2?force=true", Some(TOKEN), ""))
+                .await
+                .unwrap(),
         )
         .await;
         assert_eq!(status, 200);
         assert_eq!(
             *mock.remove_calls.lock().unwrap(),
-            vec![("volume-server-2".to_string(), true)]
+            vec![("volume-2".to_string(), true)]
         );
 
         let mock2 = MockOps::ha(true);
@@ -824,7 +815,7 @@ mod tests {
         let (status, _) = status_of(
             app.oneshot(req(
                 "POST",
-                "/nodes/volume-server-2/maintenance",
+                "/nodes/volume-2/maintenance",
                 Some(TOKEN),
                 r#"{"enabled":true}"#,
             ))

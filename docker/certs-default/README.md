@@ -12,7 +12,7 @@ box for local development and testing.
 | `ca.key`                   | CA private key (master uses to sign leaf certs)         |
 | `client_registry.json`     | Master-side registry of issued leaf cert fingerprints   |
 | `filer-*.crt` / `*.key`    | Storage-node certs (filer-1/2/3)                        |
-| `volume-server-*.crt/.key` | Storage-node certs (volume-server-1..6)                 |
+| `volume-*.crt` / `*.key`   | Storage-node certs (volume-1..6)                        |
 | `fuse-client-*.crt/.key`   | FUSE user-space client certs (fuse-client-1/2)          |
 | `kernel-client-*.crt/.key` | Kernel client certs (kernel-client-1/2 for VM mounts)   |
 

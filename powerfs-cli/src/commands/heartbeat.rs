@@ -7,7 +7,7 @@ use tokio_stream::StreamExt as _;
 #[derive(Args)]
 pub struct HeartbeatArgs {
     /// Volume server ID
-    #[arg(short, long, default_value = "test-volume-server")]
+    #[arg(short, long, default_value = "test-volume")]
     id: String,
 
     /// IP address

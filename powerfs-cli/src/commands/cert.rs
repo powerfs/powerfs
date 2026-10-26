@@ -77,7 +77,7 @@ pub struct SignClientArgs {
 
 #[derive(Args, Debug)]
 pub struct SignNodeArgs {
-    /// Storage node ID (e.g. "filer-1", "volume-server-1"). This MUST
+    /// Storage node ID (e.g. "filer-1", "volume-1"). This MUST
     /// match the node_id reported by the filer/volume server in its
     /// RegisterFiler/Heartbeat TLV. The master rejects a cert whose
     /// client_name does not match the reported node_id.

@@ -939,9 +939,9 @@ impl MasterNode {
             {
                 let mut topology = master.topology.write().unwrap();
 
-                // Add volume-server-1: IP=172.20.0.21, grpc=8080, http=8091
+                // Add volume-1: IP=172.20.0.21, grpc=8080, http=8091
                 let node1 = DataNodeInfo::new(
-                    NodeId("volume-server-1".to_string()),
+                    NodeId("volume-1".to_string()),
                     "172.20.0.21:8080".to_string(), // gRPC address
                     RackId("rack-1".to_string()),
                     DataCenterId("dc-1".to_string()),
@@ -951,9 +951,9 @@ impl MasterNode {
                 );
                 topology.get_or_create_node(node1);
 
-                // Add volume-server-2: IP=172.20.0.22, grpc=8080, http=8092
+                // Add volume-2: IP=172.20.0.22, grpc=8080, http=8092
                 let node2 = DataNodeInfo::new(
-                    NodeId("volume-server-2".to_string()),
+                    NodeId("volume-2".to_string()),
                     "172.20.0.22:8080".to_string(), // gRPC address
                     RackId("rack-1".to_string()),
                     DataCenterId("dc-1".to_string()),
@@ -963,9 +963,9 @@ impl MasterNode {
                 );
                 topology.get_or_create_node(node2);
 
-                // Add volume-server-3: IP=172.20.0.23, grpc=8080, http=8093
+                // Add volume-3: IP=172.20.0.23, grpc=8080, http=8093
                 let node3 = DataNodeInfo::new(
-                    NodeId("volume-server-3".to_string()),
+                    NodeId("volume-3".to_string()),
                     "172.20.0.23:8080".to_string(), // gRPC address
                     RackId("rack-1".to_string()),
                     DataCenterId("dc-1".to_string()),

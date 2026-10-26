@@ -276,7 +276,7 @@ mod tests {
     fn create_test_nodes(count: usize) -> Vec<DataNodeInfo> {
         (0..count)
             .map(|i| DataNodeInfo {
-                id: NodeId(format!("volume-server-{}", i + 1)),
+                id: NodeId(format!("volume-{}", i + 1)),
                 address: format!("172.20.0.{}", 21 + i),
                 rack_id: RackId(format!("rack-{}", (i % 2) + 1)),
                 data_center_id: DataCenterId("dc-1".to_string()),
@@ -314,10 +314,10 @@ mod tests {
     fn test_round_robin_three_nodes() {
         let assigner = RoundRobinAssigner;
         let nodes = create_test_nodes(3);
-        assert_eq!(assigner.assign(0, &nodes, 1)[0].id.0, "volume-server-1");
-        assert_eq!(assigner.assign(1, &nodes, 1)[0].id.0, "volume-server-2");
-        assert_eq!(assigner.assign(2, &nodes, 1)[0].id.0, "volume-server-3");
-        assert_eq!(assigner.assign(3, &nodes, 1)[0].id.0, "volume-server-1");
+        assert_eq!(assigner.assign(0, &nodes, 1)[0].id.0, "volume-1");
+        assert_eq!(assigner.assign(1, &nodes, 1)[0].id.0, "volume-2");
+        assert_eq!(assigner.assign(2, &nodes, 1)[0].id.0, "volume-3");
+        assert_eq!(assigner.assign(3, &nodes, 1)[0].id.0, "volume-1");
     }
 
     #[test]

@@ -14,7 +14,7 @@ net_port = 8901
 data_dir = "/data"
 master_addresses = ["192.168.100.4:9333"]
 master_net_port = 9334
-node_id = "volume-server-1"
+node_id = "volume-1"
 max_volume_size = 107374182400
 initial_volume_count = 4
 advertise_addr = "192.168.100.4"
@@ -23,5 +23,5 @@ force_sync_on_write = false      # 持久化策略: false=内存ack(NVMe-oF盘�
 wal_idle_sync_secs = 30   # 后台空闲 WAL fsync 间隔(秒): 0=禁用, >0 空闲时检查并 fsync 有新写入的 WAL
 registration_token = "powerfs-cluster-test"
 ca_crt = "/etc/powerfs/certs/ca.crt"
-client_crt = "/etc/powerfs/certs/volume-server-1.crt"
-client_key = "/etc/powerfs/certs/volume-server-1.key"
+client_crt = "/etc/powerfs/certs/volume-1.crt"
+client_key = "/etc/powerfs/certs/volume-1.key"

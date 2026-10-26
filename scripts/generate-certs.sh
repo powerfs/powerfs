@@ -4,7 +4,7 @@
 # =============================================================================
 # 通过 master CA 服务 (powerfs-cli cert) 生成完整证书套件：
 #   - CA 证书 (ca.crt) — 分发给所有节点验证 leaf 证书
-#   - 存储节点证书 (filer-*.crt, volume-server-*.crt) — filer/volume 作为
+#   - 存储节点证书 (filer-*.crt, volume-*.crt) — filer/volume 作为
 #     master 客户端 mTLS
 #   - 客户端证书 (kernel-client-*.crt, fuse-client-*.crt) — FUSE/kernel 客户端
 #     mount 时 mTLS，绑定源 IP + 挂载目录
@@ -76,7 +76,7 @@ declare -p HOST_VM2_IPS >/dev/null 2>&1 || HOST_VM2_IPS=(192.168.100.52 172.30.0
 # IP 必须与 docker-compose.yml 的 ipv4_address 一致, 否则 master 证书验证拒绝.
 declare -p THREE_FILER_IDS  >/dev/null 2>&1 || THREE_FILER_IDS=(filer-1 filer-2 filer-3)
 declare -p THREE_FILER_IPS  >/dev/null 2>&1 || THREE_FILER_IPS=(172.30.0.31 172.30.0.32 172.30.0.33)
-declare -p THREE_VOLUME_IDS >/dev/null 2>&1 || THREE_VOLUME_IDS=(volume-server-1 volume-server-2 volume-server-3 volume-server-4 volume-server-5 volume-server-6)
+declare -p THREE_VOLUME_IDS >/dev/null 2>&1 || THREE_VOLUME_IDS=(volume-1 volume-2 volume-3 volume-4 volume-5 volume-6)
 declare -p THREE_VOLUME_IPS >/dev/null 2>&1 || THREE_VOLUME_IPS=(172.30.0.21 172.30.0.22 172.30.0.23 172.30.0.24 172.30.0.25 172.30.0.26)
 declare -p THREE_FUSE_IDS   >/dev/null 2>&1 || THREE_FUSE_IDS=(fuse-client-1 fuse-client-2)
 declare -p THREE_FUSE_IPS   >/dev/null 2>&1 || THREE_FUSE_IPS=(172.30.0.41 172.30.0.42)
@@ -187,9 +187,9 @@ sign_node() {
 
 if [[ "$TOPOLOGY" == "host" ]]; then
     sign_node filer-1 "$HOST_NODE_IP"
-    sign_node volume-server-1 "$HOST_NODE_IP"
-    sign_node volume-server-2 "$HOST_NODE_IP"
-    sign_node volume-server-3 "$HOST_NODE_IP"
+    sign_node volume-1 "$HOST_NODE_IP"
+    sign_node volume-2 "$HOST_NODE_IP"
+    sign_node volume-3 "$HOST_NODE_IP"
 elif [[ "$TOPOLOGY" == "three" ]]; then
     for i in "${!THREE_FILER_IDS[@]}"; do
         sign_node "${THREE_FILER_IDS[i]}" "${THREE_FILER_IPS[i]}"

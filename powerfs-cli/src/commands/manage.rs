@@ -62,7 +62,7 @@ pub struct NodeMaintenanceArgs {
 
 #[derive(Args, Debug)]
 pub struct NodeRemoveArgs {
-    /// Data-node id (string), e.g. "volume-server-rdma"
+    /// Data-node id (string), e.g. "volume-1"
     pub node_id: String,
     /// Force removal even if the node still appears healthy and owns volumes
     #[arg(long)]

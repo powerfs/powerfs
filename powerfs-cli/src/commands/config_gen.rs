@@ -696,7 +696,7 @@ pub fn config_gen(args: &ConfigGenArgs) -> Result<(), String> {
         let config = build_volume_config(
             &cfg,
             ip,
-            &format!("volume-server-{}", i + 1),
+            &format!("volume-{}", i + 1),
             &master_addrs,
             &filer_peers,
         );
@@ -775,7 +775,7 @@ fn build_config(
             data_dir: format!("{}/volume", cfg.data_dir),
             master_addresses: master_addrs.to_vec(),
             master_net_port: cfg.master_net_port,
-            node_id: "volume-server-1".to_string(),
+            node_id: "volume-1".to_string(),
             max_volume_size: cfg.max_volume_size,
             initial_volume_count: cfg.initial_volume_count,
             device_capacity: None,

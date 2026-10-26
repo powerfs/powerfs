@@ -130,7 +130,7 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://demo-redis:6379
-    command: /app/powerfs-volume --grpc-address 172.21.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-1
+    command: /app/powerfs-volume --grpc-address 172.21.0.21:8080 --http-port 8091 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-1
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.21 8080 || exit 1"]
       interval: 5s
@@ -157,7 +157,7 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://demo-redis:6379
-    command: /app/powerfs-volume --grpc-address 172.21.0.22:8080 --http-port 8092 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-2
+    command: /app/powerfs-volume --grpc-address 172.21.0.22:8080 --http-port 8092 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-2
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.22 8080 || exit 1"]
       interval: 5s
@@ -184,7 +184,7 @@ services:
     environment:
       - RUST_LOG=info
       - REDIS_URL=redis://demo-redis:6379
-    command: /app/powerfs-volume --grpc-address 172.21.0.23:8080 --http-port 8093 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-server-3
+    command: /app/powerfs-volume --grpc-address 172.21.0.23:8080 --http-port 8093 --data-dir /data --master-address 172.21.0.11:9333 --master-address 172.21.0.12:9333 --master-address 172.21.0.13:9333 --node-id volume-3
     healthcheck:
       test: ["CMD-SHELL", "nc -z 172.21.0.23 8080 || exit 1"]
       interval: 5s

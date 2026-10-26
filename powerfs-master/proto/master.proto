@@ -115,7 +115,7 @@ service MasterService {
     rpc UpdateRebalancePolicy(UpdateRebalancePolicyRequest) returns (PolicyUpdateResponse);
     rpc SetNodeMaintenance(SetNodeMaintenanceRequest) returns (MigrationControlResponse);
     // Permanently remove a data (volume) node and all its volume routes / zone
-    // references (string node_id, e.g. "volume-server-1"). Refuses a healthy
+    // references (string node_id, e.g. "volume-1"). Refuses a healthy
     // node that still serves volumes unless `force=true`.
     rpc RemoveDataNode(RemoveDataNodeRequest) returns (MigrationControlResponse);
     rpc PinVolume(PinVolumeRequest) returns (VolumeManageResponse);
@@ -1880,7 +1880,7 @@ message SetNodeMaintenanceRequest {
 }
 
 message RemoveDataNodeRequest {
-    // Data-node identifier (string), e.g. "volume-server-rdma".
+    // Data-node identifier (string), e.g. "volume-rdma-1".
     string node_id = 1;
     // If false (default), refuse to remove a node that is still Healthy and
     // owns volumes (drain it first or take it down so the liveness watcher

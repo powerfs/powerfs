@@ -1,6 +1,6 @@
 # 配置去硬编码优化方案
 
-> 状态：P1 已完成（含端到端验证）；P2 待前置阻塞解除
+> 状态：P1 已完成（含端到端验证）；P2 前置阻塞 #1（证书命名）#5（项目名派生）已解，余 #2/#3/#4
 > 日期：2026-10-26
 > 关联 issue：private 库「config: eliminate hardcoded IPs and duplicated config files」
 
@@ -117,7 +117,7 @@
 
 ### P2 前置阻塞（实施中发现）
 
-1. **证书命名两套不统一**：legacy 夹具为 `volume-server-N.crt`，`powerfs-ctl` 声明式路径为 `volume-N.crt`；模板改指向任一命名前，需先统一（否则 mTLS 失败）
+1. ~~**证书命名两套不统一**~~ **已完成**：统一为 `volume-N`（与 `powerfs-ctl` 声明式路径一致）。改动覆盖 `docker/topology.env`、`generate-certs.sh`、`docker/config/**`（含 rdma/rdma-host/kernel-test 及 master 参考段）、`powerfs-ctl` 之外的 CLI 生成器/测试/文档，并重新签发 `docker/certs-default/` 整套证书（CA 不变，registry 重建为干净夹具）。已实测：legacy 三 master + 6 volume 以新名注册、mTLS 通过、FUSE IO 校验一致；旧 `volume-server-N` 僵尸节点经 `manage node-remove` 清理；声明式 bootstrap + FUSE IO 回归通过
 2. **FUSE 每客户端参数**：静态 `fuse-1/2.toml` 含 `admin_port=9998`、`verbose/container/log_file`，渲染模板未覆盖；测试 compose 依赖这些值
 3. **主 compose 含 fuse-1/fuse-2 服务**：渲染模板不含（设计上由 `client enroll` + `run-fuse-client.sh` 管理），直接替换需同步 README 与脚本
 4. **CI runner 恢复路径**：nightly 用 `cd docker && docker compose up -d` 恢复后端；若静态配置改为渲染产物，runner 需先生成 `.powerfs/rendered`，须与 workflow 同批修改并演练

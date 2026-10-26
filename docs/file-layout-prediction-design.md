@@ -1103,7 +1103,7 @@ fio --name=randwrite --filename=/mnt/powerfs/fio_randwrite.bin \
 
 ```
 测试脚本: kernel/vm/test_layout_prediction.sh
-环境: Docker single-node (master-1 + filer-1 + volume-server-1 + fuse-1)
+环境: Docker single-node (master-1 + filer-1 + volume-1 + fuse-1)
 
 结果: 56 PASS, 0 FAIL, 0 WARN
 
