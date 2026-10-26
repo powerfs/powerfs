@@ -1,6 +1,6 @@
 # 配置去硬编码优化方案
 
-> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3 已完成（含双 VM 运行时回归）；P4（防回归）待实施
+> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3 已完成（含双 VM 运行时回归）；P4 IP lint 已完成（文档清理待做）
 > 日期：2026-10-26
 > 关联 issue：private 库「config: eliminate hardcoded IPs and duplicated config files」
 
@@ -171,8 +171,13 @@
 ### P4：防回归
 
 - **已完成部分**：`scripts/check-topology-sync.sh` 校验 `docker/topology.env` 与主 compose 的地址集合、网段、网关一致，已接入 CI `quality` job
-- CI 增加 IP 字面量 lint（白名单：rendered 产物、测试 fixtures）
-- 文档只保留单源路径；删除“手工改 compose/config”的指引
+- **✅ CI IP 字面量 lint 已接入**（`scripts/check-ip-literals.sh` + `scripts/ip-literal-baseline.txt`）：
+  - 扫描父仓库 git 索引中的文本文件（`docs/`、`*.md` 允许示例地址；`kernel/` 为 submodule 不在范围）
+  - 正则只匹配 RFC1918 私网段（10/8、172.16/12、192.168/16），统计**出现次数**而非行数
+  - 基线存量 89 文件 / 560 次；基线外新文件或超基线出现次数 → CI 失败并输出 `::error file=…` 注解
+  - 出现次数减少或文件删除不失败，仅提示可 `--update` 刷新基线（防止基线长期失真）
+  - 已做负向测试：新增文件含 IP → 失败；`docker/run-fuse-client.sh` 增 1 个 IP（2→3）→ 失败；`docs/` 新增 IP → 通过；无变更 → 89/560 通过
+- 文档只保留单源路径；删除“手工改 compose/config”的指引（待做）
 
 ## 5. 风险与回滚
 

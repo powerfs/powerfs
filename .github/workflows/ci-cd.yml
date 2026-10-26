@@ -107,6 +107,12 @@ jobs:
         ./target/release/powerfs-ctl --home "$TMP_HOME" config render
         ./scripts/check-topology-sync.sh "$TMP_HOME/rendered/docker-compose.yml" "$TMP_HOME/cluster.toml"
 
+    - name: IP literal lint (P4)
+      run: |
+        # 禁止新增硬编码私网 IP: 基线外的文件或超过基线的出现次数都会失败.
+        # 清理存量后用 ./scripts/check-ip-literals.sh --update 刷新基线.
+        ./scripts/check-ip-literals.sh
+
     - name: Format Check
       run: |
         source "$HOME/.cargo/env"
