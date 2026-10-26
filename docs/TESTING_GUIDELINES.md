@@ -145,7 +145,7 @@ docker exec fuse-2 ls -la /mnt/powerfs/test_dir/
 
 ### Docker Compose 文件
 
-- **主配置**: `docker/docker-compose.yml` - 完整集群配置
+- **主配置**: `.powerfs/rendered/docker-compose.yml` - 完整集群配置
 - **测试配置**: `docker/docker-compose.test.yml` - 单节点测试配置（已废弃，使用主配置）
 
 ### 关键端口
@@ -182,7 +182,7 @@ docker exec fuse-1 bash -c "echo 'persistent data' > /mnt/powerfs/persist.txt"
 docker exec fuse-1 cat /mnt/powerfs/persist.txt
 
 # 3. 重启 FUSE 客户端
-docker compose -f docker/docker-compose.yml restart fuse-1
+docker compose -f .powerfs/rendered/docker-compose.yml restart fuse-1
 
 # 4. 验证数据持久化
 docker exec fuse-1 cat /mnt/powerfs/persist.txt

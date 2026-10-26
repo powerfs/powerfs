@@ -51,8 +51,8 @@ foreign=$(docker ps --format '{{.Names}}' | grep -E '(^|-)master-1$' | grep -vx 
   Another cluster occupies this host. Tear it down first (or debug it), then re-run."
 
 # --- 2. stale legacy network --------------------------------------------------
-# The legacy docker/docker-compose.yml project ('docker') and the rendered
-# project both bind com.docker.network.bridge.name=powerfs-br0. If the legacy
+# The legacy docker/ project (hand-maintained compose, now deleted) and the
+# rendered compose both bind com.docker.network.bridge.name=powerfs-br0. If the legacy
 # network survived a `compose down`, remove it when unused so the rendered
 # network can take the bridge. `network rm` fails while endpoints exist, which
 # is exactly the case we must not touch.

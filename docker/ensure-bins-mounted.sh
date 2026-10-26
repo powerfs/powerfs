@@ -4,7 +4,8 @@
 #
 # The default docker image (BUILD_BINS=0) ships ZERO Rust binaries inside the
 # image itself — they are expected to arrive at runtime via the bind-mounts
-# declared in docker-compose.yml:
+# declared in the rendered compose (powerfs-ctl config render produces
+# .powerfs/rendered/docker-compose.yml, which bind-mounts the binary).
 #
 #     volumes:
 #       - ./target/release/powerfs-filer:/app/powerfs-filer:ro
@@ -21,7 +22,7 @@
 #   2. Verifies that it exists AND is a non-empty regular file.
 #   3. If NOT, emits a clear, actionable error that:
 #        - names the missing binary,
-#        - points to the docker-compose volume-mount convention,
+#        - points to the powerfs-ctl render volume-mount convention,
 #        - reminds the user of the BUILD_BINS=1 escape hatch to bake
 #          binaries into the image instead, and
 #        - exits with code 2 (ENOENT semantics, easy to grep for).
@@ -66,21 +67,21 @@ EOF
     cat >&2 <<'EOF'
 
   The image was built with BUILD_BINS=0 (the default), so no powerfs
-  binaries are baked into the image. Docker-compose MUST bind-mount
-  ./target/release/powerfs-<svc> from your host source tree onto
+  binaries are baked into the image. The rendered compose (from
+  `powerfs-ctl config render`) MUST bind-mount
+  ../../target/release/powerfs-<svc> from your host source tree onto
   /app/powerfs-<svc>:ro inside the container, e.g.
 
-      services:
-        filer-1:
-          image: powerfs:latest
-          volumes:
-            - ./target/release/powerfs-filer:/app/powerfs-filer:ro
-            - ./config:/etc/powerfs:ro
+      # (inside .powerfs/rendered/docker-compose.yml)
+      volumes:
+        - ../../target/release/powerfs-filer:/app/powerfs-filer:ro
+        - ../certs:/etc/powerfs/certs:ro
+        - ./config/filer-1.toml:/app/config/filer.toml:ro
 
   First thing to try:
       cargo build --release
-      # (re)start containers so the new binary is bind-mounted:
-      docker-compose -f docker/docker-compose.yml restart
+      # re-render + bootstrap to pick up new binaries:
+      powerfs-ctl bootstrap
 
   Alternative — bake binaries INTO the image (slower, CI/packaging only):
       docker build \

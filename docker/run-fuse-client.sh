@@ -10,7 +10,9 @@
 #
 # Access the mount INSIDE the container (`docker exec <name> ls /mnt/powerfs`):
 # the host bind dir /tmp/powerfs/<name> is rprivate and does NOT track the
-# fuse view (same as the fuse services in docker/docker-compose.yml).
+# fuse view (same configuration shape the old hand-maintained compose used
+# to carry; the rendered compose no longer includes fuse services — clients
+# are declared in cluster.toml [client.*] and started via this script).
 #
 # Env overrides: NETWORK (default derived from $POWERFS_HOME/cluster.toml's
 # name as `<cluster>_powerfs-network`), CERTS_DIR (default
@@ -61,7 +63,8 @@ docker network inspect "$NETWORK" >/dev/null 2>&1 || {
 mkdir -p "/tmp/powerfs/$NAME"
 docker rm -f "$NAME" 2>/dev/null || true
 
-# Flags mirror the fuse services in docker/docker-compose.yml (privileged,
+# Flags mirror the rendered compose fuse service section
+# (privileged, cap_add, /dev/fuse bind-mount, cgroup host).
 # /dev/fuse, host mount dir), but certs/config come from the enroll output
 # and cert paths are passed on the CLI — the rendered client toml has no
 # tls keys.

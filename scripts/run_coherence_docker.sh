@@ -8,10 +8,16 @@ set -e
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
 
-# Docker container names (must match docker-compose.yml)
+# Docker container names — rendered compose prefixes with cluster.name
+# (powerfs-ctl bootstrap sets top-level `name: <cluster.name>`).
+# FUSE containers keep bare names (run-fuse-client.sh uses --name fuse-1).
+CLUSTER_NAME=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$PROJECT_ROOT/.powerfs/cluster.toml" 2>/dev/null | head -1)
+CLUSTER_NAME="${CLUSTER_NAME:-powerfs}"
+PFIX="${CLUSTER_NAME}-"
 FUSE1_CONTAINER="fuse-1"
 FUSE2_CONTAINER="fuse-2"
-MASTER_CONTAINER="master-1"
+MASTER_CONTAINER="${PFIX}master-1"
 
 # Mount points inside containers
 FUSE_MOUNT="/mnt/powerfs"

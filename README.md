@@ -313,7 +313,7 @@ registration_token = "your-cluster-token" # 节点注册认证令牌
 
 > **Note**: Docker Compose is the recommended way for development/testing. Production environments must use 3+ Raft nodes with TLS certificates.
 
-> **Deprecation**: the `fuse-1`/`fuse-2` services in `docker/docker-compose.yml`
+> **Deprecation**: the `fuse-1`/`fuse-2` services in `.powerfs/rendered/docker-compose.yml`
 > are being retired — FUSE clients are managed outside compose via
 > `powerfs-ctl client enroll <name> --ip <ip>` + `docker/run-fuse-client.sh
 > <name> <ip>` (see the powerfs-ctl section above). The container keeps
@@ -324,7 +324,7 @@ registration_token = "your-cluster-token" # 节点注册认证令牌
 docker compose -f docker/docker-compose.rdma.yml up -d
 
 # 三节点 HA 拓扑 (bridge network, 172.30.0.x)
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f .powerfs/rendered/docker-compose.yml up -d
 ```
 
 证书生成（master 启动后）：

@@ -37,7 +37,7 @@ container:
 ```bash
 # 1. start master (auto-generates ca.crt + ca.key + client_registry.json
 #    into this directory on first start)
-docker compose -f docker/docker-compose.yml up -d master-1 master-2 master-3
+docker compose -f .powerfs/rendered/docker-compose.yml up -d master-1 master-2 master-3
 
 # 2. sign all storage node + client certs (writes them into this directory)
 ./scripts/generate-certs.sh --topology three \
@@ -76,7 +76,7 @@ certificates and mount `docker/certs/` instead of `docker/certs-default/`.
 #    (docker/certs/ is gitignored — secrets stay local)
 
 # 3. start cluster with production certs
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f .powerfs/rendered/docker-compose.yml up -d
 ```
 
 ## Replacing certs on a running cluster
