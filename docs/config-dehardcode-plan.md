@@ -117,8 +117,17 @@
   - legacy 路径（host/three 显式传参）**完全保留**，不受影响
   - topology.env 继续是 legacy 路径来源
 - `docker/topology.env` 注释已更新：P3 后 from-cluster 优先 cluster.toml，legacy 才读 topology.env
+- `kernel/vm/` **✅ 核心 launcher + test 脚本统一 source share/powerfs.env**（commit 待 push）：
+  - **扩展 share/powerfs.env**（已被 4 个脚本 source，扩成完整单源）：
+    - 顶部加 from-cluster 自动覆盖块（扫描 cluster.toml + rendered compose → awk 派生 MASTER/FILER/VOLUME 地址 + cluster.toml 取 SUBNET/GATEWAY/SHARD_COUNT）
+    - 补 POWERFS_FILER_ADDR / POWERFS_VOLUME_ADDR / POWERFS_API_PORT / POWERFS_SUBNET / POWERFS_GATEWAY / VM1_ETH0_IP / VM2_ETH0_IP 等缺失字段
+    - 用户 env 显式设置优先覆盖 from-cluster（`${VAR+set}` guard）
+    - 默认值保持 host RDMA 拓扑（不破坏 VM 原生场景）
+  - **核心 launcher 脚本 10 个**：run_qemu.sh / run_qemu_vm2.sh / run_qemu_kernel_ssh.sh / run_qemu_kernel.sh / run-vm.sh / qemuctl.sh / qemuctl2.sh / setup_network.sh / setup_network_dual.sh / build_initramfs.sh — 加 source powerfs.env，删所有 `:-172.30.0.11,...` / `:-9334` 硬编码 fallback，改用 `: "${VAR:?not set}"` 引用
+  - **修正漂移 bug**：filer IP 从旧单节点 `172.30.0.35,172.30.0.36,172.30.0.37` 统一到 HA 集群正确值 `31/32/33`（from-cluster 自动覆盖）
+  - **test_*.sh + fault_injection.sh**：批量加 source 块 + sed 替换硬编码 mount 命令里的 `master_addr=172.30.0.11,...` → `${POWERFS_MASTER_ADDR}`
+  - **bash -n 全量通过**（kernel/vm/ + kernel/vm/share/ 共 54+107 个脚本）
 - kernel client from-cluster 路径（段名 → sign_client 第一个参数）**待完善**（cluster.toml 默认注释掉 kernel client 声明，不阻断）
-- VM 54 脚本统一 `kernel/vm/cluster.env`，删除各自默认值 — **待实施**
 
 ### P1-3：端到端验证（已完成，2026-10-26）
 
