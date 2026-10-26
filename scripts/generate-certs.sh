@@ -77,7 +77,7 @@ MASTER_IDS=(); MASTER_IPS=()
 FILER_IDS=(); FILER_IPS=()
 VOLUME_IDS=(); VOLUME_IPS=()
 CLIENT_FUSE_IDS=(); CLIENT_FUSE_IPS=()
-KERNEL_CLIENT_IPS=()
+KERNEL_CLIENT_IDS=(); KERNEL_CLIENT_IPS=()
 
 if [ "$FROM_CLUSTER" = "1" ]; then
     echo "INFO: --from-cluster mode — reading topology from $CLUSTER_TOML + $RENDERED_COMPOSE" >&2
@@ -137,7 +137,7 @@ if [ "$FROM_CLUSTER" = "1" ]; then
             fuse)
                 CLIENT_FUSE_IDS+=("$cname"); CLIENT_FUSE_IPS+=("$cip") ;;
             kernel)
-                [ -n "$cip" ] && KERNEL_CLIENT_IPS+=("$cip") ;;
+                [ -n "$cip" ] && { KERNEL_CLIENT_IDS+=("$cname"); KERNEL_CLIENT_IPS+=("$cip"); } ;;
         esac
     done < <(awk '
         /^\[client\.[^]]+\]/ {
@@ -162,7 +162,7 @@ if [ "$FROM_CLUSTER" = "1" ]; then
     echo "  filers:         ${FILER_IDS[*]:-none}" >&2
     echo "  volumes:        ${VOLUME_IDS[*]:-none}" >&2
     echo "  fuse clients:    ${#CLIENT_FUSE_IDS[@]} (${CLIENT_FUSE_IDS[*]:-none})" >&2
-    echo "  kernel clients:  ${#KERNEL_CLIENT_IPS[@]} IPs" >&2
+    echo "  kernel clients:  ${#KERNEL_CLIENT_IDS[@]} (${KERNEL_CLIENT_IDS[*]:-none})" >&2
 fi
 
 # --- 缺省参数（legacy path 留原逻辑不动）---
@@ -365,10 +365,11 @@ if [ "$FROM_CLUSTER" = "1" ]; then
         sign_client "${CLIENT_FUSE_IDS[i]}" "${CLIENT_FUSE_IPS[i]}"
     done
     [ ${#CLIENT_FUSE_IDS[@]} -gt 0 ] || echo "  (no fuse clients declared in cluster.toml)" >&2
-    for i in "${!KERNEL_CLIENT_IPS[@]}"; do
+    for i in "${!KERNEL_CLIENT_IDS[@]}"; do
         # kernel-client 名从 cluster.toml 段名取（如 [client.kernel-default]）
-        echo "  INFO: kernel client IP ${KERNEL_CLIENT_IPS[i]} (声明方式待完善)" >&2
+        sign_client "${KERNEL_CLIENT_IDS[i]}" "${KERNEL_CLIENT_IPS[i]}"
     done
+    [ ${#KERNEL_CLIENT_IDS[@]} -gt 0 ] || echo "  (no kernel clients declared in cluster.toml)" >&2
 else
     if [[ "$TOPOLOGY" == "host" ]]; then
         sign_client kernel-client-1 "${HOST_VM1_IPS[@]}"

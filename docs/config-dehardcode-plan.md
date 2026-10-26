@@ -1,6 +1,6 @@
 # 配置去硬编码优化方案
 
-> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3（脚本接入单源）、P4（防回归）待实施
+> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3 代码改造已完成（VM 运行时回归待重启 VM 后执行）；P4（防回归）待实施
 > 日期：2026-10-26
 > 关联 issue：private 库「config: eliminate hardcoded IPs and duplicated config files」
 
@@ -117,7 +117,7 @@
   - legacy 路径（host/three 显式传参）**完全保留**，不受影响
   - topology.env 继续是 legacy 路径来源
 - `docker/topology.env` 注释已更新：P3 后 from-cluster 优先 cluster.toml，legacy 才读 topology.env
-- `kernel/vm/` **✅ 核心 launcher + test 脚本统一 source share/powerfs.env**（commit 待 push）：
+- `kernel/vm/` **✅ 核心 launcher + test 脚本统一 source share/powerfs.env**（kernel submodule `ee811cd`，父仓库 `ec755151`，均已推送）：
   - **扩展 share/powerfs.env**（已被 4 个脚本 source，扩成完整单源）：
     - 顶部加 from-cluster 自动覆盖块（扫描 cluster.toml + rendered compose → awk 派生 MASTER/FILER/VOLUME 地址 + cluster.toml 取 SUBNET/GATEWAY/SHARD_COUNT）
     - 补 POWERFS_FILER_ADDR / POWERFS_VOLUME_ADDR / POWERFS_API_PORT / POWERFS_SUBNET / POWERFS_GATEWAY / VM1_ETH0_IP / VM2_ETH0_IP 等缺失字段
@@ -127,7 +127,17 @@
   - **修正漂移 bug**：filer IP 从旧单节点 `172.30.0.35,172.30.0.36,172.30.0.37` 统一到 HA 集群正确值 `31/32/33`（from-cluster 自动覆盖）
   - **test_*.sh + fault_injection.sh**：批量加 source 块 + sed 替换硬编码 mount 命令里的 `master_addr=172.30.0.11,...` → `${POWERFS_MASTER_ADDR}`
   - **bash -n 全量通过**（kernel/vm/ + kernel/vm/share/ 共 54+107 个脚本）
-- kernel client from-cluster 路径（段名 → sign_client 第一个参数）**待完善**（cluster.toml 默认注释掉 kernel client 声明，不阻断）
+- `generate-certs.sh` **✅ kernel client from-cluster 已打通**：
+  - `[client.<name>] type="kernel"` 现按段名签发（`KERNEL_CLIENT_IDS` + IP 成对入参），不再只打印 INFO
+  - 实测：临时 home 声明 `[client.kernel-test] ip=172.30.0.200` → `kernel-test.crt/key` 成功签发，SAN-IP 正确；无声明时输出 `(no kernel clients declared)`
+  - 限制：`ClientSpec` 目前只有单 `ip` 字段，VM 双 SAN（ib0+eth0）仍需显式 `cert sign-client --san-ip` 或多声明段；与 P3 验收无冲突
+- `kernel/vm/share/powerfs.env` **✅ 恢复 POSIX sh 兼容**（修复 P3 改造引入的两个 bashism）：
+  - `BASH_SOURCE[0]` 数组引用 → `${BASH_SOURCE:-$0}`（busybox ash/dash 下回退 `$0`）
+  - 进程替换 `done < <(awk …)` → here-doc 命令替换（`sh -n`/`dash -n` 通过）
+  - 逐级上溯查找仓库根（`share → vm → kernel → repo/.powerfs`），不再依赖固定相对层级
+  - 新增 `POWERFS_MASTER_PRIMARY`（HA 逗号列表首项）供 admin API / ping 等单主机语义使用；修正 `qemuctl.sh` 证书脚本 `--master-api`、`qemuctl2.sh` ib0 ping 的取址
+  - `setup_network.sh` 尾部回显、`run_qemu_kernel_ssh.sh` 的 VM_IP/GATEWAY 改为 env 派生（删除 172.20/172.30 字面量）
+- VM 运行时回归（本轮未完成）：`dash/busybox sh` source 验证通过（有/无 `.powerfs` 两种场景：HA 172.30 vs host-RDMA 192.168.100.3）；`qemuctl.sh mount` 实测已正确解析为 `master_addr=172.30.0.11,172.30.0.12,172.30.0.13, shard_count=3`，但当前主机上遗留的 RDMA 双 VM 的 tap0/tap1 未接入 `powerfs-br0`（此前 qemuctl2 session 状态），VM 无法连通 Docker 网段，故 mount 在 `connect -113` 失败。需用标准脚本重启 VM 后补跑 IO 校验，不阻塞代码合入。
 
 ### P1-3：端到端验证（已完成，2026-10-26）
 
