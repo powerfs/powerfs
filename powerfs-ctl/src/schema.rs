@@ -40,6 +40,11 @@ pub struct Cluster {
     /// Admin API token (used by powerfs-cli cert subcommands).
     #[serde(default = "default_admin_token")]
     pub admin_token: String,
+    /// Host port published for the monitor UI (host:8083 → container:8081 when
+    /// `Some`). Omit when running multiple clusters on one host to avoid port
+    /// collisions; the UI stays reachable at `http://<monitor_ip>:8081`.
+    #[serde(default)]
+    pub monitor_host_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +196,19 @@ pub enum SchemaError {
         role: &'static str,
         profile: Profile,
     },
+    #[error("invalid cluster name '{0}': must match [a-z0-9][a-z0-9_-]* (used as the docker compose project name)")]
+    BadName(String),
+}
+
+/// `cluster.name` becomes the docker compose project name (top-level `name:`),
+/// so it must satisfy compose's project-name grammar.
+fn valid_project_name(name: &str) -> bool {
+    let mut it = name.bytes();
+    match it.next() {
+        Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit() => {}
+        _ => return false,
+    }
+    it.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 impl ClusterConfig {
@@ -198,6 +216,9 @@ impl ClusterConfig {
     pub fn validate(&self) -> Result<ResolvedCluster, SchemaError> {
         if self.cluster.shard_count == 0 {
             return Err(SchemaError::ZeroShardCount);
+        }
+        if !valid_project_name(&self.cluster.name) {
+            return Err(SchemaError::BadName(self.cluster.name.clone()));
         }
         let (subnet_net, prefix) = parse_subnet(&self.network.subnet)?;
 
@@ -366,5 +387,38 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(cfg.validate(), Err(SchemaError::ZeroShardCount)));
+    }
+
+    #[test]
+    fn rejects_invalid_cluster_name() {
+        for bad in ["PowerFS", "-bad", "_bad", "a b", "a.b", ""] {
+            let cfg: ClusterConfig = toml::from_str(&format!(
+                r#"
+                [cluster]
+                name = "{bad}"
+                shard_count = 1
+                [network]
+                subnet = "172.30.0.0/16"
+            "#
+            ))
+            .unwrap();
+            assert!(
+                matches!(cfg.validate(), Err(SchemaError::BadName(_))),
+                "name {bad:?} should be rejected"
+            );
+        }
+        for good in ["powerfs", "a1", "a-b", "a_b", "9lives"] {
+            let cfg: ClusterConfig = toml::from_str(&format!(
+                r#"
+                [cluster]
+                name = "{good}"
+                shard_count = 1
+                [network]
+                subnet = "172.30.0.0/16"
+            "#
+            ))
+            .unwrap();
+            assert!(cfg.validate().is_ok(), "name {good:?} should be accepted");
+        }
     }
 }

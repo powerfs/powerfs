@@ -111,6 +111,9 @@ fn build_context(rc: &ResolvedCluster) -> Result<Map<String, Value>, RenderError
         json!(rc.cfg.cluster.registration_token),
     );
     m.insert("admin_token".into(), json!(rc.cfg.cluster.admin_token));
+    if let Some(p) = rc.cfg.cluster.monitor_host_port {
+        m.insert("monitor_host_port".into(), json!(p));
+    }
     m.insert("master_ips".into(), json!(rc.master_ips));
     m.insert("volume_ips".into(), json!(rc.volume_ips));
     m.insert("filer_ips".into(), json!(rc.filer_ips));

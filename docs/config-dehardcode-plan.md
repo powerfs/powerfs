@@ -121,7 +121,7 @@
 2. **FUSE 每客户端参数**：静态 `fuse-1/2.toml` 含 `admin_port=9998`、`verbose/container/log_file`，渲染模板未覆盖；测试 compose 依赖这些值
 3. **主 compose 含 fuse-1/fuse-2 服务**：渲染模板不含（设计上由 `client enroll` + `run-fuse-client.sh` 管理），直接替换需同步 README 与脚本
 4. **CI runner 恢复路径**：nightly 用 `cd docker && docker compose up -d` 恢复后端；若静态配置改为渲染产物，runner 需先生成 `.powerfs/rendered`，须与 workflow 同批修改并演练
-5. **compose 项目名与容器名固定**：`DockerComposeDriver` 未传 `-p`，项目名取目录名（恒为 `rendered`），模板 `container_name` 也写死 `master-1`/`redis`/…。两个 home 并存时会共享 `rendered_*` 卷/网络并撞容器名——首轮 live 验证即因复用旧 3 节点 raft 卷而选不出 leader。需由 `cluster.name` 派生项目名与容器前缀（涉及 driver 接口与全部调用点，单独一批处理）
+5. **compose 项目名与容器名固定**：`DockerComposeDriver` 未传 `-p`，项目名取目录名（恒为 `rendered`），模板 `container_name` 也写死 `master-1`/`redis`/…。两个 home 并存时会共享 `rendered_*` 卷/网络并撞容器名——首轮 live 验证即因复用旧 3 节点 raft 卷而选不出 leader。~~需由 `cluster.name` 派生项目名与容器前缀~~ **已完成**：渲染 compose 声明 top-level `name: <cluster.name>`，容器名统一 `<cluster>-<svc>` 前缀，`cluster.name` 增加 compose 项目名规则校验（`[a-z0-9][a-z0-9_-]*`），`run-fuse-client.sh` 默认网络名改为从 cluster.toml 派生；monitor 宿主端口改为可选 `cluster.monitor_host_port`（缺省不发布，避免多集群撞 8083）。已实测 powerfs(HA) 与 powerfs-uni(simple) 双集群并存，FUSE IO 正常
 
 ### P4：防回归
 

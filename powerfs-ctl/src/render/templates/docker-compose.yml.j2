@@ -1,5 +1,9 @@
 # Rendered by powerfs-ctl. DO NOT EDIT — edit cluster.toml and run `powerfs-ctl config render`.
 
+# Project name comes from cluster.name so multiple cluster homes can coexist
+# without sharing volumes/networks or colliding on container names.
+name: {{ cluster_name }}
+
 networks:
   powerfs-network:
     driver: bridge
@@ -32,7 +36,7 @@ volumes:
 services:
   redis:
     image: redis:7-alpine
-    container_name: redis
+    container_name: {{ cluster_name }}-redis
     logging: *default-logging
     networks:
       powerfs-network:
@@ -49,7 +53,7 @@ services:
 {% for i in range(master_ips | length) %}
   master-{{ i + 1 }}:
     image: {{ image_tag }}
-    container_name: master-{{ i + 1 }}
+    container_name: {{ cluster_name }}-master-{{ i + 1 }}
     logging: *default-logging
     restart: unless-stopped
     networks:
@@ -77,7 +81,7 @@ services:
 {% for i in range(volume_ips | length) %}
   volume-{{ i + 1 }}:
     image: {{ image_tag }}
-    container_name: volume-{{ i + 1 }}
+    container_name: {{ cluster_name }}-volume-{{ i + 1 }}
     logging: *default-logging
     restart: unless-stopped
     networks:
@@ -96,7 +100,7 @@ services:
 {% for i in range(filer_ips | length) %}
   filer-{{ i + 1 }}:
     image: {{ image_tag }}
-    container_name: filer-{{ i + 1 }}
+    container_name: {{ cluster_name }}-filer-{{ i + 1 }}
     logging: *default-logging
     restart: unless-stopped
     networks:
@@ -114,7 +118,7 @@ services:
 {% endfor %}
   monitor:
     image: {{ image_tag }}
-    container_name: monitor
+    container_name: {{ cluster_name }}-monitor
     logging: *default-logging
     restart: unless-stopped
     networks:
@@ -123,15 +127,17 @@ services:
     volumes:
       - ./config/monitor.toml:/app/config/monitor.toml:ro
       - ../../target/release/powerfs-monitor:/app/powerfs-monitor:ro
+{% if monitor_host_port is defined %}
     ports:
-      - "8083:8081"
+      - "{{ monitor_host_port }}:8081"
+{% endif %}
     command: /app/powerfs-monitor --config /app/config/monitor.toml
     depends_on:
       - master-1
 
   s3:
     image: {{ image_tag }}
-    container_name: s3
+    container_name: {{ cluster_name }}-s3
     logging: *default-logging
     restart: unless-stopped
     networks:

@@ -12,12 +12,26 @@
 # the host bind dir /tmp/powerfs/<name> is rprivate and does NOT track the
 # fuse view (same as the fuse services in docker/docker-compose.yml).
 #
-# Env overrides: NETWORK (default rendered_powerfs-network),
-# CERTS_DIR (default <repo>/.powerfs/certs), IMAGE (default powerfs:latest)
+# Env overrides: NETWORK (default derived from $POWERFS_HOME/cluster.toml's
+# name as `<cluster>_powerfs-network`), CERTS_DIR (default
+# <repo>/.powerfs/certs), IMAGE (default powerfs:latest)
 set -e
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NETWORK="${NETWORK:-rendered_powerfs-network}"
+HOME_DIR="${POWERFS_HOME:-$REPO_ROOT/.powerfs}"
+if [ -z "${NETWORK:-}" ]; then
+    # Rendered compose declares top-level `name: <cluster.name>`, so the
+    # network is `<cluster.name>_powerfs-network`.
+    cname=""
+    if [ -f "$HOME_DIR/cluster.toml" ]; then
+        cname=$(sed -n 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$HOME_DIR/cluster.toml" | head -1)
+    fi
+    if [ -n "$cname" ]; then
+        NETWORK="${cname}_powerfs-network"
+    else
+        NETWORK="rendered_powerfs-network"  # legacy pre-project-name default
+    fi
+fi
 CERTS_DIR="${CERTS_DIR:-$REPO_ROOT/.powerfs/certs}"
 IMAGE="${IMAGE:-powerfs:latest}"
 FUSE_BIN="$REPO_ROOT/target/release/powerfs-fuse"

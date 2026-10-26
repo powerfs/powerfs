@@ -16,6 +16,10 @@ data_root = "/var/lib/powerfs"
 image_tag = "ghcr.io/powerfs/powerfs:latest"
 registration_token = "powerfs-cluster"
 admin_token = "powerfs-admin"
+# Host port for the monitor UI (host:8083 → container:8081). Comment out when
+# running multiple clusters on one host to avoid port collisions; the UI stays
+# reachable at http://<monitor-ip>:8081.
+monitor_host_port = 8083
 
 [network]
 subnet = "172.30.0.0/16"
