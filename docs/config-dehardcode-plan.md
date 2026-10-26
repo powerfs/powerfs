@@ -1,6 +1,6 @@
 # 配置去硬编码优化方案
 
-> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3 代码改造已完成（VM 运行时回归待重启 VM 后执行）；P4（防回归）待实施
+> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3 已完成（含双 VM 运行时回归）；P4（防回归）待实施
 > 日期：2026-10-26
 > 关联 issue：private 库「config: eliminate hardcoded IPs and duplicated config files」
 
@@ -106,7 +106,7 @@
 - `docker exec fuse-2`: echo → 写 fuse-2 mount → cat fuse-1 mount → 一致 ✅（跨容器一致性）
 - `check-topology-sync.sh`: 17 addresses, 172.30.0.0/16 ✅
 
-### P3：脚本接入单源（进行中）
+### P3：脚本接入单源（已完成，2026-10-26）
 
 - `scripts/generate-certs.sh` **✅ 已完成** — 新增 `--from-cluster` 模式（commit `684a8bd8`）：
   - 自动启用条件：cluster.toml + rendered compose 同时存在 **且** 用户未显式传 `--topology`/`--master-api`
@@ -137,7 +137,14 @@
   - 逐级上溯查找仓库根（`share → vm → kernel → repo/.powerfs`），不再依赖固定相对层级
   - 新增 `POWERFS_MASTER_PRIMARY`（HA 逗号列表首项）供 admin API / ping 等单主机语义使用；修正 `qemuctl.sh` 证书脚本 `--master-api`、`qemuctl2.sh` ib0 ping 的取址
   - `setup_network.sh` 尾部回显、`run_qemu_kernel_ssh.sh` 的 VM_IP/GATEWAY 改为 env 派生（删除 172.20/172.30 字面量）
-- VM 运行时回归（本轮未完成）：`dash/busybox sh` source 验证通过（有/无 `.powerfs` 两种场景：HA 172.30 vs host-RDMA 192.168.100.3）；`qemuctl.sh mount` 实测已正确解析为 `master_addr=172.30.0.11,172.30.0.12,172.30.0.13, shard_count=3`，但当前主机上遗留的 RDMA 双 VM 的 tap0/tap1 未接入 `powerfs-br0`（此前 qemuctl2 session 状态），VM 无法连通 Docker 网段，故 mount 在 `connect -113` 失败。需用标准脚本重启 VM 后补跑 IO 校验，不阻塞代码合入。
+- VM 运行时回归 **✅ 已完成**（复用标准脚本，无临时新建脚本）：
+  - 流程：`qemuctl2.sh stop` → `setup_network_dual.sh` → `run_qemu_kernel_ssh.sh` / `run_qemu_vm2.sh`，SSH 各 4s 就绪
+  - 单源生效证据：VM `/proc/cmdline` 为 `powerfs_master_addr=172.30.0.11,172.30.0.12,172.30.0.13`、`powerfs_volume_addr=172.30.0.21…26`、`vm_ip=172.30.0.100/101`，全部来自 cluster.toml/render，脚本内无字面量
+  - 网络：tap0/tap1 → `powerfs-br0`，VM ping master 0.163ms
+  - 挂载：双 VM `transport=tcp` + `master_addr` 列表 + `shard_count=3`，`MOUNT_RC=0`
+  - 跨 VM：VM1 写 4MiB → VM2 md5 一致；VM2 删除 → VM1 不可见
+  - 稳定性：30 轮 4MiB 写/读/删，63s，FAIL=0；`check_dmesg_anomaly.sh` VM1/VM2 均通过（860/610 行，无 BUG/Oops/KASAN）
+  - 观察项（非 P3 缺陷）：VM2 对未创建过的文件收到删除通知时打印 `remove_dir_entry NOT_FOUND`，属日志噪音，另记 issue 跟踪
 
 ### P1-3：端到端验证（已完成，2026-10-26）
 
