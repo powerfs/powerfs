@@ -855,9 +855,11 @@ impl RaftNodeV2 {
     /// - **假 Leader（lease 过期后仍 Leader）**：openraft 设计上 Leader 不主动下台，
     ///   等待其他节点选举。但若其他节点都停止，Leader 永远卡住 → 停止服务。
     pub fn spawn_health_monitor(&self, has_peers: bool, raft_unavailable: Arc<AtomicBool>) {
+        // 单节点集群也必须运行本任务：指标（IS_LEADER/RAFT_TERM/commit/applied）
+        // 只在这里发布，缺了它们 powerfs-ctl 的健康门禁永远看不到 leader。
+        // 仅跳过"假 Leader"探测——无 peer 时不存在 quorum 丢失语义。
         if !has_peers {
-            info!("RaftNodeV2: skip health monitor for single-node cluster");
-            return;
+            info!("RaftNodeV2: single-node cluster — publishing raft metrics, skipping fake-Leader probe");
         }
 
         let raft = self.raft.clone();
@@ -942,7 +944,7 @@ impl RaftNodeV2 {
                 // 方案 C: 超过阈值后设置 raft_unavailable=true,
                 // net_handler 拒绝需要 raft 的请求 (返回 UNAVAILABLE).
                 // 不退出进程, 保持内存状态, quorum 恢复后立即恢复服务.
-                if current_state == ServerState::Leader {
+                if has_peers && current_state == ServerState::Leader {
                     let propose_ok = match raft.ensure_linearizable(ReadPolicy::ReadIndex).await {
                         Ok(_) => true,
                         Err(e) => {
