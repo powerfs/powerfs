@@ -31,8 +31,21 @@
 # =============================================================================
 set -euo pipefail
 
+# --- 拓扑单一来源 ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# docker/topology.env 是节点 IP 的唯一来源；文件缺失时才退回下方内置缺省。
+TOPOLOGY_ENV="${TOPOLOGY_ENV:-${REPO_ROOT}/docker/topology.env}"
+if [ -f "$TOPOLOGY_ENV" ]; then
+    # shellcheck source=../docker/topology.env
+    . "$TOPOLOGY_ENV"
+else
+    echo "WARN: $TOPOLOGY_ENV not found — falling back to built-in topology" >&2
+fi
+
 # --- 缺省参数 ---
-MASTER_API="${MASTER_API:-192.168.100.3:9300}"
+MASTER_API="${MASTER_API:-${MASTER_API_HOST:-192.168.100.3}:${MASTER_API_PORT:-9300}}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-powerfs-admin-test}"
 OUTPUT_DIR="${OUTPUT_DIR:-docker/certs-default}"
 TOPOLOGY="host"
@@ -41,8 +54,6 @@ MOUNT_DIR="${MOUNT_DIR:-/mnt/powerfs}"
 # 自动探测 powerfs-cli (CLI 参数优先级最高, 然后是 repo-root/target/release/powerfs-cli,
 # 然后是 CWD/target/release/powerfs-cli, 最后 PATH)
 if [ -z "${CLI:-}" ]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
     if [ -x "${REPO_ROOT}/target/release/powerfs-cli" ]; then
         CLI="${REPO_ROOT}/target/release/powerfs-cli"
     elif [ -x "target/release/powerfs-cli" ]; then
@@ -54,26 +65,28 @@ if [ -z "${CLI:-}" ]; then
     fi
 fi
 
+# 以下为 topology.env 缺失时的内置缺省；已从 env 加载的配置优先。
 # host RDMA 拓扑: 所有存储节点共享 host IP 192.168.100.3
 HOST_NODE_IP="${HOST_NODE_IP:-192.168.100.3}"
 # VM kernel-client 源 IP (ib0 IPoIB 优先, eth0 docker-net 兜底)
-HOST_VM1_IPS=(192.168.100.51 172.30.0.100)
-HOST_VM2_IPS=(192.168.100.52 172.30.0.101)
+declare -p HOST_VM1_IPS >/dev/null 2>&1 || HOST_VM1_IPS=(192.168.100.51 172.30.0.100)
+declare -p HOST_VM2_IPS >/dev/null 2>&1 || HOST_VM2_IPS=(192.168.100.52 172.30.0.101)
 
 # 三节点 HA: 各服务独立 IP (bridge 172.30.0.x)
 # IP 必须与 docker-compose.yml 的 ipv4_address 一致, 否则 master 证书验证拒绝.
-THREE_FILER_IDS=(filer-1 filer-2 filer-3)
-THREE_FILER_IPS=(172.30.0.31 172.30.0.32 172.30.0.33)
-THREE_VOLUME_IDS=(volume-server-1 volume-server-2 volume-server-3 volume-server-4 volume-server-5 volume-server-6)
-THREE_VOLUME_IPS=(172.30.0.21 172.30.0.22 172.30.0.23 172.30.0.24 172.30.0.25 172.30.0.26)
-THREE_FUSE_IDS=(fuse-client-1 fuse-client-2)
-THREE_FUSE_IPS=(172.30.0.41 172.30.0.42)
+declare -p THREE_FILER_IDS  >/dev/null 2>&1 || THREE_FILER_IDS=(filer-1 filer-2 filer-3)
+declare -p THREE_FILER_IPS  >/dev/null 2>&1 || THREE_FILER_IPS=(172.30.0.31 172.30.0.32 172.30.0.33)
+declare -p THREE_VOLUME_IDS >/dev/null 2>&1 || THREE_VOLUME_IDS=(volume-server-1 volume-server-2 volume-server-3 volume-server-4 volume-server-5 volume-server-6)
+declare -p THREE_VOLUME_IPS >/dev/null 2>&1 || THREE_VOLUME_IPS=(172.30.0.21 172.30.0.22 172.30.0.23 172.30.0.24 172.30.0.25 172.30.0.26)
+declare -p THREE_FUSE_IDS   >/dev/null 2>&1 || THREE_FUSE_IDS=(fuse-client-1 fuse-client-2)
+declare -p THREE_FUSE_IPS   >/dev/null 2>&1 || THREE_FUSE_IPS=(172.30.0.41 172.30.0.42)
 
 usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
+  拓扑与节点 IP 来自 docker/topology.env（可用 TOPOLOGY_ENV 指向其它文件）
   --topology host|three     拓扑 (默认 host)
-  --master-api HOST:PORT    master admin API (默认 192.168.100.3:9300)
+  --master-api HOST:PORT    master admin API (默认 ${MASTER_API})
   --admin-token TOKEN       admin token (默认 powerfs-admin-test)
   --output-dir DIR          输出目录 (默认 docker/certs-default)
   --mount-dir DIR           客户端绑定挂载目录 (默认 /mnt/powerfs)
