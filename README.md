@@ -137,38 +137,14 @@ powerfs-ctl node data add volume-7
 powerfs-ctl doctor                 # diagnostics
 ```
 
-### Alternative: raw docker compose
+### Legacy deployment paths (removed)
 
-```bash
-cd powerfs/docker
-
-# Build & launch full cluster (Redis + Masters + Volumes + Filers + FUSE)
-sudo ./build_powerfs_image.sh
-docker compose -f docker-compose.test.yml up -d
-```
-
-### Alternative: run binaries manually from source
-
-```bash
-cargo build --release
-
-# 1. Start Redis
-docker run -d --name redis -p 6379:6379 redis:7-alpine
-
-# 2. Start 3 Masters (Raft)
-./target/release/powerfs-master --config config/master-{1,2,3}.toml
-
-# 3. Start 3 Volumes
-./target/release/powerfs-volume --config config/volume-{1,2,3}.toml
-
-# 4. Start 3 Filers (each formats the POSIX root on first boot, via Raft;
-#    no separate init step needed — see "Filer Node (metadata format is
-#    automatic)" below)
-./target/release/powerfs-filer --config config/filer-{1,2,3}.toml
-
-# 5. Mount
-./target/release/powerfs-fuse --config config/fuse.toml
-```
+The old hand-maintained deployment paths are gone:
+`docker/build_powerfs_image.sh`, `docker/docker-compose.test.yml`, and the
+top-level `config/` directory no longer exist. Do not copy or edit node
+configuration files — all of them are generated from `.powerfs/cluster.toml`
+into `.powerfs/rendered/` (see [Single-source configuration](#single-source-configuration)).
+Run `powerfs-ctl` instead of assembling the cluster by hand.
 
 **Kernel client**: install `powerfs.ko` via DKMS so it rebuilds across kernel
 upgrades — see [kernel/README.md](kernel/README.md#dkms-install-auto-rebuild-on-kernel-upgrades).
@@ -279,103 +255,86 @@ PowerFS adopts a **multi-binary independent deployment** architecture, where eac
 
 > Filers format the POSIX root inode themselves on first boot (replicated via Raft, guarded by a persistent format marker) — no separate init step is required. The legacy `powerfs-init` binary has been removed.
 
-### Configuration
+### Single-source configuration
 
-All services use **unified TOML configuration files** with no hardcoded default values. Configuration priority: CLI parameters > configuration file > default values (configuration must explicitly specify all ports and addresses).
+All topology, addressing, and port settings live in **one hand-written file**,
+`.powerfs/cluster.toml`. `powerfs-ctl` renders it into per-service TOML files
+and a compose file:
 
-#### Configuration Example (master-1.toml)
+```text
+.powerfs/cluster.toml                          # you edit this
+  └── powerfs-ctl config render
+        ├── .powerfs/rendered/config/*.toml    # generated — do not edit
+        └── .powerfs/rendered/docker-compose.yml
+```
 
 ```toml
-[global]
-log_level = "info"
-redis_url = "redis://127.0.0.1:6379"
+[cluster]
+name = "powerfs"
+profile = "ha"                  # simple | ha | rdma
+shard_count = 3
+data_root = "/var/lib/powerfs"
+registration_token = "powerfs-cluster"
+admin_token = "powerfs-admin"
 
-[master]
-port = 9333                    # HTTP/gRPC端口
-raft_port = 9335              # Raft端口 (必须与port不同)
-metrics_port = 9300           # Metrics/Admin HTTP端口 (cert API挂载于此)
-net_port = 9334               # powerfs-net TLV端口
-dir = "/data/master"
-ip = "0.0.0.0"
-raft_id = 1
-advertise_addr = "192.168.1.100:9333"
-raft_peers = [
-    "192.168.1.100:9335",
-    "192.168.1.101:9335",
-    "192.168.1.102:9335",
-]
-admin_token = "your-admin-secret"        # 管理API认证令牌 (CLI cert命令需要)
-ca_dir = "/data/master/ca"              # CA证书存储目录
-registration_token = "your-cluster-token" # 节点注册认证令牌
+[network]
+subnet = "172.30.0.0/16"        # gateway and bridge are derived if omitted
+
+[nodes.master]                  # count/ips optional; profile defaults apply
+# count = 3
+# ips = ["172.30.0.11", "172.30.0.12", "172.30.0.13"]
+
+[client.fuse-1]                 # optional pre-declared clients
+type = "fuse"
+ip = "172.30.0.41"
 ```
 
-### Quick Start (Docker Compose)
+Change an address or scale a role by editing `cluster.toml`, then run
+`powerfs-ctl config render` (or `bootstrap`, which renders first). Rendered
+files are overwritten on every render, so edits there are lost. Certificates
+are issued automatically during bootstrap; there is no separate cert step.
 
-> **Note**: Docker Compose is the recommended way for development/testing. Production environments must use 3+ Raft nodes with TLS certificates.
+### Quick Start (rendered compose)
 
-> **Deprecation**: the `fuse-1`/`fuse-2` services in `.powerfs/rendered/docker-compose.yml`
-> are being retired — FUSE clients are managed outside compose via
-> `powerfs-ctl client enroll <name> --ip <ip>` + `docker/run-fuse-client.sh
-> <name> <ip>` (see the powerfs-ctl section above). The container keeps
-> `<name>`, so `docker exec fuse-1 ...` based test scripts are unaffected.
+> `powerfs-ctl bootstrap` is the supported entry point: it renders
+> `cluster.toml`, issues certificates, starts the cluster and waits for the
+> health gate. Production environments must use 3+ Raft nodes.
+
+The compose file is a rendered output, never a source file:
 
 ```bash
-# Host RDMA 拓扑 (单 host + 3 volume, 使用 host network)
-docker compose -f docker/docker-compose.rdma.yml up -d
+# Deploy (render -> certs -> up -> health gate)
+./target/release/powerfs-ctl bootstrap --profile ha
 
-# 三节点 HA 拓扑 (bridge network, 172.30.0.x)
-docker compose -f .powerfs/rendered/docker-compose.yml up -d
+# Inspect / stop the generated compose without editing it
+docker compose -f .powerfs/rendered/docker-compose.yml ps
+docker compose -f .powerfs/rendered/docker-compose.yml down
 ```
 
-证书生成（master 启动后）：
-```bash
-bash scripts/generate-certs.sh                  # 默认 host 拓扑
-bash scripts/generate-certs.sh --topology three # 三节点 HA
-```
-
-### Quick Start (3-Node Raft Cluster)
-
-```bash
-# Step 1: Start Redis
-docker run -d --name redis -p 6379:6379 redis:7-alpine
-
-# Step 2: Start 3 Master nodes
-./target/release/powerfs-master --config config/master-1.toml
-./target/release/powerfs-master --config config/master-2.toml
-./target/release/powerfs-master --config config/master-3.toml
-
-# Step 3: Start 3 Volume nodes
-./target/release/powerfs-volume --config config/volume-1.toml
-./target/release/powerfs-volume --config config/volume-2.toml
-./target/release/powerfs-volume --config config/volume-3.toml
-
-# Step 4: Start 3 Filer nodes (POSIX root is formatted automatically on
-# first boot through Raft — no separate init step)
-./target/release/powerfs-filer --config config/filer-1.toml
-./target/release/powerfs-filer --config config/filer-2.toml
-./target/release/powerfs-filer --config config/filer-3.toml
-
-# Step 5: Mount FUSE
-./target/release/powerfs-fuse --config config/fuse.toml
-```
+FUSE clients are not part of the rendered compose; enroll them as shown in the
+quick start above (`powerfs-ctl client enroll` + `docker/run-fuse-client.sh`).
 
 ### Run Each Component
+
+> The configs below are generated from `.powerfs/cluster.toml` by
+> `powerfs-ctl config render`. Use them for debugging individual services;
+> do not edit them in place — change `cluster.toml` and re-render.
 
 #### Master Node
 
 ```bash
 # 3-node Raft cluster
-powerfs-master --config config/master-1.toml
-powerfs-master --config config/master-2.toml
-powerfs-master --config config/master-3.toml
+powerfs-master --config .powerfs/rendered/config/master-1.toml
+powerfs-master --config .powerfs/rendered/config/master-2.toml
+powerfs-master --config .powerfs/rendered/config/master-3.toml
 ```
 
 #### Volume Node
 
 ```bash
-powerfs-volume --config config/volume-1.toml
-powerfs-volume --config config/volume-2.toml
-powerfs-volume --config config/volume-3.toml
+powerfs-volume --config .powerfs/rendered/config/volume-1.toml
+powerfs-volume --config .powerfs/rendered/config/volume-2.toml
+powerfs-volume --config .powerfs/rendered/config/volume-3.toml
 ```
 
 #### Filer Node (metadata format is automatic)
@@ -388,9 +347,9 @@ A Filer formats the POSIX root inode (`inode 1`, `/`) itself on first boot — t
 
 ```bash
 # Just start it — formatting/adoption happens behind the boot gate.
-powerfs-filer --config config/filer-1.toml
-powerfs-filer --config config/filer-2.toml
-powerfs-filer --config config/filer-3.toml
+powerfs-filer --config .powerfs/rendered/config/filer-1.toml
+powerfs-filer --config .powerfs/rendered/config/filer-2.toml
+powerfs-filer --config .powerfs/rendered/config/filer-3.toml
 ```
 
 > The legacy `powerfs-init` binary (offline RocksDB writer, bypassing Raft) has been removed; its role is fully covered by the boot gate above. To discard metadata intentionally, wipe the data volumes instead (e.g. `powerfs-ctl down --purge`).
@@ -398,20 +357,20 @@ powerfs-filer --config config/filer-3.toml
 #### FUSE Client
 
 ```bash
-powerfs-fuse --config config/fuse.toml
+powerfs-fuse --config .powerfs/rendered/config/fuse.toml
 ```
 
 #### CLI Tool
 
 ```bash
 # Check cluster status
-powerfs-cli --config config/master-1.toml status
+powerfs-cli --config .powerfs/rendered/config/master-1.toml status
 
 # List volumes
-powerfs-cli --config config/master-1.toml volumes
+powerfs-cli --config .powerfs/rendered/config/master-1.toml volumes
 
 # Create bucket
-powerfs-cli --config config/master-1.toml create-bucket my-bucket
+powerfs-cli --config .powerfs/rendered/config/master-1.toml create-bucket my-bucket
 
 # Certificate management (requires admin_token)
 powerfs-cli cert init-ca --master-api master-1:9300 --admin-token "your-admin-secret" -o /etc/powerfs/certs/
@@ -437,44 +396,26 @@ PowerFS uses a **three-tier authentication** model:
 
 ### Docker Deployment (Recommended)
 
-PowerFS provides Docker Compose configuration for quick multi-node cluster deployment:
+The rendered compose is produced from `cluster.toml`; it is not checked in and
+must not be edited by hand.
 
 ```bash
-# Clone the repository
+# Clone and build
 git clone https://github.com/powerfs/powerfs.git
-cd powerfs/docker
+cd powerfs
+cargo build --release
 
-# Build Docker images
-sudo ./build_powerfs_image.sh
+# Render + issue certs + start + wait for the health gate
+./target/release/powerfs-ctl bootstrap --profile ha
 
-# Start the test environment (Redis + Masters + Volumes + Init + Filers + FUSE)
-docker compose -f docker-compose.test.yml up -d
-
-# Stop the test environment
-docker compose -f docker-compose.test.yml down
+# Inspect
+./target/release/powerfs-ctl status
+docker compose -f .powerfs/rendered/docker-compose.yml ps
 ```
 
-**Service Ports**:
-| Service | Container Port | Host Port (Test) |
-|---------|---------------|------------------|
-| Redis | 6379 | 6380 |
-| Master-1 | 9333 (gRPC), 9334 (net) | 9433 |
-| Master-2 | 9333, 9334 | 9434 |
-| Master-3 | 9333, 9334 | 9435 |
-| Volume-1 | 8080 (gRPC), 8091 (http), 8901 (net) | 8180, 8191 |
-| Volume-2 | 8080, 8091, 8901 | 8181, 8192 |
-| Volume-3 | 8080, 8091, 8901 | 8182, 8193 |
-| Filer-1 | 8888 (S3), 8889 (gRPC), 8890 (net) | 8988, 8989, 8990 |
-| Filer-2 | 8888, 8889, 8890 | 8991, 8992, 8993 |
-| Filer-3 | 8888, 8889, 8890 | 8994, 8995, 8996 |
-| FUSE | Mount at /mnt/fuse | - |
-
-**Deployment Order**:
-1. **Wave 1**: Redis
-2. **Wave 2**: Masters (all 3 start simultaneously for Raft)
-3. **Wave 3**: Volumes
-4. **Wave 4**: Filers (each formats/adopts metadata on first boot via a Raft-replicated, marker-guarded gate)
-5. **Wave 5**: FUSE client
+Per-service ports, addresses and peers live in
+`.powerfs/rendered/config/*.toml` (generated) and always derive from
+`.powerfs/cluster.toml`.
 
 > **Key Principle**: formatting is part of the Filer startup gate, not a separate offline step. A persistent filesystem marker ensures existing metadata is never reformatted; an unmarked but non-empty data directory makes the Filer refuse to start (override only with explicit `force_format = true`).
 
@@ -500,8 +441,11 @@ cargo test -p powerfs-core
 cargo test -p powerfs-fuse
 cargo test -p powerfs-volume
 
-# Run integration tests in Docker (FUSE real mount testing)
-docker exec fuse-test /app/powerfs-fuse --config /config/fuse.toml
+# FUSE real-mount integration track (container environment)
+./scripts/tests/run_all.sh --track fuse
+
+# Test plan and guidelines
+#   docs/TESTING_GUIDELINES.md
 ```
 
 ### Web Dashboard
@@ -582,8 +526,8 @@ powerfs/
 ├── powerfs-master-net/  # Master net: TLV protocol client (TlvMasterClient) for FUSE/kernel
 ├── powerfs-s3/          # S3 protocol implementation
 ├── rfs_tester/          # Integration test tool
-├── docker/              # Docker Compose configs and deployment scripts
-├── config/              # Example configuration files (TOML)
+├── docker/              # Container launch scripts + test-only topology compose files
+├── .powerfs/            # cluster.toml (single source) + rendered outputs (generated)
 └── Cargo.toml           # Workspace manifest
 ```
 
@@ -927,7 +871,7 @@ This section records critical issues discovered and resolved during development.
 
 **Root Cause**: Docker Compose `depends_on` configured Filer nodes to start sequentially (Filer-2 depends on Filer-1 healthy, Filer-3 depends on Filer-2 healthy). But Raft requires ALL nodes to be running before leader election can proceed.
 
-**Fix**: All Filer nodes MUST start simultaneously, depending only on Master health (not on each other). Updated `docker-compose.test.yml` accordingly.
+**Fix**: All Filer nodes MUST start simultaneously, depending only on Master health (not on each other). The rendered compose enforces this.
 
 **Lesson**: Raft clusters require all nodes to be running before leader election. NEVER chain Raft node startup sequentially.
 
@@ -990,7 +934,7 @@ This section records critical issues discovered and resolved during development.
 
 **Root Cause**: Test harness in `test_harness.rs` referenced old unified binary `target/debug/powerfs`, which no longer exists after multi-binary refactoring.
 
-**Fix**: Use Docker Compose (`docker-compose.test.yml`) for integration tests. Run tests INSIDE the FUSE container, not on the host.
+**Fix**: Use the container-based integration harness (`scripts/tests/run_all.sh --track fuse`). Run tests INSIDE the FUSE container, not on the host.
 
 **Lesson**: Integration tests MUST run in the container environment. Do not connect to test environment from host via FUSE (network limitations).
 

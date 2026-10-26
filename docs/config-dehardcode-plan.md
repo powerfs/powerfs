@@ -1,6 +1,6 @@
 # 配置去硬编码优化方案
 
-> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3 已完成（含双 VM 运行时回归）；P4 IP lint 已完成（文档清理待做）
+> 状态：P1 已完成；P2 已完成（含 cold-start 端到端验证）；P3 已完成（含双 VM 运行时回归）；P4 已完成（IP lint + 文档清理）
 > 日期：2026-10-26
 > 关联 issue：private 库「config: eliminate hardcoded IPs and duplicated config files」
 
@@ -177,7 +177,12 @@
   - 基线存量 89 文件 / 560 次；基线外新文件或超基线出现次数 → CI 失败并输出 `::error file=…` 注解
   - 出现次数减少或文件删除不失败，仅提示可 `--update` 刷新基线（防止基线长期失真）
   - 已做负向测试：新增文件含 IP → 失败；`docker/run-fuse-client.sh` 增 1 个 IP（2→3）→ 失败；`docs/` 新增 IP → 通过；无变更 → 89/560 通过
-- 文档只保留单源路径；删除“手工改 compose/config”的指引（待做）
+- **✅ 文档清理已完成**（只保留单源路径，删除手工改 compose/config 指引）：
+  - `README.md`：新增 `Single-source configuration` 章节（cluster.toml → render 产物树 + 示例）；`docker-compose.test.yml` / `build_powerfs_image.sh` / `config/` 的部署与测试指引全部替换为 `powerfs-ctl bootstrap` + `.powerfs/rendered/*`；逐组件启动命令改为指向渲染配置并注明“不要就地编辑”；端口表、部署 wave 表删除（已由渲染配置承载）；测试指引改为 `scripts/tests/run_all.sh --track fuse`；仓库目录树中标明 `.powerfs/` 与生成的 `config/*.toml`
+  - `docs/TESTING_GUIDELINES.md`：删除 deprecated `docker-compose.test.yml`，改为渲染 compose + 四个独立测试拓扑
+  - `docs/collection-management-design.md`、`docs/config-consistency-fix-plan.md`：改动文件表中的 `docker/config/*.toml` / `config/fuse-*.toml` 改为 `.powerfs/cluster.toml`（渲染生成）
+  - `docs/config-dehardcode-plan.md` 内历史分析段保留旧路径（作为迁移记录，不再作为操作指引）
+  - 校验：README 引用的 7 个路径全部存在；`check-ip-literals.sh` 仍通过（md 豁免不影响）
 
 ## 5. 风险与回滚
 

@@ -87,7 +87,7 @@
 **改动文件**：
 - `powerfs-fuse-core/src/fuse_client_facade.rs`
 - `powerfs-fuse/src/main.rs`（含 FuseConfig）
-- `config/fuse-*.toml`
+- `.powerfs/cluster.toml`（渲染生成 fuse 配置）
 
 **改动内容**：
 - `fetch_topology` 后校验 `total_shards > 0` 且至少 1 个 healthy filer

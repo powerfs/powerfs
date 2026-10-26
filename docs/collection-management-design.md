@@ -759,7 +759,7 @@ compression = "zstd"
 | `powerfs-filer/src/shard_store.rs` | 修改 | 增加从指定路径打开的接口 |
 | `powerfs-filer/src/filer_server.rs` | 修改 | API 增加 collection 参数 |
 | `powerfs-fuse-core/src/meta_shard_client.rs` | 修改 | 请求携带 collection |
-| `docker/config/filer-*.toml` | 修改 | 增加 collection 配置 |
+| `.powerfs/cluster.toml` | 修改 | 增加 collection 配置（渲染到 filer 配置） |
 
 ---
 
@@ -1615,4 +1615,4 @@ async fn put_block(&self, req: PutBlockRequest) -> Result<PutBlockResponse> {
 | `powerfs-volume/src/proto/powerfs.proto` | 修改 | CreateVolumeRequest 增加 collection |
 | `powerfs-cli/src/collection_cmd.rs` | 新增 | Collection CLI 命令 |
 | `powerfs-monitor-frontend/src/pages/Collections/` | 新增 | 前端管理页面 |
-| `docker/config/*.toml` | 修改 | Volume 启动配置增加 collection |
+| `.powerfs/cluster.toml` | 修改 | Volume collection 配置（渲染到 volume 配置） |

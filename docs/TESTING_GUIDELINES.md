@@ -145,8 +145,8 @@ docker exec fuse-2 ls -la /mnt/powerfs/test_dir/
 
 ### Docker Compose 文件
 
-- **主配置**: `.powerfs/rendered/docker-compose.yml` - 完整集群配置
-- **测试配置**: `docker/docker-compose.test.yml` - 单节点测试配置（已废弃，使用主配置）
+- **主配置**: `.powerfs/rendered/docker-compose.yml` - 由 `.powerfs/cluster.toml` 渲染生成（不要手改）
+- **测试拓扑**: `docker/docker-compose.{simple,kernel-test,rdma,crdt-test}.yml` - 独立测试拓扑，仅测试使用
 
 ### 关键端口
 
