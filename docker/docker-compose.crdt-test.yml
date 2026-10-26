@@ -183,7 +183,7 @@ services:
         ipv4_address: 172.31.0.31
     volumes:
       - crdt-volume-1-data:/data
-      - ../config/volume-crdt-1.toml:/etc/powerfs/volume-1.toml
+      - ./config/crdt-test/volume-1.toml:/etc/powerfs/volume-1.toml
     expose:
       - "8080"
       - "8091"

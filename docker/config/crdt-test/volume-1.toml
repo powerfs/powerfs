@@ -1,0 +1,20 @@
+[global]
+log_level = "info"
+redis_url = "redis://172.31.0.10:6379"
+
+[volume]
+transport = "tcp"
+grpc_port = 8080
+http_port = 8091
+net_port = 8901
+data_dir = "/data"
+node_id = "crdt-volume-1"
+master_addresses = ["172.31.0.11:9333"]
+master_net_port = 9334
+max_volume_size = 107374182400   # 100GB
+initial_volume_count = 1
+advertise_addr = "172.31.0.31"
+registration_token = "powerfs-cluster-test"
+lease_enabled = false
+force_sync_on_write = false
+wal_idle_sync_secs = 30
