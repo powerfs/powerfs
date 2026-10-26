@@ -31,11 +31,16 @@
 # =============================================================================
 set -euo pipefail
 
-# --- 拓扑单一来源 ---
+# --- 拓扑单一来源（三层优先级）---
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# docker/topology.env 是节点 IP 的唯一来源；文件缺失时才退回下方内置缺省。
+# 1. cluster.toml（declarative single source）—— 自动探测或 --home 指定
+CLUSTER_TOML="${CLUSTER_TOML:-${POWERFS_HOME:-${REPO_ROOT}/.powerfs}/cluster.toml}"
+RENDERED_COMPOSE="${RENDERED_COMPOSE:-${POWERFS_HOME:-${REPO_ROOT}/.powerfs}/rendered/docker-compose.yml}"
+FROM_CLUSTER=0
+
+# 2. docker/topology.env（legacy fallback，host RDMA 拓扑仍依赖）
 TOPOLOGY_ENV="${TOPOLOGY_ENV:-${REPO_ROOT}/docker/topology.env}"
 if [ -f "$TOPOLOGY_ENV" ]; then
     # shellcheck source=../docker/topology.env
@@ -44,9 +49,128 @@ else
     echo "WARN: $TOPOLOGY_ENV not found — falling back to built-in topology" >&2
 fi
 
-# --- 缺省参数 ---
+# 3. 决定是否启用 --from-cluster：
+#    - 显式传 --from-cluster 强制启用
+#    - cluster.toml + rendered compose 同时存在 **且** 用户未显式传
+#      --topology / --master-api 时自动启用（避免抢 legacy 路径显式传参）
+FROM_CLUSTER=0
+AUTO_FROM_CLUSTER=0
+if [ -f "$CLUSTER_TOML" ] && [ -f "$RENDERED_COMPOSE" ]; then
+    AUTO_FROM_CLUSTER=1
+fi
+# 先扫描 $1..$N 是否有显式 --topology / --master-api
+for a in "$@"; do
+    case "$a" in --topology|--master-api) AUTO_FROM_CLUSTER=0; break;; esac
+done
+
+if [ "${1:-}" = "--from-cluster" ]; then
+    FROM_CLUSTER=1; shift
+elif [ "$AUTO_FROM_CLUSTER" = "1" ]; then
+    FROM_CLUSTER=1
+fi
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# --- 从 cluster.toml + rendered compose 解析节点与客户端 ---
+# 产出：MASTER_API、ADMIN_TOKEN、MASTER_IDS/IPS、FILER_IDS/IPS、VOLUME_IDS/IPS、CLIENT_FUSE_IDS/IPS、kernel_client_ips
+MASTER_IDS=(); MASTER_IPS=()
+FILER_IDS=(); FILER_IPS=()
+VOLUME_IDS=(); VOLUME_IPS=()
+CLIENT_FUSE_IDS=(); CLIENT_FUSE_IPS=()
+KERNEL_CLIENT_IPS=()
+
+if [ "$FROM_CLUSTER" = "1" ]; then
+    echo "INFO: --from-cluster mode — reading topology from $CLUSTER_TOML + $RENDERED_COMPOSE" >&2
+
+    # ADMIN_TOKEN 优先 cluster.toml，其次 legacy env
+    ADMIN_TOKEN="$(sed -n 's/^[[:space:]]*admin_token[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CLUSTER_TOML" | head -1)"
+    [ -n "$ADMIN_TOKEN" ] || ADMIN_TOKEN="${ADMIN_TOKEN:-powerfs-admin-test}"
+
+    # admin_port：cluster.toml 没有单独字段，master admin API 模板默认 9300
+    ADMIN_PORT=9300
+
+    # --- 从 rendered compose 解析 node id→ip ---
+    # rendered compose 结构：
+    #   master-1:
+    #     networks: { powerfs-network: { ipv4_address: 172.30.0.11 } }
+    # awk 遇到 'role-N:' 行就记 current_role，随后第一个 ipv4_address 记到该 role
+    declare -A NODE_IP_MAP
+    while IFS='=' read -r role ip; do
+        [ -z "$role" ] && continue
+        NODE_IP_MAP["$role"]="$ip"
+    done < <(awk '
+        /^  [a-z]+-[0-9]+:[[:space:]]*$/ {
+            role = $0; sub(/^  /, "", role); sub(/:[[:space:]]*$/, "", role)
+            found_ip = 0
+            next
+        }
+        role != "" && found_ip == 0 && /ipv4_address:/ {
+            ip = $0; sub(/.*ipv4_address:[[:space:]]*/, "", ip); gsub(/[[:space:]]/, "", ip)
+            found_ip = 1
+            print role "=" ip
+        }
+    ' "$RENDERED_COMPOSE")
+
+    # --- 按角色归档数组（数组有序：1, 2, 3, ...）---
+    # master
+    for key in $(printf '%s\n' "${!NODE_IP_MAP[@]}" | grep '^master-[0-9]\+$' | sort -V); do
+        MASTER_IDS+=("$key"); MASTER_IPS+=("${NODE_IP_MAP[$key]}")
+    done
+    # filer
+    for key in $(printf '%s\n' "${!NODE_IP_MAP[@]}" | grep '^filer-[0-9]\+$' | sort -V); do
+        FILER_IDS+=("$key"); FILER_IPS+=("${NODE_IP_MAP[$key]}")
+    done
+    # volume
+    for key in $(printf '%s\n' "${!NODE_IP_MAP[@]}" | grep '^volume-[0-9]\+$' | sort -V); do
+        VOLUME_IDS+=("$key"); VOLUME_IPS+=("${NODE_IP_MAP[$key]}")
+    done
+
+    [ ${#MASTER_IDS[@]} -gt 0 ] || die "rendered compose 中未找到 master 节点（检查 $RENDERED_COMPOSE）"
+    # MASTER_API = 首个 master IP + 9300
+    MASTER_API="${MASTER_IPS[0]}:${ADMIN_PORT}"
+
+    # --- 从 cluster.toml 解析 [client.*] ---
+    # 复用 check-topology-sync.sh 已验证的 awk 模式
+    while IFS='=' read -r ctype cname cip; do
+        [ -z "$cname" ] && continue
+        case "$ctype" in
+            fuse)
+                CLIENT_FUSE_IDS+=("$cname"); CLIENT_FUSE_IPS+=("$cip") ;;
+            kernel)
+                [ -n "$cip" ] && KERNEL_CLIENT_IPS+=("$cip") ;;
+        esac
+    done < <(awk '
+        /^\[client\.[^]]+\]/ {
+            if (name != "" && ctype != "") print ctype "=" name "=" ip
+            name = $0; sub(/^\[client\./, "", name); sub(/\].*$/, "", name)
+            ctype = ""; ip = ""; next
+        }
+        /^\[/ { if (name != "" && ctype != "") print ctype "=" name "=" ip; name = ""; ctype = ""; next }
+        /^[[:space:]]*type[[:space:]]*=/ {
+            v = $0; sub(/^[^"]*"/, "", v); sub(/".*$/, "", v); ctype = v; next
+        }
+        /^[[:space:]]*ip[[:space:]]*=/ {
+            v = $0; sub(/^[^"]*"/, "", v); sub(/".*$/, "", v); ip = v; next
+        }
+        END { if (name != "" && ctype != "") print ctype "=" name "=" ip }
+    ' "$CLUSTER_TOML")
+
+    # --- 打印汇总 ---
+    echo "  admin_token:    $ADMIN_TOKEN" >&2
+    echo "  master_api:     $MASTER_API" >&2
+    echo "  masters:        ${MASTER_IDS[*]} (${MASTER_IPS[*]})" >&2
+    echo "  filers:         ${FILER_IDS[*]:-none}" >&2
+    echo "  volumes:        ${VOLUME_IDS[*]:-none}" >&2
+    echo "  fuse clients:    ${#CLIENT_FUSE_IDS[@]} (${CLIENT_FUSE_IDS[*]:-none})" >&2
+    echo "  kernel clients:  ${#KERNEL_CLIENT_IPS[@]} IPs" >&2
+fi
+
+# --- 缺省参数（legacy path 留原逻辑不动）---
 MASTER_API="${MASTER_API:-${MASTER_API_HOST:-192.168.100.3}:${MASTER_API_PORT:-9300}}"
-ADMIN_TOKEN="${ADMIN_TOKEN:-powerfs-admin-test}"
+if [ "${ADMIN_TOKEN:-}" != "powerfs-admin-test" ] || [ "$FROM_CLUSTER" != "1" ]; then
+    # 未从 cluster.toml 解析时用 legacy 默认（环境变量可覆盖）
+    ADMIN_TOKEN="${ADMIN_TOKEN:-powerfs-admin-test}"
+fi
 OUTPUT_DIR="${OUTPUT_DIR:-docker/certs-default}"
 TOPOLOGY="host"
 MOUNT_DIR="${MOUNT_DIR:-/mnt/powerfs}"
@@ -84,14 +208,19 @@ declare -p THREE_FUSE_IPS   >/dev/null 2>&1 || THREE_FUSE_IPS=(172.30.0.41 172.3
 usage() {
     cat <<EOF
 Usage: $0 [OPTIONS]
-  拓扑与节点 IP 来自 docker/topology.env（可用 TOPOLOGY_ENV 指向其它文件）
-  --topology host|three     拓扑 (默认 host)
-  --master-api HOST:PORT    master admin API (默认 ${MASTER_API})
-  --admin-token TOKEN       admin token (默认 powerfs-admin-test)
+  --from-cluster            从 cluster.toml + rendered compose 读取拓扑
+                            （自动：若 $CLUSTER_TOML 和 $RENDERED_COMPOSE 同时存在）
+  --home DIR                等价 POWERFS_HOME=DIR
+  --topology host|three     拓扑 (默认 host；--from-cluster 时自动忽略此选项)
+  --master-api HOST:PORT    master admin API (默认 ${MASTER_API}；--from-cluster 时自动解析首 master)
+  --admin-token TOKEN       admin token (默认 powerfs-admin-test；--from-cluster 时从 cluster.toml 读取)
   --output-dir DIR          输出目录 (默认 docker/certs-default)
   --mount-dir DIR           客户端绑定挂载目录 (默认 /mnt/powerfs)
   --cli PATH                powerfs-cli 路径 (默认 target/release/powerfs-cli)
   -h, --help                显示帮助
+
+LEGACY：无 --from-cluster 时节点 IP 来自 docker/topology.env（或其内置缺省）。
+host RDMA 拓扑始终走 legacy 路径（不读 cluster.toml）。
 EOF
     exit 0
 }
@@ -185,21 +314,31 @@ sign_node() {
         -o "$OUTPUT_DIR"
 }
 
-if [[ "$TOPOLOGY" == "host" ]]; then
-    sign_node filer-1 "$HOST_NODE_IP"
-    sign_node volume-1 "$HOST_NODE_IP"
-    sign_node volume-2 "$HOST_NODE_IP"
-    sign_node volume-3 "$HOST_NODE_IP"
-elif [[ "$TOPOLOGY" == "three" ]]; then
-    for i in "${!THREE_FILER_IDS[@]}"; do
-        sign_node "${THREE_FILER_IDS[i]}" "${THREE_FILER_IPS[i]}"
+if [ "$FROM_CLUSTER" = "1" ]; then
+    # 从 cluster.toml + rendered compose 解析
+    for i in "${!FILER_IDS[@]}"; do
+        sign_node "${FILER_IDS[i]}" "${FILER_IPS[i]}"
     done
-    for i in "${!THREE_VOLUME_IDS[@]}"; do
-        sign_node "${THREE_VOLUME_IDS[i]}" "${THREE_VOLUME_IPS[i]}"
+    for i in "${!VOLUME_IDS[@]}"; do
+        sign_node "${VOLUME_IDS[i]}" "${VOLUME_IPS[i]}"
     done
 else
-    echo "ERROR: unknown topology '$TOPOLOGY' (use host|three)" >&2
-    exit 1
+    # legacy path（topology.env 或内置缺省）
+    if [[ "$TOPOLOGY" == "host" ]]; then
+        sign_node filer-1 "$HOST_NODE_IP"
+        sign_node volume-1 "$HOST_NODE_IP"
+        sign_node volume-2 "$HOST_NODE_IP"
+        sign_node volume-3 "$HOST_NODE_IP"
+    elif [[ "$TOPOLOGY" == "three" ]]; then
+        for i in "${!THREE_FILER_IDS[@]}"; do
+            sign_node "${THREE_FILER_IDS[i]}" "${THREE_FILER_IPS[i]}"
+        done
+        for i in "${!THREE_VOLUME_IDS[@]}"; do
+            sign_node "${THREE_VOLUME_IDS[i]}" "${THREE_VOLUME_IPS[i]}"
+        done
+    else
+        die "unknown topology '$TOPOLOGY' (use host|three)"
+    fi
 fi
 
 # --- 3. 签发客户端证书 ---
@@ -220,17 +359,29 @@ sign_client() {
         -o "$OUTPUT_DIR"
 }
 
-if [[ "$TOPOLOGY" == "host" ]]; then
-    sign_client kernel-client-1 "${HOST_VM1_IPS[@]}"
-    sign_client kernel-client-2 "${HOST_VM2_IPS[@]}"
-elif [[ "$TOPOLOGY" == "three" ]]; then
-    # kernel-client (VM, 假设 VM eth0 172.30.0.100/101)
-    sign_client kernel-client-1 172.30.0.100
-    sign_client kernel-client-2 172.30.0.101
-    # fuse-client (FUSE 用户态, 各自 IP)
-    for i in "${!THREE_FUSE_IDS[@]}"; do
-        sign_client "${THREE_FUSE_IDS[i]}" "${THREE_FUSE_IPS[i]}"
+if [ "$FROM_CLUSTER" = "1" ]; then
+    # 只签 cluster.toml [client.*] 声明了的客户端
+    for i in "${!CLIENT_FUSE_IDS[@]}"; do
+        sign_client "${CLIENT_FUSE_IDS[i]}" "${CLIENT_FUSE_IPS[i]}"
     done
+    [ ${#CLIENT_FUSE_IDS[@]} -gt 0 ] || echo "  (no fuse clients declared in cluster.toml)" >&2
+    for i in "${!KERNEL_CLIENT_IPS[@]}"; do
+        # kernel-client 名从 cluster.toml 段名取（如 [client.kernel-default]）
+        echo "  INFO: kernel client IP ${KERNEL_CLIENT_IPS[i]} (声明方式待完善)" >&2
+    done
+else
+    if [[ "$TOPOLOGY" == "host" ]]; then
+        sign_client kernel-client-1 "${HOST_VM1_IPS[@]}"
+        sign_client kernel-client-2 "${HOST_VM2_IPS[@]}"
+    elif [[ "$TOPOLOGY" == "three" ]]; then
+        # kernel-client (VM, 假设 VM eth0 172.30.0.100/101)
+        sign_client kernel-client-1 172.30.0.100
+        sign_client kernel-client-2 172.30.0.101
+        # fuse-client (FUSE 用户态, 各自 IP)
+        for i in "${!THREE_FUSE_IDS[@]}"; do
+            sign_client "${THREE_FUSE_IDS[i]}" "${THREE_FUSE_IPS[i]}"
+        done
+    fi
 fi
 
 # --- 汇总 ---
