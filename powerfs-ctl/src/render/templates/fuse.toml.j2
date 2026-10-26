@@ -12,9 +12,19 @@ filer_net_port = 9334
 collection = "default"
 replication = "000"
 threads = 8
-verbose = false
-container = false
-
+verbose = {{ verbose | lower }}
+container = {{ container | lower }}
+{% if log_file is defined %}log_file = "{{ log_file }}"
+{% endif %}
+{% if force_mount %}
+force_mount = true
+# Fallback when master topology has no healthy filer shards yet.
+filer_addresses = [{% for ip in filer_ips %}"{{ ip }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+volume_addresses = [{% for ip in volume_ips %}"{{ ip }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+{% endif %}
+request_timeout_secs = {{ request_timeout_secs }}
+{% if admin_port is defined %}admin_port = {{ admin_port }}
+{% endif %}
 [fuse.lease]
 mode = "cap"
 lease_duration_ms = 30000

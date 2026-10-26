@@ -73,7 +73,7 @@ pub fn render_client_config(
     let certs = home.certs_dir();
     match kind {
         ClientKind::Fuse => {
-            let toml = render::render_fuse_client(rc)
+            let toml = render::render_fuse_client(rc, name)
                 .map_err(|e| format!("render fuse client.toml: {e}"))?;
             let p = certs.join(format!("client-{name}.toml"));
             std::fs::write(&p, &toml).map_err(|e| format!("write {}: {}", p.display(), e))?;

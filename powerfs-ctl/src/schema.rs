@@ -143,6 +143,29 @@ pub struct ClientSpec {
     /// user runs `client enroll <name> --ip <ip>` on the fly.
     #[serde(default)]
     pub ip: Option<String>,
+    // ---- fuse-only knobs (ignored for kernel clients) ----
+    /// Admin/debug HTTP port (0/None = disabled). Exposes request stats +
+    /// in-flight tracking; query via `powerfs-cli fuse-stats`.
+    #[serde(default)]
+    pub admin_port: Option<u16>,
+    /// Verbose logging. Rendered into the client TOML so compose services
+    /// that launch `powerfs-fuse --config <file>` (no CLI flags) behave the
+    /// same as `run-fuse-client.sh` (which passes `--verbose`).
+    #[serde(default)]
+    pub verbose: bool,
+    /// Container mode (no daemonize, logs to stdout unless log_file set).
+    #[serde(default)]
+    pub container: bool,
+    /// Log file path inside the container.
+    #[serde(default)]
+    pub log_file: Option<String>,
+    /// Force-mount fallback: skip topology health check and fall back to
+    /// the rendered filer/volume address lists.
+    #[serde(default)]
+    pub force_mount: bool,
+    /// Per-RPC timeout in seconds (master/filer/volume).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

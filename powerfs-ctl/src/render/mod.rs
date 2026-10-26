@@ -53,15 +53,29 @@ pub fn render(rc: &ResolvedCluster) -> Result<Rendered, RenderError> {
     })
 }
 
-/// Render only the fuse client TOML — used by `client enroll` to emit
-/// `<certs_dir>/client-<name>.toml` without re-rendering the whole cluster.
-/// The fuse template carries the cluster's master_net_addrs + redis_url and
-/// has no per-client variation, so every fuse client in the same cluster
-/// gets identical content.
-pub fn render_fuse_client(rc: &ResolvedCluster) -> Result<String, RenderError> {
+/// Render the fuse client TOML for one client — used by `client enroll` to
+/// emit `<certs_dir>/client-<name>.toml` without re-rendering the whole
+/// cluster. Per-client knobs (`[client.<name>]` in cluster.toml: admin_port,
+/// verbose, container, log_file, force_mount, request_timeout_secs) override
+/// the cluster-wide defaults.
+pub fn render_fuse_client(rc: &ResolvedCluster, client_name: &str) -> Result<String, RenderError> {
     let mut env = Environment::new();
     env.add_template("fuse", FUSE_TEMPLATE)?;
-    let ctx = build_context(rc)?;
+    let mut ctx = build_context(rc)?;
+    if let Some(spec) = rc.cfg.client.get(client_name) {
+        ctx.insert("verbose".into(), json!(spec.verbose));
+        ctx.insert("container".into(), json!(spec.container));
+        ctx.insert("force_mount".into(), json!(spec.force_mount));
+        if let Some(p) = spec.admin_port {
+            ctx.insert("admin_port".into(), json!(p));
+        }
+        if let Some(f) = &spec.log_file {
+            ctx.insert("log_file".into(), json!(f));
+        }
+        if let Some(t) = spec.request_timeout_secs {
+            ctx.insert("request_timeout_secs".into(), json!(t));
+        }
+    }
     Ok(env.get_template("fuse")?.render(&ctx)?)
 }
 
@@ -129,6 +143,11 @@ fn build_context(rc: &ResolvedCluster) -> Result<Map<String, Value>, RenderError
         json!(format!("redis://{}:6379", rc.redis_ip)),
     );
     m.insert("clients".into(), json!(clients));
+    // fuse client defaults (overridden per client in render_fuse_client).
+    m.insert("verbose".into(), json!(false));
+    m.insert("container".into(), json!(false));
+    m.insert("force_mount".into(), json!(false));
+    m.insert("request_timeout_secs".into(), json!(10));
     Ok(m)
 }
 
@@ -220,5 +239,67 @@ mod tests {
                 panic!("rendered {}.toml failed {:?} validation: {}", name, svc, e)
             });
         }
+    }
+
+    /// Per-client knobs in `[client.<name>]` must land in the enrolled fuse
+    /// TOML; force_mount additionally renders the fallback address lists and
+    /// the result must pass the runtime FUSE validator (which requires those
+    /// lists when force_mount=true).
+    #[test]
+    fn fuse_client_toml_honors_per_client_knobs() {
+        let cfg: ClusterConfig = toml::from_str(
+            r#"
+            [cluster]
+            name = "t"
+            profile = "ha"
+            shard_count = 3
+            [network]
+            subnet = "172.30.0.0/16"
+            [client.fuse-1]
+            type = "fuse"
+            ip = "172.30.0.41"
+            admin_port = 9998
+            verbose = true
+            container = true
+            log_file = "/var/log/powerfs-fuse.log"
+            force_mount = true
+            request_timeout_secs = 3
+            [client.plain]
+            type = "fuse"
+        "#,
+        )
+        .unwrap();
+        let rc = cfg.validate().unwrap();
+
+        let toml_str = render_fuse_client(&rc, "fuse-1").unwrap();
+        assert!(toml_str.contains("admin_port = 9998"), "{toml_str}");
+        assert!(toml_str.contains("verbose = true"), "{toml_str}");
+        assert!(toml_str.contains("container = true"), "{toml_str}");
+        assert!(
+            toml_str.contains("log_file = \"/var/log/powerfs-fuse.log\""),
+            "{toml_str}"
+        );
+        assert!(toml_str.contains("force_mount = true"), "{toml_str}");
+        assert!(toml_str.contains("request_timeout_secs = 3"), "{toml_str}");
+        assert!(toml_str.contains("\"172.30.0.31\""), "{toml_str}"); // filer fallback
+        assert!(toml_str.contains("\"172.30.0.21\""), "{toml_str}"); // volume fallback
+        let cfg: PowerFsConfig = toml::from_str(&toml_str).unwrap();
+        cfg.validate_for(ServiceType::Fuse).unwrap();
+
+        // Client without extra knobs gets cluster defaults, no optional keys.
+        let plain = render_fuse_client(&rc, "plain").unwrap();
+        assert!(plain.contains("verbose = false"), "{plain}");
+        assert!(plain.contains("container = false"), "{plain}");
+        assert!(!plain.contains("force_mount"), "{plain}");
+        assert!(!plain.contains("admin_port"), "{plain}");
+        assert!(!plain.contains("log_file"), "{plain}");
+        assert!(!plain.contains("filer_addresses"), "{plain}");
+        assert!(plain.contains("request_timeout_secs = 10"), "{plain}");
+        let cfg: PowerFsConfig = toml::from_str(&plain).unwrap();
+        cfg.validate_for(ServiceType::Fuse).unwrap();
+
+        // Unknown client name (not declared in cluster.toml) also gets defaults.
+        let undeclared = render_fuse_client(&rc, "nope").unwrap();
+        assert!(undeclared.contains("verbose = false"), "{undeclared}");
     }
 }
