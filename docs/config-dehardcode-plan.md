@@ -1,6 +1,6 @@
 # 配置去硬编码优化方案
 
-> 状态：P1 实施中
+> 状态：P1 已完成（含端到端验证）；P2 待前置阻塞解除
 > 日期：2026-10-26
 > 关联 issue：private 库「config: eliminate hardcoded IPs and duplicated config files」
 
@@ -101,12 +101,27 @@
 - `docker/run-fuse-client.sh` 已参数化（name/ip 由参数传入），无需改动
 - VM 54 个脚本统一 `kernel/vm/cluster.env`，删除各自默认值
 
+### P1-3：端到端验证（已完成，2026-10-26）
+
+验证方式：simple profile 测试 home（`.powerfs-uni-test/`，未入库），**只改 `cluster.toml` 两处**——`[network].subnet` 172.41.0.0/16 → 172.42.0.0/16、`[client.fuse-uni].ip` 172.41.0.100 → 172.42.0.100，然后重跑 `powerfs-ctl bootstrap`。
+
+| 检查项 | 结果 |
+|---|---|
+| rendered compose 的 subnet/gateway/全部 `ipv4_address` 随单源变化 | 通过（172.41 残留 0） |
+| rendered 节点配置的 `redis_url`/`master_addresses`/`advertise_addr`/`node_id` | 通过（全部 172.42） |
+| bootstrap 全链路（render → leader 门禁 → CA → filer/volume/fuse 重签 → 全量 up） | 通过（term=1, commit_index=4） |
+| FUSE 挂载 4 MiB 随机写 + sync + md5 回读 | 通过（校验一致），小文件读写正常 |
+| `rendered/certs/client_registry.json` 历史签发记录 | 仍含旧地址（仅审计记录，不影响运行） |
+
+验证中修复的阻塞 bug：`spawn_health_monitor` 在 `has_peers == false` 时直接 return，单节点集群从不发布 `powerfs_is_leader`/`powerfs_raft_*`，`/metrics` 为空导致健康门禁 120s 超时。已改为单节点照常发布指标、仅跳过假 Leader探测（commit `2dd3adfd`）。
+
 ### P2 前置阻塞（实施中发现）
 
 1. **证书命名两套不统一**：legacy 夹具为 `volume-server-N.crt`，`powerfs-ctl` 声明式路径为 `volume-N.crt`；模板改指向任一命名前，需先统一（否则 mTLS 失败）
 2. **FUSE 每客户端参数**：静态 `fuse-1/2.toml` 含 `admin_port=9998`、`verbose/container/log_file`，渲染模板未覆盖；测试 compose 依赖这些值
 3. **主 compose 含 fuse-1/fuse-2 服务**：渲染模板不含（设计上由 `client enroll` + `run-fuse-client.sh` 管理），直接替换需同步 README 与脚本
 4. **CI runner 恢复路径**：nightly 用 `cd docker && docker compose up -d` 恢复后端；若静态配置改为渲染产物，runner 需先生成 `.powerfs/rendered`，须与 workflow 同批修改并演练
+5. **compose 项目名与容器名固定**：`DockerComposeDriver` 未传 `-p`，项目名取目录名（恒为 `rendered`），模板 `container_name` 也写死 `master-1`/`redis`/…。两个 home 并存时会共享 `rendered_*` 卷/网络并撞容器名——首轮 live 验证即因复用旧 3 节点 raft 卷而选不出 leader。需由 `cluster.name` 派生项目名与容器前缀（涉及 driver 接口与全部调用点，单独一批处理）
 
 ### P4：防回归
 
