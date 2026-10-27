@@ -1,35 +1,40 @@
 [package]
 name = "powerfs-rustfs-store"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["PowerFS Team <jiangjinhu@fudan.edu.cn>"]
 description = "PowerFS storage backend adapter for the RustFS ExternalBackend contract"
 
 [dependencies]
 # RustFS 存储契约 trait（ExternalBackend）与对象读写类型。
+# 这两个 path deps 要求 rustfs git 子模块已 init。
 rustfs-ecstore = { path = "../rustfs/crates/ecstore" }
 # ExternalBackend 方法签名里的桶/列表/range 契约类型直接来自 storage-api crate。
 rustfs-storage-api = { path = "../rustfs/crates/storage-api" }
-# PowerFS 侧的 master 分配与 Filer 元数据客户端。
+# PowerFS 侧的 master 分配与 Filer 元数据客户端（path deps 到父 workspace）。
 powerfs-master = { path = "../powerfs-master" }
 powerfs-common = { path = "../powerfs-common" }
 # needle 数据面走 powerfs-net TLV 协议（master 下发的 DataNodeInfo.grpc_port
 # 实际承载 net_port，TLV 是 volume 数据面的唯一客户端协议，见 powerfs-net::TlvVolumeClient）。
 powerfs-net = { path = "../powerfs-net" }
-async-trait = { workspace = true }
-tokio = { workspace = true }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
 # S3 单段对象的 ETag 按协议为内容 MD5 的十六进制表示。
 md-5 = "0.11.0"
-chrono = { workspace = true }
-tonic = { workspace = true }
-uuid = { workspace = true }
+chrono = "0.4"
+tonic = "0.12"
+uuid = { version = "1", features = ["v4"] }
 http = "1"
 hex = "0.4"
 tracing = "0.1"
 # ObjectInfo::mod_time 的类型是 time::OffsetDateTime。
 time = "0.3"
-# 版本钉住：本 workspace 重新解析 rustfs 依赖树时会把 pkcs1 选到 0.8.0-rc.5，
-# 与 rustfs 使用的 rsa 0.10.0-rc.18 不兼容（rc.5 改了 API，编译失败）。
-# rustfs 子模块自己的 Cargo.lock 固定为 rc.4；本仓库的 Cargo.lock 未纳入版本控制，
-# 因此在依赖里显式钉住，保证干净环境也能编译。
+# 版本钉住：rustfs 子模块自己的 Cargo.lock 固定 pkcs1 = rc.4；
+# 不钉会被 PowerFS workspace 重新解析到 rc.5，与 rustfs 的 rsa rc.18 不兼容。
 pkcs1 = "=0.8.0-rc.4"
+
+# 注意：本 crate 不在主 Cargo workspace 里（出于 deploy 默认路径不带 rustfs 的目的），
+# 所以所有版本都是字面量，不能用 workspace = true。构建需要显式 manifest 路径：
+#   git submodule update --init rustfs
+#   cargo build --manifest-path powerfs-rustfs-store/Cargo.toml

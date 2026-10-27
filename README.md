@@ -94,10 +94,11 @@ operations (restart/scale/doctor/cert renewal). See
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
 
-# Required before the first build: two git submodules are build-time
-# dependencies. kernel is NOT needed here — that one is for building the
-# optional in-tree powerfs.ko module (see kernel/README.md).
-git submodule update --init rfs_tester rustfs
+# Required: rfs_tester is a workspace dev-dependency of powerfs-master
+# and powerfs-fuse (file-system sandbox crate).
+# rustfs submodule is OPTIONAL — only needed if you build the separate
+# powerfs-rustfs-store S3 backend adapter (see optional section below).
+git submodule update --init rfs_tester
 
 # 1. Build all binaries (ctl + master/filer/volume/monitor/s3; requires Docker Engine + compose v2).
 #    The rendered compose bind-mounts target/release/powerfs-* into the containers,
@@ -197,7 +198,7 @@ upgrades — see [kernel/README.md](kernel/README.md#dkms-install-auto-rebuild-o
 
 ### Prerequisites
 
-- Rust 1.99+ stable (with cargo) — the rustfs S3 backend crates use edition 2024
+- Rust 1.75+ stable (with cargo)
 - Protobuf compiler (`protoc`)
 - FUSE 2.x development libraries (for FUSE client)
 - Linux kernel headers (for FUSE)
@@ -231,22 +232,35 @@ sudo yum install -y \
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
 
-# Fetch the submodules the build depends on (workspace member + S3 backend crates).
-# kernel submodule is only needed for the optional powerfs.ko DKMS build.
-git submodule update --init rfs_tester rustfs
+# Required: rfs_tester is a dev-dependency of powerfs-master / powerfs-fuse.
+git submodule update --init rfs_tester
 
-# Build all packages
-cargo build --all
-
-# Build in release mode (recommended for production)
-cargo build --all --release
+# Build all workspace packages (default deploy path — no rustfs needed)
+cargo build --release
 
 # Build individual components
-cargo build -p powerfs-master
-cargo build -p powerfs-volume
-cargo build -p powerfs-filer
-cargo build -p powerfs-fuse
-cargo build -p powerfs-ctl      # deployment & lifecycle control plane
+cargo build -p powerfs-master --release
+cargo build -p powerfs-volume --release
+cargo build -p powerfs-filer --release
+cargo build -p powerfs-fuse --release
+cargo build -p powerfs-ctl --release    # deployment & lifecycle control plane
+```
+
+#### Optional: rustfs S3 backend adapter
+
+`powerfs-rustfs-store` is a standalone adapter that plugs PowerFS into the
+[rustfs](https://github.com/powerfs/rustfs) S3 server (ExternalBackend
+contract). It is intentionally out of the main workspace so a plain deploy
+does not need the rustfs submodule. Build it when you want rustfs as a
+back-end for S3 operations:
+
+```bash
+# Requires Rust 1.99+ (rustfs uses edition 2024, rust-version = 1.99.0).
+rustup install 1.99
+rustup default 1.99
+
+git submodule update --init rustfs
+cargo build --manifest-path powerfs-rustfs-store/Cargo.toml --release
 ```
 
 ### Component Architecture

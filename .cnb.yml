@@ -20,7 +20,7 @@ main:
             - echo 'registry = "https://rsproxy.cn/crates.io-index"' >> ~/.cargo/config.toml
         - name: Lint & Build
           script:
-            - git submodule update --init rfs_tester rustfs
+            - git submodule update --init rfs_tester
             - cargo clippy --all-targets --all-features -- -D warnings
             - cargo build --release
         - name: Test

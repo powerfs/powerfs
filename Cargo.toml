@@ -25,12 +25,15 @@ members = [
     "powerfs-coherence",
     "powerfs-ctl",
     "powerfs-raft",
-    "powerfs-rustfs-store",
     "rfs_tester",
 ]
-# rustfs/ 是独立 workspace（有自己的 [workspace] 与 package 继承），
-# 这里排除它，避免 Cargo 把 rustfs crate 当成当前 workspace 的成员。
-exclude = ["rustfs"]
+# powerfs-rustfs-store is intentionally absent — it is the optional external
+# S3 backend adapter and pulls the rustfs submodule via path deps. A plain
+# `git clone` + `cargo build` must succeed without rustfs; users who want
+# the full S3 backend init the submodule and build with --manifest-path:
+#   git submodule update --init rustfs
+#   cargo build --manifest-path powerfs-rustfs-store/Cargo.toml --features rustfs
+exclude = ["rustfs", "powerfs-rustfs-store"]
 resolver = "2"
 
 [workspace.package]

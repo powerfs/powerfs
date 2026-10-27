@@ -48,8 +48,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
@@ -151,8 +151,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
@@ -219,8 +219,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
@@ -314,8 +314,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
@@ -398,8 +398,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
@@ -496,8 +496,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
@@ -632,8 +632,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
@@ -686,8 +686,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0
@@ -745,8 +745,8 @@ jobs:
             # Submodule update with retry
             for SUB_ATTEMPT in 1 2 3 4 5; do
               echo "  submodule update attempt $SUB_ATTEMPT/5"
-              rm -rf rfs_tester rustfs .git/modules/rfs_tester .git/modules/rustfs 2>/dev/null || true
-              if git submodule update --init --force rfs_tester rustfs 2>&1; then
+              rm -rf rfs_tester .git/modules/rfs_tester 2>/dev/null || true
+              if git submodule update --init --force rfs_tester 2>&1; then
                 git -C rfs_tester checkout --force HEAD 2>/dev/null || true
                 echo "Checked out: $(git log --oneline -1)"
                 exit 0

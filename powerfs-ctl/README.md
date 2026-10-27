@@ -21,11 +21,11 @@ scaling masters/data nodes, cert renewal, diagnostics).
 ## Build
 
 ```bash
-# from repo root — first fetch the submodules the workspace needs
-# for a basic service build (rfs_tester is a workspace member, rustfs
-# provides the S3 backend crates). kernel is NOT needed here — it's
-# only for the optional powerfs.ko DKMS build (see ../kernel/README.md).
-git submodule update --init rfs_tester rustfs
+# from repo root — fetch rfs_tester (dev-dep of powerfs-master/powerfs-fuse).
+# rustfs submodule is NOT needed unless you also build the optional
+# powerfs-rustfs-store S3 backend adapter (see root README).
+# kernel submodule is for the optional DKMS powerfs.ko build only.
+git submodule update --init rfs_tester
 
 # then build everything: the rendered compose bind-mounts the
 # host's target/release/powerfs-{master,filer,volume,monitor,s3} binaries
