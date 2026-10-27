@@ -248,7 +248,7 @@ PowerFS adopts a **multi-binary independent deployment** architecture, where eac
 |-----------|--------|------|-------------|
 | **Master** | `powerfs-master` | 9333 (gRPC), 9334 (net) | Cluster control plane, Raft scheduling, Volume routing |
 | **Volume** | `powerfs-volume` | 8080 (gRPC), 8091 (http), 8901 (net) | Data storage plane, Needle storage, Lease lock management |
-| **Filer** | `powerfs-filer` | 8888 (S3), 8889 (gRPC), 8890 (net) | Metadata sharding, Raft strong consistency, S3 gateway |
+| **Filer** | `powerfs-filer` | 8888 (S3), 8889 (gRPC), 9334 (net) | Metadata sharding, Raft strong consistency, S3 gateway |
 | **FUSE** | `powerfs-fuse` | Userspace FUSE | POSIX interface client, three-client communication architecture |
 | **Ctl** | `powerfs-ctl` | None | Declarative deployment & lifecycle control (bootstrap/up/restart/doctor/cert/node) |
 | **CLI** | `powerfs-cli` | None | Command-line management tool |
@@ -301,26 +301,6 @@ are issued automatically during bootstrap; there is no separate cert step.
 > `powerfs-ctl down --purge` → edit `cluster.toml` → `bootstrap`. Same-IP
 > restarts and client-only changes do not need a purge.
 
-### Quick Start (rendered compose)
-
-> `powerfs-ctl bootstrap` is the supported entry point: it renders
-> `cluster.toml`, issues certificates, starts the cluster and waits for the
-> health gate. Production environments must use 3+ Raft nodes.
-
-The compose file is a rendered output, never a source file:
-
-```bash
-# Deploy (render -> certs -> up -> health gate)
-./target/release/powerfs-ctl bootstrap --profile ha
-
-# Inspect / stop the generated compose without editing it
-docker compose -f .powerfs/rendered/docker-compose.yml ps
-docker compose -f .powerfs/rendered/docker-compose.yml down
-```
-
-FUSE clients are not part of the rendered compose; enroll them as shown in the
-quick start above (`powerfs-ctl client enroll` + `docker/run-fuse-client.sh`).
-
 ### Run Each Component
 
 > The configs below are generated from `.powerfs/cluster.toml` by
@@ -371,15 +351,12 @@ powerfs-fuse --config .powerfs/rendered/config/fuse.toml
 
 ```bash
 # Check cluster status
-powerfs-cli --config .powerfs/rendered/config/master-1.toml status
+powerfs-cli -m 172.30.0.11:9333 status
 
 # List volumes
-powerfs-cli --config .powerfs/rendered/config/master-1.toml volumes
+powerfs-cli -m 172.30.0.11:9333 volume-list
 
-# Create bucket
-powerfs-cli --config .powerfs/rendered/config/master-1.toml create-bucket my-bucket
-
-# Certificate management (requires admin_token)
+# Certificate management (calls master CA API, requires admin_token)
 powerfs-cli cert init-ca --master-api master-1:9300 --admin-token "your-admin-secret" -o /etc/powerfs/certs/
 powerfs-cli cert sign-client --master-api master-1:9300 --admin-token "your-admin-secret" \
   --common-name "fuse-client-1" -o /etc/powerfs/certs/
@@ -400,42 +377,6 @@ PowerFS uses a **three-tier authentication** model:
 - **Master CA**: Master acts as cluster Certificate Authority (rcgen self-signed CA), signs client/server TLS certs via HTTP API (`/api/cert/ca`, `/api/cert/sign-client`, `/api/cert/sign-server`)
 - **Dev mode**: Empty/None tokens = no auth (for development only)
 - **Production**: Set non-empty `admin_token` and `registration_token`; use CLI cert commands to manage TLS certificates
-
-### Docker Deployment (Recommended)
-
-The rendered compose is produced from `cluster.toml`; it is not checked in and
-must not be edited by hand.
-
-```bash
-# Clone and build
-git clone https://github.com/powerfs/powerfs.git
-cd powerfs
-cargo build --release
-
-# Render + issue certs + start + wait for the health gate
-./target/release/powerfs-ctl bootstrap --profile ha
-
-# Inspect
-./target/release/powerfs-ctl status
-docker compose -f .powerfs/rendered/docker-compose.yml ps
-```
-
-Per-service ports, addresses and peers live in
-`.powerfs/rendered/config/*.toml` (generated) and always derive from
-`.powerfs/cluster.toml`.
-
-> **Key Principle**: formatting is part of the Filer startup gate, not a separate offline step. A persistent filesystem marker ensures existing metadata is never reformatted; an unmarked but non-empty data directory makes the Filer refuse to start (override only with explicit `force_format = true`).
-
-### Login Information
-
-**Default Credentials**:
-- **Username**: `admin`
-- **Password**: `admin123`
-
-**S3 Credentials**:
-- **Access Key**: `powerfs`
-- **Secret Key**: `powerfs123`
-- **Endpoint**: http://localhost:9000
 
 ### Run Tests
 
@@ -623,27 +564,23 @@ See [powerfs-ctl/README.md](powerfs-ctl/README.md) for the full guide.
 #### powerfs-cli
 
 ```
-PowerFS CLI - Cluster management tool
+PowerFS CLI - Cluster management & testing tool
 
-Usage: powerfs-cli --config <CONFIG> <COMMAND>
+Usage: powerfs-cli [-m <host:port>] <COMMAND>   # default master: localhost:9333
 
-Commands:
-  status          Check cluster health
-  volumes         List all volumes
-  create-bucket   Create a new bucket
-  delete-bucket   Delete a bucket
-  cert            Certificate management (init-ca, sign-client, sign-server)
-  help            Print help
-
-Options:
-  -c, --config <CONFIG>  Path to TOML configuration file (required)
-  -h, --help             Print help
-
-Cert subcommands (use --master-api <addr:port> --admin-token <token>):
-  init-ca         Fetch master CA certificate to local directory
-  sign-client     Request master to sign a client certificate
-  sign-server     Request master to sign a server certificate
+Command groups:
+  status / cluster-* / topology        Cluster inspection and Raft membership
+  volume-list / volume / grow / compact / assign / lookup
+                                       Volume administration and FID routing
+  read / write / heartbeat             Low-level data-plane probes
+  kv / conflicts / fsck / fuse-stats / filer-stats / debug / manage
+                                       KV cache, conflict policy, consistency check, stats, allocator
+  collection / mount / config / admin  Collections, FUSE mount, config generation, token helpers
+  cert init-ca | sign-client | sign-server
+                                       Certificate management (master CA API, requires admin token)
 ```
+
+Run `powerfs-cli help <command>` for per-command flags.
 
 ## Architecture Details
 
