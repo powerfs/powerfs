@@ -29,6 +29,9 @@ use crate::filer::ObjectMetaWrite;
 pub(crate) const EXT_ETAG: &str = "s3.etag";
 /// 对象元数据键：content-type。
 pub(crate) const EXT_CONTENT_TYPE: &str = "s3.content-type";
+/// 对象元数据键：tagging（URL 编码 tag set）。与 native 一致，该键
+/// 同时出现在 user_defined 中，由 S3 层渲染响应时过滤。
+pub(crate) const EXT_TAGGING: &str = "s3.x-amz-tagging";
 
 impl PowerFsStore {
     /// 读取对象元数据条目：先确认桶存在，再取对象条目。
@@ -259,6 +262,193 @@ impl PowerFsStore {
         Ok(info)
     }
 
+    /// 服务端复制：深拷贝数据（逐 chunk 读源、写新 needle），目标与源
+    /// 完全独立，删除互不影响。元数据以 `src_info` 为准——S3 处理器已按
+    /// COPY/REPLACE 指令合并好 user_defined / user_tags / content_type，
+    /// 且 ETag 继承源对象（simple copy 不改变内容）。
+    #[allow(clippy::too_many_arguments)] // 参数个数由 S3 copy 契约决定
+    pub(crate) async fn copy_object_impl(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        _src_opts: &ObjectOptions,
+        _dst_opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.ensure_bucket(dst_bucket).await?;
+        let src_entry = self.load_entry(src_bucket, src_object).await?;
+        let now = unix_secs_now();
+
+        // 深拷贝：每个源 chunk 读出后写入新分配的 needle。
+        let mut chunks = Vec::with_capacity(src_entry.chunks.len());
+        for chunk in &src_entry.chunks {
+            let read_address = self.volume_address(chunk.volume_id).await?;
+            let data = self
+                .volumes
+                .read_needle(&read_address, chunk.volume_id, chunk.needle_id)
+                .await
+                .map_err(crate::error::from_volume)?;
+
+            let (fid, nodes) = self
+                .master
+                .assign_volume(&self.config.replication, &self.config.collection)
+                .await
+                .map_err(crate::error::from_master)?;
+            let node = nodes
+                .first()
+                .ok_or_else(|| Error::other("assign_volume 未返回任何数据节点"))?;
+            // 与 write_object 一致：master 下发的 grpc_port 实为 net 数据端口。
+            let write_address = format!("{}:{}", node.address, node.grpc_port);
+            self.volumes
+                .write_needle(&write_address, fid.volume_id.0, fid.file_key, &data)
+                .await
+                .map_err(crate::error::from_volume)?;
+
+            chunks.push(FileChunk {
+                offset: chunk.offset,
+                size: data.len() as u64,
+                mtime: now,
+                needle_id: fid.file_key,
+                volume_id: fid.volume_id.0,
+                crc32: 0,
+            });
+        }
+
+        let size = src_entry.content_size;
+        let mut extended: HashMap<String, Vec<u8>> = HashMap::new();
+        if let Some(etag) = &src_info.etag {
+            extended.insert(EXT_ETAG.to_string(), etag.clone().into_bytes());
+        }
+        if let Some(content_type) = &src_info.content_type {
+            extended.insert(
+                EXT_CONTENT_TYPE.to_string(),
+                content_type.clone().into_bytes(),
+            );
+        }
+        // user_defined 已含 effective tags（x-amz-tagging 键），统一小写落盘。
+        for (key, value) in src_info.user_defined.iter() {
+            extended.insert(
+                format!("s3.{}", key.to_ascii_lowercase()),
+                value.clone().into_bytes(),
+            );
+        }
+
+        self.filer
+            .put_object_meta(ObjectMetaWrite {
+                bucket: dst_bucket,
+                key: dst_object,
+                size,
+                chunks: &chunks,
+                extended: &extended,
+            })
+            .await?;
+
+        Ok(object_info_from_entry(
+            dst_bucket,
+            &Entry {
+                name: dst_object.to_string(),
+                directory: format!("/{dst_bucket}"),
+                attributes: Some(file_attributes(size, now)),
+                chunks,
+                extended,
+                content_size: size,
+                disk_size: size,
+                ..Entry::default()
+            },
+        ))
+    }
+
+    /// 仅合并元数据（对象锁 legal hold / retention 的 eval_metadata），
+    /// 不触碰数据。retention 的强制删除拦截语义留待对象锁阶段。
+    pub(crate) async fn put_object_metadata_impl(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let mut entry = self.load_entry(bucket, object).await?;
+        if let Some(eval_metadata) = &opts.eval_metadata {
+            for (key, value) in eval_metadata {
+                entry.extended.insert(
+                    format!("s3.{}", key.to_ascii_lowercase()),
+                    value.clone().into_bytes(),
+                );
+            }
+        }
+        self.filer
+            .put_object_meta(ObjectMetaWrite {
+                bucket,
+                key: object,
+                size: entry.content_size,
+                chunks: &entry.chunks,
+                extended: &entry.extended,
+            })
+            .await?;
+        Ok(object_info_from_entry(bucket, &entry))
+    }
+
+    /// 覆盖对象 tag set。
+    pub(crate) async fn put_object_tags_impl(
+        &self,
+        bucket: &str,
+        object: &str,
+        tags: &str,
+        _opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let mut entry = self.load_entry(bucket, object).await?;
+        entry
+            .extended
+            .insert(EXT_TAGGING.to_string(), tags.as_bytes().to_vec());
+        self.filer
+            .put_object_meta(ObjectMetaWrite {
+                bucket,
+                key: object,
+                size: entry.content_size,
+                chunks: &entry.chunks,
+                extended: &entry.extended,
+            })
+            .await?;
+        Ok(object_info_from_entry(bucket, &entry))
+    }
+
+    /// 读取对象 tag set（URL 编码字符串）；无标签时返回空串。
+    pub(crate) async fn get_object_tags_impl(
+        &self,
+        bucket: &str,
+        object: &str,
+        _opts: &ObjectOptions,
+    ) -> Result<String> {
+        let entry = self.load_entry(bucket, object).await?;
+        Ok(entry
+            .extended
+            .get(EXT_TAGGING)
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .unwrap_or_default())
+    }
+
+    /// 清空对象 tag set。
+    pub(crate) async fn delete_object_tags_impl(
+        &self,
+        bucket: &str,
+        object: &str,
+        _opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        let mut entry = self.load_entry(bucket, object).await?;
+        entry.extended.remove(EXT_TAGGING);
+        self.filer
+            .put_object_meta(ObjectMetaWrite {
+                bucket,
+                key: object,
+                size: entry.content_size,
+                chunks: &entry.chunks,
+                extended: &entry.extended,
+            })
+            .await?;
+        Ok(object_info_from_entry(bucket, &entry))
+    }
+
     /// 由 volume id 解析出 volume server 的数据面（TLV）地址。
     async fn volume_address(&self, volume_id: u64) -> Result<String> {
         self.master
@@ -298,6 +488,7 @@ pub(crate) fn object_info_from_entry(bucket: &str, entry: &Entry) -> ObjectInfo 
     let mut user_defined = HashMap::new();
     let mut etag = None;
     let mut content_type = None;
+    let mut user_tags = String::new();
 
     for (key, value) in &entry.extended {
         let lowered = key.to_ascii_lowercase();
@@ -307,6 +498,10 @@ pub(crate) fn object_info_from_entry(bucket: &str, entry: &Entry) -> ObjectInfo 
         } else if lowered == EXT_CONTENT_TYPE {
             content_type = Some(text);
         } else if let Some(name) = lowered.strip_prefix("s3.") {
+            // tagging 与 native 一样保留在 user_defined 里，同时填入 user_tags。
+            if name == "x-amz-tagging" {
+                user_tags = text.clone();
+            }
             user_defined.insert(name.to_string(), text);
         } else {
             user_defined.insert(lowered, text);
@@ -330,6 +525,7 @@ pub(crate) fn object_info_from_entry(bucket: &str, entry: &Entry) -> ObjectInfo 
         etag,
         content_type,
         user_defined: Arc::new(user_defined),
+        user_tags: Arc::new(user_tags),
         ..ObjectInfo::default()
     }
 }

@@ -85,11 +85,19 @@
   - s3-tests P2a 目标 23 用例：19 通过；4 失败均为已定边界——`test_object_copy_16m`（copy_object 未委托，P2b）、`test_atomic_dual_conditional_write_1mb`（条件请求未实现，P2c）、`test_get_obj_tagging`/`test_put_max_tags`（tagging 未委托，T2.4）；`test_ranged_request_empty_object` 修复生效
   - P1c 基线 19/19 无回归（误匹配的 4 个额外用例在 native 同样失败，属上游限制）
 
-### P2b 委托漏网（待实施）
+### P2b 委托漏网（已完成，2026-10-27）
 
-- [ ] `copy_object`（`store/mod.rs`）委托；可元数据级复用源对象 chunks，不搬运数据
-- [ ] `put_object_metadata`（`store/mod.rs`）委托
-- [ ] tagging 链路（`put_object_tagging/get_object_tagging`）委托或显式能力声明
+- [x] `copy_object`（`store/mod.rs`）委托。**数据策略：深拷贝**（逐 chunk 读源写新 needle）——`remove_object` 会物理删除 needle，共享 chunks 会导致删除一个对象破坏另一个；needle 引用计数留作后续优化项。元数据以 S3 处理器合并好的 `src_info` 为准（含 REPLACE 指令、effective tags），ETag 继承源。
+  - 文件：`crates/ecstore/src/store/external.rs`、`store/mod.rs`、`store/object.rs`、`powerfs-rustfs-store/src/{object,backend}.rs`
+- [x] `put_object_metadata`（`store/mod.rs`）委托：合并 `opts.eval_metadata` 落盘（服务 legal_hold/retention API）；retention 强制拦截删除语义留待对象锁阶段。
+- [x] tagging 链路委托：`put_object_tags`/`get_object_tags`/`delete_object_tags` 三方法 trait 委托；tags 以 `s3.x-amz-tagging` 键落盘（与 native 一致保留在 user_defined，S3 层渲染时过滤），`object_info_from_entry` 同步填 `ObjectInfo.user_tags`。
+- [x] 附带修复：copy 源读取走固有方法 `get_object_reader_for_copy`（`store/object.rs`），绕过 trait 委托读本地盘报 NoSuchKey——补委托分支，与 P1c 固有方法委托点同模式。
+- 备注：trait `delete_objects`（`store/mod.rs`）仅 lifecycle/replication 调用，S3 批量删除走 P1c 已委托的固有方法，本阶段不动。
+- 验收（2026-10-27 全绿）：
+  - 静态：fork external 缝单测 4/4、适配 crate 单测 7/7、clippy `-D warnings` 0 警告、fmt 0 差异
+  - copy+tagging 目标组 21/21（含 P2a 遗留的 `test_object_copy_16m`、0 字节 copy、REPLACE/retaining 元数据、ifmatch/ifnonematch 条件 copy、tagging 全组 10 个）
+  - native 对照同组 21/21，行为一致
+  - CRUD 回归 22/22；P1c 基线 19/19 无回归（4 个误匹配失败为 T0.3 已记录的上游边界）
 
 - [ ] T2.1 版本化与删除标记（`versionId`、`null`、delete marker、多版本列举）。
   - 文件：`powerfs-master/src/object_meta/store.rs`、`powerfs-rustfs-store/src/object.rs`、`src/list.rs`

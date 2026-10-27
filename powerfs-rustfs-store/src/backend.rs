@@ -142,6 +142,59 @@ impl ExternalBackend for PowerFsStore {
         self.remove_object(bucket, object, opts).await
     }
 
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.copy_object_impl(
+            src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts,
+        )
+        .await
+    }
+
+    async fn put_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.put_object_metadata_impl(bucket, object, opts).await
+    }
+
+    async fn get_object_tags(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<String> {
+        self.get_object_tags_impl(bucket, object, opts).await
+    }
+
+    async fn put_object_tags(
+        &self,
+        bucket: &str,
+        object: &str,
+        tags: &str,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.put_object_tags_impl(bucket, object, tags, opts).await
+    }
+
+    async fn delete_object_tags(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.delete_object_tags_impl(bucket, object, opts).await
+    }
+
     async fn list_objects_v2(
         &self,
         bucket: &str,
