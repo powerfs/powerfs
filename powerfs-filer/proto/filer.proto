@@ -41,6 +41,19 @@ service FilerMetaService {
 
     // size/chunks 强一致更新（close 时 sync 账本，§5.1 lease 协调，§4 1.5）
     rpc UpdateInodeSizeChunks(UpdateInodeSizeChunksRequest) returns (UpdateInodeSizeChunksResponse);
+
+    // ===== S3 对象元数据（P1c：bucket 根目录由服务端解析） =====
+    // bucket 根目录挂在 inode 0 下，并登记到 root_inodes；
+    // key 作为扁平名字存于 bucket 根目录，允许包含 '/'；
+    // 数据指针存 chunks，S3 元数据（etag/content-type/用户元数据）存 extended 的 s3.* 键。
+    rpc EnsureBucketRoot(EnsureBucketRootRequest) returns (EnsureBucketRootResponse);
+    rpc GetBucketRoot(GetBucketRootRequest) returns (GetBucketRootResponse);
+    rpc ListBucketRoots(ListBucketRootsRequest) returns (ListBucketRootsResponse);
+    rpc DeleteBucketRoot(DeleteBucketRootRequest) returns (DeleteBucketRootResponse);
+    rpc PutObjectMeta(PutObjectMetaRequest) returns (PutObjectMetaResponse);
+    rpc GetObjectMeta(GetObjectMetaRequest) returns (GetObjectMetaResponse);
+    rpc DeleteObjectMeta(DeleteObjectMetaRequest) returns (DeleteObjectMetaResponse);
+    rpc ListObjectMetas(ListObjectMetasRequest) returns (ListObjectMetasResponse);
 }
 
 // POSIX 元数据服务 (扁平路径，FUSE 使用)
@@ -260,6 +273,106 @@ message InodeChunkEntry {
 message FindInodesByVolumeResponse {
     repeated InodeChunkEntry entries = 1;
     string error = 2;
+}
+
+// S3 bucket 根目录信息（inode 0 下的直属目录）。
+message BucketRootInfo {
+    string bucket = 1;
+    uint64 inode = 2;
+    uint64 mtime = 3;
+}
+
+message EnsureBucketRootRequest {
+    string bucket = 1;
+}
+
+message EnsureBucketRootResponse {
+    bool success = 1;
+    bool created = 2;
+    uint64 inode = 3;
+    uint64 mtime = 4;
+    string error = 5;
+}
+
+message GetBucketRootRequest {
+    string bucket = 1;
+}
+
+message GetBucketRootResponse {
+    bool found = 1;
+    uint64 inode = 2;
+    uint64 mtime = 3;
+    string error = 4;
+}
+
+message ListBucketRootsRequest {}
+
+message ListBucketRootsResponse {
+    repeated BucketRootInfo buckets = 1;
+    string error = 2;
+}
+
+message DeleteBucketRootRequest {
+    string bucket = 1;
+    // true 时跳过“桶必须为空”的检查（S3 的强制删除语义）。
+    bool force = 2;
+}
+
+message DeleteBucketRootResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+// 提交对象元数据：不存在则创建普通文件，存在则原地替换 size/chunks，
+// 并同步 extended 中的 s3.* 键。shard 路由完全由服务端完成。
+message PutObjectMetaRequest {
+    string bucket = 1;
+    string key = 2;
+    uint64 size = 3;
+    repeated FileChunk chunks = 4;
+    map<string, bytes> extended = 5;
+    string client_id = 6;
+}
+
+message PutObjectMetaResponse {
+    bool success = 1;
+    uint64 inode = 2;
+    string error = 3;
+}
+
+message GetObjectMetaRequest {
+    string bucket = 1;
+    string key = 2;
+}
+
+message GetObjectMetaResponse {
+    bool found = 1;
+    Entry entry = 2;
+    string error = 3;
+}
+
+message DeleteObjectMetaRequest {
+    string bucket = 1;
+    string key = 2;
+}
+
+message DeleteObjectMetaResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message ListObjectMetasRequest {
+    string bucket = 1;
+    // 本页最多返回条数；<=0 时按 1000 处理。
+    uint64 limit = 2;
+    // 上一页最后一个 key；空串表示从桶头开始。
+    string last_key = 3;
+}
+
+message ListObjectMetasResponse {
+    repeated Entry entries = 1;
+    bool has_more = 2;
+    string error = 3;
 }
 
 message FileChunk {

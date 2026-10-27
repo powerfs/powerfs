@@ -25,8 +25,12 @@ members = [
     "powerfs-coherence",
     "powerfs-ctl",
     "powerfs-raft",
+    "powerfs-rustfs-store",
     "rfs_tester",
 ]
+# rustfs/ 是独立 workspace（有自己的 [workspace] 与 package 继承），
+# 这里排除它，避免 Cargo 把 rustfs crate 当成当前 workspace 的成员。
+exclude = ["rustfs"]
 resolver = "2"
 
 [workspace.package]

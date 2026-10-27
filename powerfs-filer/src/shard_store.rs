@@ -562,6 +562,16 @@ impl ShardStore {
         root_inodes.iter().map(|(k, v)| (k.clone(), *v)).collect()
     }
 
+    /// 删除 bucket 的根 inode 登记（内存 + 落盘）。
+    pub fn remove_root_inode(&self, bucket: &str) {
+        self.root_inodes.write().unwrap().remove(bucket);
+        self.save_root_inodes();
+        if let Some(cf) = self.db.cf_handle(CF_METADATA) {
+            let key = format!("root_inode:{}", bucket);
+            let _ = self.db.delete_cf(cf, key.as_bytes());
+        }
+    }
+
     // ========================================================================
     // Filesystem format marker (data-safety: never auto-format existing data)
     // ========================================================================

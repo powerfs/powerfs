@@ -206,7 +206,7 @@ pub struct FilerNetHandler {
     /// MC-108 Task 4: Filer→Volume client used to materialize the
     /// authoritative inline snapshot into the destination needle while an
     /// inode is in the Migrating window. `None` in transport-less tests.
-    volume_client: Option<Arc<crate::tlv_volume_client::TlvVolumeClient>>,
+    volume_client: Option<Arc<powerfs_net::TlvVolumeClient>>,
     /// MC-108 Task 4: per-inode serialization for the migration critical
     /// section. Only one request drives quiesce→Begin→materialize→Commit per
     /// inode; concurrent migrators wait on the inner mutex and then observe
@@ -488,10 +488,7 @@ impl FilerNetHandler {
     /// MC-108 Task 4: wire the Filer→Volume client used to materialize the
     /// inline migration snapshot into the destination needle during Migrating.
     #[must_use]
-    pub fn with_volume_client(
-        mut self,
-        client: Arc<crate::tlv_volume_client::TlvVolumeClient>,
-    ) -> Self {
+    pub fn with_volume_client(mut self, client: Arc<powerfs_net::TlvVolumeClient>) -> Self {
         self.volume_client = Some(client);
         self
     }

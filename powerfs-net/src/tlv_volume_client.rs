@@ -6,8 +6,8 @@
 //! 提供 read_needle / write_needle / delete_needle 三个方法,
 //! 签名与 gRPC VolumeClientPool 一致, 便于无缝替换.
 
+use crate::{ClientConnPool, FieldId, MsgType, NetMessage, TlvEncoder, STATUS_OK};
 use log::debug;
-use powerfs_net::{ClientConnPool, FieldId, MsgType, NetMessage, TlvEncoder, STATUS_OK};
 use std::sync::Arc;
 
 /// TLV 协议 Volume 客户端, 封装 ClientConnPool.

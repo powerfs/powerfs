@@ -7,3 +7,7 @@
 [submodule "kernel"]
 	path = kernel
 	url = https://github.com/powerfs/powerfs-kernel.git
+
+[submodule "rustfs"]
+	path = rustfs
+	url = git@github.com:powerfs/rustfs.git

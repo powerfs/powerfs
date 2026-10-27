@@ -13,8 +13,8 @@ use crate::shard_store::{
     DirEntry, FileType, FormatMarker, InodeInfo, ShardStats, ShardStore, StoredFileChunk,
 };
 use crate::shard_strategy::ShardStrategy;
-use crate::tlv_volume_client::TlvVolumeClient;
 use crate::volume_router::VolumeRouter;
+use powerfs_net::TlvVolumeClient;
 
 // POSIX 根 inode (固定为 1，inode 0 保留给虚拟根)
 pub const POSIX_ROOT_INODE: u64 = 1;
@@ -4616,8 +4616,26 @@ impl MetaShardManager {
             return Err("failed to create bucket root: timeout waiting for apply".to_string());
         }
 
-        // Async mode: optimistically register and return.
+        // Async mode: 乐观登记缓存，但仍需确认目录项已 apply 再返回。
+        // `find_bucket_root` 以已 apply 的目录项为权威，若这里提前返回，
+        // 紧随其后的 HeadBucket/GetBucketRoot 会误判桶不存在。
         self.register_root_inode(bucket, inode);
+        let mut retries = 0;
+        while retries < 100 {
+            let applied = {
+                let stores = self.shard_stores.read().unwrap();
+                stores
+                    .get(&shard_id)
+                    .and_then(|store| store.get_dir_entry_inode(0, bucket))
+                    .is_some()
+            };
+            if applied {
+                return Ok(inode);
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            retries += 1;
+        }
+        // 超时仍返回已登记的 inode：读路径会跨端点重试，由已 apply 的节点答复。
         Ok(inode)
     }
 
@@ -4625,6 +4643,52 @@ impl MetaShardManager {
     /// This is the legacy method - prefer format_bucket_root for initial setup.
     pub async fn ensure_bucket_root(&self, bucket: &str) -> Result<u64, String> {
         self.format_bucket_root(bucket).await
+    }
+
+    /// 查找 bucket 根 inode（只读，不创建）。
+    ///
+    /// 与 `format_bucket_root` 的区别：这里每一步都只查不建，供 S3 的
+    /// GetBucket / ListBuckets / HeadBucket 使用；找到但缓存缺失时补登记缓存。
+    pub fn find_bucket_root(&self, bucket: &str) -> Option<u64> {
+        // 权威状态是 inode 0 下已 apply 的 Raft 目录项。`root_inodes` 只是
+        // 本节点缓存（另有一份本地 RocksDB 副本），不随 Raft 复制：在 leader
+        // 或其它节点删桶后，本节点缓存仍会残留旧条目，直接返回会让
+        // GetBucketRoot/ListBucketRoots 报告桶仍存在。因此必须校验目录项。
+        let shard_id = self.shard_strategy.calculate_shard(0);
+        let authoritative = {
+            let stores = self.shard_stores.read().unwrap();
+            stores
+                .get(&shard_id)
+                .and_then(|store| store.get_dir_entry_inode(0, bucket))
+        };
+
+        match authoritative {
+            Some(inode) => {
+                let cached = self.root_inodes.read().unwrap().get(bucket).copied();
+                if cached != Some(inode) {
+                    self.register_root_inode(bucket, inode);
+                }
+                Some(inode)
+            }
+            None => {
+                // 目录项不存在说明桶已被删除（或尚未 apply），顺手清掉本地
+                // 残影；仅在缓存确有该条目时才落盘清理，避免普通未命中写盘。
+                if self.root_inodes.read().unwrap().contains_key(bucket) {
+                    self.unregister_root_inode(bucket);
+                }
+                None
+            }
+        }
+    }
+
+    /// 从 root_inodes 与 shard 元数据中移除 bucket 登记（删桶后调用）。
+    pub fn unregister_root_inode(&self, bucket: &str) {
+        self.root_inodes.write().unwrap().remove(bucket);
+        let shard_id = self.shard_strategy.calculate_shard(0);
+        let stores = self.shard_stores.read().unwrap();
+        if let Some(store) = stores.get(&shard_id) {
+            store.remove_root_inode(bucket);
+        }
     }
 
     /// Create an S3 object entry (file inode with fid/volume_id/etag) under a bucket root.

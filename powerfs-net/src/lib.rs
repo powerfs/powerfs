@@ -33,6 +33,7 @@ pub mod rpc_client;
 pub mod serialize;
 pub mod server;
 pub mod server_connection;
+pub mod tlv_volume_client;
 pub mod transport;
 #[cfg(feature = "rdma")]
 pub mod transport_rdma;
@@ -75,6 +76,7 @@ pub use server::{PowerFsNetServer, ServerConfig};
 pub use server_connection::{
     HealthStatus, MetricsSnapshot, NetHandler, ServerConnectionManager, SessionState,
 };
+pub use tlv_volume_client::TlvVolumeClient;
 pub use transport::{
     create_transport, AutoTransport, Transport, TransportConfig, TransportListener, TransportStream,
 };

@@ -9,8 +9,8 @@ use crate::metadata_store::BucketInfo;
 use crate::bucket_manager::BucketManager;
 use crate::entry_manager::EntryManager;
 use crate::meta_shard_manager::MetaShardManager;
-use crate::tlv_volume_client::TlvVolumeClient;
 use crate::volume_router::VolumeRouter;
+use powerfs_net::TlvVolumeClient;
 
 /// Admin bucket create request body (JSON, proxied via Monitor).
 #[derive(Debug, Deserialize)]

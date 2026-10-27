@@ -28,7 +28,6 @@ design/
 seaweedfs/
 ceph/
 Mooncake/
-rustfs/
 tifs/
 node_modules/
 log
@@ -61,6 +60,7 @@ kernel/**/.*.o
 __pycache__
 build
 *.egg-info
+.venv-*/
 
 # node.js
 node_modules

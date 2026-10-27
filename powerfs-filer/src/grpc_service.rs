@@ -4,23 +4,32 @@ use tonic::{Request, Response, Status};
 
 use crate::meta_shard_manager::{InodeSizeChunksUpdate, MetaShardManager};
 use crate::raft_group_manager_v2::ShardId;
+use crate::shard_store::{FileType, ShardStore};
 use crate::shard_strategy::ShardStrategy;
 
 use super::powerfs::filer_meta_service_server::FilerMetaService;
 use super::powerfs::{
     AddShardRequest, AddShardResponse, AllocInodeBatchRequest, AllocInodeBatchResponse,
-    CreateEntryRequest, CreateEntryResponse, DeleteEntryRequest, DeleteEntryResponse,
-    DrainShardRequest, Entry as ProtoEntry, FileChunk as ProtoFileChunk, FindInodesByVolumeRequest,
-    FindInodesByVolumeResponse, FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse,
-    GetEntryRequest, GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse,
+    BucketRootInfo, CreateEntryRequest, CreateEntryResponse, DeleteBucketRootRequest,
+    DeleteBucketRootResponse, DeleteEntryRequest, DeleteEntryResponse, DeleteObjectMetaRequest,
+    DeleteObjectMetaResponse, DrainShardRequest, EnsureBucketRootRequest, EnsureBucketRootResponse,
+    Entry as ProtoEntry, FileChunk as ProtoFileChunk, FindInodesByVolumeRequest,
+    FindInodesByVolumeResponse, FuseAttributes, GetBucketRootRequest, GetBucketRootResponse,
+    GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest, GetEntryResponse,
+    GetObjectMetaRequest, GetObjectMetaResponse, GetShardStatsRequest, GetShardStatsResponse,
     InodeChunkEntry, LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest,
-    LeaseRenewResponse, LeaseRequest, LeaseResponse, ListEntriesRequest, ListEntriesResponse,
-    ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
+    LeaseRenewResponse, LeaseRequest, LeaseResponse, ListBucketRootsRequest,
+    ListBucketRootsResponse, ListEntriesRequest, ListEntriesResponse, ListObjectMetasRequest,
+    ListObjectMetasResponse, ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
     LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse, PushDeltaRequest,
-    PushDeltaResponse, RaftMessageRequest, RaftMessageResponse, RemoveShardRequest,
-    RenameEntryRequest, RenameEntryResponse, ShardControlResponse, UpdateEntryRequest,
-    UpdateEntryResponse, UpdateInodeSizeChunksRequest, UpdateInodeSizeChunksResponse,
+    PushDeltaResponse, PutObjectMetaRequest, PutObjectMetaResponse, RaftMessageRequest,
+    RaftMessageResponse, RemoveShardRequest, RenameEntryRequest, RenameEntryResponse,
+    ShardControlResponse, UpdateEntryRequest, UpdateEntryResponse, UpdateInodeSizeChunksRequest,
+    UpdateInodeSizeChunksResponse,
 };
+
+/// S3 元数据在 inode `extended` 中的保留前缀；带此前缀但不在请求里的键会被清理。
+const S3_META_PREFIX: &str = "s3.";
 
 pub struct FilerMetaServiceImpl {
     meta_shard_manager: Arc<MetaShardManager>,
@@ -40,6 +49,39 @@ impl FilerMetaServiceImpl {
 
     fn inode_to_shard_id(&self, inode: u64) -> ShardId {
         self.shard_strategy.calculate_shard(inode)
+    }
+
+    /// bucket 根目录的 mtime；读不到时返回 0（S3 侧回落为当前时间）。
+    async fn bucket_mtime(&self, inode: u64) -> u64 {
+        let shard_id = self.inode_to_shard_id(inode);
+        self.meta_shard_manager
+            .get_entry(inode, shard_id)
+            .await
+            .map(|info| info.mtime)
+            .unwrap_or(0)
+    }
+
+    /// 强制删桶前清理子项；只支持扁平对象，遇到子目录直接报错（P1c 不建中间目录）。
+    async fn remove_bucket_children(&self, bucket: &str, parent_inode: u64) -> Result<(), String> {
+        loop {
+            let (children, _) =
+                self.meta_shard_manager
+                    .list_directory_paginated(parent_inode, "", 1000);
+            if children.is_empty() {
+                return Ok(());
+            }
+            for child in children {
+                if child.mode & 0o170000 == 0o040000 {
+                    return Err(format!(
+                        "bucket {bucket} contains directory {}, force delete unsupported",
+                        child.name
+                    ));
+                }
+                self.meta_shard_manager
+                    .delete_object_entry(parent_inode, &child.name)
+                    .await?;
+            }
+        }
     }
 }
 
@@ -330,30 +372,31 @@ impl FilerMetaService for FilerMetaServiceImpl {
             }));
         }
 
-        let shard_id = self.inode_to_shard_id(parent_ino);
-        let entries = match self
-            .meta_shard_manager
-            .list_entries(parent_ino, shard_id, limit)
-            .await
-        {
-            Ok(e) => e,
-            Err(_) => {
-                return Ok(Response::new(ListEntriesResponse {
-                    entries: vec![],
-                    has_more: false,
-                    error: "failed to list entries".to_string(),
-                }));
-            }
-        };
+        // 目录项由 `list_directory_paginated` 按名字升序返回，跨节点也保持有序；
+        // 之前走 `list_entries` 是全量扫描且顺序取决于 shard 内部顺序。
+        let limit = if limit == 0 { 1000 } else { limit };
+        let (children, more) =
+            self.meta_shard_manager
+                .list_directory_paginated(parent_ino, &req.last_name, limit);
+        let has_more = more || children.len() > limit;
 
-        let proto_entries = entries
-            .into_iter()
-            .map(|e| proto_entry_from_inode(&e))
-            .collect();
+        let mut proto_entries = Vec::with_capacity(children.len().min(limit));
+        for child in children.into_iter().take(limit) {
+            let shard_id = self.inode_to_shard_id(child.inode);
+            if let Ok(info) = self
+                .meta_shard_manager
+                .get_entry(child.inode, shard_id)
+                .await
+            {
+                let mut entry = proto_entry_from_inode(&info);
+                entry.name = child.name;
+                proto_entries.push(entry);
+            }
+        }
 
         Ok(Response::new(ListEntriesResponse {
             entries: proto_entries,
-            has_more: false,
+            has_more,
             error: "".to_string(),
         }))
     }
@@ -390,9 +433,12 @@ impl FilerMetaService for FilerMetaServiceImpl {
             }
         };
 
+        // inode 记录位于 calculate_shard(inode)，与父目录所在 shard 不一定相同；
+        // 之前误用父目录 shard，跨 shard 时查不到条目。
+        let child_shard_id = self.inode_to_shard_id(child_inode);
         let entry = match self
             .meta_shard_manager
-            .get_entry(child_inode, shard_id)
+            .get_entry(child_inode, child_shard_id)
             .await
         {
             Ok(e) => e,
@@ -920,6 +966,393 @@ impl FilerMetaService for FilerMetaServiceImpl {
             error: String::new(),
         }))
     }
+
+    async fn ensure_bucket_root(
+        &self,
+        request: Request<EnsureBucketRootRequest>,
+    ) -> Result<Response<EnsureBucketRootResponse>, Status> {
+        let bucket = request.into_inner().bucket;
+        if let Err(error) = validate_bucket_name(&bucket) {
+            return Ok(Response::new(EnsureBucketRootResponse {
+                success: false,
+                created: false,
+                inode: 0,
+                mtime: 0,
+                error,
+            }));
+        }
+
+        let existed = self.meta_shard_manager.find_bucket_root(&bucket).is_some();
+        match self.meta_shard_manager.format_bucket_root(&bucket).await {
+            Ok(inode) => Ok(Response::new(EnsureBucketRootResponse {
+                success: true,
+                created: !existed,
+                inode,
+                mtime: self.bucket_mtime(inode).await,
+                error: String::new(),
+            })),
+            Err(error) => Ok(Response::new(EnsureBucketRootResponse {
+                success: false,
+                created: false,
+                inode: 0,
+                mtime: 0,
+                error,
+            })),
+        }
+    }
+
+    async fn get_bucket_root(
+        &self,
+        request: Request<GetBucketRootRequest>,
+    ) -> Result<Response<GetBucketRootResponse>, Status> {
+        let bucket = request.into_inner().bucket;
+        if let Err(error) = validate_bucket_name(&bucket) {
+            return Ok(Response::new(GetBucketRootResponse {
+                found: false,
+                inode: 0,
+                mtime: 0,
+                error,
+            }));
+        }
+
+        match self.meta_shard_manager.find_bucket_root(&bucket) {
+            Some(inode) => Ok(Response::new(GetBucketRootResponse {
+                found: true,
+                inode,
+                mtime: self.bucket_mtime(inode).await,
+                error: String::new(),
+            })),
+            None => Ok(Response::new(GetBucketRootResponse {
+                found: false,
+                inode: 0,
+                mtime: 0,
+                error: String::new(),
+            })),
+        }
+    }
+
+    async fn list_bucket_roots(
+        &self,
+        _request: Request<ListBucketRootsRequest>,
+    ) -> Result<Response<ListBucketRootsResponse>, Status> {
+        let mut buckets = Vec::new();
+        for bucket in self.meta_shard_manager.list_buckets() {
+            if let Some(inode) = self.meta_shard_manager.find_bucket_root(&bucket) {
+                buckets.push(BucketRootInfo {
+                    bucket,
+                    inode,
+                    mtime: self.bucket_mtime(inode).await,
+                });
+            }
+        }
+        Ok(Response::new(ListBucketRootsResponse {
+            buckets,
+            error: String::new(),
+        }))
+    }
+
+    async fn delete_bucket_root(
+        &self,
+        request: Request<DeleteBucketRootRequest>,
+    ) -> Result<Response<DeleteBucketRootResponse>, Status> {
+        let req = request.into_inner();
+        let Some(inode) = self.meta_shard_manager.find_bucket_root(&req.bucket) else {
+            return Ok(Response::new(DeleteBucketRootResponse {
+                success: false,
+                error: "bucket not found".to_string(),
+            }));
+        };
+
+        if req.force {
+            if let Err(error) = self.remove_bucket_children(&req.bucket, inode).await {
+                return Ok(Response::new(DeleteBucketRootResponse {
+                    success: false,
+                    error,
+                }));
+            }
+        } else {
+            let (children, _) = self
+                .meta_shard_manager
+                .list_directory_paginated(inode, "", 1);
+            if !children.is_empty() {
+                return Ok(Response::new(DeleteBucketRootResponse {
+                    success: false,
+                    error: "bucket not empty".to_string(),
+                }));
+            }
+        }
+
+        if let Err(error) = self
+            .meta_shard_manager
+            .delete_directory_by_inode(inode, self.inode_to_shard_id(inode))
+            .await
+        {
+            return Ok(Response::new(DeleteBucketRootResponse {
+                success: false,
+                error,
+            }));
+        }
+        self.meta_shard_manager.unregister_root_inode(&req.bucket);
+        Ok(Response::new(DeleteBucketRootResponse {
+            success: true,
+            error: String::new(),
+        }))
+    }
+
+    async fn put_object_meta(
+        &self,
+        request: Request<PutObjectMetaRequest>,
+    ) -> Result<Response<PutObjectMetaResponse>, Status> {
+        let req = request.into_inner();
+        // tonic 的 Status 较大，闭包返回值体积告警与本次改动无关。
+        #[allow(clippy::result_large_err)]
+        let failure = |error: String| {
+            Ok(Response::new(PutObjectMetaResponse {
+                success: false,
+                inode: 0,
+                error,
+            }))
+        };
+
+        if let Err(error) = validate_bucket_name(&req.bucket) {
+            return failure(error);
+        }
+        if let Err(error) = validate_object_key(&req.key) {
+            return failure(error);
+        }
+
+        let parent_inode = match self.meta_shard_manager.find_bucket_root(&req.bucket) {
+            Some(inode) => inode,
+            None => match self
+                .meta_shard_manager
+                .format_bucket_root(&req.bucket)
+                .await
+            {
+                Ok(inode) => inode,
+                Err(error) => return failure(error),
+            },
+        };
+        let parent_shard = self.inode_to_shard_id(parent_inode);
+        match self
+            .meta_shard_manager
+            .get_entry(parent_inode, parent_shard)
+            .await
+        {
+            Ok(info) if info.file_type == FileType::Directory => {}
+            Ok(_) => return failure(format!("{} is not a directory", req.bucket)),
+            Err(error) => return failure(error),
+        }
+
+        let inode = match self
+            .meta_shard_manager
+            .get_object_entry(parent_inode, &req.key)
+        {
+            Some(info) => info.inode,
+            None => {
+                match self
+                    .meta_shard_manager
+                    .create_file_with_shard(parent_inode, &req.key, parent_shard, 0o100644, 0, 0)
+                    .await
+                {
+                    Ok((inode, _)) => inode,
+                    Err(error) => return failure(error),
+                }
+            }
+        };
+        let shard_id = self.inode_to_shard_id(inode);
+
+        let chunks: Vec<crate::shard_store::StoredFileChunk> =
+            req.chunks.iter().map(stored_chunk_from_proto).collect();
+        if let Err(error) = self
+            .meta_shard_manager
+            .update_inode_size_chunks_atomic(
+                shard_id,
+                inode,
+                InodeSizeChunksUpdate {
+                    size: req.size,
+                    chunks,
+                    inline_data: None,
+                    is_append: false,
+                    inline_dirty_mask: None,
+                },
+            )
+            .await
+        {
+            return failure(error);
+        }
+
+        // 写入与覆盖写都刷新 mtime，保证 S3 Last-Modified 随内容更新。
+        // Filer 元数据的 mtime 统一为秒级时间戳。
+        // 显式带上传入 size：SetAttr 的 MetaCache 投影会用 store 里的值兜底，
+        // 而异步持久化下 store 可能还是旧的 size（0），会把刚写入的 size 覆盖回去。
+        let now = ShardStore::current_time();
+        if let Err(error) = self
+            .meta_shard_manager
+            .setattr(
+                inode,
+                shard_id,
+                Some(req.size),
+                None,
+                None,
+                None,
+                Some(now),
+                Some(now),
+            )
+            .await
+        {
+            return failure(error);
+        }
+
+        let existing = self
+            .meta_shard_manager
+            .get_entry(inode, shard_id)
+            .await
+            .map(|info| info.extended)
+            .unwrap_or_default();
+        for (key, value) in &req.extended {
+            if existing.get(key) != Some(value) {
+                if let Err(error) = self
+                    .meta_shard_manager
+                    .set_xattr(inode, shard_id, key, value.clone())
+                    .await
+                {
+                    return failure(error);
+                }
+            }
+        }
+        for key in existing.keys() {
+            if key.starts_with(S3_META_PREFIX) && !req.extended.contains_key(key) {
+                if let Err(error) = self
+                    .meta_shard_manager
+                    .remove_xattr(inode, shard_id, key)
+                    .await
+                {
+                    return failure(error);
+                }
+            }
+        }
+
+        Ok(Response::new(PutObjectMetaResponse {
+            success: true,
+            inode,
+            error: String::new(),
+        }))
+    }
+
+    async fn get_object_meta(
+        &self,
+        request: Request<GetObjectMetaRequest>,
+    ) -> Result<Response<GetObjectMetaResponse>, Status> {
+        let req = request.into_inner();
+        let Some(parent_inode) = self.meta_shard_manager.find_bucket_root(&req.bucket) else {
+            return Ok(Response::new(GetObjectMetaResponse {
+                found: false,
+                entry: None,
+                error: String::new(),
+            }));
+        };
+        let Some(info) = self
+            .meta_shard_manager
+            .get_object_entry(parent_inode, &req.key)
+        else {
+            return Ok(Response::new(GetObjectMetaResponse {
+                found: false,
+                entry: None,
+                error: String::new(),
+            }));
+        };
+
+        let mut entry = proto_entry_from_inode(&info);
+        entry.directory = format!("/{}", req.bucket);
+        Ok(Response::new(GetObjectMetaResponse {
+            found: true,
+            entry: Some(entry),
+            error: String::new(),
+        }))
+    }
+
+    async fn delete_object_meta(
+        &self,
+        request: Request<DeleteObjectMetaRequest>,
+    ) -> Result<Response<DeleteObjectMetaResponse>, Status> {
+        let req = request.into_inner();
+        let Some(parent_inode) = self.meta_shard_manager.find_bucket_root(&req.bucket) else {
+            return Ok(Response::new(DeleteObjectMetaResponse {
+                success: false,
+                error: "bucket not found".to_string(),
+            }));
+        };
+        if self
+            .meta_shard_manager
+            .get_object_entry(parent_inode, &req.key)
+            .is_none()
+        {
+            return Ok(Response::new(DeleteObjectMetaResponse {
+                success: false,
+                error: "object not found".to_string(),
+            }));
+        }
+        match self
+            .meta_shard_manager
+            .delete_object_entry(parent_inode, &req.key)
+            .await
+        {
+            Ok(()) => Ok(Response::new(DeleteObjectMetaResponse {
+                success: true,
+                error: String::new(),
+            })),
+            Err(error) => Ok(Response::new(DeleteObjectMetaResponse {
+                success: false,
+                error,
+            })),
+        }
+    }
+
+    async fn list_object_metas(
+        &self,
+        request: Request<ListObjectMetasRequest>,
+    ) -> Result<Response<ListObjectMetasResponse>, Status> {
+        let req = request.into_inner();
+        let Some(parent_inode) = self.meta_shard_manager.find_bucket_root(&req.bucket) else {
+            return Ok(Response::new(ListObjectMetasResponse {
+                entries: Vec::new(),
+                has_more: false,
+                error: "bucket not found".to_string(),
+            }));
+        };
+
+        let limit = if req.limit == 0 {
+            1000
+        } else {
+            req.limit as usize
+        };
+        let (children, more) =
+            self.meta_shard_manager
+                .list_directory_paginated(parent_inode, &req.last_key, limit);
+        let has_more = more || children.len() > limit;
+        let mut entries = Vec::new();
+        for child in children.into_iter().take(limit) {
+            if child.mode & 0o170000 != 0o100000 {
+                continue;
+            }
+            let shard_id = self.inode_to_shard_id(child.inode);
+            if let Ok(info) = self
+                .meta_shard_manager
+                .get_entry(child.inode, shard_id)
+                .await
+            {
+                let mut entry = proto_entry_from_inode(&info);
+                entry.directory = format!("/{}", req.bucket);
+                entries.push(entry);
+            }
+        }
+
+        Ok(Response::new(ListObjectMetasResponse {
+            entries,
+            has_more,
+            error: String::new(),
+        }))
+    }
 }
 
 fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
@@ -942,18 +1375,7 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
             crtime: inode.ctime,
             perm: 0,
         }),
-        chunks: inode
-            .chunks
-            .iter()
-            .map(|c| ProtoFileChunk {
-                offset: c.offset,
-                size: c.size,
-                mtime: c.mtime,
-                needle_id: c.needle_id,
-                volume_id: c.volume_id,
-                crc32: c.crc32,
-            })
-            .collect(),
+        chunks: inode.chunks.iter().map(proto_chunk_from_stored).collect(),
         hard_link_id: "".to_string(),
         hard_link_counter: 0,
         extended: inode.extended.clone(),
@@ -965,4 +1387,52 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
         generation: 0,
         version: inode.version,
     }
+}
+
+fn proto_chunk_from_stored(chunk: &crate::shard_store::StoredFileChunk) -> ProtoFileChunk {
+    ProtoFileChunk {
+        offset: chunk.offset,
+        size: chunk.size,
+        mtime: chunk.mtime,
+        needle_id: chunk.needle_id,
+        volume_id: chunk.volume_id,
+        crc32: chunk.crc32,
+    }
+}
+
+fn stored_chunk_from_proto(chunk: &ProtoFileChunk) -> crate::shard_store::StoredFileChunk {
+    crate::shard_store::StoredFileChunk {
+        offset: chunk.offset,
+        size: chunk.size,
+        mtime: chunk.mtime,
+        needle_id: chunk.needle_id,
+        volume_id: chunk.volume_id,
+        crc32: chunk.crc32,
+        is_reference: false,
+    }
+}
+
+/// S3 bucket 名合法性：非空、不含 `/`、不是 `.`/`..`。
+fn validate_bucket_name(bucket: &str) -> Result<(), String> {
+    if bucket.is_empty() {
+        return Err("bucket name is empty".to_string());
+    }
+    if bucket == "." || bucket == ".." || bucket.contains('/') {
+        return Err(format!("invalid bucket name: {bucket}"));
+    }
+    Ok(())
+}
+
+/// S3 object key 合法性：非空、不以 `/` 开头、不含 `..` 段。
+fn validate_object_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("object key is empty".to_string());
+    }
+    if key.starts_with('/') {
+        return Err(format!("invalid object key: {key}"));
+    }
+    if key.split('/').any(|segment| segment == "..") {
+        return Err(format!("invalid object key: {key}"));
+    }
+    Ok(())
 }

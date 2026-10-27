@@ -190,7 +190,50 @@ impl S3MasterClient {
         }
     }
 
+    /// 解析 volume 的数据面端点（powerfs-net TLV），返回 `ip:port`。
+    ///
+    /// `LookupVolume` 响应的 `Location.grpc_port` 即拓扑节点的 grpc_port，
+    /// add_node 用 powerfs-net 数据端口填充（与 `Master::get_volume_data_endpoint`
+    /// 的 D.3 语义一致）。注意 `Location.url` 承载的是 http_port，不能用于
+    /// needle 读写。
+    pub async fn get_volume_data_endpoint(&self, volume_id: &VolumeId) -> Option<String> {
+        let vid_str = volume_id.0.to_string();
+        let request = LookupVolumeRequest {
+            volume_or_file_ids: vec![vid_str],
+            collection: String::new(),
+        };
+
+        let response = self
+            .inner
+            .call(move |mut client| {
+                let req = request.clone();
+                async move { client.lookup_volume(tonic::Request::new(req)).await }
+            })
+            .await
+            .ok()?
+            .into_inner();
+
+        for vol_loc in response.volume_id_locations {
+            if !vol_loc.error.is_empty() {
+                continue;
+            }
+            if let Some(loc) = vol_loc.locations.first() {
+                // url 形如 "ip:http_port" 或裸 IP，只取 IP 部分。
+                let addr = loc.url.split('/').next().unwrap_or(&loc.url);
+                let ip = addr.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(addr);
+                if loc.grpc_port > 0 {
+                    return Some(format!("{}:{}", ip, loc.grpc_port));
+                }
+            }
+        }
+        None
+    }
+
     /// Pure local helper — does not contact the master.
+    ///
+    /// 仅 `MasterApi::Remote`（powerfs-s3 退役路径）仍在使用；端口是
+    /// 旧环境启发式，不是真实 TLV 数据端口。新调用方一律改用
+    /// [`S3MasterClient::get_volume_data_endpoint`]。
     pub fn get_node_info(&self, node_id: &str) -> Option<DataNodeInfo> {
         let mut addr = node_id.strip_prefix("http://").unwrap_or(node_id);
         addr = addr.strip_prefix("https://").unwrap_or(addr);

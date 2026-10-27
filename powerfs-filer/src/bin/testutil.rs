@@ -10,7 +10,7 @@
 //!     (读取 needle 数据并输出到 stdout, 用于校验 shard 内容 / 确认删除生效)
 
 use clap::{Parser, Subcommand};
-use powerfs_filer::TlvVolumeClient;
+use powerfs_net::TlvVolumeClient;
 use powerfs_net::{ClientConnPool, ClientPoolConfig};
 use std::sync::Arc;
 

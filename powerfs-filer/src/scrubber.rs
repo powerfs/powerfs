@@ -13,9 +13,9 @@
 use crate::meta_shard_manager::MetaShardManager;
 use crate::net_handler::FilerNetHandler;
 use crate::shard_store::StoredFileChunk;
-use crate::tlv_volume_client::TlvVolumeClient;
 use log::{debug, error, info, warn};
 use powerfs_layout::reliability::{Reliability, ReliabilityState};
+use powerfs_net::TlvVolumeClient;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
