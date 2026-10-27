@@ -383,6 +383,8 @@ impl FuseClientFacade {
             max_retries: 3,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
             client_cert_pem: config.client_cert_pem.clone(),
+            // 与数据面 (filer/volume) 握手一致的稳定 id —— 数据面封禁按此 id 生效.
+            stable_client_id: Some(config.client_identity.client_id),
         };
 
         let master_client = Arc::new(MasterClient::new(
@@ -456,6 +458,8 @@ impl FuseClientFacade {
             max_retries: 3,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
             client_cert_pem: config.client_cert_pem.clone(),
+            // 与数据面 (filer/volume) 握手一致的稳定 id —— 数据面封禁按此 id 生效.
+            stable_client_id: Some(config.client_identity.client_id),
         };
 
         let master_client = Arc::new(MasterClient::new(

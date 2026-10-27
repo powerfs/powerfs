@@ -302,6 +302,10 @@ pub struct MasterClientConfig {
     /// 可选：客户端证书 PEM 原文（生产模式必填，master 有 CA 时强制校验）。
     /// 会通过 TLV FieldId::ClientCert (0xD4) 嵌入 RegisterClient/DeregisterClient 请求。
     pub client_cert_pem: Option<String>,
+    /// 稳定 client_id (hostname+mount_point hash). Some 时作为 master 连接的
+    /// 握手 client_id, 与数据面 (filer/volume) 连接一致 —— 证书吊销联动的
+    /// 数据面封禁依赖 master 侧校验记录的 client_id 与数据面握手 id 相同.
+    pub stable_client_id: Option<u64>,
 }
 
 impl Default for MasterClientConfig {
@@ -312,6 +316,7 @@ impl Default for MasterClientConfig {
             max_retries: 3,
             circuit_breaker_config: crate::circuit_breaker::CircuitBreakerConfig::default(),
             client_cert_pem: None,
+            stable_client_id: None,
         }
     }
 }
@@ -361,6 +366,7 @@ impl MasterClient {
             request_timeout: config.request_timeout,
             max_retries: config.max_retries,
             client_cert_pem: config.client_cert_pem,
+            pre_reg_client_id: config.stable_client_id,
             ..Default::default()
         };
 

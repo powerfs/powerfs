@@ -617,6 +617,34 @@ impl<'a> TlvDecoder<'a> {
         }
     }
 
+    /// Scan the remaining buffer for `field` and return its raw bytes.
+    /// Unlike [`TlvDecoder::next_bytes`] (which only reads the *next* field),
+    /// this scans all remaining fields without consuming anything — the
+    /// decoder position is unchanged. Used for order-independent extraction
+    /// of optional trailing fields (e.g. FieldId::BannedClientIds appended
+    /// after zone/volume records in Heartbeat / RegisterFiler responses).
+    pub fn find_bytes(&self, field: FieldId) -> Option<Vec<u8>> {
+        let mut scan_pos = self.pos;
+        while scan_pos + 5 <= self.buf.len() {
+            let field_id = self.buf[scan_pos];
+            let length = u32::from_be_bytes([
+                self.buf[scan_pos + 1],
+                self.buf[scan_pos + 2],
+                self.buf[scan_pos + 3],
+                self.buf[scan_pos + 4],
+            ]) as usize;
+            scan_pos += 5;
+            if scan_pos + length > self.buf.len() {
+                break;
+            }
+            if field_id == field as u8 {
+                return Some(self.buf[scan_pos..scan_pos + length].to_vec());
+            }
+            scan_pos += length;
+        }
+        None
+    }
+
     /// Read raw bytes for the given field (consumes the field, returns owned Vec<u8>)
     pub fn next_bytes(&mut self, field: FieldId) -> Result<Vec<u8>, NetError> {
         match self.next_field() {
@@ -1959,6 +1987,43 @@ mod tests {
         let entry = decode_entry_resp(&body).unwrap();
         assert_eq!(entry.ino, 100);
         assert_eq!(entry.symlink_target.as_deref(), Some("/tmp/target"));
+    }
+
+    #[test]
+    fn test_find_bytes_scans_trailing_field() {
+        // BannedClientIds-style payload: packed u64 LE list appended AFTER
+        // other fields — must be found by full-buffer scan without
+        // disturbing sequential decode.
+        let mut enc = TlvEncoder::new();
+        enc.add_u64(FieldId::Entries, 2);
+        enc.add_string(FieldId::Owner, "leader-1").unwrap();
+        let ids: Vec<u64> = vec![111, 222];
+        let blob: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+        enc.add_bytes(FieldId::BannedClientIds, &blob).unwrap();
+        let bytes = enc.into_bytes();
+
+        let dec = TlvDecoder::new(&bytes);
+        let found = dec.find_bytes(FieldId::BannedClientIds).unwrap();
+        assert_eq!(found.len(), 16);
+        let parsed: Vec<u64> = found
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
+            .collect();
+        assert_eq!(parsed, ids);
+
+        // scan does not consume: sequential decode still starts at Entries
+        let mut dec2 = TlvDecoder::new(&bytes);
+        let _ = dec2.find_bytes(FieldId::BannedClientIds);
+        assert_eq!(dec2.next_u64(FieldId::Entries).unwrap(), 2);
+
+        // absent field → None
+        let mut enc3 = TlvEncoder::new();
+        enc3.add_u64(FieldId::Entries, 1);
+        let bytes3 = enc3.into_bytes();
+        let dec3 = TlvDecoder::new(&bytes3);
+        assert!(dec3.find_bytes(FieldId::BannedClientIds).is_none());
     }
 
     #[test]

@@ -45,6 +45,10 @@ pub struct MasterClient {
     transport_port: u64,
     /// RDMA device name (e.g. "mlx5_0"). Empty when transport_type=TCP.
     rdma_device: String,
+    /// 数据面 net server 的连接注册表 (吊销联动作用目标).
+    /// 心跳响应携带的 BannedClientIds 全量替换其封禁集合并 sweep 现存连接.
+    /// None = 未启用 net server 或 dev 模式 (无吊销联动).
+    net_registry: Option<Arc<powerfs_net::ConnRegistry>>,
 }
 
 pub struct NewMasterClientParams<'a> {
@@ -71,6 +75,10 @@ pub struct NewMasterClientParams<'a> {
     pub transport_port: u64,
     /// RDMA device name. Empty when TCP.
     pub rdma_device: String,
+    /// Data-plane connection registry for cert-revocation enforcement.
+    /// The master pushes BannedClientIds in every Heartbeat response; the
+    /// volume replaces the registry's banned set and sweeps live conns.
+    pub net_registry: Option<Arc<powerfs_net::ConnRegistry>>,
 }
 
 impl MasterClient {
@@ -98,6 +106,7 @@ impl MasterClient {
                 Some(params.client_cert_pem.to_string())
             },
             transport: params.transport.clone(),
+            pre_reg_client_id: None,
         };
 
         let tlv_client = Arc::new(TlvMasterClient::new(endpoints, tlv_config));
@@ -114,6 +123,7 @@ impl MasterClient {
             transport_type: params.transport_type,
             transport_port: params.transport_port,
             rdma_device: params.rdma_device.clone(),
+            net_registry: params.net_registry.clone(),
         }
     }
 
@@ -217,6 +227,29 @@ impl MasterClient {
             "VOLUME_HEARTBEAT: heartbeat ok, leader={}, volume_size_limit={}",
             leader, volume_size_limit
         );
+
+        // 证书吊销联动: master 下发的数据面封禁 client_id 列表 (全量
+        // replace 语义). 替换注册表封禁集合 + sweep 现存连接; 后续新连接
+        // 在 handshake 阶段被拒绝 (ConnRegistry::is_banned).
+        if let Some(registry) = self.net_registry.as_ref() {
+            if let Some(bytes) = dec.find_bytes(FieldId::BannedClientIds) {
+                let ids: Vec<u64> = bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_le_bytes(*c))
+                    .collect();
+                registry.set_banned_clients(&ids);
+                let swept = registry.sweep_banned().await;
+                if swept > 0 {
+                    info!(
+                        "VOLUME_HEARTBEAT: cert-revocation ban list applied (banned={}, swept {} live conns)",
+                        ids.len(),
+                        swept
+                    );
+                }
+            }
+        }
 
         Ok(())
     }

@@ -1511,11 +1511,13 @@ auto_consistency_check = true
 
 ### 4.4 部署易用性缺陷（2026-10-26 换网段实测发现）
 
+> **⑦ 证书吊销联动 ✅ 已修复（2026-10-27）**：吊销传播已扩展到 filer/volume 数据面。实现：master 在 Heartbeat / RegisterFiler 响应尾部附带全量封禁 client_id 集合（`FieldId::BannedClientIds=0xE4`，replace 语义）；filer/volume 收到后 sweep 现存连接并在 handshake 阶段拒绝被封客户端重连。master 侧封禁来源三路齐备：(a) revoke hook 经持久化 `fp_client_index.json`（证书指纹→client_id 索引，解决 fuse 短连接 sweep 遗漏）反查封禁；(b) 证书校验失败且指纹为**已吊销**时自 ban（注册重试路径）；(c) `banned_clients.json` 持久化 + 编码路径 mtime 懒加载（共享 ca_dir 跨 master 收敛，leader 切换不丢封禁）。同步修复前置缺陷：fuse 控制面连接改用稳定身份（`TlvMasterClientConfig::pre_reg_client_id`），使 master 校验记录的 client_id 与数据面握手 id 一致。持有效证书重新注册自动解封（re-enroll 恢复）。**实测**：revoke fuse-2 后 ~35s 其挂载写失败（EIO），filer 日志 `cert-revocation ban list applied (banned=2, swept 1 live conns)`；re-enroll + 重启后 ~20s 自动解封、写恢复；对照组 fuse-1 全程读写正常。验收标准"revoke 客户端后其 fuse 挂载的读写实际失败"达成。
+
 | 项目 | 详情 |
 |------|------|
-| **问题** | ① `powerfs-ctl client enroll <name> --ip <ip>` 对已声明但无 `ip` 字段的 `[client.<name>]` 段只 skip append、不补写 ip，bootstrap 反复跳过该客户端（`skipping client <name> (no ip …)`），新手无提示可卡壳；② `init` 生成的 cluster.toml 不含任何 `[client.*]` 示例段，bootstrap 成功后集群无可用客户端；③ `docker/tests/test_filer_failover_write.sh` 残留未使用的 `FILER_IPS` 字面量且依赖 rendered compose 已不再提供的 host 端口映射（8888/8898/8908），脚本实际已失效 |
-| **目标** | ① enroll 检测到已有段缺 `ip` 时原地补写（或报错提示手工补）；② `init` 模板追加注释掉的 `[client.fuse-1]` 示例 + 注释说明"声明后 bootstrap 自动启动" |
-| **验收** | 新手路径 `init → 取消注释 client 段 → bootstrap` 直通；`enroll --ip` 幂等补 ip 后 bootstrap 不再 skip |
+| **问题** | ① `powerfs-ctl client enroll <name> --ip <ip>` 对已声明但无 `ip` 字段的 `[client.<name>]` 段只 skip append、不补写 ip，bootstrap 反复跳过该客户端（`skipping client <name> (no ip …)`），新手无提示可卡壳；② `docker/tests/test_filer_failover_write.sh` 残留未使用的 `FILER_IPS` 字面量且依赖 rendered compose 已不再提供的 host 端口映射（8888/8898/8908），脚本实际已失效；③ **bootstrap 签发不幂等**：重跑 bootstrap 对全部节点/客户端无条件重新签发证书，`client_registry.json` 的 `by_fingerprint` 只增不减（两次换网段实测后已达 83 条，含已废弃 SAN 的死记录），且无清理命令；④ **rdma profile 名不副实**：`Profile::Rdma` 渲染产物与 ha 完全一致（compose 模板无 network_mode/host、无 /dev/infiniband 设备挂载、无 RDMA 传输配置），选 rdma 得不到 RDMA 部署；⑤ **前端无部署入口**：`docker/Dockerfile-frontend` + `nginx-frontend.conf` 存在但不在 rendered compose 中，README 无说明；nginx-frontend.conf:29 的 `proxy_pass http://$filer_host:8888` 直连 filer admin，违反"前端只经 Monitor"约束；⑥ s3.toml 模板 access_key/secret_key 写死 `powerfs/powerfs123`，schema 无可配字段；⑦ **证书吊销联动只覆盖 master 控制面**：`sweep_revoked_cert_connections` 仅踢 master 连接，fuse 到 filer/volume 的数据面连接不受影响——实测 revoke fuse-2 后其挂载读写照常（仅 master 侧一次性抖动 `status=1`），吊销隔离不彻底；⑧ `node data maintenance <name>` help 自称 "Toggle" 但实际是开关（`--off` 关闭），且维护模式 ON 期间实测数据读写不受任何影响（语义/执行缺失）；⑨ `node master remove <id>` 只摘 raft membership，不清理 rendered 配置与容器，需手工 `docker rm` + 回改 `count` |
+| **目标** | ① enroll 检测到已有段缺 `ip` 时原地补写（或报错提示手工补）；③ bootstrap 签发前检查 SAN 匹配的有效证书已存在则复用（或提供 `cert prune` 清理死记录）；④ rdma profile 补齐 RDMA 网络/设备渲染或在文档明示其为占位；⑤ 前端纳入 compose 模板（可选项）+ 修正 nginx 直连 filer；⑥ s3 密钥入 schema；⑦ 吊销联动扩展到 filer/volume 数据面（fingerprint 回填 + 各服务 sweep hook）；⑧ maintenance 语义明确化：要么改名 `maintenance-on/off`，要么在 master 路由层拒绝向维护节点分配新写入；⑨ `node master remove` 提供 `--purge` 选项连容器/配置一起清 |
+| **验收** | 新手路径 `init → 取消注释 client 段 → bootstrap` 直通；`enroll --ip` 幂等补 ip 后 bootstrap 不再 skip；连跑两次 bootstrap 后 registry 指纹数不翻倍；`bootstrap --profile rdma` 产物与 ha 有实质差异或文档明确标注占位；revoke 客户端后其 fuse 挂载的读写实际失败；维护节点不再接收新分配的分片写入 |
 
 ### 4.5 暂缓项（第二梯队，记录备查）
 

@@ -719,7 +719,15 @@ impl PowerFsNetServer {
 
         // handshake 需要读写 stream, 完成后返回 (read_half, write_half, client_id, ...)
         let (read_half, write_half, client_id, client_type, channel, features) =
-            match Self::handle_handshake(stream, handler.clone(), manager.clone(), peer).await {
+            match Self::handle_handshake(
+                stream,
+                handler.clone(),
+                manager.clone(),
+                registry.clone(),
+                peer,
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Handshake failed from {}: {:?}", peer, e);
@@ -842,6 +850,7 @@ impl PowerFsNetServer {
         stream: Box<dyn TransportStream>,
         handler: Arc<dyn NetHandler>,
         manager: Option<Arc<ServerConnectionManager>>,
+        registry: Arc<ConnRegistry>,
         peer_addr: SocketAddr,
     ) -> NetResult<(
         Box<dyn AsyncRead + Send + Unpin>,
@@ -881,14 +890,33 @@ impl PowerFsNetServer {
             req.client_id, client_type, ch_str, peer_addr
         );
 
+        // 证书吊销联动: master 经心跳/注册响应下发的封禁 client_id,
+        // handshake 阶段直接 REJECT, 防止被吊销客户端重建数据面连接.
+        let banned = registry.is_banned(req.client_id);
+
         // Send handshake response
-        let resp = HandshakeResponse::ok(0);
+        let resp = if banned {
+            HandshakeResponse::reject()
+        } else {
+            HandshakeResponse::ok(0)
+        };
         let mut resp_buf = vec![0u8; HandshakeResponse::SIZE];
         resp.encode(&mut resp_buf);
         write_half
             .write_all(&resp_buf)
             .await
             .map_err(|e| NetError::Connection(format!("handshake write failed: {}", e)))?;
+
+        if banned {
+            warn!(
+                "Handshake REJECTED: client_id={} addr={} (cert revoked, banned by master)",
+                req.client_id, peer_addr
+            );
+            return Err(NetError::Connection(format!(
+                "client_id={} banned (cert revoked)",
+                req.client_id
+            )));
+        }
 
         let client_id = req.client_id;
 

@@ -21,7 +21,7 @@
 //! - list (管理/监控)
 
 use crate::protocol::{ClientType, NetMessage};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -401,6 +401,9 @@ pub struct ConnRegistry {
     conns: DashMap<u64, HashMap<u8, Arc<ClientConn>>>,
     /// holder_uuid → client_id (lease 校验时用)
     by_holder: DashMap<String, u64>,
+    /// 证书被吊销的客户端 client_id 集合 (master 经心跳/注册响应下发).
+    /// handshake 拒绝 + sweep 断连, 见 [`ConnRegistry::set_banned_clients`].
+    banned_client_ids: DashSet<u64>,
 }
 
 impl ConnRegistry {
@@ -408,7 +411,41 @@ impl ConnRegistry {
         Self {
             conns: DashMap::new(),
             by_holder: DashMap::new(),
+            banned_client_ids: DashSet::new(),
         }
+    }
+
+    /// 全量替换封禁集合 (replace 语义).
+    ///
+    /// 由数据面服务端 (filer/volume) 在心跳/注册响应中收到 master 下发的
+    /// BannedClientIds 后调用. master 每次下发完整集合: 吊销加入封禁,
+    /// 持有效证书重新通过校验的客户端 (re-enroll) 从集合中移除, 两侧自动
+    /// 收敛. 新连接在 handshake 阶段即被拒绝, 现存连接由调用方随后调
+    /// [`ConnRegistry::sweep_banned`] 清扫.
+    pub fn set_banned_clients(&self, ids: &[u64]) {
+        self.banned_client_ids.clear();
+        for id in ids {
+            self.banned_client_ids.insert(*id);
+        }
+    }
+
+    /// 判断 client_id 是否已被封禁 (handshake 路径调用).
+    pub fn is_banned(&self, id: u64) -> bool {
+        self.banned_client_ids.contains(&id)
+    }
+
+    /// 断开所有已封禁客户端的现存连接, 返回断开的 client_id 数.
+    pub async fn sweep_banned(&self) -> usize {
+        let targets: Vec<u64> = self
+            .list_client_ids()
+            .into_iter()
+            .filter(|id| self.banned_client_ids.contains(id))
+            .collect();
+        let n = targets.len();
+        for id in targets {
+            self.disconnect(id).await;
+        }
+        n
     }
 
     /// 注册新连接 (按 channel 独立存储)
@@ -987,5 +1024,40 @@ mod tests {
         // A brand-new connection (reconnect) must re-authenticate.
         let reconnect = make_conn(301);
         assert!(!reconnect.is_authenticated());
+    }
+
+    #[tokio::test]
+    async fn test_banned_clients_set_replace_semantics() {
+        let registry = ConnRegistry::new();
+
+        assert!(!registry.is_banned(7));
+        registry.set_banned_clients(&[7, 8]);
+        assert!(registry.is_banned(7));
+        assert!(registry.is_banned(8));
+        assert!(!registry.is_banned(9));
+
+        // replace (not merge): re-enrolled client 7 disappears from the set
+        registry.set_banned_clients(&[8]);
+        assert!(!registry.is_banned(7));
+        assert!(registry.is_banned(8));
+
+        // empty list clears all bans
+        registry.set_banned_clients(&[]);
+        assert!(!registry.is_banned(8));
+    }
+
+    #[tokio::test]
+    async fn test_sweep_banned_disconnects_only_banned() {
+        let registry = ConnRegistry::new();
+        let banned_conn = make_conn(11);
+        let innocent_conn = make_conn(12);
+        registry.register(banned_conn.clone()).await;
+        registry.register(innocent_conn.clone()).await;
+
+        registry.set_banned_clients(&[11]);
+        let swept = registry.sweep_banned().await;
+        assert_eq!(swept, 1);
+        assert_eq!(*banned_conn.state.read().await, ConnState::Closing);
+        assert_eq!(*innocent_conn.state.read().await, ConnState::Active);
     }
 }

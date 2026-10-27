@@ -611,6 +611,9 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         }
     }
 
+    // 数据面连接注册表 (吊销联动: master 心跳下发的封禁 client_id 作用于此)
+    let net_registry = net_server.as_ref().map(|s| s.registry().clone());
+
     // Spawn net server serve loop
     if let Some(net_server) = net_server {
         tokio::spawn(async move {
@@ -764,6 +767,7 @@ async fn run_volume(cfg: PowerFsConfig, args: Args) -> powerfs_common::error::Re
         transport_type,
         transport_port,
         rdma_device,
+        net_registry: net_registry.clone(),
     });
 
     let register = args.register_with_master.unwrap_or(true);

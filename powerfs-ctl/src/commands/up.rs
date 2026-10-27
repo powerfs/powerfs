@@ -191,6 +191,20 @@ pub async fn run<P: MetricsProbe>(
     Ok(())
 }
 
+fn write_state(home: &Home, info: &crate::health::LeaderInfo) -> std::io::Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body = serde_json::json!({
+        "started_at": now,
+        "leader_ip": info.ip,
+        "leader_term": info.term,
+        "leader_commit_index": info.commit_index,
+    });
+    home.write_file(Path::new("state.json"), &body.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,18 +258,4 @@ mod tests {
         // master itself must NOT be listed
         assert!(!err.contains("powerfs-master\n"), "{err}");
     }
-}
-
-fn write_state(home: &Home, info: &crate::health::LeaderInfo) -> std::io::Result<()> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let body = serde_json::json!({
-        "started_at": now,
-        "leader_ip": info.ip,
-        "leader_term": info.term,
-        "leader_commit_index": info.commit_index,
-    });
-    home.write_file(Path::new("state.json"), &body.to_string())
 }

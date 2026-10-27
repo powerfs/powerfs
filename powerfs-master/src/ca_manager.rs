@@ -216,7 +216,7 @@ impl CaManager {
     /// sharing the same `ca_dir` is picked up. After an actual replacement
     /// the revocation hook is invoked so live connections using a revoked
     /// certificate get swept.
-    fn try_reload_registry(&self) {
+    pub(crate) fn try_reload_registry(&self) {
         let fresh = ClientRegistry::load(&self.ca_dir);
         let mut guard = match self.registry.write() {
             Ok(g) => g,
@@ -268,6 +268,22 @@ impl CaManager {
                 reg.by_fingerprint
                     .get(fingerprint)
                     .map(|e| !e.revoked)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether a certificate fingerprint is present in the registry AND
+    /// marked revoked. Unknown fingerprints return false — data-plane
+    /// banning keys off this so a follower master with a stale/empty
+    /// registry cannot ban healthy clients.
+    pub fn is_fingerprint_revoked(&self, fingerprint: &str) -> bool {
+        self.registry
+            .read()
+            .map(|reg| {
+                reg.by_fingerprint
+                    .get(fingerprint)
+                    .map(|e| e.revoked)
                     .unwrap_or(false)
             })
             .unwrap_or(false)
@@ -1147,6 +1163,22 @@ mod tests {
             CertAdminError::Revoked(name) => assert_eq!(name, "fuse-1"),
             other => panic!("expected Revoked, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn is_fingerprint_revoked_only_true_for_explicitly_revoked() {
+        let (_dir, ca) = test_ca();
+        let fp = issue(&ca, "fuse-1");
+        // Unknown fingerprint: NOT revoked (must not trigger data-plane bans).
+        assert!(!ca.is_fingerprint_revoked(&"00".repeat(32)));
+        // Issued and active: not revoked.
+        assert!(!ca.is_fingerprint_revoked(&fp));
+        assert!(ca.is_fingerprint_active(&fp));
+        // After revoke: revoked=true, active=false.
+        ca.revoke_client_cert(RevokeSelector::ClientName("fuse-1".into()))
+            .unwrap();
+        assert!(ca.is_fingerprint_revoked(&fp));
+        assert!(!ca.is_fingerprint_active(&fp));
     }
 
     #[test]

@@ -25,6 +25,27 @@ impl MasterNetHandler {
         Self { master }
     }
 
+    /// Encode the current data-plane banned client id set (cert-revoked
+    /// clients) as FieldId::BannedClientIds — packed u64 LE array.
+    /// Full-replace semantics: filer/volume servers replace their local
+    /// ban set with the master's on every Heartbeat / RegisterFiler
+    /// response, so revocations propagate and re-enrolled clients
+    /// (unbanned on successful cert validation) recover automatically.
+    fn encode_banned_client_ids(&self, enc: &mut TlvEncoder) {
+        // Fresh variant: picks up bans persisted by other masters via
+        // the shared ca_dir (cheap mtime stat), so a revoke handled by
+        // any master converges on all heartbeat/register responders.
+        let banned = self.master.banned_client_ids_fresh();
+        if banned.is_empty() {
+            return;
+        }
+        let mut bytes = Vec::with_capacity(banned.len() * 8);
+        for id in banned {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        let _ = enc.add_bytes(FieldId::BannedClientIds, &bytes);
+    }
+
     /// Encode an Assign request
     pub fn encode_assign_req(
         collection: &str,
@@ -395,6 +416,10 @@ impl MasterNetHandler {
                     "NET_HEARTBEAT: rejected node={} peer={} — {}",
                     node_id_str, peer_ip, e
                 );
+                // Revoked node cert ⇒ ban its client_id on the data plane
+                // (short-lived conns escape the revoke-time live sweep).
+                self.master
+                    .note_revoked_client_cert(ctx.client.client_id, &client_cert_pem);
                 return Ok(Self::build_response(
                     msg,
                     STATUS_ERR_PERMISSION_DENIED,
@@ -519,6 +544,8 @@ impl MasterNetHandler {
         let mut enc = TlvEncoder::new();
         enc.add_string(FieldId::Owner, &leader)?;
         enc.add_u64(FieldId::Size, default_volume_size);
+        // 证书吊销联动: 向 volume 下发数据面封禁 client_id 列表
+        self.encode_banned_client_ids(&mut enc);
 
         Ok(Self::build_response(
             msg,
@@ -675,6 +702,13 @@ impl MasterNetHandler {
                         "NET_REGISTER_CLIENT: rejected uuid={} peer={} mount='{}' — {}",
                         client_uuid, peer_ip, mount_point, e
                     );
+                    // Revoked client cert ⇒ ban its client_id on the data
+                    // plane. Fuse clients re-register over short-lived
+                    // conns, so this self-ban on the next attempt is what
+                    // actually propagates a revocation (the revoke-time
+                    // live sweep usually finds no connection).
+                    self.master
+                        .note_revoked_client_cert(ctx.client.client_id, &client_cert_pem);
                     let mut enc = TlvEncoder::new();
                     enc.add_u8(FieldId::MountAllowed, 0);
                     enc.add_string(
@@ -1175,6 +1209,10 @@ impl MasterNetHandler {
                     "NET_REGISTER_FILER: rejected filer={} peer={} — {}",
                     filer_id, peer_ip, e
                 );
+                // Revoked filer cert ⇒ ban its client_id on the data plane
+                // (short-lived conns escape the revoke-time live sweep).
+                self.master
+                    .note_revoked_client_cert(ctx.client.client_id, &client_cert_pem);
                 return Ok(Self::build_response(
                     msg,
                     STATUS_ERR_PERMISSION_DENIED,
@@ -1312,6 +1350,9 @@ impl MasterNetHandler {
                 .sum::<usize>(),
             node_count.len()
         );
+
+        // 证书吊销联动: 向 filer 下发数据面封禁 client_id 列表
+        self.encode_banned_client_ids(&mut enc);
 
         Ok(Self::build_response(
             msg,

@@ -57,6 +57,13 @@ pub struct TlvMasterClientConfig {
     pub client_cert_pem: Option<String>,
     /// Optional transport (e.g. RDMA). When None, uses TCP.
     pub transport: Option<std::sync::Arc<dyn Transport>>,
+    /// Explicit pre-registration client_id for the handshake. When None a
+    /// per-(hostname, process-seq) id is generated (legacy behaviour).
+    /// FUSE passes its stable (hostname+mount_point) identity here so the
+    /// id the master records at cert validation MATCHES the id presented
+    /// to filers/volumes on the data plane — required for cert-revocation
+    /// data-plane bans to hit the right connections.
+    pub pre_reg_client_id: Option<u64>,
 }
 
 impl Default for TlvMasterClientConfig {
@@ -70,6 +77,7 @@ impl Default for TlvMasterClientConfig {
             retry_backoff: Duration::from_millis(5),
             client_cert_pem: None,
             transport: None,
+            pre_reg_client_id: None,
         }
     }
 }
@@ -566,12 +574,17 @@ impl TlvMasterClient {
         // seq_counter + 1000000 fallback. After successful RegisterClient
         // the master issues an authoritative client_id.
         static PRE_REG_SEQ: AtomicU64 = AtomicU64::new(0);
-        let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "anon".into());
-        let mut hash: u64 = 0;
-        for b in hostname.bytes() {
-            hash = hash.wrapping_mul(31).wrapping_add(b as u64);
-        }
-        let pre_reg_id = (hash & 0x0FFF_FFFF) * 1000 + PRE_REG_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pre_reg_id = match config.pre_reg_client_id {
+            Some(id) => id,
+            None => {
+                let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "anon".into());
+                let mut hash: u64 = 0;
+                for b in hostname.bytes() {
+                    hash = hash.wrapping_mul(31).wrapping_add(b as u64);
+                }
+                (hash & 0x0FFF_FFFF) * 1000 + PRE_REG_SEQ.fetch_add(1, Ordering::Relaxed)
+            }
+        };
         let net_cfg = ClientConfig {
             addr: host.to_string(),
             port,

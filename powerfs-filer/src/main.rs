@@ -867,6 +867,9 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 _ => String::new(),
             };
             let net_port_for_reg = net_port;
+            // 数据面连接注册表 (吊销联动: RegisterFiler 响应下发的封禁
+            // client_id 作用于此; 与 net server 共享同一 ConnRegistry)
+            let net_registry_for_reg = net_registry.clone();
             // S3 HTTP port (filer_cfg.port). The S3 server also serves the
             // /admin/shards endpoint, so the Master needs this port to
             // proxy shard-introspection in GetFilerStats.
@@ -883,6 +886,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 let registration_token_for_reg = registration_token_for_reg.clone();
                 let client_cert_pem_for_reg = client_cert_pem_for_reg.clone();
                 let advertise_addr_for_reg = advertise_addr_for_reg.clone();
+                let net_registry_for_reg = net_registry_for_reg.clone();
                 async move {
                     let filer_id = format!("filer-{}", filer_raft_id);
                     let shard_ids: Vec<u64> = (0..shard_count).collect();
@@ -928,6 +932,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                                 master_addr,
                                 &registration,
                                 transport_for_zone.clone(),
+                                Some(net_registry_for_reg.clone()),
                             )
                             .await
                             {

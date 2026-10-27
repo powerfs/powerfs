@@ -62,10 +62,15 @@ pub struct FilerNodeRegistration {
 ///   reg: Filer 节点注册信息 (filer_id + advertise_addr + net_port + shard_ids)
 ///
 /// 注意: 使用循环处理 REDIRECT 而非递归, 避免深度重定向导致栈溢出。
+///
+/// `net_registry`: 数据面 net server 的连接注册表 (吊销联动作用目标).
+/// 每次成功注册 (60s 心跳) 都会用响应中的 BannedClientIds 全量替换注册表
+/// 的封禁集合并 sweep 现存连接; None = dev 模式/未启用, 跳过吊销联动.
 pub async fn register_filer(
     master_addr: &str,
     reg: &FilerNodeRegistration,
     transport: Option<Arc<dyn Transport>>,
+    net_registry: Option<Arc<powerfs_net::ConnRegistry>>,
 ) -> Result<Vec<ZoneInfo>, String> {
     let mut current_addr = master_addr.to_string();
     // 重定向深度限制: 防止 Master 持续返回 REDIRECT 导致无限循环
@@ -202,6 +207,31 @@ pub async fn register_filer(
 
         if reply.body.is_empty() {
             return Err("empty response body".to_string());
+        }
+
+        // 证书吊销联动: master 在 RegisterFiler 响应尾部附带数据面封禁
+        // client_id 列表 (FieldId::BannedClientIds, packed u64 LE, 全量
+        // replace 语义). 解析 zones 用独立 decoder (字段顺序敏感), 这里
+        // 另起一个 decoder 全表扫描 BannedClientIds.
+        if let Some(registry) = &net_registry {
+            let dec = TlvDecoder::new(&reply.body);
+            if let Some(bytes) = dec.find_bytes(FieldId::BannedClientIds) {
+                let ids: Vec<u64> = bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_le_bytes(*c))
+                    .collect();
+                registry.set_banned_clients(&ids);
+                let swept = registry.sweep_banned().await;
+                if swept > 0 {
+                    log::info!(
+                        "ZONE_CLIENT: cert-revocation ban list applied (banned={}, swept {} live conns)",
+                        ids.len(),
+                        swept
+                    );
+                }
+            }
         }
 
         return parse_zones_response(&reply.body, &reg.filer_id);

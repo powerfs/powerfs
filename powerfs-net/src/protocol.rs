@@ -1592,6 +1592,11 @@ pub enum FieldId {
     /// Cannot be a server-side error status: the kernel degrades open
     /// grants to SHARED_WRITE on RPC errors instead of retrying.
     MigrateInProgress = 0xE3,
+    /// Packed u64 LE array of banned (cert-revoked) client ids. Carried in
+    /// Heartbeat / RegisterFiler responses: the Master pushes the revoked
+    /// fuse client ids to filer/volume data-plane servers so they sweep
+    /// existing connections and reject new handshakes from those clients.
+    BannedClientIds = 0xE4,
 }
 
 impl FieldId {
@@ -1736,6 +1741,7 @@ impl FieldId {
             0xE1 => Some(Self::DirtyBitmap),
             0xE2 => Some(Self::MigrateCommitted),
             0xE3 => Some(Self::MigrateInProgress),
+            0xE4 => Some(Self::BannedClientIds),
             _ => None,
         }
     }
@@ -2870,6 +2876,12 @@ mod tests {
                 assert_eq!(fid.as_u8(), v);
             }
         }
+    }
+
+    #[test]
+    fn test_banned_client_ids_field_id() {
+        assert_eq!(FieldId::BannedClientIds.as_u8(), 0xE4);
+        assert_eq!(FieldId::from_u8(0xE4), Some(FieldId::BannedClientIds));
     }
 
     fn make_request_msg(seq: u32, body: &[u8]) -> NetMessage {

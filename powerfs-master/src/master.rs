@@ -130,6 +130,26 @@ pub struct MasterNode {
     /// this is always `Some` once the master has initialised its CA
     /// directory.
     ca_manager: Option<Arc<crate::ca_manager::CaManager>>,
+    /// 证书吊销联动的数据面封禁集合: 证书被吊销的客户端 client_id.
+    /// 经 Heartbeat / RegisterFiler 响应 (FieldId::BannedClientIds, 全量
+    /// replace 语义) 下发给 filer/volume, 后者 sweep 现存连接并在
+    /// handshake 阶段拒绝重连. 持久化到 ca_dir/banned_clients.json,
+    /// master 重启后封禁不丢失; 客户端持有效证书重新通过校验时
+    /// (record_conn_cert_fingerprint) 自动解除封禁 (re-enroll 恢复).
+    banned_client_ids: Arc<RwLock<HashSet<u64>>>,
+    /// Last observed mtime of `{ca_dir}/banned_clients.json`. The ca_dir
+    /// is shared by all masters, so the persisted banned set is the
+    /// cross-master source of truth: `banned_client_ids_fresh` reloads
+    /// when the mtime advances, converging followers/leader-successors
+    /// without a restart.
+    banned_file_mtime: Arc<RwLock<Option<std::time::SystemTime>>>,
+    /// Durable cert-fingerprint → client_id index, populated on every
+    /// successful cert validation and persisted to
+    /// `{ca_dir}/fp_client_index.json`. Revocation sweeps resolve the
+    /// revoked fp to its client_id through this index — live-connection
+    /// scans alone are unreliable because fuse clients talk to the master
+    /// over short-lived connections and re-register only at process start.
+    fp_client_index: Arc<RwLock<HashMap<String, u64>>>,
     /// Registration token for authenticating Volume/Filer node registrations.
     /// When `None` or empty, registrations are open (dev mode). When set,
     /// Volume/Filer must send a matching token in their TLV requests.
@@ -189,13 +209,190 @@ impl MasterNode {
     /// (no TLS handshake), so the fingerprint can only be back-filled when
     /// the first cert-carrying request passes validation.
     pub async fn record_conn_cert_fingerprint(&self, client_id: u64, cert_pem: &str) {
+        // 证书刚通过校验 ⇒ 该 client_id 持有有效证书, 解除数据面封禁.
+        // re-enroll 场景: fuse client_id 由 (hostname, mount_point) 稳定哈希
+        // 生成, 重签新证书后 client_id 不变, 必须在下发给 filer/volume 的
+        // 封禁集合中移除, 否则恢复后的客户端仍被数据面拒绝.
+        if self.banned_client_ids.write().unwrap().remove(&client_id) {
+            info!(
+                "MasterNode: client_id={} presented a valid cert — removed from data-plane banned set",
+                client_id
+            );
+            Self::persist_banned_client_ids(&self.banned_client_ids, self.ca_dir.as_deref());
+        }
+        let fp = crate::ca_manager::CaManager::fingerprint_sha256(cert_pem);
+        // Durable fp→client_id 索引: revoke 时按吊销 fp 反查 client_id 封禁
+        // 数据面. fuse 的 master 连接是短连接且运行期极少重新注册, 仅靠
+        // 活跃连接 sweep 几乎必然错过 —— 该索引是唯一可靠的反查来源.
+        if Self::upsert_fp_client_index(&self.fp_client_index, &fp, client_id) {
+            Self::persist_fp_client_index(&self.fp_client_index, self.ca_dir.as_deref());
+        }
         let net_mgr_opt = self.net_manager.read().unwrap().clone();
         let Some(net_mgr) = net_mgr_opt else {
             return;
         };
         if let Some(conn) = net_mgr.registry().get(client_id) {
-            let fp = crate::ca_manager::CaManager::fingerprint_sha256(cert_pem);
             conn.set_cert_fingerprint(fp).await;
+        }
+    }
+
+    /// Insert `fp → client_id` into the durable index, first dropping any
+    /// other fingerprint rows owned by the same client (cert renewal moves
+    /// a client to a new fp; the stale row would otherwise re-ban the
+    /// client on the next sweep). Returns true when the map changed.
+    fn upsert_fp_client_index(
+        index: &RwLock<HashMap<String, u64>>,
+        fp: &str,
+        client_id: u64,
+    ) -> bool {
+        let mut idx = index.write().unwrap();
+        if idx.get(fp) == Some(&client_id) {
+            return false;
+        }
+        idx.retain(|_, v| *v != client_id);
+        idx.insert(fp.to_string(), client_id);
+        true
+    }
+
+    /// Persist the fp→client_id index to `{ca_dir}/fp_client_index.json`.
+    /// Whole-file write; index changes are rare (cert issue/renew), and
+    /// the shared ca_dir lets every master resolve revocations for certs
+    /// whose registrations were validated by a different master.
+    fn persist_fp_client_index(index: &RwLock<HashMap<String, u64>>, ca_dir: Option<&str>) {
+        let Some(dir) = ca_dir else { return };
+        let path = format!("{}/fp_client_index.json", dir);
+        let idx = index.read().unwrap();
+        match serde_json::to_string(&*idx) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!(
+                        "MasterNode: failed to persist fp client index to {}: {}",
+                        path, e
+                    );
+                }
+            }
+            Err(e) => warn!("MasterNode: failed to encode fp client index: {}", e),
+        }
+    }
+
+    /// Load the persisted fp→client_id index from `{ca_dir}/fp_client_index.json`.
+    fn load_fp_client_index(ca_dir: &str) -> HashMap<String, u64> {
+        let path = format!("{}/fp_client_index.json", ca_dir);
+        match std::fs::read_to_string(&path) {
+            Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
+                warn!(
+                    "MasterNode: corrupt fp_client_index.json at {} ({}), starting empty",
+                    path, e
+                );
+                HashMap::new()
+            }),
+            Err(_) => HashMap::new(), // first run — empty
+        }
+    }
+
+    /// Snapshot of the data-plane banned client id set (cert-revoked
+    /// clients). Encoded as FieldId::BannedClientIds into Heartbeat /
+    /// RegisterFiler responses so filer/volume servers sweep existing
+    /// connections and reject new handshakes from those clients.
+    pub fn banned_client_ids(&self) -> Vec<u64> {
+        self.banned_client_ids
+            .read()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Banned set with cross-master convergence. All masters share the
+    /// same ca_dir; whoever processes a revoke/unban persists the set
+    /// there. A cheap stat() per heartbeat response picks up changes
+    /// written by other masters (revoke via a different API endpoint,
+    /// or a fresh leader that never saw the old leader's in-memory set).
+    pub fn banned_client_ids_fresh(&self) -> Vec<u64> {
+        if let Some(dir) = self.ca_dir.as_deref() {
+            let path = format!("{}/banned_clients.json", dir);
+            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let mut last = self.banned_file_mtime.write().unwrap();
+            if mtime != *last {
+                *last = mtime;
+                let fresh = Self::load_banned_client_ids(dir);
+                let mut guard = self.banned_client_ids.write().unwrap();
+                if *guard != fresh {
+                    info!(
+                        "MasterNode: banned_clients.json changed on disk — reloaded ({} ids)",
+                        fresh.len()
+                    );
+                    *guard = fresh;
+                }
+            }
+        }
+        self.banned_client_ids()
+    }
+
+    /// If `cert_pem`'s fingerprint is recorded as REVOKED in the CA
+    /// registry, add `client_id` to the data-plane banned set (and
+    /// persist). Called from the cert-validation failure paths.
+    ///
+    /// This is the propagation path that actually catches fuse clients:
+    /// they re-register every few seconds over short-lived connections,
+    /// so the revoke-time sweep of live connections usually finds
+    /// nothing — but the client's next re-registration attempt with the
+    /// revoked cert self-bans here. Only explicitly-revoked fingerprints
+    /// ban; unknown certs / IP or mount mismatches do not (a follower
+    /// with a stale registry must not ban healthy clients).
+    pub fn note_revoked_client_cert(&self, client_id: u64, cert_pem: &str) {
+        let Some(ca) = self.ca_manager.as_ref() else {
+            return;
+        };
+        if cert_pem.is_empty() {
+            return;
+        }
+        let fp = crate::ca_manager::CaManager::fingerprint_sha256(cert_pem);
+        if !ca.is_fingerprint_revoked(&fp) {
+            return;
+        }
+        if self.banned_client_ids.write().unwrap().insert(client_id) {
+            info!(
+                "MasterNode: client_id={} presented REVOKED cert fp={:.16}… — added to data-plane banned set",
+                client_id, fp
+            );
+            Self::persist_banned_client_ids(&self.banned_client_ids, self.ca_dir.as_deref());
+        }
+    }
+
+    /// Persist the banned client id set to `{ca_dir}/banned_clients.json`
+    /// so bans survive master restarts. No-op in dev mode (no ca_dir).
+    fn persist_banned_client_ids(banned: &RwLock<HashSet<u64>>, ca_dir: Option<&str>) {
+        let Some(dir) = ca_dir else { return };
+        let ids: Vec<u64> = banned.read().unwrap().iter().copied().collect();
+        let path = format!("{}/banned_clients.json", dir);
+        match serde_json::to_string(&ids) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    warn!(
+                        "MasterNode: failed to persist banned client ids to {}: {}",
+                        path, e
+                    );
+                }
+            }
+            Err(e) => warn!("MasterNode: failed to encode banned client ids: {}", e),
+        }
+    }
+
+    /// Load persisted banned client ids from `{ca_dir}/banned_clients.json`.
+    fn load_banned_client_ids(ca_dir: &str) -> HashSet<u64> {
+        let path = format!("{}/banned_clients.json", ca_dir);
+        match std::fs::read_to_string(&path) {
+            Ok(json) => serde_json::from_str::<Vec<u64>>(&json)
+                .map(|v| v.into_iter().collect())
+                .unwrap_or_else(|e| {
+                    warn!(
+                        "MasterNode: corrupt banned_clients.json at {} ({}), starting empty",
+                        path, e
+                    );
+                    HashSet::new()
+                }),
+            Err(_) => HashSet::new(), // file absent (first run) — empty set
         }
     }
 
@@ -204,13 +401,59 @@ impl MasterNode {
     /// unknown). Connections with no recorded fingerprint (dev mode,
     /// admin/internal conns) are never touched.
     ///
+    /// Revoked client ids are additionally merged into the shared
+    /// `banned_client_ids` set (and persisted), which is pushed to
+    /// filer/volume servers via Heartbeat / RegisterFiler responses —
+    /// closing the data-plane gap where a revoked fuse client kept full
+    /// read/write access through its existing filer/volume connections.
+    ///
     /// Disconnection goes through `ClientConn::disconnect` → IoLoop
     /// shutdown → `registry.unregister` → `handler.on_disconnect`, i.e.
     /// the normal connection-teardown path with its existing lease cleanup.
     pub async fn sweep_revoked_cert_connections(
         net_manager: &RwLock<Option<Arc<ServerConnectionManager>>>,
         ca: &crate::ca_manager::CaManager,
+        banned_client_ids: &RwLock<HashSet<u64>>,
+        fp_client_index: &RwLock<HashMap<String, u64>>,
+        ca_dir: Option<&str>,
     ) {
+        // Refresh our in-memory registry from the shared ca_dir so certs
+        // issued/revoked via other masters are visible before we judge.
+        ca.try_reload_registry();
+        // Merge the on-disk fp→client_id index first: registrations may
+        // have been validated (and persisted) by a DIFFERENT master sharing
+        // this ca_dir, so our in-memory copy alone can miss the revoked
+        // cert's owner. Rare event; a full read is cheap.
+        if let Some(dir) = ca_dir {
+            let disk = Self::load_fp_client_index(dir);
+            if !disk.is_empty() {
+                fp_client_index.write().unwrap().extend(disk);
+            }
+        }
+        // Data-plane ban: resolve every EXPLICITLY-revoked fingerprint to
+        // its client_id via the durable index. This catches clients whose
+        // control-plane connections are long gone (short-lived fuse master
+        // connections) — the ban propagates to filer/volume via the next
+        // Heartbeat / RegisterFiler response. Unknown fps do NOT ban:
+        // after the reload that can only mean a stale view, and we must
+        // not ban healthy clients on stale data.
+        let mut newly_banned = false;
+        for (fp, client_id) in fp_client_index.read().unwrap().iter() {
+            if ca.is_fingerprint_revoked(fp) {
+                info!(
+                    "MasterNode: cert fp={:.16}… revoked — banning client_id={} on data plane",
+                    fp, client_id
+                );
+                if banned_client_ids.write().unwrap().insert(*client_id) {
+                    newly_banned = true;
+                }
+            }
+        }
+        if newly_banned {
+            Self::persist_banned_client_ids(banned_client_ids, ca_dir);
+        }
+        // Control-plane: drop any LIVE connections still presenting the
+        // revoked cert (long-lived volume/filer conns, in-flight sessions).
         let net_mgr_opt = net_manager.read().unwrap().clone();
         let Some(net_mgr) = net_mgr_opt else {
             return;
@@ -219,8 +462,8 @@ impl MasterNode {
         for (client_id, fp) in registry.cert_fingerprints().await {
             if !ca.is_fingerprint_active(&fp) {
                 info!(
-                    "MasterNode: cert fp={:.16}… revoked/unknown — disconnecting client_id={}",
-                    fp, client_id
+                    "MasterNode: disconnecting live conn client_id={} (revoked/unknown cert fp={:.16}…)",
+                    client_id, fp
                 );
                 registry.disconnect(client_id).await;
             }
@@ -770,6 +1013,9 @@ impl MasterNode {
             admin_token,
             ca_dir: ca_dir.clone(),
             ca_manager: None,
+            banned_client_ids: Arc::new(RwLock::new(HashSet::new())),
+            banned_file_mtime: Arc::new(RwLock::new(None)),
+            fp_client_index: Arc::new(RwLock::new(HashMap::new())),
             registration_token,
         };
 
@@ -790,15 +1036,28 @@ impl MasterNode {
                     // Weak<CaManager> avoids an Arc cycle (CaManager holds
                     // the hook, the hook would otherwise hold the CaManager).
                     let net_manager = master.net_manager.clone();
+                    let banned_client_ids = master.banned_client_ids.clone();
+                    let fp_client_index = master.fp_client_index.clone();
+                    let ca_dir_for_sweep = ca_dir.clone();
                     let ca_weak = Arc::downgrade(&ca);
                     ca.set_revocation_hook(Arc::new(move || {
                         let Some(ca) = ca_weak.upgrade() else {
                             return;
                         };
                         let net_manager = net_manager.clone();
+                        let banned_client_ids = banned_client_ids.clone();
+                        let fp_client_index = fp_client_index.clone();
+                        let ca_dir = ca_dir_for_sweep.clone();
                         if let Ok(handle) = tokio::runtime::Handle::try_current() {
                             handle.spawn(async move {
-                                Self::sweep_revoked_cert_connections(&net_manager, &ca).await;
+                                Self::sweep_revoked_cert_connections(
+                                    &net_manager,
+                                    &ca,
+                                    &banned_client_ids,
+                                    &fp_client_index,
+                                    ca_dir.as_deref(),
+                                )
+                                .await;
                             });
                         }
                     }));
@@ -815,6 +1074,29 @@ impl MasterNode {
             warn!(
                 "MasterNode: ca_dir not configured — certificate enforcement on RegisterClient is DISABLED (dev mode)."
             );
+        }
+
+        // 恢复持久化的数据面封禁集合 (master 重启后 filer/volume 的封禁不丢失;
+        // replace 语义下发要求 master 侧集合本身完整).
+        if let Some(ref dir) = ca_dir {
+            let loaded = Self::load_banned_client_ids(dir);
+            if !loaded.is_empty() {
+                info!(
+                    "MasterNode: restored {} banned client ids from {}/banned_clients.json",
+                    loaded.len(),
+                    dir
+                );
+                *master.banned_client_ids.write().unwrap() = loaded;
+            }
+            let fp_index = Self::load_fp_client_index(dir);
+            if !fp_index.is_empty() {
+                info!(
+                    "MasterNode: restored {} fp→client_id entries from {}/fp_client_index.json",
+                    fp_index.len(),
+                    dir
+                );
+                *master.fp_client_index.write().unwrap() = fp_index;
+            }
         }
 
         // P1.3: Replay Zone commands from Raft log to restore zone_registry.
@@ -5136,6 +5418,9 @@ impl Clone for MasterNode {
             admin_token: self.admin_token.clone(),
             ca_dir: self.ca_dir.clone(),
             ca_manager: self.ca_manager.clone(),
+            banned_client_ids: self.banned_client_ids.clone(),
+            banned_file_mtime: self.banned_file_mtime.clone(),
+            fp_client_index: self.fp_client_index.clone(),
             registration_token: self.registration_token.clone(),
         }
     }
@@ -6004,5 +6289,58 @@ mod tests {
         assert_eq!(super::data_endpoint_port(8902, 8901), Some(8902));
         assert_eq!(super::data_endpoint_port(0, 8901), Some(8901));
         assert_eq!(super::data_endpoint_port(0, 0), None);
+    }
+
+    #[test]
+    fn test_banned_client_ids_persist_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("powerfs-banned-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let banned: RwLock<HashSet<u64>> = RwLock::new([111u64, 222, 333].into_iter().collect());
+        MasterNode::persist_banned_client_ids(&banned, Some(&dir_str));
+
+        let loaded = MasterNode::load_banned_client_ids(&dir_str);
+        assert_eq!(loaded, [111u64, 222, 333].into_iter().collect());
+
+        // Missing file → empty set (first run)
+        let absent = MasterNode::load_banned_client_ids("/nonexistent/ca/dir");
+        assert!(absent.is_empty());
+
+        // None ca_dir (dev mode) → persist is a no-op, no panic
+        MasterNode::persist_banned_client_ids(&banned, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fp_client_index_upsert_and_cert_migration() {
+        let idx: RwLock<HashMap<String, u64>> = RwLock::new(HashMap::new());
+
+        // First record: inserted.
+        assert!(MasterNode::upsert_fp_client_index(&idx, "fp-a", 42));
+        // Idempotent for the same (fp, client_id) — heartbeat path must
+        // not dirty the index on every beat.
+        assert!(!MasterNode::upsert_fp_client_index(&idx, "fp-a", 42));
+        // Cert renewal: client 42 moves fp-a → fp-b; the stale fp-a row
+        // must be dropped so a later revoke of fp-a cannot re-ban the
+        // re-enrolled client.
+        assert!(MasterNode::upsert_fp_client_index(&idx, "fp-b", 42));
+        let snap = idx.read().unwrap();
+        assert_eq!(snap.get("fp-b"), Some(&42));
+        assert!(!snap.contains_key("fp-a"));
+        assert_eq!(snap.len(), 1);
+        drop(snap);
+
+        // Persist + load roundtrip.
+        let dir = std::env::temp_dir().join(format!("powerfs-fpidx-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        MasterNode::persist_fp_client_index(&idx, Some(&dir_str));
+        let loaded = MasterNode::load_fp_client_index(&dir_str);
+        assert_eq!(loaded.get("fp-b"), Some(&42));
+        assert!(MasterNode::load_fp_client_index("/nonexistent/ca/dir").is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
