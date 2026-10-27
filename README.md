@@ -142,6 +142,13 @@ docker/run-fuse-client.sh fuse-1 172.30.0.41
 docker exec fuse-1 sh -c 'echo hello > /mnt/powerfs/hello.txt && cat /mnt/powerfs/hello.txt'
 ```
 
+> **Switching profiles**: `--profile` only writes `.powerfs/cluster.toml` when
+> it does not exist yet. If you already bootstrapped another profile,
+> `bootstrap --profile simple` reuses the existing config and stays on the old
+> topology. Edit `profile = "simple"` in `.powerfs/cluster.toml` (or delete the
+> file) and rerun `bootstrap`. Note `down --purge` drops volumes but keeps
+> `cluster.toml`.
+
 ### Recommended: powerfs-ctl (declarative one-command deployment)
 
 `powerfs-ctl` renders the whole stack from a single `cluster.toml`, issues
