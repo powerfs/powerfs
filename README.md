@@ -4,7 +4,7 @@
 
 Unified POSIX / S3 / KV cache in a single cluster — eliminating the three-stack fragmentation that plagues HPC+AI converged infrastructure.
 
-[Why PowerFS](#why-powerfs) • [Architecture](#architecture) • [Key Features](#key-features) • [Roadmap](#-roadmap) • [Scenarios](#application-scenarios) • [Benchmark](#benchmark) • [Quick Start](#quick-start) • [Articles](articles/) • [License](#license)
+[Why PowerFS](#why-powerfs) • [Architecture](#architecture) • [Key Features](#key-features) • [Roadmap](#-roadmap) • [Scenarios](#application-scenarios) • [Benchmark](#benchmark) • [Prerequisites](#prerequisites) • [Quick Start](#quick-start) • [Articles](articles/) • [License](#license)
 
 ---
 
@@ -51,18 +51,65 @@ PowerFS adopts a **three-layer decoupled, Filer Raft strong-consistency + Cap mo
 
 ---
 
+## Prerequisites
+
+Everything below assumes a Linux host. Docker Desktop on macOS/Windows cannot
+run the FUSE client (no `/dev/fuse` passthrough).
+
+| Requirement | Why | Check |
+|---|---|---|
+| Rust 1.75+ stable + cargo | build the service binaries | `rustc --version` |
+| `protoc` | gRPC codegen at build time | `protoc --version` |
+| Docker Engine + compose v2 | run services and FUSE clients | `docker info && docker compose version` |
+| Docker usable without sudo | `powerfs-ctl` shells out to `docker compose` | `docker info >/dev/null && echo OK` |
+| `/dev/fuse` on the host | FUSE client containers | `ls /dev/fuse` |
+| `libfuse-dev` + kernel headers | build `powerfs-fuse` / `powerfs.ko` | `pkg-config --modversion fuse` |
+
+If `docker info` needs sudo, add yourself to the docker group and re-login:
+`sudo usermod -aG docker "$USER"`.
+
+### Ubuntu/Debian
+
+```bash
+sudo apt-get update && sudo apt-get install -y \
+    build-essential pkg-config \
+    protobuf-compiler libfuse-dev linux-headers-generic \
+    docker.io docker-compose-plugin
+```
+
+### CentOS/RHEL
+
+```bash
+sudo yum install -y gcc gcc-c++ make pkg-config \
+    protobuf-compiler fuse-devel kernel-devel docker
+sudo yum install -y docker-compose-plugin || \
+    sudo dnf install -y docker-compose-plugin   # name differs across repos
+```
+
+### Rust toolchain
+
+Use [rustup](https://rustup.rs) rather than a distro package — distro Rust
+is often older than the workspace's MSRV:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+```
+
+---
+
 ## Quick Start
 
 > **Before anything else**: Docker Engine must be running, and your user must
 > be able to talk to it without sudo (`docker info >/dev/null && echo OK`).
 > FUSE containers also need the host to expose `/dev/fuse` — check with
-> `ls /dev/fuse`. Full package list: [Prerequisites](#prerequisites).
+> `ls /dev/fuse`. Package list and install commands: [Prerequisites](#prerequisites).
 
 | Path | Use when | Time to first write |
 |---|---|---|
 | [Single container demo](#try-it-in-one-container-fastest--no-source-build) | Evaluate it, no build toolchain needed | 1 pull |
 | [Single-node cluster](#single-node-cluster-first-real-deployment) | First real deployment, learn the ctl model | 1 build |
-| [3-master HA cluster](#recommended-powerfs-ctl-declarative-one-command-deployment) | Production-shaped, survives one master loss | 1 build |
+| [3-master HA cluster](#3-master-ha-cluster-production-shaped) | Production-shaped, survives one master loss | 1 build |
 
 ### Try it in one container (fastest — no source build)
 
@@ -96,9 +143,13 @@ across `docker rm`. Stop with `docker rm -f powerfs`.
 
 ### Single-node cluster (first real deployment)
 
-The smallest ctl-managed cluster — 1 master, 1 volume, 1 filer (+ redis,
-monitor, s3) — all in containers on this host. No HA, no RDMA. Use this to
-learn the declarative model before scaling out.
+The smallest `powerfs-ctl`-managed cluster — 1 master, 1 volume, 1 filer
+(+ redis, monitor, s3) — all in containers on this host. No HA, no RDMA.
+`powerfs-ctl` renders the stack from `.powerfs/cluster.toml`, signs mTLS
+certs, starts services behind raft health gates, and handles day-2 ops
+(restart/scale/doctor/cert renew). Full guide:
+[powerfs-ctl/README.md](powerfs-ctl/README.md). Use this to learn the
+declarative model before scaling out.
 
 ```bash
 git clone https://github.com/powerfs/powerfs.git
@@ -109,10 +160,9 @@ cd powerfs
 git submodule update --init rfs_tester
 
 # Build every service binary. The rendered compose bind-mounts
-# target/release/powerfs-* into the containers, so `-p powerfs-ctl` alone
-# is not enough. Sanity-check the fuse binary exists afterwards:
+# target/release/powerfs-* into the containers, so building powerfs-ctl alone
+# is not enough — bootstrap preflight-checks and errors out if any is missing.
 cargo build --release
-ls -l target/release/powerfs-{ctl,master,filer,volume,monitor,s3,fuse}
 
 # init cluster.toml → render compose/config → issue mTLS certs
 # → compose up → raft health gate. One command, idempotent.
@@ -121,12 +171,15 @@ ls -l target/release/powerfs-{ctl,master,filer,volume,monitor,s3,fuse}
 # What success looks like: every service UP, master LEADER, healthz=ok
 ./target/release/powerfs-ctl status
 #   SERVICE        NAME                 STATE      HEALTH
-#   master         powerfs-master-1     running    healthy
-#   filer          powerfs-filer-1      running    healthy
-#   volume         powerfs-volume-1     running    healthy
-#   ...
+#   filer-1        powerfs-filer-1      running
+#   master-1       powerfs-master-1     running    healthy
+#   monitor        powerfs-monitor      running
+#   redis          powerfs-redis        running    healthy
+#   s3             powerfs-s3           running
+#   volume-1       powerfs-volume-1     running
+#
 #   master raft health:
-#     172.30.0.11      LEADER   term=1    commit=9    applied=9    healthz=ok
+#     172.30.0.11      LEADER   term=1    commit=3    applied=3    healthz=ok
 ```
 
 The cluster lives on its own bridge network (`172.30.0.0/16` by default;
@@ -149,36 +202,29 @@ docker exec fuse-1 sh -c 'echo hello > /mnt/powerfs/hello.txt && cat /mnt/powerf
 > file) and rerun `bootstrap`. Note `down --purge` drops volumes but keeps
 > `cluster.toml`.
 
-### Recommended: powerfs-ctl (declarative one-command deployment)
+### 3-master HA cluster (production-shaped)
 
-`powerfs-ctl` renders the whole stack from a single `cluster.toml`, issues
-mTLS certs, brings services up behind raft health gates, and handles day-2
-operations (restart/scale/doctor/cert renewal). See
-[powerfs-ctl/README.md](powerfs-ctl/README.md) for the full guide.
-
-Same steps as above, with `--profile ha` for 3 masters / 6 volumes / 3 filers:
+Same binary, same `powerfs-ctl` flow — only the profile differs (3 masters /
+6 volumes / 3 filers on the same subnet). On a fresh checkout:
 
 ```bash
-git clone https://github.com/powerfs/powerfs.git
-cd powerfs
-git submodule update --init rfs_tester
-cargo build --release
-
-# 3-master HA cluster (init → render → certs → up → health gate)
 ./target/release/powerfs-ctl bootstrap --profile ha
 ./target/release/powerfs-ctl status
+```
 
-# Two FUSE clients (NOT part of the rendered compose).
-# enroll signs a per-client cert + writes client-<name>.toml; the script
-# launches the container on the cluster network.
-# IPs are arbitrary free addresses in the subnet; they must match the
-# value passed to enroll (cert SAN is pinned to it).
+To move an existing single-node cluster to HA, see the profile note above
+(set `profile = "ha"` in `.powerfs/cluster.toml`, then rerun `bootstrap`).
+
+Two FUSE clients sharing one filesystem (clients are NOT services in the
+rendered compose; IPs must match enroll's `--ip` because they become the
+cert SAN):
+
+```bash
 ./target/release/powerfs-ctl client enroll fuse-1 --ip 172.30.0.41 --kind fuse
 ./target/release/powerfs-ctl client enroll fuse-2 --ip 172.30.0.42 --kind fuse
 docker/run-fuse-client.sh fuse-1 172.30.0.41
 docker/run-fuse-client.sh fuse-2 172.30.0.42
 
-# One shared filesystem across both clients:
 docker exec fuse-1 sh -c 'echo "hello powerfs" > /mnt/powerfs/hello.txt'
 docker exec fuse-2 cat /mnt/powerfs/hello.txt      # → hello powerfs
 docker exec fuse-2 sh -c 'mkdir -p /mnt/powerfs/demo && cp /mnt/powerfs/hello.txt /mnt/powerfs/demo/'
@@ -260,71 +306,18 @@ upgrades — see [kernel/README.md](kernel/README.md#dkms-install-auto-rebuild-o
 
 ## Getting Started
 
-### Prerequisites
-
-| Requirement | Why | Check |
-|---|---|---|
-| Rust 1.75+ stable + cargo | build the service binaries | `rustc --version` |
-| `protoc` | gRPC codegen at build time | `protoc --version` |
-| Docker Engine + compose v2 | run services and FUSE clients | `docker info && docker compose version` |
-| Docker usable without sudo | `powerfs-ctl` shells out to `docker compose` | `docker info >/dev/null && echo OK` |
-| `/dev/fuse` on the host | FUSE client containers | `ls /dev/fuse` |
-| `libfuse-dev` + kernel headers | build `powerfs-fuse` / `powerfs.ko` | `pkg-config --modversion fuse` |
-
-If `docker info` needs sudo, add yourself to the docker group and re-login:
-`sudo usermod -aG docker "$USER"`.
-
-A Linux host is assumed for the container paths. Docker Desktop on
-macOS/Windows cannot run the FUSE client (no `/dev/fuse` passthrough).
-
-#### Ubuntu/Debian
-
-```bash
-sudo apt-get update && sudo apt-get install -y \
-    build-essential pkg-config \
-    protobuf-compiler libfuse-dev linux-headers-generic \
-    docker.io docker-compose-plugin
-```
-
-#### CentOS/RHEL
-
-```bash
-sudo yum install -y gcc gcc-c++ make pkg-config \
-    protobuf-compiler fuse-devel kernel-devel docker
-sudo yum install -y docker-compose-plugin || \
-    sudo dnf install -y docker-compose-plugin   # name differs across repos
-```
-
-#### Rust toolchain
-
-Use [rustup](https://rustup.rs) rather than a distro package — distro Rust
-is often older than the workspace's MSRV:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-. "$HOME/.cargo/env"
-```
-
 ### Build
 
+The [Quick Start](#quick-start) owns the clone/build/deploy flow. In short:
+
 ```bash
-# Clone the repository
-git clone https://github.com/powerfs/powerfs.git
-cd powerfs
-
-# Required: rfs_tester is a dev-dependency of powerfs-master / powerfs-fuse.
-git submodule update --init rfs_tester
-
-# Build all workspace packages (default deploy path — no rustfs needed)
-cargo build --release
-
-# Build individual components
-cargo build -p powerfs-master --release
-cargo build -p powerfs-volume --release
-cargo build -p powerfs-filer --release
-cargo build -p powerfs-fuse --release
-cargo build -p powerfs-ctl --release    # deployment & lifecycle control plane
+git submodule update --init rfs_tester   # build-time dev-dependency
+cargo build --release                    # whole workspace, not just powerfs-ctl
 ```
+
+Build every service, not only the ctl binary: the rendered compose
+bind-mounts `target/release/powerfs-{master,filer,volume,monitor,s3}` into the
+containers, and `powerfs-ctl` refuses to bootstrap when any is missing.
 
 #### Optional: rustfs S3 backend adapter
 
