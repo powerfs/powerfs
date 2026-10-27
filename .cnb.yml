@@ -20,6 +20,7 @@ main:
             - echo 'registry = "https://rsproxy.cn/crates.io-index"' >> ~/.cargo/config.toml
         - name: Lint & Build
           script:
+            - git submodule update --init rfs_tester rustfs
             - cargo clippy --all-targets --all-features -- -D warnings
             - cargo build --release
         - name: Test
@@ -43,6 +44,8 @@ $:
           script: rustup component add rustfmt clippy rust-src
         - name: checkout
           script: git checkout tests && git pull origin tests
+        - name: Init submodules
+          script: git submodule update --init rfs_tester rustfs
         - name: 国内crates镜像
           script:
             - mkdir -p ~/.cargo

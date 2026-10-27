@@ -61,7 +61,7 @@ container needs `/dev/fuse`; Docker Desktop on macOS/Windows is not supported
 for this image).
 
 ```bash
-docker pull ghcr.io/powerfs/powerfs-demo:latest
+docker pull ghcr.io/powerfs/powerfs-demo:latest   # public package; ghcr.io/powerfs must be visible
 
 docker run -d --name powerfs \
     --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
