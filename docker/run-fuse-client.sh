@@ -16,7 +16,9 @@
 #
 # Env overrides: NETWORK (default derived from $POWERFS_HOME/cluster.toml's
 # name as `<cluster>_powerfs-network`), CERTS_DIR (default
-# <repo>/.powerfs/certs), IMAGE (default powerfs:latest)
+# <repo>/.powerfs/certs), IMAGE (default: the image declared in the rendered
+# compose, i.e. the same one the cluster runs on; falls back to
+# ghcr.io/powerfs/powerfs:latest).
 set -e
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,7 +37,14 @@ if [ -z "${NETWORK:-}" ]; then
     fi
 fi
 CERTS_DIR="${CERTS_DIR:-$REPO_ROOT/.powerfs/certs}"
-IMAGE="${IMAGE:-powerfs:latest}"
+# Reuse whatever image the cluster was bootstrapped with (the rendered compose
+# declares it), so a client never needs a second image. FUSE_BIN is
+# bind-mounted on top, so only the runtime libs come from the image.
+if [ -z "${IMAGE:-}" ] && [ -f "$HOME_DIR/rendered/docker-compose.yml" ]; then
+    IMAGE=$(sed -n 's/^[[:space:]]*image:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' \
+        "$HOME_DIR/rendered/docker-compose.yml" | grep -v '^redis:' | head -1)
+fi
+IMAGE="${IMAGE:-ghcr.io/powerfs/powerfs:latest}"
 FUSE_BIN="$REPO_ROOT/target/release/powerfs-fuse"
 
 if [ "$1" = "stop" ]; then
