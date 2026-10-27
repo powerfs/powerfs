@@ -4,7 +4,7 @@ main:
     - runner:
         cpus: 16
       docker:
-        image: rust:1.96-slim
+        image: rust:1.99-slim
         volumes:
           - cargo_registry:copy-on-write
           - target:copy-on-write
@@ -35,7 +35,7 @@ $:
       services:
         - vscode
       docker:
-        image: rust:1.96-slim
+        image: rust:1.99-slim
       branches: tests
       stages:
         - name: Install git + 编译系统依赖

@@ -94,8 +94,9 @@ operations (restart/scale/doctor/cert renewal). See
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
 
-# Required before the first build: two git submodules are part of the
-# workspace (rfs_tester) or provide S3 backend crates (rustfs).
+# Required before the first build: two git submodules are build-time
+# dependencies. kernel is NOT needed here — that one is for building the
+# optional in-tree powerfs.ko module (see kernel/README.md).
 git submodule update --init rfs_tester rustfs
 
 # 1. Build all binaries (ctl + master/filer/volume/monitor/s3; requires Docker Engine + compose v2).
@@ -230,7 +231,8 @@ sudo yum install -y \
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
 
-# Fetch the submodules the build depends on (workspace member + S3 backend crates)
+# Fetch the submodules the build depends on (workspace member + S3 backend crates).
+# kernel submodule is only needed for the optional powerfs.ko DKMS build.
 git submodule update --init rfs_tester rustfs
 
 # Build all packages
