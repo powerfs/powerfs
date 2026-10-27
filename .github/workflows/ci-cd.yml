@@ -794,3 +794,46 @@ jobs:
         mkdir -p "$ARTIFACT_DIR"
         cp -r ./powerfs-monitor-frontend/dist "$ARTIFACT_DIR/" 2>/dev/null || true
         echo "Artifacts saved to: $ARTIFACT_DIR"
+
+  # Optional check for the external S3 backend adapter. Runs on every push
+  # like other jobs, but is a single shallow cargo check — cheap enough to
+  # not warrant a separate workflow_dispatch. powerfs-rustfs-store is
+  # intentionally excluded from the main workspace (default deploy path
+  # does not need rustfs), so this job is the only CI coverage it gets.
+  rustfs-check:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+    - name: Configure Git for SSH
+      run: |
+        git config --global url."git@github.com:".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 100
+        git config --global http.lowSpeedTime 300
+
+    - name: Checkout code
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        rm -rf .git ./* ./.[!.]* 2>/dev/null || true
+        git init
+        git remote add origin "git@github.com:${GITHUB_REPOSITORY}.git"
+        git fetch --depth 1 origin "$GITHUB_SHA"
+        git checkout FETCH_HEAD
+        git config submodule.rustfs.url https://github.com/powerfs/rustfs.git
+        git submodule update --init --force rfs_tester rustfs
+        git submodule status
+
+    - name: Ensure Rust 1.99 (rustfs requires edition 2024)
+      run: |
+        if rustup toolchain list | grep -q "^1\.99"; then
+          rustup default 1.99
+        else
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain 1.99 --profile minimal
+          . "$HOME/.cargo/env"
+        fi
+        rustc --version
+
+    - name: Check powerfs-rustfs-store independently
+      run: |
+        cargo check --manifest-path powerfs-rustfs-store/Cargo.toml 2>&1 | tail -20
+        cargo clippy --manifest-path powerfs-rustfs-store/Cargo.toml -- -D warnings

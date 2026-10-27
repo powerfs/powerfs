@@ -138,9 +138,9 @@ Topology changes are declarative — edit `[nodes.*]` counts in
 `.powerfs/cluster.toml`, then reconcile:
 
 ```bash
-powerfs-ctl node master add 4      # render → cert → start → raft join → gate
-powerfs-ctl node data add volume-7
-powerfs-ctl doctor                 # diagnostics
+./target/release/powerfs-ctl node master add 4   # render → cert → start → raft join → gate
+./target/release/powerfs-ctl node data add volume-7
+./target/release/powerfs-ctl doctor              # diagnostics
 ```
 
 ### Legacy deployment paths (removed)
