@@ -99,6 +99,22 @@
   - native 对照同组 21/21，行为一致
   - CRUD 回归 22/22；P1c 基线 19/19 无回归（4 个误匹配失败为 T0.3 已记录的上游边界）
 
+### P2c 条件请求 + Range（已完成，2026-10-27）
+
+- [x] 写路径条件请求（`If-Match` / `If-None-Match`）：`write_object` 在**正文读完之后、写 needle 之前**判定（对齐上游「提交时检查」），语义镜像 `set_disk::evaluate_write_precondition`——存在且条件不满足 → 412 `PreconditionFailed`；不存在且带 `If-Match` → 404 `NoSuchKey`，仅带 `If-None-Match` 放行。
+  - 文件：`powerfs-rustfs-store/src/object.rs`
+  - 备注：正文先读完再判定，正是 `test_atomic_dual_conditional_write_1mb` 所需的时序（并发写在正文传输期间完成，后者提交时看到新 etag 返回 412）。
+- [x] 读路径条件请求与 Range 复核：条件 GET（If-Match/If-None-Match/If-Modified-Since/If-Unmodified-Since）与 Range 全组本就由元数据 `etag`/`mod_time` 与 `HTTPRangeSpec` 覆盖，无需新增实现；P2a 的多 chunk Range 路径保持有效。
+- 边界（与 native 完全一致，不算回归）：
+  - `test_put_current_object_if_none_match` / `test_put_current_object_if_match` / `test_put_object_current_if_match` 3 例：S3 层对**非通配符 If-None-Match 写请求**先返回 501（`reject_non_wildcard_write_if_none_match`），且末段依赖版本化 delete marker（P2e）。native 同组同 3 例失败。
+  - DELETE 条件（`test_delete_object(s)_if_match*`）native 全失败，属上游限制，留档不改测试。
+- 验收（2026-10-27）：
+  - 目标组 20/20（条件 GET 8 + 条件 PUT 6 + atomic 2 + Range 7，含 `test_ranged_request_empty_object`；重跑两次稳定）
+  - native 对照：同组除上述 3 例版本化相关外全过
+  - CRUD 回归 22/22 × 3；P2b copy/tagging 组主体通过（抖动项见下）
+  - 静态：适配 crate 单测 11/11（新增 4 个 etag 条件判定单测）、clippy `-D warnings`、fmt 全绿
+- **已知问题（本阶段发现，非 P2c 引入）**：Filer 读路径跨端点轮询，命中 apply 滞后的 follower 时会返回**旧版本条目**（症状：刚写/刚 copy 的对象 GET 缺 `ContentType`、tags 返回空、`ContentLength` 为 0；teardown 偶发 `DeleteBucket BucketNotEmpty`）。`get_object_meta` 目前只在 `found=false` 时换端点，陈旧命中不重试。单键 240 次读探针未复现，s3-tests 高并发下复现率约 10–30%。建议在 P2d 之前单独排期修复（方案：写成功端点的 leader 粘滞 / 会话一致性水位比较）。
+
 - [ ] T2.1 版本化与删除标记（`versionId`、`null`、delete marker、多版本列举）。
   - 文件：`powerfs-master/src/object_meta/store.rs`、`powerfs-rustfs-store/src/object.rs`、`src/list.rs`
   - 验收：`s3-tests` versioning 组通过；覆盖写与删除语义正确
@@ -106,6 +122,7 @@
   - 文件：`powerfs-rustfs-store/src/multipart.rs`、master service、volume blob
   - 验收：分块组通过；Abort 后无残留 blob（GC 后）
 - [ ] T2.3 条件请求、Range、校验和（CRC32C/CRC64NVME/SHA256 按上游能力）。
+  - 进度：条件请求与 Range 已在 P2c 完成；**校验和未实现**——`test_object_checksum_sha256`/`test_object_checksum_crc64nvme`/`test_get_checksum_object_attributes` 当前失败（`ObjectInfo.checksum` 未填充、`x-amz-checksum-*` 未落盘），native 通过，留待独立阶段
   - 验收：条件请求与 Range 用例通过；校验失败错误码与上游一致
 - [ ] T2.4 对象元数据：content-type、user metadata、tags、storage class、对象锁字段。
   - 验收：HEAD 元数据与 S3 语义一致；对象锁/保留用例通过

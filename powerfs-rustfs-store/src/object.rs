@@ -75,6 +75,10 @@ impl PowerFsStore {
             .await
             .map_err(Error::Io)?;
 
+        // 条件写在正文读完之后判定：与上游「提交时检查」一致，并发写入
+        // 在正文传输期间完成时，后者应看到新的 etag 并得到 412。
+        self.check_write_preconditions(bucket, object, opts).await?;
+
         let size = u64::try_from(body.len()).unwrap_or(u64::MAX);
         let now = unix_secs_now();
         let etag = hex::encode(Md5::digest(&body));
@@ -149,6 +153,49 @@ impl PowerFsStore {
                 ..Entry::default()
             },
         ))
+    }
+
+    /// 写路径条件请求判定（If-Match / If-None-Match）。
+    ///
+    /// 语义对齐上游 `set_disk::evaluate_write_precondition`：
+    /// - 对象存在且条件不满足 → `PreconditionFailed`（412）；
+    /// - 对象不存在：带 If-Match → `ObjectNotFound`（404 NoSuchKey），
+    ///   仅带 If-None-Match → 放行（首次创建）。
+    pub(crate) async fn check_write_preconditions(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        let Some(preconditions) = &opts.http_preconditions else {
+            return Ok(());
+        };
+        let if_match = preconditions.if_match_value();
+        let if_none_match = preconditions.if_none_match_value();
+        if if_match.is_none() && if_none_match.is_none() {
+            return Ok(());
+        }
+
+        let existing = self
+            .filer
+            .get_object_meta(bucket, object)
+            .await?
+            .and_then(|response| response.entry);
+
+        match existing {
+            Some(entry) => {
+                let etag = entry_etag(&entry);
+                if should_prevent_write(etag.as_deref(), if_none_match, if_match) {
+                    return Err(Error::PreconditionFailed);
+                }
+                Ok(())
+            }
+            None if if_match.is_some() => Err(Error::ObjectNotFound(
+                bucket.to_string(),
+                object.to_string(),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// 读取对象，支持单个 HTTP range。
@@ -527,5 +574,104 @@ pub(crate) fn object_info_from_entry(bucket: &str, entry: &Entry) -> ObjectInfo 
         user_defined: Arc::new(user_defined),
         user_tags: Arc::new(user_tags),
         ..ObjectInfo::default()
+    }
+}
+
+/// 从对象条目取 ETag（`s3.etag` 扩展键，大小写不敏感）。
+fn entry_etag(entry: &Entry) -> Option<String> {
+    entry
+        .extended
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(EXT_ETAG))
+        .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
+}
+
+/// 写条件是否应阻止本次写入。语义对齐上游 `set_disk::should_prevent_write`：
+/// If-None-Match 命中（含 `*`）阻止；If-Match 不含 `*` 且不匹配阻止。
+fn should_prevent_write(
+    etag: Option<&str>,
+    if_none_match: Option<&str>,
+    if_match: Option<&str>,
+) -> bool {
+    let if_none_match = non_empty_condition(if_none_match);
+    let if_match = non_empty_condition(if_match);
+
+    match etag {
+        Some(etag) => {
+            if if_none_match.is_some_and(|condition| weak_etag_matches(etag, condition)) {
+                return true;
+            }
+            if if_match.is_some_and(|condition| !strong_etag_matches(etag, condition)) {
+                return true;
+            }
+            false
+        }
+        // 无 ETag 时，任一条件都保守阻止（与上游一致）。
+        None => if_none_match.is_some() || if_match.is_some(),
+    }
+}
+
+fn non_empty_condition(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// 弱比较：忽略 `W/` 前缀与引号；`*` 视为命中。
+fn weak_etag_matches(etag: &str, condition: &str) -> bool {
+    if condition.trim() == "*" {
+        return true;
+    }
+    canonicalize_etag(strip_weak(etag)) == canonicalize_etag(strip_weak(condition))
+}
+
+/// 强比较：`*` 匹配任意现有对象；否则忽略引号后严格相等。
+fn strong_etag_matches(etag: &str, condition: &str) -> bool {
+    if condition.trim() == "*" {
+        return true;
+    }
+    canonicalize_etag(etag) == canonicalize_etag(condition)
+}
+
+fn strip_weak(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix("W/")
+        .or_else(|| trimmed.strip_prefix("w/"))
+        .unwrap_or(trimmed)
+}
+
+/// 去掉包裹的引号（对齐上游 `canonicalize_etag`）。
+fn canonicalize_etag(value: &str) -> &str {
+    value.trim().trim_matches('"')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn if_none_match_blocks_matching_etag() {
+        assert!(should_prevent_write(Some("abc"), Some("\"abc\""), None));
+        assert!(should_prevent_write(Some("abc"), Some("*"), None));
+        assert!(should_prevent_write(Some("abc"), Some("W/\"abc\""), None));
+        assert!(!should_prevent_write(Some("abc"), Some("def"), None));
+    }
+
+    #[test]
+    fn if_match_blocks_only_non_matching_etag() {
+        assert!(!should_prevent_write(Some("abc"), None, Some("\"abc\"")));
+        assert!(!should_prevent_write(Some("abc"), None, Some("*")));
+        assert!(should_prevent_write(Some("abc"), None, Some("def")));
+    }
+
+    #[test]
+    fn missing_etag_blocks_any_condition() {
+        assert!(should_prevent_write(None, Some("*"), None));
+        assert!(should_prevent_write(None, None, Some("*")));
+        assert!(!should_prevent_write(None, None, None));
+    }
+
+    #[test]
+    fn blank_conditions_are_ignored() {
+        assert!(!should_prevent_write(Some("abc"), Some("  "), Some("")));
     }
 }
