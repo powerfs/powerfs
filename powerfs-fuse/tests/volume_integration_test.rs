@@ -44,10 +44,14 @@ fn docker_exec(cmd: &str) -> String {
 }
 
 fn container_exists(name: &str) -> bool {
-    let output = Command::new("docker")
+    let output = match Command::new("docker")
         .args(["inspect", "-f", "{{.State.Running}}", name])
         .output()
-        .expect("Failed to check container");
+    {
+        Ok(o) => o,
+        // 测试容器内通常没有 docker CLI，此时按容器不存在处理（跳过而非 panic）
+        Err(_) => return false,
+    };
     String::from_utf8_lossy(&output.stdout).trim() == "true"
 }
 

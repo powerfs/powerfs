@@ -22,9 +22,12 @@ fn is_powerfs_mounted(mount_path: &str) -> bool {
                     let fstype = parts[2];
                     info!("Found mount: {} type={}", mount_path, fstype);
                     // 接受 "fuse"、"fuse.powerfs-fuse" 以及任何 "fuse.*" 形式
-                    return fstype == "fuse"
+                    if fstype == "fuse"
                         || fstype == "fuse.powerfs-fuse"
-                        || fstype.starts_with("fuse.");
+                        || fstype.starts_with("fuse.")
+                    {
+                        return true;
+                    }
                 }
             }
             false

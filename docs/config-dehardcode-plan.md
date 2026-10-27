@@ -146,6 +146,27 @@
   - 稳定性：30 轮 4MiB 写/读/删，63s，FAIL=0；`check_dmesg_anomaly.sh` VM1/VM2 均通过（860/610 行，无 BUG/Oops/KASAN）
   - 观察项（非 P3 缺陷）：VM2 对未创建过的文件收到删除通知时打印 `remove_dir_entry NOT_FOUND`，属日志噪音，另记 issue 跟踪
 
+### P3 补漏：HA 全链路换网段实测（已完成，2026-10-26）
+
+P3 回归只验证了默认 172.30 网段，未覆盖"改 subnet 后 kernel VM 链路"。本次将 HA 集群 `subnet` 改为 172.31.0.0/16 做端到端实测，发现并修复 4 处遗漏的写死：
+
+| 位置 | 问题 | 修复 |
+|---|---|---|
+| `kernel/vm/share/powerfs.env` | `POWERFS_GATEWAY`/`VM1_ETH0_IP`/`VM2_ETH0_IP` 是 `:-172.30.x` 字面量默认值，cluster.toml 未显式写 `gateway` 时不随 SUBNET 派生 | 三者统一从 `POWERFS_SUBNET` 前两段派生（`<a.b>.0.1` / `.100` / `.101`），与 render auto-derive 语义一致；用户显式 export 仍优先 |
+| `kernel/vm/run_qemu_vm2.sh` | cmdline 写死 `vm_ip=172.30.0.101` | 改 `vm_ip=${VM2_ETH0_IP}` |
+| `kernel/vm/run_qemu_kernel_ssh.sh` | `VM_IP` 只用于 echo，从未传入 cmdline，VM1 实际靠 init 脚本内写死 fallback 拿 IP | cmdline 补 `vm_ip=${VM_IP}` |
+| `kernel/vm/build_initramfs.sh`（init） | VM 内 `ip route add default via 172.30.0.1` 字面量 | 从 `VM_IP` 派生 `${VM_IP%.*.*}.0.1` |
+
+另修 `docker/scripts/stop-cluster.sh` bug：`REMOVE_VOLUMES=1` 传递的 `--remove-volumes` 不是合法 flag，改为 `-v`。
+
+换网段实测结论（172.31.0.0/16）：
+
+- docker 侧 rendered compose/config 零 172.30 残留，bootstrap、FUSE 写读、跨客户端一致 ✅
+- kernel VM smoke 13/13 ✅（证书经 `[client.kernel-client-N]` 声明自动重签，SAN=172.31.0.100/101）
+- **改子网必须先清数据卷**：旧 raft log 的 membership 记录旧 IP，带卷重建会出现 zombie-leader 脑裂（master-1 term=1 自认 leader，其余 term 持续增长互投；TCP 连通但 raft RPC `Elapsed` 超时）。正确顺序：`powerfs-ctl down --purge`（或 `compose down -v`）→ 改 `cluster.toml` → `bootstrap`
+- **bridge 重建后 QEMU 必须重启**：`compose down` 删 `powerfs-br0` 会使 tap0/tap1 孤立、QEMU 持有死 fd（表现为 VM 内 EHOSTUNREACH/EINPROGRESS）。正确顺序：compose up → `setup_network_dual.sh` → 重启 VM
+- `client enroll --ip` 对已声明但无 `ip` 的 `[client.*]` 段不补写 ip（只 skip append），bootstrap 会反复跳过该客户端——待修，见 improvement-plan
+
 ### P1-3：端到端验证（已完成，2026-10-26）
 
 验证方式：simple profile 测试 home（`.powerfs-uni-test/`，未入库），**只改 `cluster.toml` 两处**——`[network].subnet` 172.41.0.0/16 → 172.42.0.0/16、`[client.fuse-uni].ip` 172.41.0.100 → 172.42.0.100，然后重跑 `powerfs-ctl bootstrap`。

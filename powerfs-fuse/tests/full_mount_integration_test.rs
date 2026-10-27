@@ -31,7 +31,9 @@ fn is_powerfs_mounted(mount_path: &str) -> bool {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 3 && parts[1] == mount_path {
                     let fstype = parts[2];
-                    return fstype == "fuse" || fstype.starts_with("fuse.");
+                    if fstype == "fuse" || fstype.starts_with("fuse.") {
+                        return true;
+                    }
                 }
             }
             false

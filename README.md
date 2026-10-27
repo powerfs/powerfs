@@ -294,6 +294,13 @@ Change an address or scale a role by editing `cluster.toml`, then run
 files are overwritten on every render, so edits there are lost. Certificates
 are issued automatically during bootstrap; there is no separate cert step.
 
+> **Changing `[network].subnet` (or any node IP) requires wiping data
+> volumes first**: the persisted raft log still records the old membership
+> addresses, and re-bootstraping on top of it produces a split zombie-leader
+> cluster (raft RPCs time out despite TCP connectivity). Correct sequence:
+> `powerfs-ctl down --purge` → edit `cluster.toml` → `bootstrap`. Same-IP
+> restarts and client-only changes do not need a purge.
+
 ### Quick Start (rendered compose)
 
 > `powerfs-ctl bootstrap` is the supported entry point: it renders

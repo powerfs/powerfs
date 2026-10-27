@@ -1477,7 +1477,8 @@ auto_consistency_check = true
 > 来源：2026-10-01 全系统代码审视。第一梯队中 WAL strict 模式维持 async 默认
 > （性能考虑，不实施）；布局可靠性结论：inline 由 Raft N=3 保护，非 inline
 > 经 P4→P6 两段式 scrubber 收敛到 EC（文档已同步至 file-layout-design.md §5）。
-> 以下两项排入完善计划，择机实施。
+> 以下三项排入完善计划，择机实施（4.3 为回归测试确认的预存并发写缺陷，
+> 与 4.1 同源，建议一并实施）。
 
 ### 4.1 Lease Fencing Token 全链路校验
 
@@ -1496,7 +1497,27 @@ auto_consistency_check = true
 | **目标** | ① ReadIndex 超时改单调时钟（Instant 已全部满足，排查是否混入 SystemTime）；② 增加 follower 侧反向确认：leader 连续 N 轮未收到多数派心跳响应即主动 step down，不依赖 ReadIndex 超时兜底；③ step down 后触发加速重选（缩短 election timeout 随机化区间下界） |
 | **验证** | 复用 ctl 健康门控（powerfs-ctl/src/health/mod.rs zombie leader 检测）做回归；增加非对称分区故障注入测试用例 |
 
-### 4.3 暂缓项（第二梯队，记录备查）
+### 4.3 多客户端并发写同文件不同偏移（MC-108，预存问题）✅ 已修复
+
+> **2026-10-26 验证**：kernel 子模块 writeback 修复（kernel@`b304e02` 等，修复 buffered write 24-45 MiB/s 的 4 个根因）后，MC-108 在 full 模式中 **PASS**（19/19 全绿，无 dmesg 异常）。本条保留作历史记录，无需再实施。
+
+| 项目 | 详情 |
+|------|------|
+| **现状** | kernel 多客户端 full 测试 MC-108 长期失败（非本次 tier-3 加固引入：CI run 35497246552，2026-09-20 nightly 即以 `PASS=18 FAIL=1` 同签名失败）。场景：8192B 文件，VM1 `dd seek=0` 写前 4K、VM2 `dd seek=1` 写后 4K（不相交偏移），双方 sync 后 md5 不一致（本地复现约 2/3 概率发散，1/3 因失效传播时序恰好一致） |
+| **初步判断** | 写路径在无 range lease/范围锁保护时呈 last-writer-wins：两客户端各自从陈旧视图 flush，chunk 粒度写入把未持有区域的陈旧内容/零一并落盘，后写者覆盖先写者的非相交区域；两客户端 page cache 随后又各自保留自己的半份，读结果随服务端实际收敛版本与本地缓存而发散 |
+| **目标** | 不相交偏移的并发写必须合并：① 明确内核客户端 flush 的写入粒度（仅脏页范围，禁止整 chunk 带陈旧内容回写）；② 与 4.1 的 range lease fencing 联动——未持有该范围 lease 的写入必须走服务端 read-merge-write 或被拒绝后带租权重试；③ MC-108 在本地 20 次连跑与 nightly full 中稳定 PASS |
+| **验证** | `kernel/vm/test_multi_client.sh --mode=full --dmesg-check` 全绿；补充偏移交错（seek=0/2/4 三客户端）与写后立即交叉读的加强用例；FUSE 客户端跑同类场景确认两侧行为一致 |
+| **关联** | 与 4.1（Lease Fencing Token）、4.5 中"Invalidate 广播丢失窗口"同源，实施 4.1 时优先覆盖此路径 |
+
+### 4.4 部署易用性缺陷（2026-10-26 换网段实测发现）
+
+| 项目 | 详情 |
+|------|------|
+| **问题** | ① `powerfs-ctl client enroll <name> --ip <ip>` 对已声明但无 `ip` 字段的 `[client.<name>]` 段只 skip append、不补写 ip，bootstrap 反复跳过该客户端（`skipping client <name> (no ip …)`），新手无提示可卡壳；② `init` 生成的 cluster.toml 不含任何 `[client.*]` 示例段，bootstrap 成功后集群无可用客户端；③ `docker/tests/test_filer_failover_write.sh` 残留未使用的 `FILER_IPS` 字面量且依赖 rendered compose 已不再提供的 host 端口映射（8888/8898/8908），脚本实际已失效 |
+| **目标** | ① enroll 检测到已有段缺 `ip` 时原地补写（或报错提示手工补）；② `init` 模板追加注释掉的 `[client.fuse-1]` 示例 + 注释说明"声明后 bootstrap 自动启动" |
+| **验收** | 新手路径 `init → 取消注释 client 段 → bootstrap` 直通；`enroll --ip` 幂等补 ip 后 bootstrap 不再 skip |
+
+### 4.5 暂缓项（第二梯队，记录备查）
 
 - CAP_R 缓存绕过 TTL 的刷新机制（关联 issue #65 多客户端 stale 缓存，待复现后再定方案）
 - Invalidate 广播丢失窗口（客户端重连期间的失效通知补偿）

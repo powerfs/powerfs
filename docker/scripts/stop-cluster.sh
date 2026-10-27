@@ -12,7 +12,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HOME_DIR="${POWERFS_HOME:-$REPO_ROOT/.powerfs}"
-REMOVE_FLAG="${REMOVE_VOLUMES:+--remove-volumes}"
+REMOVE_FLAG="${REMOVE_VOLUMES:+-v}"
 
 if [ -f "$HOME_DIR/rendered/docker-compose.yml" ]; then
     cd "$HOME_DIR/rendered"
