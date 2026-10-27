@@ -398,7 +398,10 @@ mod tests {
 
     #[test]
     fn endpoint_scheme_is_added() {
-        assert_eq!(normalize_endpoint("10.0.0.1:9000"), "http://10.0.0.1:9000");
+        assert_eq!(
+            normalize_endpoint("203.0.113.1:9000"),
+            "http://203.0.113.1:9000"
+        );
         assert_eq!(
             normalize_endpoint("https://filer:9000"),
             "https://filer:9000"
