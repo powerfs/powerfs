@@ -94,3 +94,25 @@ returns EIO).
    don't determine whether dirty data exists. Kernel writeback can
    flush during any open mode. Always check `has_dirty_chunks` before
    deciding to skip sync.
+
+### Changed - Deployment Defaults and Newcomer Docs (2026-10-27)
+
+- **rustfs is now optional**: `powerfs-rustfs-store` moved out of the main
+  Cargo workspace. A plain `git clone` + `cargo build --release` no longer
+  needs the rustfs submodule. Build the adapter explicitly with
+  `git submodule update --init rustfs` +
+  `cargo +1.99 build --manifest-path powerfs-rustfs-store/Cargo.toml`.
+- **README Quick Start** split into three explicit paths — single-container
+  demo, single-node `--profile simple`, and 3-master HA — with prerequisite
+  checks (`docker info` without sudo, `/dev/fuse`), the expected
+  `powerfs-ctl status` output, client-IP/cert-SAN semantics, and
+  `powerfs-ctl down [--purge]` teardown.
+- **`docker/run-fuse-client.sh`** now reuses the image declared in the
+  rendered compose instead of defaulting to a local `powerfs:latest` that
+  bootstrap never builds.
+- **Doc audit**: removed references to deleted deployment paths
+  (`docker-compose.test.yml`, `docker/docker-compose.yml`) in benchmark,
+  scripts, and certs-default docs; fixed `cert sign-client` flags in README
+  (`--client-name` + mandatory `--san-ip`, not `--common-name`); fixed
+  `docker compose restart fuse-1`, which cannot work because fuse clients
+  are not services in the rendered compose.
