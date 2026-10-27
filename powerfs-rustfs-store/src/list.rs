@@ -129,9 +129,13 @@ impl PowerFsStore {
 
         Ok(StorageListObjectVersionsInfo {
             is_truncated: listed.is_truncated,
-            next_marker: listed.next_continuation_token,
-            // 单版本模型下不存在版本 id 游标。
-            next_version_idmarker: None,
+            next_marker: listed.next_continuation_token.clone(),
+            // 单版本模型下没有真实版本 id 游标，但必须回显与 key 游标等价的
+            // 不透明 token：S3 客户端在 IsTruncated=true 时会把
+            // NextVersionIdMarker 原样带回下一次请求；缺省会得到 None，
+            // 直接在客户端参数校验阶段报错（s3-tests 清理逻辑因此级联失败）。
+            // 服务端忽略 version_marker，回显不会产生语义副作用。
+            next_version_idmarker: listed.next_continuation_token,
             objects: listed.objects,
             prefixes: listed.prefixes,
         })

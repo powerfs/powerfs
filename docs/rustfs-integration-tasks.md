@@ -67,6 +67,30 @@
 
 ## P2 元数据与 S3 语义
 
+> 实施顺序（已批准）：P2a 大对象分块 → P2b 委托漏网（copy_object/put_object_metadata/delete_objects trait）→ P2c 条件请求+Range 完整 → P2d Multipart → P2e Versioning。
+> P2a–P2e 完成后统一回填 T2.1–T2.6 勾选。
+
+### P2a 大对象分块（已完成，2026-10-27）
+
+- [x] 写路径按 `MAX_DATA_SIZE`（2MB）分块：正文切 ≤2MB slice，每块独立 `assign_volume` + TLV `write_needle`，`chunks[]` 按 offset 升序登记；ETag 保持整对象 MD5；0 字节对象不写 needle。
+  - 文件：`powerfs-rustfs-store/src/object.rs`
+- [x] 读路径多 chunk 拼接与跨块 Range：按 `[want_start, want_end)` 遍历 chunks，仅拉相交块并裁剪边界；移除 `chunks.len() > 1 → NotImplemented` 门控。
+  - 文件：`powerfs-rustfs-store/src/object.rs`
+- [x] 附带修复：`list_object_versions` 截断响应回显 `next_version_idmarker`（消除 s3-tests teardown 的 `VersionIdMarker=None` 客户端参数校验级联失败）。
+  - 文件：`powerfs-rustfs-store/src/list.rs`
+- 验收（2026-10-27 全绿）：
+  - 静态：clippy `-D warnings` 0 警告、fmt 0 差异、适配 crate 7/7 单测
+  - CRUD 回归 22/22（首轮 15/22 系前序失败运行残留桶 `p1c-v7` 的旧 entry 被 follower 陈旧读命中所致，强删残留桶后复跑全过；非 P2a 回归）
+  - 大对象 20/20：3/4/8/16MB PUT（ETag=MD5）、全量 GET、跨块 Range（末尾跨界 / 中间跨界）、单字节 Range
+  - s3-tests P2a 目标 23 用例：19 通过；4 失败均为已定边界——`test_object_copy_16m`（copy_object 未委托，P2b）、`test_atomic_dual_conditional_write_1mb`（条件请求未实现，P2c）、`test_get_obj_tagging`/`test_put_max_tags`（tagging 未委托，T2.4）；`test_ranged_request_empty_object` 修复生效
+  - P1c 基线 19/19 无回归（误匹配的 4 个额外用例在 native 同样失败，属上游限制）
+
+### P2b 委托漏网（待实施）
+
+- [ ] `copy_object`（`store/mod.rs`）委托；可元数据级复用源对象 chunks，不搬运数据
+- [ ] `put_object_metadata`（`store/mod.rs`）委托
+- [ ] tagging 链路（`put_object_tagging/get_object_tagging`）委托或显式能力声明
+
 - [ ] T2.1 版本化与删除标记（`versionId`、`null`、delete marker、多版本列举）。
   - 文件：`powerfs-master/src/object_meta/store.rs`、`powerfs-rustfs-store/src/object.rs`、`src/list.rs`
   - 验收：`s3-tests` versioning 组通过；覆盖写与删除语义正确

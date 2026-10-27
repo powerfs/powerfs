@@ -1,6 +1,6 @@
 # RustFS 集成规格：S3 服务与管理面走 RustFS，PowerFS 提供 needle 存储
 
-> 状态：P0 完成；P1 分阶段 A′ 已全部通过（P1a 注入缝、P1b 对象读写、P1c 真实后端与启动接线），见 [rustfs-p1-gate-report.md](rustfs-p1-gate-report.md) §9
+> 状态：P0 完成；P1 分阶段 A′ 已全部通过（P1a 注入缝、P1b 对象读写、P1c 真实后端与启动接线），见 [rustfs-p1-gate-report.md](rustfs-p1-gate-report.md) §9；P2a 大对象分块已完成（2026-10-27，验证矩阵全绿）
 > 修订：2026-10-26 改用「ECStore 内部委托」注入点（A′），不再改 `AppContext` 与 `rustfs/src/app/**`
 > 日期：2026-10-26
 > 关联规划：[conplan.md](conplan.md) 第 155-159 行
@@ -262,10 +262,10 @@ S3 客户端
   - 桶登记的权威性：桶根存在性以 **inode 0 下已 apply 的 Raft 目录项**为准。`find_bucket_root` 不再无条件信任本地 `root_inodes` 缓存（该缓存及其实体化副本不随 Raft 复制，跨节点删桶后会残留，导致 `GetBucketRoot/ListBucketRoots` 谎报桶仍存在）；目录项缺失时顺手清理本地残影。相应地，`format_bucket_root` 在异步持久化模式下也等待目录项 apply 后再返回（超时则仍返回已登记 inode，由读路径跨端点重试兜底），避免「建桶后立即 HeadBucket 得到 404」。
 - **D6 对象操作映射**：
   - HEAD：`GetObjectMeta{bucket,key}` → `ObjectInfo`。`etag`/`content-type` 读自 `extended` 的 `s3.etag`/`s3.content-type`，其余 `s3.*` 键去前缀后作为用户元数据。
-  - PUT（新建与覆盖写同一条路径）：`assign_volume(replication, collection)` → 取 `nodes[0]` 拼 `address:port` → `write_needle(volume_id, file_key, body)` → `PutObjectMeta{bucket,key,size,chunks,extended}`。**needle 数据面走 powerfs-net TLV 协议**（`powerfs_net::TlvVolumeClient`）：master 心跳处理把 volume 的 net_port 写入 `DataNodeInfo.grpc_port`（`net_handler.rs` 注释明确该字段承载数据面端口），volume 的 tonic gRPC `WriteNeedle` 仅供 admin/测试，旧 `VolumeClientPool`（tonic）拨到 net_port 会被 TLV 握手拒绝。TLV 单帧 DATA 段上限 2MB，P1c 单对象单 needle，超限明确报错，多分块在 P2 做。Filer 对已存在的 key **原地替换** size/chunks/extended，因此覆盖写是**单次原子 RPC**，不存在「删旧建新」窗口。ETag = 内容 **MD5** hex（S3 协议对单段对象的定义；powerfs-s3 旧接口用 SHA-256，属独立实现，不在本次对齐范围）。
+  - PUT（新建与覆盖写同一条路径）：`assign_volume(replication, collection)` → 取 `nodes[0]` 拼 `address:port` → `write_needle(volume_id, file_key, body)` → `PutObjectMeta{bucket,key,size,chunks,extended}`。**needle 数据面走 powerfs-net TLV 协议**（`powerfs_net::TlvVolumeClient`）：master 心跳处理把 volume 的 net_port 写入 `DataNodeInfo.grpc_port`（`net_handler.rs` 注释明确该字段承载数据面端口），volume 的 tonic gRPC `WriteNeedle` 仅供 admin/测试，旧 `VolumeClientPool`（tonic）拨到 net_port 会被 TLV 握手拒绝。TLV 单帧 DATA 段上限 2MB（`MAX_DATA_SIZE`）。**P2a 起写路径按 `MAX_DATA_SIZE` 分块**：对象正文切成 ≤2MB 的 slice，每块独立 `assign_volume` + `write_needle`，`chunks[]` 按 offset 升序登记；ETag 仍为整对象正文的 MD5（S3 单段语义不变）。Filer 对已存在的 key **原地替换** size/chunks/extended，因此覆盖写是**单次原子 RPC**，不存在「删旧建新」窗口。ETag = 内容 **MD5** hex（S3 协议对单段对象的定义；powerfs-s3 旧接口用 SHA-256，属独立实现，不在本次对齐范围）。
   - mtime：`PutObjectMeta` 在 Filer 侧同时刷新对象 inode 的 mtime/atime，统一使用**秒级**时间戳（与 `ShardStore::current_time()` 和 FUSE 现有约定一致）；适配层不再写纳秒。
   - 0 字节对象：不写 needle，`chunks=[]`，读取返回空 body。
-  - GET：`GetObjectMeta`，P1c 仅支持 `chunks.len() == 1` 的 range 切片；`chunks.len() > 1` 返回 `NotImplemented`（P2 做多段拼接）。`ObjectInfo.size` 取 `entry.content_size`，不取实际读到长度。读端点由 `S3MasterClient::get_volume_data_endpoint`（一次 `lookup_volume`）解析：IP 取自 `Location.url`、端口用 `Location.grpc_port`（拓扑节点的 powerfs-net 数据端口）。禁止用旧的 `get_node_info` 启发式——它按 IP 前缀硬编码 9333（master gRPC 端口），拨上去必然失败。
+  - GET：`GetObjectMeta`；**P2a 起支持多 chunk 拼接与跨块 Range**：先按 `range` 求 `[want_start, want_end)`（无 range 为全对象），遍历 `chunks[]` 仅拉取相交块并按边界裁剪后顺序拼接；不再按 `chunks.len()` 设限。`ObjectInfo.size` 取 `entry.content_size`，不取实际读到长度。读端点由 `S3MasterClient::get_volume_data_endpoint`（一次 `lookup_volume`）解析：IP 取自 `Location.url`、端口用 `Location.grpc_port`（拓扑节点的 powerfs-net 数据端口）。禁止用旧的 `get_node_info` 启发式——它按 IP 前缀硬编码 9333（master gRPC 端口），拨上去必然失败。
   - DELETE：`DeleteObjectMeta{bucket,key}` → 尽力删除 needle（失败只记 warn）。
 - **D7 列举**：`ListObjectMetas{bucket,last_key,limit=1000}` 循环扫描直到 `has_more=false` 或空页；prefix/delimiter/max_keys 在适配层处理；continuation token 沿用「最后已消费 key 的 hex」。`list_object_versions` 返回单版本模型（`is_latest=true, num_versions=1`）。
 - **D8 能力声明**：P1c `capability()` 全 false（ec/versioning/multipart/object_lock/lifecycle），仅用于日志与后续 Admin 快照；不扩展 fork 的 trait 面，Admin 501 门控在 P3.2 做。

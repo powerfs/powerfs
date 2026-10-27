@@ -13,6 +13,7 @@ use http::HeaderMap;
 use md5::{Digest, Md5};
 use powerfs_common::types::VolumeId;
 use powerfs_master::filer_proto::powerfs::{Entry, FileChunk, FuseAttributes};
+use powerfs_net::protocol::MAX_DATA_SIZE;
 use rustfs_ecstore::api::error::{Error, Result};
 use rustfs_ecstore::api::object::{
     GetObjectBodySource, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader,
@@ -86,44 +87,40 @@ impl PowerFsStore {
             extended.insert(format!("s3.{key}"), value.clone().into_bytes());
         }
 
-        // 0 字节对象不写 needle。
+        // 0 字节对象不写 needle；其余按 2MB（TLV 单帧上限）分块，
+        // 每块独立 assign_volume + write_needle。
         let chunks = if size == 0 {
             Vec::new()
         } else {
-            // TLV 数据面单帧 DATA 段上限 2MB（powerfs-net MAX_DATA_SIZE）。
-            // P1c 单对象单 needle；更大对象由 P2 的分块/流式写入覆盖。
-            const MAX_NEEDLE_DATA: u64 = 2 * 1024 * 1024;
-            if size > MAX_NEEDLE_DATA {
-                return Err(Error::other(format!(
-                    "对象大小 {size} 超过 P1c 单 needle 上限 {MAX_NEEDLE_DATA} 字节"
-                )));
+            let mut chunks = Vec::with_capacity(body.len().div_ceil(MAX_DATA_SIZE));
+            for (index, slice) in body.chunks(MAX_DATA_SIZE).enumerate() {
+                let (fid, nodes) = self
+                    .master
+                    .assign_volume(&self.config.replication, &self.config.collection)
+                    .await
+                    .map_err(crate::error::from_master)?;
+                let node = nodes
+                    .first()
+                    .ok_or_else(|| Error::other("assign_volume 未返回任何数据节点"))?;
+                // master 下发的 DataNodeInfo.grpc_port 实际承载 powerfs-net 数据端口
+                // （net_port），needle 读写必须走 TLV 协议而非 gRPC。
+                let node_address = format!("{}:{}", node.address, node.grpc_port);
+
+                self.volumes
+                    .write_needle(&node_address, fid.volume_id.0, fid.file_key, slice)
+                    .await
+                    .map_err(crate::error::from_volume)?;
+
+                chunks.push(FileChunk {
+                    offset: (index * MAX_DATA_SIZE) as u64,
+                    size: slice.len() as u64,
+                    mtime: now,
+                    needle_id: fid.file_key,
+                    volume_id: fid.volume_id.0,
+                    crc32: 0,
+                });
             }
-
-            let (fid, nodes) = self
-                .master
-                .assign_volume(&self.config.replication, &self.config.collection)
-                .await
-                .map_err(crate::error::from_master)?;
-            let node = nodes
-                .first()
-                .ok_or_else(|| Error::other("assign_volume 未返回任何数据节点"))?;
-            // master 下发的 DataNodeInfo.grpc_port 实际承载 powerfs-net 数据端口
-            // （net_port），needle 读写必须走 TLV 协议而非 gRPC。
-            let node_address = format!("{}:{}", node.address, node.grpc_port);
-
-            self.volumes
-                .write_needle(&node_address, fid.volume_id.0, fid.file_key, &body)
-                .await
-                .map_err(crate::error::from_volume)?;
-
-            vec![FileChunk {
-                offset: 0,
-                size,
-                mtime: now,
-                needle_id: fid.file_key,
-                volume_id: fid.volume_id.0,
-                crc32: 0,
-            }]
+            chunks
         };
 
         self.filer
@@ -152,6 +149,9 @@ impl PowerFsStore {
     }
 
     /// 读取对象，支持单个 HTTP range。
+    ///
+    /// 多分块对象按 chunk 顺序拼接；带 range 时只读取与请求区间相交的
+    /// chunk，避免整对象回源。
     pub(crate) async fn read_object(
         &self,
         bucket: &str,
@@ -163,38 +163,47 @@ impl PowerFsStore {
         let entry = self.load_entry(bucket, object).await?;
         let info = object_info_from_entry(bucket, &entry);
 
-        if entry.chunks.len() > 1 {
-            return Err(Error::NotImplemented);
-        }
-
-        let data = match entry.chunks.first() {
-            None => Vec::new(),
-            Some(chunk) => {
-                let address = self.volume_address(chunk.volume_id).await?;
-                self.volumes
-                    .read_needle(&address, chunk.volume_id, chunk.needle_id)
-                    .await
-                    .map_err(crate::error::from_volume)?
-            }
-        };
-
         // 对象大小以元数据为准，避免 needle 长度漂移影响 HEAD/GET 一致。
         let total = i64::try_from(entry.content_size).unwrap_or(i64::MAX);
 
-        let body = match range {
-            None => data,
+        // 计算需要返回的对象内区间 [want_start, want_end)。
+        let (want_start, want_end) = match &range {
+            None => (0u64, entry.content_size),
             Some(spec) => {
                 let (offset, length) = spec
                     .get_offset_length(total)
                     .map_err(|error| Error::InvalidRangeSpec(error.to_string()))?;
-                let start = offset.min(data.len());
-                let end = match usize::try_from(length) {
-                    Ok(length) => start.saturating_add(length).min(data.len()),
-                    Err(_) => data.len(),
-                };
-                data[start..end].to_vec()
+                let start = (offset as u64).min(entry.content_size);
+                let end = start
+                    .saturating_add(u64::try_from(length).unwrap_or(u64::MAX))
+                    .min(entry.content_size);
+                (start, end)
             }
         };
+
+        // 只拉取与 [want_start, want_end) 相交的 chunk，并裁掉区间外部分。
+        let mut body = Vec::with_capacity(usize::try_from(want_end - want_start).unwrap_or(0));
+        for chunk in &entry.chunks {
+            let chunk_start = chunk.offset;
+            let chunk_end = chunk.offset.saturating_add(chunk.size);
+            if chunk_end <= want_start || chunk_start >= want_end {
+                continue;
+            }
+            let address = self.volume_address(chunk.volume_id).await?;
+            let needle = self
+                .volumes
+                .read_needle(&address, chunk.volume_id, chunk.needle_id)
+                .await
+                .map_err(crate::error::from_volume)?;
+            // needle 数据即该 chunk 的完整内容，裁出与请求区间相交的部分。
+            let from = usize::try_from(want_start.saturating_sub(chunk_start)).unwrap_or(0);
+            let to = usize::try_from(want_end.min(chunk_end) - chunk_start)
+                .unwrap_or(usize::MAX)
+                .min(needle.len());
+            if from < to {
+                body.extend_from_slice(&needle[from..to]);
+            }
+        }
 
         Ok(GetObjectReader {
             stream: Box::new(std::io::Cursor::new(body)),
