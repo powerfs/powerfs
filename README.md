@@ -94,6 +94,10 @@ operations (restart/scale/doctor/cert renewal). See
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
 
+# Required before the first build: two git submodules are part of the
+# workspace (rfs_tester) or provide S3 backend crates (rustfs).
+git submodule update --init rfs_tester rustfs
+
 # 1. Build all binaries (ctl + master/filer/volume/monitor/s3; requires Docker Engine + compose v2).
 #    The rendered compose bind-mounts target/release/powerfs-* into the containers,
 #    so building powerfs-ctl alone is not enough.
@@ -192,7 +196,7 @@ upgrades — see [kernel/README.md](kernel/README.md#dkms-install-auto-rebuild-o
 
 ### Prerequisites
 
-- Rust 1.75+ (with cargo)
+- Rust 1.99+ stable (with cargo) — the rustfs S3 backend crates use edition 2024
 - Protobuf compiler (`protoc`)
 - FUSE 2.x development libraries (for FUSE client)
 - Linux kernel headers (for FUSE)
@@ -225,6 +229,9 @@ sudo yum install -y \
 # Clone the repository
 git clone https://github.com/powerfs/powerfs.git
 cd powerfs
+
+# Fetch the submodules the build depends on (workspace member + S3 backend crates)
+git submodule update --init rfs_tester rustfs
 
 # Build all packages
 cargo build --all

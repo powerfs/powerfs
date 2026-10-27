@@ -21,7 +21,11 @@ scaling masters/data nodes, cert renewal, diagnostics).
 ## Build
 
 ```bash
-# from repo root — build everything: the rendered compose bind-mounts the
+# from repo root — first fetch the submodules the workspace needs:
+# rfs_tester is a workspace member and rustfs provides the S3 backend crates.
+git submodule update --init rfs_tester rustfs
+
+# then build everything: the rendered compose bind-mounts the
 # host's target/release/powerfs-{master,filer,volume,monitor,s3} binaries
 # into the containers, so `-p powerfs-ctl` alone leaves bootstrap without
 # the services it needs (ctl now preflight-checks this and errors out).
