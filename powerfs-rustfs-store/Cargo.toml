@@ -19,12 +19,12 @@ powerfs-common = { path = "../powerfs-common" }
 # 实际承载 net_port，TLV 是 volume 数据面的唯一客户端协议，见 powerfs-net::TlvVolumeClient）。
 powerfs-net = { path = "../powerfs-net" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.35", features = ["full"] }
 # S3 单段对象的 ETag 按协议为内容 MD5 的十六进制表示。
 md-5 = "0.11.0"
 chrono = "0.4"
-tonic = "0.12"
-uuid = { version = "1", features = ["v4"] }
+tonic = "0.11"
+uuid = { version = "1.7", features = ["v4"] }
 http = "1"
 hex = "0.4"
 tracing = "0.1"
