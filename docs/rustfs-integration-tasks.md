@@ -3,6 +3,11 @@
 > 关联规格：[rustfs-integration-spec.md](rustfs-integration-spec.md)
 > 状态：P1c 决策完成（spec §4.4），待审批；未获批准前不得修改代码
 > 约定：每阶段结束必须完成该阶段的验证并通过退出条件，未通过时停在当前阶段修复，不进入下一阶段
+>
+> **当前构建方式（已变更）**：`powerfs-rustfs-store` 已移出主 Cargo workspace，
+> 默认 deploy 路径不再需要 rustfs 子模块。构建该适配器请用
+> `git submodule update --init rustfs` + `cargo +1.99 build --manifest-path powerfs-rustfs-store/Cargo.toml`
+> （rustfs 使用 edition 2024，需要 Rust 1.99+）。下文 T0/T1 的验证记录保留为当时状态。
 
 ## P0 基线：fork 与 submodule
 

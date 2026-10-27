@@ -466,10 +466,13 @@ powerfs-cli -m 172.30.0.11:9333 volume-list
 
 # Certificate management (calls master CA API, requires admin_token)
 powerfs-cli cert init-ca --master-api master-1:9300 --admin-token "your-admin-secret" -o /etc/powerfs/certs/
+# sign-client takes --client-name + at least one --san-ip (the cert is only
+# valid from those source IPs); repeat --mount-dir to bind mount paths.
 powerfs-cli cert sign-client --master-api master-1:9300 --admin-token "your-admin-secret" \
-  --common-name "fuse-client-1" -o /etc/powerfs/certs/
+  --client-name "fuse-client-1" --san-ip 172.30.0.41 --mount-dir /mnt/powerfs -o /etc/powerfs/certs/
+# sign-server uses --common-name + repeatable --san
 powerfs-cli cert sign-server --master-api master-1:9300 --admin-token "your-admin-secret" \
-  --common-name "filer-1" --san 172.20.0.31 -o /etc/powerfs/certs/
+  --common-name "filer-1" --san 172.30.0.31 -o /etc/powerfs/certs/
 ```
 
 ### Security & Authentication

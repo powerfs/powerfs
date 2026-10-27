@@ -18,8 +18,9 @@ box for local development and testing.
 
 ## How this directory is used
 
-`docker-compose.yml` and `docker-compose.rdma.yml` mount this directory into
-every service container:
+The rendered compose (`.powerfs/rendered/docker-compose.yml`) and the
+hand-maintained `docker-compose.rdma.yml` mount this directory into every
+service container:
 
 - Master container:  `./certs-default` → `/data/master/ca`  (read-write,
   master loads `ca.crt`/`ca.key` and writes `client_registry.json` here)
@@ -31,8 +32,8 @@ point for the dev/test cluster.
 
 ## Generating the default bundle
 
-Run once after enabling `ca_dir` in `master-*.toml` and starting the master
-container:
+Run once after enabling `ca_dir` in the rendered master config
+(`.powerfs/rendered/config/master-*.toml`) and starting the master container:
 
 ```bash
 # 1. start master (auto-generates ca.crt + ca.key + client_registry.json
@@ -71,8 +72,8 @@ certificates and mount `docker/certs/` instead of `docker/certs-default/`.
     --admin-token <real-admin-token-from-master.toml> \
     --output-dir docker/certs
 
-# 2. override the compose mount with an env var or edit compose file:
-#    replace ./certs-default with ./certs in docker-compose.yml
+# 2. override the compose mount with an env var or edit the rendered compose:
+#    replace ./certs-default with ./certs in .powerfs/rendered/docker-compose.yml
 #    (docker/certs/ is gitignored — secrets stay local)
 
 # 3. start cluster with production certs

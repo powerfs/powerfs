@@ -204,12 +204,11 @@
 ### 测试验证步骤
 
 1. **编译验证**：`cargo build --release` 成功
-2. **Docker 镜像构建**：`docker build -t powerfs:latest` 成功
-3. **集群启动**：`docker compose -f docker-compose.test.yml up -d` 成功
-4. **服务健康检查**：所有容器健康状态为 Healthy
-5. **FUSE 挂载验证**：`mount | grep powerfs` 确认挂载成功
-6. **fio 测试**：在 fuse-test 容器中运行，验证实际 PowerFS 性能
-7. **目录列表**：验证元数据查询功能正常
+2. **集群启动**：`./target/release/powerfs-ctl bootstrap --profile simple`（渲染 compose + 签发证书 + 健康门；旧的 `docker-compose.test.yml` 已删除）
+3. **服务健康检查**：`./target/release/powerfs-ctl status` 全部 `healthy`，master 显示 `LEADER`
+4. **FUSE 挂载验证**：`./target/release/powerfs-ctl client enroll fuse-1 --ip 172.30.0.41 --kind fuse` + `docker/run-fuse-client.sh fuse-1 172.30.0.41`，`docker exec fuse-1 ls /mnt/powerfs`
+5. **fio 测试**：在 fuse-1 容器内运行，验证实际 PowerFS 性能
+6. **目录列表**：验证元数据查询功能正常
 
 ---
 

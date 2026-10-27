@@ -181,8 +181,9 @@ docker exec fuse-1 bash -c "echo 'persistent data' > /mnt/powerfs/persist.txt"
 # 2. 验证写入成功
 docker exec fuse-1 cat /mnt/powerfs/persist.txt
 
-# 3. 重启 FUSE 客户端
-docker compose -f .powerfs/rendered/docker-compose.yml restart fuse-1
+# 3. 重启 FUSE 客户端（客户端容器由 docker/run-fuse-client.sh 启动，
+#    不在渲染的 compose 里，所以用 docker restart 而不是 docker compose）
+docker restart fuse-1
 
 # 4. 验证数据持久化
 docker exec fuse-1 cat /mnt/powerfs/persist.txt

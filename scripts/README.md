@@ -392,10 +392,12 @@ lsof -i :9460
 
 **Q: Docker 环境启动失败？**
 ```bash
-# 重新构建镜像
-cd docker && docker build -t powerfs:latest .
+# 重新渲染并启动（bootstrap 是幂等的：init + render + cert + up + 健康门）
+./target/release/powerfs-ctl bootstrap --profile simple
 # 查看容器日志
-docker compose -f docker-compose.test.yml logs
+docker compose -f .powerfs/rendered/docker-compose.yml logs
+# 诊断
+./target/release/powerfs-ctl doctor
 ```
 
 ## 脚本依赖关系

@@ -188,8 +188,9 @@ fuse config). Kernel clients also need the module installed on that host —
 see the [kernel DKMS guide](../kernel/README.md#dkms-install-auto-rebuild-on-kernel-upgrades).
 
 For fuse clients the rendered compose has no fuse service — run the enrolled
-client with the helper script (mirrors the fuse services of
-`.powerfs/rendered/docker-compose.yml`, but with certs/config from the enroll output):
+client with the helper script (it reuses the cluster image declared in the
+rendered compose and bind-mounts `target/release/powerfs-fuse` over it, so no
+separate image build is needed):
 
 ```bash
 docker/run-fuse-client.sh fuse-ws1 172.30.0.99   # start, host mount: /tmp/powerfs/fuse-ws1
