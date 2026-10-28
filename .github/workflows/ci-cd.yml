@@ -579,15 +579,38 @@ jobs:
         # (powerfs/powerfs-private) 的 GITHUB_TOKEN 无权写入 public 仓库
         # 创建的 ghcr.io/powerfs/powerfs 包，导致 docker job permission_denied。
         # 按仓库名推送后各推各的包，从根本上避免跨仓库权限冲突。
+        #
+        # ghcr 对同一镜像连续推多个 tag 存在偶发 ACL 竞态：第一个 tag 刚推完,
+        # 第二个 tag 就被拒 "denied: permission_denied: write_package"（run
+        # 40632660833 实测 :latest 成功后 :<sha> 被拒, private 侧同代码则两连
+        # 推成功）。逐 tag 走重试兜底。
+        push_retry() {
+          for ATTEMPT in 1 2 3 4; do
+            if docker push "$1"; then return 0; fi
+            echo "::warning::push $1 denied/failed (attempt $ATTEMPT/4), retrying"
+            sleep $((ATTEMPT * 20))
+          done
+          echo "::error::push $1 failed after 4 attempts"
+          return 1
+        }
         IMAGE_TAG="ghcr.io/${{ github.repository }}"
         # 不传 --pull: 上面经镜像源拉取并打回 tag 的本地 ubuntu:20.04 会被
         # BuildKit 直接复用 (pull policy=missing), 不回源 registry-1.docker.io.
         docker build -f docker/Dockerfile -t "${IMAGE_TAG}:latest" -t "${IMAGE_TAG}:${GITHUB_SHA}" .
-        docker push "${IMAGE_TAG}:latest"
-        docker push "${IMAGE_TAG}:${GITHUB_SHA}"
+        push_retry "${IMAGE_TAG}:latest"
+        push_retry "${IMAGE_TAG}:${GITHUB_SHA}"
 
     - name: Build and Push Demo Image
       run: |
+        push_retry() {
+          for ATTEMPT in 1 2 3 4; do
+            if docker push "$1"; then return 0; fi
+            echo "::warning::push $1 denied/failed (attempt $ATTEMPT/4), retrying"
+            sleep $((ATTEMPT * 20))
+          done
+          echo "::error::push $1 failed after 4 attempts"
+          return 1
+        }
         # Self-contained trial image (redis+master+filer+volume+fuse in one
         # container). Release tags get an additional :vX.Y.Z tag.
         DEMO_TAG="ghcr.io/${{ github.repository }}-demo"
@@ -596,10 +619,10 @@ jobs:
         if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
           docker tag "${DEMO_TAG}:latest" "${DEMO_TAG}:${GITHUB_REF_NAME}"
         fi
-        docker push "${DEMO_TAG}:latest"
-        docker push "${DEMO_TAG}:${GITHUB_SHA}"
+        push_retry "${DEMO_TAG}:latest"
+        push_retry "${DEMO_TAG}:${GITHUB_SHA}"
         if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-          docker push "${DEMO_TAG}:${GITHUB_REF_NAME}"
+          push_retry "${DEMO_TAG}:${GITHUB_REF_NAME}"
         fi
 
   # 部署到测试环境
