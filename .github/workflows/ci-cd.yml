@@ -822,18 +822,26 @@ jobs:
         git submodule update --init --force rfs_tester rustfs
         git submodule status
 
-    - name: Ensure Rust 1.99 (rustfs requires edition 2024)
+    - name: Ensure Rust 1.99 + clippy (rustfs requires edition 2024)
       run: |
-        if rustup toolchain list | grep -q "^1\.99"; then
-          rustup default 1.99
-        else
+        # Self-hosted runners often start with a PATH that lacks ~/.cargo/bin.
+        export PATH="$HOME/.cargo/bin:$PATH"
+        if ! command -v rustup >/dev/null 2>&1; then
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --default-toolchain 1.99 --profile minimal
-          . "$HOME/.cargo/env"
+            sh -s -- -y --default-toolchain none --profile minimal --no-modify-path
+          export PATH="$HOME/.cargo/bin:$PATH"
         fi
-        rustc --version
+        rustup toolchain install 1.99 --profile minimal --no-self-update
+        # clippy is not part of the minimal profile — add it explicitly,
+        # otherwise `cargo clippy` fails with "cargo-clippy is not installed".
+        rustup component add clippy --toolchain 1.99
+        rustup run 1.99 rustc --version
+        rustup run 1.99 cargo clippy --version
 
     - name: Check powerfs-rustfs-store independently
       run: |
-        cargo check --manifest-path powerfs-rustfs-store/Cargo.toml 2>&1 | tail -20
-        cargo clippy --manifest-path powerfs-rustfs-store/Cargo.toml -- -D warnings
+        export PATH="$HOME/.cargo/bin:$PATH"
+        # No `rustup default 1.99`: pinning per-command keeps the shared
+        # self-hosted runner's global toolchain untouched.
+        rustup run 1.99 cargo check --manifest-path powerfs-rustfs-store/Cargo.toml
+        rustup run 1.99 cargo clippy --manifest-path powerfs-rustfs-store/Cargo.toml -- -D warnings

@@ -70,7 +70,10 @@ COPY target/release/powerfs-fuse   /opt/bins-stash/powerfs-fuse
 COPY target/release/powerfs-cli    /opt/bins-stash/powerfs-cli
 COPY target/release/powerfs-testutil /opt/bins-stash/powerfs-testutil
 
-COPY config/ /etc/powerfs/
+# No configs are baked into the image: powerfs-ctl renders them from
+# .powerfs/cluster.toml into .powerfs/rendered/config/ and bind-mounts that
+# directory at runtime. Keep /etc/powerfs as a mount target (certs, overrides).
+RUN mkdir -p /etc/powerfs
 COPY docker/ensure-bins-mounted.sh /app/ensure-bins-mounted.sh
 RUN chmod 0755 /app/ensure-bins-mounted.sh
 
@@ -96,4 +99,6 @@ RUN set -eux; \
 EXPOSE 9333 8080 8081 8888 8889 9000 8890
 
 ENTRYPOINT ["/app/ensure-bins-mounted.sh"]
-CMD ["/app/powerfs-master", "--config", "/etc/powerfs/master-1.toml"]
+# Placeholder only — the rendered compose always overrides this with
+# `command: /app/powerfs-<svc> --config /app/config/<svc>.toml`.
+CMD ["/app/powerfs-master", "--config", "/app/config/master.toml"]
