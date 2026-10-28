@@ -140,6 +140,7 @@
     - `-k multipart` 全组 powerfs 32 通过 / 30 失败，native 42 通过 / 20 失败；**powerfs 独有失败 13 例全部为已声明非目标**
       （SSE-C 4、校验和 3、版本化 3、对象锁 2、copy_versioned 1），无 multipart 语义回归
     - 重传探针（30MiB × 5 种重传模式，逐字节比对）：**102 次上传 0 错乱**（EC 转换关闭状态下）
+    - 条件请求/Range 对照（powerfs vs native，同选择器）：powerfs 独有失败仍仅 `test_delete_objects_if_match` 1 例（批量删除未委托），无新增
 - **新发现：EC 转换与 S3 读路径不兼容（阻塞 EC 启用，已记录 issue）**
   - 现象：addr 解析修复后 EC 转换首次真正执行；被转成 EC(4+2) 的对象（>4MiB）在 S3 GET 时，
     前 4MiB 正确、其后到文件尾全是校验分片/错位数据，`HEAD Content-Length` 仍正确，表现为**持久性数据损坏**。
