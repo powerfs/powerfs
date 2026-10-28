@@ -382,6 +382,16 @@ impl PowerFsStore {
             );
         }
 
+        tracing::debug!(
+            bucket = dst_bucket,
+            key = dst_object,
+            size,
+            chunks = chunks.len(),
+            extended = extended.len(),
+            src_size = src_entry.content_size,
+            src_chunks = src_entry.chunks.len(),
+            "copy_object 写入目标元数据"
+        );
         self.filer
             .put_object_meta(ObjectMetaWrite {
                 bucket: dst_bucket,

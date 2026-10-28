@@ -113,7 +113,13 @@
   - native 对照：同组除上述 3 例版本化相关外全过
   - CRUD 回归 22/22 × 3；P2b copy/tagging 组主体通过（抖动项见下）
   - 静态：适配 crate 单测 11/11（新增 4 个 etag 条件判定单测）、clippy `-D warnings`、fmt 全绿
-- **已知问题（本阶段发现，非 P2c 引入）**：Filer 读路径跨端点轮询，命中 apply 滞后的 follower 时会返回**旧版本条目**（症状：刚写/刚 copy 的对象 GET 缺 `ContentType`、tags 返回空、`ContentLength` 为 0；teardown 偶发 `DeleteBucket BucketNotEmpty`）。`get_object_meta` 目前只在 `found=false` 时换端点，陈旧命中不重试。单键 240 次读探针未复现，s3-tests 高并发下复现率约 10–30%。建议在 P2d 之前单独排期修复（方案：写成功端点的 leader 粘滞 / 会话一致性水位比较）。
+- **读一致性修复（P2c 验收时发现，已修复，2026-10-27/28）**：Filer 异步持久化下 `put_object_meta`/`delete_object_meta` 在 Raft propose 后即返回，且原重试分类把非重试类业务失败当作成功——失败被静默吞掉，元数据永久停留在「只创建、未更新」（size=0、无 extended）。症状：s3-tests 高并发下 10–30% 概率 GET 缺 `ContentType`/`ContentLength=0`、tags 返回空，teardown 偶发 `BucketNotEmpty`。
+  - 修复（`powerfs-rustfs-store/src/filer.rs`）：
+    1. `mutation_outcome` 任何业务失败一律跨端点重试、最终报错，绝不静默接受；
+    2. `put_object_meta` 增加写后可见性校验（`meta_matches`：size/chunks/extended 全量比对）+ 幂等重发（3 次 × 500ms 窗口）；
+    3. `delete_object_meta` 对称增加 `await_object_meta_absent` 全端点不可见确认（修 teardown `BucketNotEmpty`，根因：删桶空检查赶在删除 apply 之前）；重发遇 `object not found` 按幂等视为已生效；
+    4. leader 提示：写成功端点记为该桶 leader，读优先命中；写失败/不可见时 `forget_leader`。
+  - 验证：静态 store crate 单测 14/14、clippy `-D warnings`、fmt 全绿；P2c 组 20/20 × 2、P2b copy/tagging 组 17/17 × 3、抖动 6 用例 × 8 轮 0 error（修复前 `test_put_excess_tags` teardown 约 1/6 概率 `BucketNotEmpty`）、CRUD 22/22、P1c 基线 14/17 通过（3 失败与 native 完全一致：`test_post_object_anonymous_request`、`test_post_object_set_success_code` 403、`test_bucket_create_delete_bucket_ownership` 501，均上游边界）、P2a 大对象/原子写/Range 回归 13/13。
 
 - [ ] T2.1 版本化与删除标记（`versionId`、`null`、delete marker、多版本列举）。
   - 文件：`powerfs-master/src/object_meta/store.rs`、`powerfs-rustfs-store/src/object.rs`、`src/list.rs`
