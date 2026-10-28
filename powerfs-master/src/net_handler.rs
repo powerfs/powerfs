@@ -219,6 +219,73 @@ impl MasterNetHandler {
         }
     }
 
+    /// Handle AssignNeedle request: allocate a fresh file_key on a *specific*
+    /// volume, chosen by the caller.
+    ///
+    /// Used by the Filer scrubber for replica placement. The replica chunk
+    /// must NOT reuse the source chunk's needle_id: the Master's file_key is
+    /// a per-volume counter, so the same numeric key is independently handed
+    /// out on every volume — reusing it on the destination volume collides
+    /// with (overwrites) an unrelated file's needle there. The Master is the
+    /// authoritative allocator for each volume's key space, so the scrubber
+    /// requests a fresh key for the destination volume here.
+    ///
+    /// Request:  FieldId::VolumeId (u64)
+    /// Response: FieldId::VolumeId (u64) + FieldId::FileKey (u64)
+    async fn handle_assign_needle(
+        &self,
+        ctx: &mut RequestContext,
+        msg: &NetMessage,
+    ) -> Result<NetMessage, powerfs_net::NetError> {
+        let _ = ctx;
+        let mut dec = TlvDecoder::new(&msg.body);
+        let volume_id = dec.next_u64(FieldId::VolumeId).unwrap_or(0);
+
+        if volume_id == 0 {
+            return Ok(Self::build_response(
+                msg,
+                STATUS_ERR_BAD_REQUEST,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+
+        if let Err(resp) = self.check_raft_available(msg, "NET_ASSIGN_NEEDLE").await {
+            return resp;
+        }
+
+        match self
+            .master
+            .allocate_file_key(&powerfs_common::types::VolumeId(volume_id))
+            .await
+        {
+            Some(file_key) => {
+                debug!(
+                    "NET_ASSIGN_NEEDLE: volume_id={}, file_key={}",
+                    volume_id, file_key
+                );
+                let mut enc = TlvEncoder::new();
+                let _ = enc.add_u64(FieldId::VolumeId, volume_id);
+                let _ = enc.add_u64(FieldId::FileKey, file_key);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_OK,
+                    enc.into_bytes(),
+                    Vec::new(),
+                ))
+            }
+            None => {
+                warn!("NET_ASSIGN_NEEDLE: unknown volume_id={}", volume_id);
+                Ok(Self::build_response(
+                    msg,
+                    STATUS_ERR_NOT_FOUND,
+                    Vec::new(),
+                    Vec::new(),
+                ))
+            }
+        }
+    }
+
     /// Handle LookupVolume request
     async fn handle_lookup_volume(
         &self,
@@ -1732,6 +1799,7 @@ impl NetHandler for MasterNetHandler {
 
         match msg_type {
             MsgType::Assign => self.handle_assign(ctx, msg).await,
+            MsgType::AssignNeedle => self.handle_assign_needle(ctx, msg).await,
             MsgType::LookupVolume => self.handle_lookup_volume(ctx, msg).await,
             MsgType::Heartbeat => self.handle_heartbeat(ctx, msg).await,
             MsgType::KeepConnected => self.handle_keep_connected(ctx, msg).await,

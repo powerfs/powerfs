@@ -63,6 +63,12 @@ impl PowerFsStore {
 
     /// 创建桶。已存在且未指定 `force_create` 时返回 `BucketExists`。
     pub(crate) async fn create_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        // 与 native 一致：非法桶名在落库前拒绝，避免 Filer 里出现无法用 S3
+        // 之外规则删除的目录。内部桶（.powerfs.*）不走此入口。
+        if !rustfs_ecstore::api::bucket::utils::is_meta_bucketname(bucket) {
+            rustfs_ecstore::api::bucket::utils::check_valid_bucket_name_strict(bucket)
+                .map_err(|_| Error::BucketNameInvalid(bucket.to_string()))?;
+        }
         let exists = self.filer.get_bucket_root(bucket).await?.is_some();
         if exists && !opts.force_create {
             return Err(Error::BucketExists(bucket.to_string()));
@@ -89,6 +95,8 @@ impl PowerFsStore {
         let roots = self.filer.list_bucket_roots().await?;
         Ok(roots
             .into_iter()
+            // 分段上传的内部隐藏桶不对外暴露。
+            .filter(|root| root.bucket != crate::multipart::MPU_BUCKET)
             .map(|root| bucket_info(&root.bucket, root.mtime))
             .collect())
     }

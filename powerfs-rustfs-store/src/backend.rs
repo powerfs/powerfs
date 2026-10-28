@@ -11,6 +11,10 @@ use rustfs_ecstore::api::error::Result;
 use rustfs_ecstore::api::object::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use rustfs_ecstore::storage_external::ExternalBackend;
 use rustfs_storage_api::{
+    multipart::{
+        CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult,
+        PartInfo,
+    },
     BucketInfo, BucketOptions, DeleteBucketOptions, HTTPRangeSpec,
     ListObjectVersionsInfo as StorageListObjectVersionsInfo,
     ListObjectsV2Info as StorageListObjectsV2Info, MakeBucketOptions,
@@ -230,5 +234,101 @@ impl ExternalBackend for PowerFsStore {
     ) -> Result<StorageListObjectVersionsInfo<ObjectInfo>> {
         self.list_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
             .await
+    }
+
+    async fn new_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<MultipartUploadResult> {
+        self.new_multipart_upload_impl(bucket, object, opts).await
+    }
+
+    async fn put_object_part(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_id: usize,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+    ) -> Result<PartInfo> {
+        self.put_object_part_impl(bucket, object, upload_id, part_id, data, opts)
+            .await
+    }
+
+    async fn get_multipart_info(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<MultipartInfo> {
+        self.get_multipart_info_impl(bucket, object, upload_id, opts)
+            .await
+    }
+
+    async fn list_object_parts(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        part_number_marker: Option<usize>,
+        max_parts: usize,
+        opts: &ObjectOptions,
+    ) -> Result<ListPartsInfo> {
+        self.list_object_parts_impl(
+            bucket,
+            object,
+            upload_id,
+            part_number_marker,
+            max_parts,
+            opts,
+        )
+        .await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        self.abort_multipart_upload_impl(bucket, object, upload_id, opts)
+            .await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.complete_multipart_upload_impl(bucket, object, upload_id, uploaded_parts, opts)
+            .await
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        key_marker: Option<String>,
+        upload_id_marker: Option<String>,
+        delimiter: Option<String>,
+        max_uploads: usize,
+    ) -> Result<ListMultipartsInfo> {
+        self.list_multipart_uploads_impl(
+            bucket,
+            prefix,
+            key_marker,
+            upload_id_marker,
+            delimiter,
+            max_uploads,
+        )
+        .await
     }
 }

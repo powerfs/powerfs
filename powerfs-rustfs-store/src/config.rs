@@ -111,10 +111,7 @@ mod tests {
     #[test]
     fn parse_endpoints_splits_and_trims_blank_items() {
         let endpoints = parse_endpoints(" 203.0.113.1:9000 , ,203.0.113.2:9000 ");
-        assert_eq!(
-            endpoints,
-            vec!["203.0.113.1:9000", "203.0.113.2:9000"]
-        );
+        assert_eq!(endpoints, vec!["203.0.113.1:9000", "203.0.113.2:9000"]);
         assert!(parse_endpoints("  ,, ").is_empty());
     }
 

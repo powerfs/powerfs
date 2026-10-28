@@ -116,10 +116,13 @@ services:
       - ./config/filer-{{ i + 1 }}.toml:/app/config/filer.toml:ro
       - ../../target/release/powerfs-filer:/app/powerfs-filer:ro
     environment:
-      # scrubber/EC 阈值（docker/tests EC 场景覆盖用），默认值与 powerfs-filer 二进制一致
+      # scrubber/EC 阈值（docker/tests EC 场景覆盖用），默认值与 powerfs-filer 二进制一致。
+      # EC 转换默认关闭（1TiB 阈值）：S3 读路径（rustfs gateway / 内置 S3）尚不支持
+      # EC 分片读取，转换后大对象 GET 会读到校验分片垃圾。EC 专项测试脚本显式
+      # export POWERFS_EC_MIN_FILE_SIZE=0 覆盖。见 docs/rustfs-p2d-issues.md。
       - POWERFS_SCRUBBER_SCAN_INTERVAL=${POWERFS_SCRUBBER_SCAN_INTERVAL:-30}
       - POWERFS_SCRUBBER_MAX_INODES=${POWERFS_SCRUBBER_MAX_INODES:-50}
-      - POWERFS_EC_MIN_FILE_SIZE=${POWERFS_EC_MIN_FILE_SIZE:-0}
+      - POWERFS_EC_MIN_FILE_SIZE=${POWERFS_EC_MIN_FILE_SIZE:-1099511627776}
     command: /app/powerfs-filer --config /app/config/filer.toml
     depends_on:
       - master-1

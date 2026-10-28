@@ -99,6 +99,61 @@
   - native 对照同组 21/21，行为一致
   - CRUD 回归 22/22；P1c 基线 19/19 无回归（4 个误匹配失败为 T0.3 已记录的上游边界）
 
+### P2d Multipart（已完成，2026-10-28）
+
+- [x] fork 契约与委托：`ExternalBackend` 新增 7 个分段上传方法（`new_multipart_upload`/`put_object_part`/`get_multipart_info`/`list_object_parts`/`abort_multipart_upload`/`complete_multipart_upload`/`list_multipart_uploads`），`MultipartOperations for ECStore` 按桶委托；`StubBackend` 补 round-trip 单测。`UploadPartCopy` 不进契约（native `copy_object_part` 返回 NotImplemented）。
+  - 文件：`crates/ecstore/src/store/{external,mod}.rs`
+- [x] 附带修复（fork）：`handle_list_multipart_uploads` 补外部后端分支——native 实现只扫本地盘，powerfs 桶会返回空 `Uploads`。
+  - 文件：`crates/ecstore/src/store/multipart.rs`
+- [x] 附带修复（fork）：`UploadPartCopy` 源读取在外部后端桶上走 `backend.get_object_reader`，修正 native `prepare_get_object_reader` 只读本地盘导致的 `NoSuchKey`。
+  - 文件：`rustfs/src/app/multipart_usecase.rs`
+- [x] 适配层实现（不新增 Filer RPC）：会话与分块元数据放内部隐藏桶 `.powerfs.multipart`，键为 `<桶>/<upload_id>/__session` 与 `<桶>/<upload_id>/{part:05}`；`list_buckets` 过滤该桶；capability `multipart=true`。
+  - 文件：`powerfs-rustfs-store/src/{multipart,bucket,capability,backend}.rs`
+- [x] 语义对齐 native：非末块 <5MiB → `EntityTooSmall`；逐块 ETag 比对失败 → `InvalidPart`；会话不存在/归属不符 → `InvalidUploadID`；完成 ETag = `md5(concat(hex_decode(part etags)))-count`；`opts.eval_metadata` 叠加到会话 `s3.*` 基底。
+- [x] 完成路径为**零拷贝拼接**：各分块 chunk 偏移量整体平移后直接登记到对象元数据，提交成功后才删分块元数据与会话；分块 needle 保留供对象引用（回收留给后续引用计数/GC）。
+- [x] 完成幂等（重放）：会话已销毁时按对象 `mpu.upload-id` + `mpu.part-etags` 逐块比对，命中则返回既有对象并置 `multipart_completion_replayed=true`。
+- 验收（2026-10-28）：
+  - 静态：`rustfs-ecstore` + 适配 crate 的 clippy `-D warnings`、fmt 0 差异；适配 crate 单测 19/19、ecstore external 单测通过
+  - 手工全流程：创建会话 → 5MiB+1KiB 两块 → ListParts → Complete → GET 逐字节一致、ETag `...-2`、隐藏桶不出现在 ListBuckets → 二次 Complete 走重放成功
+  - s3-tests `-k multipart` 全组：powerfs 32 通过 / 30 失败，native 42 通过 / 20 失败；**差异 10 例全部落在已声明非目标**——SSE-C 3 例、校验和 2 例、版本化 3 例、对象锁 2 例（详见 `docs` 遗留项）。反向 powerfs 多通过 `test_multipart_upload_complete_without_create`（native 未支持）
+  - 专项组（`test_multipart_upload*`、`get_part`、`copy_*`、`list_multipart_upload`、`abort`、`resend_first_finishes_last`）：23/26 通过，3 失败与 native 完全一致（`PartsCount` 头缺失 2 例、Owner.Id 1 例，均上游 HEAD/列举实现缺口）
+  - 回归对照（powerfs vs native，同选择器）：条件请求+Range 组仅多 1 例 `test_delete_objects_if_match`（批量删除条件未委托，见遗留项）；copy/tagging 组仅多 2 例版本化用例
+- **`test_multipart_upload_resend_part` 根因修复（2026-10-28）**：该用例此前在 powerfs 后端间歇失败（native 稳定通过），
+  根因是 **Filer scrubber 副本复制复用源 chunk 的 needle_id**。
+  - 根因链：Master 的 file_key 是**按卷独立计数器**（`allocate_file_key`，步长 1MiB），同一数值会在不同卷上分别分配给不相关的文件。
+    scrubber `replicate_inode` 直接把源 `chunk.needle_id` 写到目标卷，一旦目标卷上该 key 已被其他文件占用，就把对方数据覆写掉。
+    multipart 重传场景下分块数据量大、复制窗口与重传交错，命中概率显著升高；实测捕获到 Master 在同一秒把同一 key 分配给 6 个卷、
+    以及目标卷 `.dat` 上被 1MiB 副本覆写的物理现场。
+  - 修复：Master 新增/启用 `MsgType::AssignNeedle`（指定卷分配新 file_key，复用既有 `allocate_file_key` 与 Raft 持久化）；
+    scrubber 复制改为「读源 → 校验 CRC32 → 向 Master 申请目标卷新 key → 写目标卷」，`replica_chunks` 记录新 key。
+    - 文件：`powerfs-master/src/net_handler.rs`、`powerfs-master-net/src/client.rs`、`powerfs-filer/src/scrubber.rs`
+  - 配套加固（同批）：
+    - scrubber 仅在本节点为该 shard 的 Raft leader 时复制（非 leader 的 `propose_ff` 静默丢弃，新 key 方案下会重复分配并泄漏孤儿 needle）。
+    - 复制中途失败清理已写入且未提交的副本 needle（失败重扫不重复分配）；Raft 提交失败路径不清理（propose 可能已生效）。
+    - 删除对象时 GC 回收列表纳入 `replica_chunks`——副本 needle 此前永不回收（既有泄漏），新 key 方案下回收信息完备。
+    - scrubber 的 `volume_id → addr` 解析改以 **Master 拓扑**为准（回退 Zone 视图）：Master 的 Assign 在全部 volume 上分配，
+      而 Zone 视图只含反亲和子集，导致大量 chunk「addr not found」，复制与 EC 转换长期静默失败。P4/P6 两条扫描路径共用同一映射。
+  - 验证：副本 needle 实测为全新分配（源 `0x13400001` → 副本 `0x20045000001`，递增），源/副本并存读校验一致；
+    EC 转换恢复（EC(4+2) 成功，分片分布于 6 节点）；副本复制与 EC 转换的 `addr not found` 归零。
+  - 最终回归（2026-10-28，release 重建 + 全容器重启后）：
+    - `test_multipart_upload_resend_part` 单例通过
+    - `-k multipart` 全组 powerfs 32 通过 / 30 失败，native 42 通过 / 20 失败；**powerfs 独有失败 13 例全部为已声明非目标**
+      （SSE-C 4、校验和 3、版本化 3、对象锁 2、copy_versioned 1），无 multipart 语义回归
+    - 重传探针（30MiB × 5 种重传模式，逐字节比对）：**102 次上传 0 错乱**（EC 转换关闭状态下）
+- **新发现：EC 转换与 S3 读路径不兼容（阻塞 EC 启用，已记录 issue）**
+  - 现象：addr 解析修复后 EC 转换首次真正执行；被转成 EC(4+2) 的对象（>4MiB）在 S3 GET 时，
+    前 4MiB 正确、其后到文件尾全是校验分片/错位数据，`HEAD Content-Length` 仍正确，表现为**持久性数据损坏**。
+  - 根因：`update_to_ec` 把 `info.chunks` 整体替换为 EC 分片列表（数据分片 offset = `group_start + i*shard_size`，
+    校验分片 offset = `group_start`）；而 rustfs gateway 与 master 内置 S3 的读路径按「平铺 chunk」拼接
+    （`powerfs-rustfs-store/src/object.rs` 的 `read_object`），既不知道该对象是 EC，也会把校验分片的 offset 当数据读。
+  - 证据：单对象 30MiB PUT，EC 转换（约 +20s）前后 GET 由 OK 变 BAD，`body[:4MiB]` 相等、其后全错；关闭 EC 后探针 102/102 全绿。
+  - 处置：暂将 EC 转换默认阈值调为 1TiB（`POWERFS_EC_MIN_FILE_SIZE`，`powerfs-ctl` 模板默认值），
+    EC 专项测试脚本显式 `=0` 覆盖，不受影响。EC 读路径补齐见 `docs/rustfs-p2d-issues.md`。
+- 遗留项（非 P2d 范围，已记录待排期）：
+  - 校验和 `x-amz-checksum-*` 未实现（`test_multipart_checksum_sha256`、`test_multipart_reupload_checksum_and_etag`）
+  - 批量删除条件请求：`ExternalBackend` 无 `delete_objects`，S3 层批量删除落回 native 路径，`test_delete_objects_if_match` 缺 `Errors`（建议随对象锁/删除语义阶段一并补）
+  - HEAD 的 `PartsCount` 头与 Multipart 列举的 Owner.Id 为上游实现缺口，native 同样失败
+
 ### P2c 条件请求 + Range（已完成，2026-10-27）
 
 - [x] 写路径条件请求（`If-Match` / `If-None-Match`）：`write_object` 在**正文读完之后、写 needle 之前**判定（对齐上游「提交时检查」），语义镜像 `set_disk::evaluate_write_precondition`——存在且条件不满足 → 412 `PreconditionFailed`；不存在且带 `If-Match` → 404 `NoSuchKey`，仅带 `If-None-Match` 放行。

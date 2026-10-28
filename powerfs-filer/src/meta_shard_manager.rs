@@ -4008,6 +4008,14 @@ impl MetaShardManager {
         Ok(())
     }
 
+    /// P4: 检查本节点是否为指定 shard 的 Raft leader。
+    /// Scrubber 仅在 leader 上执行副本复制 — 非 leader 的 propose_ff 会被
+    /// 静默丢弃, 若允许非 leader 复制, 数据拷白做且每轮扫描重复分配
+    /// file_key 造成孤儿 needle 泄漏。
+    pub async fn is_shard_leader(&self, shard_id: ShardId) -> bool {
+        self.raft_group_manager.is_shard_leader(shard_id).await
+    }
+
     /// P4: Update reliability state via Raft consensus.
     /// Called by scrubber worker after completing replica replication.
     pub async fn update_reliability(

@@ -16,7 +16,7 @@ use powerfs_master::filer_proto::powerfs::{Entry, FileChunk, FuseAttributes};
 use powerfs_net::protocol::MAX_DATA_SIZE;
 use rustfs_ecstore::api::error::{Error, Result};
 use rustfs_ecstore::api::object::{
-    GetObjectBodySource, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader,
+    GetObjectBodySource, GetObjectReader, ObjectInfo, ObjectOptions, ObjectPartInfo, PutObjReader,
 };
 use rustfs_storage_api::HTTPRangeSpec;
 use tokio::io::AsyncReadExt;
@@ -94,41 +94,8 @@ impl PowerFsStore {
             extended.insert(format!("s3.{key}"), value.clone().into_bytes());
         }
 
-        // 0 字节对象不写 needle；其余按 2MB（TLV 单帧上限）分块，
-        // 每块独立 assign_volume + write_needle。
-        let chunks = if size == 0 {
-            Vec::new()
-        } else {
-            let mut chunks = Vec::with_capacity(body.len().div_ceil(MAX_DATA_SIZE));
-            for (index, slice) in body.chunks(MAX_DATA_SIZE).enumerate() {
-                let (fid, nodes) = self
-                    .master
-                    .assign_volume(&self.config.replication, &self.config.collection)
-                    .await
-                    .map_err(crate::error::from_master)?;
-                let node = nodes
-                    .first()
-                    .ok_or_else(|| Error::other("assign_volume 未返回任何数据节点"))?;
-                // master 下发的 DataNodeInfo.grpc_port 实际承载 powerfs-net 数据端口
-                // （net_port），needle 读写必须走 TLV 协议而非 gRPC。
-                let node_address = format!("{}:{}", node.address, node.grpc_port);
-
-                self.volumes
-                    .write_needle(&node_address, fid.volume_id.0, fid.file_key, slice)
-                    .await
-                    .map_err(crate::error::from_volume)?;
-
-                chunks.push(FileChunk {
-                    offset: (index * MAX_DATA_SIZE) as u64,
-                    size: slice.len() as u64,
-                    mtime: now,
-                    needle_id: fid.file_key,
-                    volume_id: fid.volume_id.0,
-                    crc32: 0,
-                });
-            }
-            chunks
-        };
+        // 0 字节对象不写 needle；其余按 2MB（TLV 单帧上限）分块。
+        let chunks = self.write_body_chunks(&body, now).await?;
 
         self.filer
             .put_object_meta(ObjectMetaWrite {
@@ -275,8 +242,51 @@ impl PowerFsStore {
         let info = object_info_from_entry(bucket, &entry);
 
         self.filer.delete_object_meta(bucket, object).await?;
+        self.delete_chunks(bucket, object, &entry.chunks).await;
 
-        for chunk in &entry.chunks {
+        Ok(info)
+    }
+
+    /// 按 2MB（TLV 单帧上限）切分正文，逐块 assign_volume + write_needle。
+    /// 返回的 chunk `offset` 相对正文起点，便于分块上传按分块拼接。
+    pub(crate) async fn write_body_chunks(&self, body: &[u8], now: u64) -> Result<Vec<FileChunk>> {
+        if body.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut chunks = Vec::with_capacity(body.len().div_ceil(MAX_DATA_SIZE));
+        for (index, slice) in body.chunks(MAX_DATA_SIZE).enumerate() {
+            let (fid, nodes) = self
+                .master
+                .assign_volume(&self.config.replication, &self.config.collection)
+                .await
+                .map_err(crate::error::from_master)?;
+            let node = nodes
+                .first()
+                .ok_or_else(|| Error::other("assign_volume 未返回任何数据节点"))?;
+            // master 下发的 DataNodeInfo.grpc_port 实际承载 powerfs-net 数据端口
+            // （net_port），needle 读写必须走 TLV 协议而非 gRPC。
+            let node_address = format!("{}:{}", node.address, node.grpc_port);
+
+            self.volumes
+                .write_needle(&node_address, fid.volume_id.0, fid.file_key, slice)
+                .await
+                .map_err(crate::error::from_volume)?;
+
+            chunks.push(FileChunk {
+                offset: (index * MAX_DATA_SIZE) as u64,
+                size: slice.len() as u64,
+                mtime: now,
+                needle_id: fid.file_key,
+                volume_id: fid.volume_id.0,
+                crc32: 0,
+            });
+        }
+        Ok(chunks)
+    }
+
+    /// 尽力删除 chunk 对应的 needle；失败只告警，不阻断元数据操作。
+    pub(crate) async fn delete_chunks(&self, bucket: &str, object: &str, chunks: &[FileChunk]) {
+        for chunk in chunks {
             match self.volume_address(chunk.volume_id).await {
                 Ok(address) => {
                     if let Err(error) = self
@@ -305,8 +315,6 @@ impl PowerFsStore {
                 }
             }
         }
-
-        Ok(info)
     }
 
     /// 服务端复制：深拷贝数据（逐 chunk 读源、写新 needle），目标与源
@@ -521,7 +529,7 @@ pub(crate) fn unix_secs_now() -> u64 {
 }
 
 /// 普通文件属性。
-fn file_attributes(size: u64, mtime: u64) -> FuseAttributes {
+pub(crate) fn file_attributes(size: u64, mtime: u64) -> FuseAttributes {
     FuseAttributes {
         ino: 0,
         mode: 0o100644,
@@ -549,6 +557,10 @@ pub(crate) fn object_info_from_entry(bucket: &str, entry: &Entry) -> ObjectInfo 
 
     for (key, value) in &entry.extended {
         let lowered = key.to_ascii_lowercase();
+        // `mpu.` 是 multipart 内部元数据（分块大小、来源上传 ID），不外泄给 S3。
+        if lowered.starts_with(crate::multipart::EXT_MPU_PREFIX) {
+            continue;
+        }
         let text = String::from_utf8_lossy(value).into_owned();
         if lowered == EXT_ETAG {
             etag = Some(text);
@@ -583,12 +595,40 @@ pub(crate) fn object_info_from_entry(bucket: &str, entry: &Entry) -> ObjectInfo 
         content_type,
         user_defined: Arc::new(user_defined),
         user_tags: Arc::new(user_tags),
+        // 分块大小来自 complete 时落盘的 `mpu.part-sizes`；partNumber GET 依赖
+        // 它计算区间，`GetObjectPartsCount` 也用它返回分块数。
+        parts: Arc::new(parts_from_extended(entry)),
         ..ObjectInfo::default()
     }
 }
 
+/// 从 `mpu.part-sizes` 还原分块列表（单分块对象不含该键）。
+fn parts_from_extended(entry: &Entry) -> Vec<ObjectPartInfo> {
+    let sizes = entry
+        .extended
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(crate::multipart::EXT_PART_SIZES))
+        .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
+    let Some(sizes) = sizes else {
+        return Vec::new();
+    };
+    sizes
+        .split(',')
+        .enumerate()
+        .filter_map(|(index, text)| {
+            let size = text.parse::<u64>().ok()?;
+            Some(ObjectPartInfo {
+                number: index + 1,
+                size: usize::try_from(size).ok()?,
+                actual_size: i64::try_from(size).unwrap_or(i64::MAX),
+                ..ObjectPartInfo::default()
+            })
+        })
+        .collect()
+}
+
 /// 从对象条目取 ETag（`s3.etag` 扩展键，大小写不敏感）。
-fn entry_etag(entry: &Entry) -> Option<String> {
+pub(crate) fn entry_etag(entry: &Entry) -> Option<String> {
     entry
         .extended
         .iter()

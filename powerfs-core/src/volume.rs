@@ -594,22 +594,7 @@ impl Volume {
 
             // Normal path: parse + checksum-verify via from_bytes.
             match Needle::from_bytes(&raw, self.id(), info.offset, info.checksum_algorithm) {
-                Ok(needle) => {
-                    // #75 debug: log data_size and bytes at offset 1044480 (last 4K block)
-                    if needle.data.len() >= 1044484 {
-                        let probe = &needle.data[1044480..1044484];
-                        log::info!(
-                            "READ_NEEDLE_DEBUG needle={} data_size={} offset={} first4_at_1044480={:02x?}",
-                            needle_id.0, needle.data.len(), info.offset, probe
-                        );
-                    } else {
-                        log::info!(
-                            "READ_NEEDLE_DEBUG needle={} data_size={} offset={} (too small for 1044480)",
-                            needle_id.0, needle.data.len(), info.offset
-                        );
-                    }
-                    Ok(needle.data)
-                }
+                Ok(needle) => Ok(needle.data),
                 Err(PowerFsError::InvalidRequest(ref msg)) if msg.contains("size mismatch") => {
                     // Index data_size disagrees with the needle header on disk.
                     // This can happen during a narrow race in append_needle_version

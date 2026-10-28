@@ -453,6 +453,36 @@ impl TlvMasterClient {
         })
     }
 
+    /// Assign a fresh file_key within a *specific* volume (MsgType::AssignNeedle).
+    ///
+    /// Used by the Filer scrubber for replica placement: the replica chunk
+    /// must not reuse the source chunk's needle_id, because the Master's
+    /// file_key is a per-volume counter and the same numeric key is handed
+    /// out independently on every volume. Returns the newly allocated
+    /// file_key on `volume_id`.
+    pub async fn assign_needle(&self, volume_id: u64) -> MasterNetResult<u64> {
+        let mut enc = TlvEncoder::new();
+        let _ = enc.add_u64(FieldId::VolumeId, volume_id);
+        let body = enc.into_bytes();
+
+        let resp = self.submit_request(MsgType::AssignNeedle, &body).await?;
+
+        if resp.header.status != STATUS_OK {
+            return Err(MasterNetError::ServerError {
+                status: resp.header.status,
+                detail: format!("assign_needle volume_id={} failed", volume_id),
+            });
+        }
+
+        let mut dec = TlvDecoder::new(&resp.body);
+        // 响应字段顺序: VolumeId -> FileKey (decoder 严格顺序校验, 不可跳读)
+        let _volume_id = dec
+            .next_u64(FieldId::VolumeId)
+            .map_err(|e| MasterNetError::DecodeError(e.to_string()))?;
+        dec.next_u64(FieldId::FileKey)
+            .map_err(|e| MasterNetError::DecodeError(e.to_string()))
+    }
+
     /// Look up a volume's location by its ID.
     pub async fn lookup_volume(&self, volume_id: u64) -> MasterNetResult<Option<VolumeLocation>> {
         let mut enc = TlvEncoder::new();

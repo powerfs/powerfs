@@ -15,12 +15,12 @@ pub struct Capability {
     pub lifecycle: bool,
 }
 
-/// 当前阶段（P1c）的能力：仅基础 CRUD，上述高级能力全部不提供。
+/// 当前阶段（P2d）的能力：基础 CRUD + 条件请求 + Range + 分段上传。
 pub fn capability() -> Capability {
     Capability {
         ec: false,
         versioning: false,
-        multipart: false,
+        multipart: true,
         object_lock: false,
         lifecycle: false,
     }
@@ -28,5 +28,5 @@ pub fn capability() -> Capability {
 
 /// 一行中文说明，供 Admin 展示。
 pub fn describe() -> &'static str {
-    "PowerFS 存储后端（P1c）：支持桶与对象的单版本基础增删改查/列举；暂不支持纠删码、版本化、分段上传、对象锁与生命周期"
+    "PowerFS 存储后端（P2d）：支持桶与对象单版本增删改查/列举、条件请求、Range 与分段上传；暂不支持纠删码、版本化、对象锁与生命周期"
 }

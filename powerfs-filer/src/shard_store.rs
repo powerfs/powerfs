@@ -3361,17 +3361,21 @@ impl ShardStore {
                 continue; // 还在 grace period 内
             }
             // 查找 parent + name（从 directory_entries 反查）
+            // 回收列表 = 主副本 chunks + replica_chunks (P4 副本, 各自独立
+            // 的 volume_id/needle_id — 副本 needle 已不再复用源 needle_id).
+            let mut reclaim: Vec<StoredFileChunk> = info.chunks.clone();
+            reclaim.extend(info.replica_chunks.iter().cloned());
             let mut found = false;
             for (parent, entries) in dir_entries.iter() {
                 if let Some((name, _)) = entries.iter().find(|(_, &i)| i == *inode) {
-                    result.push((*inode, *parent, name.clone(), info.chunks.clone()));
+                    result.push((*inode, *parent, name.clone(), reclaim.clone()));
                     found = true;
                     break;
                 }
             }
             if !found {
                 // orphan inode（无 dir_entry 指向），直接加入 GC 列表
-                result.push((*inode, 0, String::new(), info.chunks.clone()));
+                result.push((*inode, 0, String::new(), reclaim));
             }
         }
 

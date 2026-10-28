@@ -19,6 +19,7 @@ pub mod config;
 pub mod error;
 pub mod filer;
 pub mod list;
+pub mod multipart;
 pub mod object;
 
 pub use backend::PowerFsStore;

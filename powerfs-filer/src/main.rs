@@ -1053,6 +1053,36 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
         //   POWERFS_SCRUBBER_MAX_INODES     每轮最大 inode 数 (默认 50)
         //   POWERFS_EC_MIN_FILE_SIZE        EC 转换最小文件字节数 (默认 0=不限制)
         {
+            // Scrubber 副本复制需要向 Master 申请目标卷的新 file_key
+            // (MsgType::AssignNeedle) — 使用独立 TLV master client
+            // (TCP 管理网络, 与 RegisterFiler 一致).
+            let scrubber_master_client = {
+                let addrs: Vec<(String, u16)> = filer_cfg
+                    .master_addresses
+                    .iter()
+                    .map(|addr| {
+                        let ip = addr
+                            .rfind(':')
+                            .map(|i| &addr[..i])
+                            .unwrap_or(addr)
+                            .to_string();
+                        (ip, filer_cfg.master_net_port)
+                    })
+                    .collect();
+                let client_cert_pem = match &filer_cfg.client_crt {
+                    Some(path) if !path.is_empty() => std::fs::read_to_string(path).ok(),
+                    _ => None,
+                };
+                Arc::new(TlvMasterClient::new(
+                    addrs,
+                    TlvMasterClientConfig {
+                        client_type: powerfs_net::ClientType::Filer,
+                        client_cert_pem,
+                        transport: Some(master_transport.clone()),
+                        ..Default::default()
+                    },
+                ))
+            };
             let scrubber_config = powerfs_filer::scrubber::ScrubberConfig {
                 scan_interval_secs: std::env::var("POWERFS_SCRUBBER_SCAN_INTERVAL")
                     .ok()
@@ -1079,10 +1109,12 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
             let msm = meta_shard_manager.clone();
             let vcp = volume_client_pool.clone();
             let nh = net_handler.clone();
+            let mc = scrubber_master_client.clone();
             powerfs_common::spawn_supervised("filer-scrubber", move || {
                 let msm = msm.clone();
                 let vcp = vcp.clone();
                 let nh = nh.clone();
+                let mc = mc.clone();
                 let config = powerfs_filer::scrubber::ScrubberConfig {
                     scan_interval_secs: std::env::var("POWERFS_SCRUBBER_SCAN_INTERVAL")
                         .ok()
@@ -1101,7 +1133,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 };
                 async move {
                     let scrubber =
-                        powerfs_filer::scrubber::ScrubberWorker::new(msm, vcp, nh, config);
+                        powerfs_filer::scrubber::ScrubberWorker::new(msm, vcp, nh, mc, config);
                     scrubber.run().await;
                 }
             });

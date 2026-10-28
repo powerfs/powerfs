@@ -358,7 +358,7 @@ impl VolumeNetHandler {
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
 
-        info!(
+        debug!(
             "NET_READ_NEEDLE: volume_id={}, file_key={}",
             volume_id, file_key
         );
@@ -625,7 +625,7 @@ impl VolumeNetHandler {
         let volume_id = dec.next_u64(FieldId::Ino).unwrap_or(0);
         let file_key = dec.next_u64(FieldId::FileKey).unwrap_or(0);
 
-        info!(
+        debug!(
             "NET_DELETE_NEEDLE: volume_id={}, file_key={}",
             volume_id, file_key
         );
@@ -819,7 +819,7 @@ impl VolumeNetHandler {
         let offset = dec.next_u64(FieldId::Offset).unwrap_or(0) as i64;
         let size = dec.next_u64(FieldId::Size).unwrap_or(0);
 
-        info!(
+        debug!(
             "NET_READ_NEEDLE_BLOB: volume_id={}, file_key={}, offset={}, size={}",
             volume_id, file_key, offset, size
         );

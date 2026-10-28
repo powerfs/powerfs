@@ -15,6 +15,7 @@ use crate::net_handler::FilerNetHandler;
 use crate::shard_store::StoredFileChunk;
 use log::{debug, error, info, warn};
 use powerfs_layout::reliability::{Reliability, ReliabilityState};
+use powerfs_master_net::TlvMasterClient;
 use powerfs_net::TlvVolumeClient;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -113,6 +114,10 @@ pub struct ScrubberWorker {
     meta_shard_manager: Arc<MetaShardManager>,
     volume_client: Arc<TlvVolumeClient>,
     net_handler: Arc<FilerNetHandler>,
+    /// Master TLV client: 副本复制时向 Master 申请目标卷的新 file_key
+    /// (MsgType::AssignNeedle). needle_id 不能跨卷复用 — Master 的
+    /// file_key 是按卷独立计数器, 同一数值会在不同卷重复分配.
+    master_client: Arc<TlvMasterClient>,
     config: ScrubberConfig,
     /// P6: EC 不可行标记 (volume 数 < data+parity 时置 true, 跳过 EC 转换).
     /// 每 EC_RECHECK_CYCLES 轮重新检查一次, 支持扩容后自动恢复 EC.
@@ -129,12 +134,14 @@ impl ScrubberWorker {
         meta_shard_manager: Arc<MetaShardManager>,
         volume_client: Arc<TlvVolumeClient>,
         net_handler: Arc<FilerNetHandler>,
+        master_client: Arc<TlvMasterClient>,
         config: ScrubberConfig,
     ) -> Self {
         Self {
             meta_shard_manager,
             volume_client,
             net_handler,
+            master_client,
             config,
             ec_infeasible: std::sync::atomic::AtomicBool::new(false),
             ec_skip_count: std::sync::atomic::AtomicU32::new(0),
@@ -173,6 +180,38 @@ impl ScrubberWorker {
         }
     }
 
+    /// 构建 volume_id → addr 映射, 供副本复制/EC 转换读取 chunk 使用.
+    ///
+    /// 以 Master 拓扑为准: Master 的 Assign 在**全部** volume 上分配
+    /// (一个节点可承载多个 volume), 而 Filer 的 Zone 视图只含反亲和选出的
+    /// 子集 — 仅用 Zone 视图会导致大量 chunk 的源卷 "addr not found",
+    /// 复制/EC 永远无法执行. 拓扑查询失败时退回 Zone 视图.
+    async fn volume_addr_map(&self) -> std::collections::HashMap<u64, String> {
+        let map: std::collections::HashMap<u64, String> =
+            match self.master_client.get_topology().await {
+                Ok(topo) if !topo.volumes.is_empty() => topo
+                    .volumes
+                    .into_iter()
+                    .map(|v| (v.volume_id, v.addr))
+                    .collect(),
+                Ok(_) => std::collections::HashMap::new(),
+                Err(e) => {
+                    warn!(
+                        "SCRUBBER: get_topology failed, falling back to zone view: {}",
+                        e
+                    );
+                    std::collections::HashMap::new()
+                }
+            };
+        if !map.is_empty() {
+            return map;
+        }
+        self.net_handler
+            .get_all_volume_addrs()
+            .into_iter()
+            .collect()
+    }
+
     /// 扫描 PendingReplicated 文件, 执行副本复制
     async fn scan_and_replicate(&self) -> Result<(), String> {
         let pending = self.meta_shard_manager.list_pending_replicated();
@@ -185,17 +224,14 @@ impl ScrubberWorker {
             pending.len()
         );
 
-        let volume_addrs = self.net_handler.get_all_volume_addrs();
-        if volume_addrs.len() < 2 {
+        let addr_map = self.volume_addr_map().await;
+        if addr_map.len() < 2 {
             warn!(
                 "P4_SCRUBBER: only {} volumes available, need >= 2 for replication",
-                volume_addrs.len()
+                addr_map.len()
             );
             return Ok(());
         }
-
-        let addr_map: std::collections::HashMap<u64, String> =
-            volume_addrs.iter().cloned().collect();
 
         let mut processed = 0usize;
         for (inode, chunks) in pending {
@@ -207,10 +243,17 @@ impl ScrubberWorker {
                 break;
             }
 
+            // 仅 shard leader 执行复制: 非 leader 的 propose_ff 会被静默丢弃,
+            // 数据拷白做, 且新 file_key 方案下每轮重扫都会重复分配 key,
+            // 在目标卷留下孤儿 needle.
+            let shard_id = self.meta_shard_manager.calculate_shard_id(inode);
+            if !self.meta_shard_manager.is_shard_leader(shard_id).await {
+                continue;
+            }
+
             match self.replicate_inode(inode, &chunks, &addr_map).await {
                 Ok(replica_chunks) => {
                     // 通过 Raft 更新状态
-                    let shard_id = self.meta_shard_manager.calculate_shard_id(inode);
                     match self
                         .meta_shard_manager
                         .update_reliability(
@@ -251,6 +294,11 @@ impl ScrubberWorker {
 
     /// 为单个 inode 的所有 chunk 创建副本
     /// 返回 replica_chunks (副本位置信息)
+    ///
+    /// 副本使用目标卷上**新分配**的 file_key (向 Master 申请), 不复用源
+    /// chunk 的 needle_id: Master 的 file_key 是按卷独立计数器, 同一数值
+    /// 在不同卷上会被重复分配给不相关的文件, 跨卷复用会覆写目标卷上
+    /// 已有数据 (P2d multipart resend 数据损坏事故根因).
     async fn replicate_inode(
         &self,
         inode: u64,
@@ -260,83 +308,143 @@ impl ScrubberWorker {
         let mut replica_chunks = Vec::with_capacity(chunks.len());
 
         for chunk in chunks {
-            // 选择目标 volume (anti-affinity: 与源 volume 不同)
-            let dst_volume_id = self
-                .select_replica_volume(chunk.volume_id, addr_map)
-                .ok_or_else(|| {
-                    format!(
-                        "no suitable replica volume for inode {} chunk at offset {} (src volume {})",
-                        inode, chunk.offset, chunk.volume_id
-                    )
-                })?;
-
-            let src_addr = addr_map
-                .get(&chunk.volume_id)
-                .ok_or_else(|| format!("src volume {} addr not found", chunk.volume_id))?
-                .clone();
-            let dst_addr = addr_map
-                .get(&dst_volume_id)
-                .ok_or_else(|| format!("dst volume {} addr not found", dst_volume_id))?
-                .clone();
-
-            // 1. 从源 volume 读取 chunk 数据 (TLV ReadNeedle)
-            let data = self
-                .volume_client
-                .read_needle(&src_addr, chunk.volume_id, chunk.needle_id)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "read_needle src vol={} needle={:#x} failed: {}",
-                        chunk.volume_id, chunk.needle_id, e
-                    )
-                })?;
-
-            // 1b. CRC32 校验: 防止复制损坏数据到副本 volume
-            // (crc32==0 表示旧数据未计算 CRC, 跳过校验)
-            if chunk.crc32 != 0 {
-                let actual_crc = crc32fast::hash(&data);
-                if actual_crc != chunk.crc32 {
-                    return Err(format!(
-                        "CRC32 mismatch during replication: inode={} offset={} src vol={} needle={:#x} expected={:#x} actual={:#x}",
-                        inode, chunk.offset, chunk.volume_id, chunk.needle_id,
-                        chunk.crc32, actual_crc
-                    ));
+            match self.replicate_chunk(inode, chunk, addr_map).await {
+                Ok(rc) => replica_chunks.push(rc),
+                Err(e) => {
+                    // 本次已写入的副本尚未通过 Raft 提交到元数据, 是确定
+                    // 无主的孤儿 needle — 清理掉, 避免失败重扫时重复分配
+                    // 导致孤儿 key 在目标卷上累积泄漏.
+                    self.delete_orphan_replicas(&replica_chunks, addr_map).await;
+                    return Err(e);
                 }
             }
-
-            // 2. 写入目标 volume (TLV WriteNeedle, 数据放在 DATA 段)
-            // 使用相同的 needle_id, 因为 needle_id 是全局唯一的
-            self.volume_client
-                .write_needle(&dst_addr, dst_volume_id, chunk.needle_id, &data)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "write_needle dst vol={} needle={:#x} failed: {}",
-                        dst_volume_id, chunk.needle_id, e
-                    )
-                })?;
-
-            debug!(
-                "P4_SCRUBBER: replicated inode={} chunk offset={} {} bytes: vol {} -> vol {}",
-                inode,
-                chunk.offset,
-                data.len(),
-                chunk.volume_id,
-                dst_volume_id
-            );
-
-            replica_chunks.push(StoredFileChunk {
-                offset: chunk.offset,
-                size: chunk.size,
-                needle_id: chunk.needle_id,
-                volume_id: dst_volume_id,
-                crc32: chunk.crc32,
-                mtime: chunk.mtime,
-                is_reference: false,
-            });
         }
 
         Ok(replica_chunks)
+    }
+
+    /// 复制单个 chunk 到 anti-affinity 目标卷, 返回副本位置信息.
+    async fn replicate_chunk(
+        &self,
+        inode: u64,
+        chunk: &StoredFileChunk,
+        addr_map: &std::collections::HashMap<u64, String>,
+    ) -> Result<StoredFileChunk, String> {
+        // 选择目标 volume (anti-affinity: 与源 volume 不同)
+        let dst_volume_id = self
+            .select_replica_volume(chunk.volume_id, addr_map)
+            .ok_or_else(|| {
+                format!(
+                    "no suitable replica volume for inode {} chunk at offset {} (src volume {})",
+                    inode, chunk.offset, chunk.volume_id
+                )
+            })?;
+
+        let src_addr = addr_map
+            .get(&chunk.volume_id)
+            .ok_or_else(|| format!("src volume {} addr not found", chunk.volume_id))?
+            .clone();
+        let dst_addr = addr_map
+            .get(&dst_volume_id)
+            .ok_or_else(|| format!("dst volume {} addr not found", dst_volume_id))?
+            .clone();
+
+        // 1. 从源 volume 读取 chunk 数据 (TLV ReadNeedle)
+        let data = self
+            .volume_client
+            .read_needle(&src_addr, chunk.volume_id, chunk.needle_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "read_needle src vol={} needle={:#x} failed: {}",
+                    chunk.volume_id, chunk.needle_id, e
+                )
+            })?;
+
+        // 1b. CRC32 校验: 防止复制损坏数据到副本 volume
+        // (crc32==0 表示旧数据未计算 CRC, 跳过校验)
+        if chunk.crc32 != 0 {
+            let actual_crc = crc32fast::hash(&data);
+            if actual_crc != chunk.crc32 {
+                return Err(format!(
+                    "CRC32 mismatch during replication: inode={} offset={} src vol={} needle={:#x} expected={:#x} actual={:#x}",
+                    inode, chunk.offset, chunk.volume_id, chunk.needle_id,
+                    chunk.crc32, actual_crc
+                ));
+            }
+        }
+
+        // 2. 向 Master 申请目标卷上的新 file_key (TLV AssignNeedle).
+        // needle_id 不能跨卷复用 — 见 replicate_inode 文档注释.
+        let replica_needle_id = self
+            .master_client
+            .assign_needle(dst_volume_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "assign_needle dst vol={} failed (inode {} offset {}): {}",
+                    dst_volume_id, inode, chunk.offset, e
+                )
+            })?;
+
+        // 3. 写入目标 volume (TLV WriteNeedle, 数据放在 DATA 段)
+        self.volume_client
+            .write_needle(&dst_addr, dst_volume_id, replica_needle_id, &data)
+            .await
+            .map_err(|e| {
+                format!(
+                    "write_needle dst vol={} needle={:#x} failed: {}",
+                    dst_volume_id, replica_needle_id, e
+                )
+            })?;
+
+        debug!(
+            "P4_SCRUBBER: replicated inode={} chunk offset={} {} bytes: vol {} needle={:#x} -> vol {} needle={:#x}",
+            inode,
+            chunk.offset,
+            data.len(),
+            chunk.volume_id,
+            chunk.needle_id,
+            dst_volume_id,
+            replica_needle_id
+        );
+
+        Ok(StoredFileChunk {
+            offset: chunk.offset,
+            size: chunk.size,
+            needle_id: replica_needle_id,
+            volume_id: dst_volume_id,
+            crc32: chunk.crc32,
+            mtime: chunk.mtime,
+            is_reference: false,
+        })
+    }
+
+    /// 清理复制中途失败时已写入的孤儿副本 needle (best-effort).
+    ///
+    /// 仅在 replicate_inode 内部失败路径调用 — 此时 replica_chunks 尚未
+    /// 提交 Raft, 保证无任何元数据引用. update_reliability 失败后**不可**
+    /// 调用本函数 (propose 可能实际已提交, 误删会破坏已生效的副本).
+    async fn delete_orphan_replicas(
+        &self,
+        replica_chunks: &[StoredFileChunk],
+        addr_map: &std::collections::HashMap<u64, String>,
+    ) {
+        for rc in replica_chunks {
+            let Some(addr) = addr_map.get(&rc.volume_id) else {
+                continue;
+            };
+            if let Err(e) = self
+                .volume_client
+                .delete_needle(addr, rc.volume_id, rc.needle_id)
+                .await
+            {
+                warn!(
+                    "P4_SCRUBBER: cleanup orphan replica vol={} needle={:#x} failed: {}",
+                    rc.volume_id, rc.needle_id, e
+                );
+            }
+        }
     }
 
     /// 选择副本目标 volume (anti-affinity: 与源 volume 不同)
@@ -389,8 +497,11 @@ impl ScrubberWorker {
             return Ok(());
         }
 
-        let volume_addrs = self.net_handler.get_all_volume_addrs();
-        if volume_addrs.len() < min_shards {
+        // 与 P4 一致: 地址/统计以 Master 拓扑为准 (全部 volume), 否则
+        // 非 Zone 子集上的 chunk 无法读取, EC 转换永远失败.
+        let addr_map = self.volume_addr_map().await;
+
+        if addr_map.len() < min_shards {
             // EC 不可行: volume 数不足. 标记并跳过, 避免每轮重复日志.
             if !self
                 .ec_infeasible
@@ -400,14 +511,14 @@ impl ScrubberWorker {
                 warn!(
                     "P6_SCRUBBER: EC disabled — only {} volumes available, need >= {} for smallest EC tier. \
                      Files will stay in Replicated state. Will re-check every {} scans.",
-                    volume_addrs.len(),
+                    addr_map.len(),
                     min_shards,
                     EC_RECHECK_CYCLES,
                 );
             } else {
                 debug!(
                     "P6_SCRUBBER: EC still infeasible ({} < {} volumes)",
-                    volume_addrs.len(),
+                    addr_map.len(),
                     min_shards
                 );
             }
@@ -421,7 +532,7 @@ impl ScrubberWorker {
         {
             info!(
                 "P6_SCRUBBER: EC re-enabled — {} volumes available (need >= {} for smallest tier)",
-                volume_addrs.len(),
+                addr_map.len(),
                 min_shards
             );
         }
@@ -431,11 +542,8 @@ impl ScrubberWorker {
         info!(
             "P6_SCRUBBER: found {} Replicated inodes eligible for EC, {} volumes available",
             pending.len(),
-            volume_addrs.len()
+            addr_map.len()
         );
-
-        let addr_map: std::collections::HashMap<u64, String> =
-            volume_addrs.iter().cloned().collect();
 
         let mut processed = 0usize;
         for (inode, chunks) in pending {
@@ -453,10 +561,10 @@ impl ScrubberWorker {
             let total_shards = (data_shards + parity_shards) as usize;
 
             // 该文件 tier 需要的 volume 数 > 当前可用数, 跳过 (不阻塞其他文件)
-            if volume_addrs.len() < total_shards {
+            if addr_map.len() < total_shards {
                 debug!(
                     "P6_SCRUBBER: inode {} file_size={} needs EC({}+{}) = {} volumes, only {} available, skipping",
-                    inode, file_size, data_shards, parity_shards, total_shards, volume_addrs.len()
+                    inode, file_size, data_shards, parity_shards, total_shards, addr_map.len()
                 );
                 continue;
             }
