@@ -670,6 +670,7 @@ pub mod handlers {
             owner: String::new(),
             generation: 0,
             replica_chunks: Vec::new(),
+            ec_layout: None,
         };
 
         let object_path = format!("/{}/{}", bucket, key);
@@ -724,6 +725,25 @@ pub mod handlers {
                 None => return build_error_response(StatusCode::NOT_FOUND, "Object not found"),
             },
         };
+
+        // P6: scrubber 转换后的 chunks 是 group-major EC 分片（校验分片 offset
+        // 与数据分片 0 重叠），而本 demo 面只读 chunks[0]，继续读会把校验分片
+        // 当数据返回。这里明确拒绝，避免静默返回错数据。
+        if entry.ec_layout.is_some() {
+            eprintln!(
+                "EC object {}/{}: legacy S3 read unsupported, use RustFS gateway",
+                bucket, key
+            );
+            let mut response = build_error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "EC read unsupported on legacy S3",
+            );
+            response.headers_mut().insert(
+                "x-powerfs-note",
+                "ec read unsupported on legacy S3".parse().unwrap(),
+            );
+            return response;
+        }
 
         if entry.chunks.is_empty() {
             return (StatusCode::OK, "").into_response();
@@ -1182,6 +1202,7 @@ pub mod handlers {
             owner: String::new(),
             generation: 0,
             replica_chunks: Vec::new(),
+            ec_layout: None,
         };
 
         let object_path = format!("/{}/{}", bucket, key);

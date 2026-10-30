@@ -191,6 +191,7 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
                     owner: String::new(),
                     generation: 0,
                     replica_chunks: Vec::new(),
+                    ec_layout: None,
                 };
 
                 let request = CreateEntryRequest {
@@ -356,6 +357,7 @@ impl LocalDirectoryTree {
                     owner: String::new(),
                     generation: 0,
                     replica_chunks: Vec::new(),
+                    ec_layout: None,
                 },
             ),
         );
@@ -465,6 +467,7 @@ impl DirectoryTreeApi for LocalDirectoryTree {
                     owner: String::new(),
                     generation: 0,
                     replica_chunks: Vec::new(),
+                    ec_layout: None,
                 };
 
                 self.entries

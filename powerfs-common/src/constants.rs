@@ -37,5 +37,12 @@ pub const MAX_BLOCK_SIZE: usize = 1024 * 1024;
 /// u64 capacity: 2^64 / 1M = 1.8×10^13 files per volume (practically unlimited).
 pub const FILE_KEY_BLOCK_SIZE: u64 = 1_048_576; // 1M chunks per file = 2TB max @ 2MB chunks
 
+/// 元数据豁免键：带该 extended 属性的 inode 禁止 scrubber 做 EC 转换。
+///
+/// multipart 分块在完成时才按 chunk 顺序拼成最终对象，一旦被转成
+/// group-major 的 EC 分片（含 offset 重叠的校验分片），拼接必然错乱。
+/// gateway 写分块时打上该标记，filer 的 EC 待转换队列据此跳过。
+pub const EC_EXEMPT_EXT_KEY: &str = "powerfs.ec-exempt";
+
 pub const LRU_CACHE_SIZE: usize = 100_000;
 pub const INDEX_CACHE_SIZE: usize = 10_000;

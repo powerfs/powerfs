@@ -15,9 +15,13 @@ rustfs-storage-api = { path = "../rustfs/crates/storage-api" }
 # PowerFS 侧的 master 分配与 Filer 元数据客户端（path deps 到父 workspace）。
 powerfs-master = { path = "../powerfs-master" }
 powerfs-common = { path = "../powerfs-common" }
+# P6 EC 读路径复用 powerfs-core 的 Reed-Solomon 编解码实现（与 scrubber 一致）。
+powerfs-core = { path = "../powerfs-core" }
 # needle 数据面走 powerfs-net TLV 协议（master 下发的 DataNodeInfo.grpc_port
 # 实际承载 net_port，TLV 是 volume 数据面的唯一客户端协议，见 powerfs-net::TlvVolumeClient）。
 powerfs-net = { path = "../powerfs-net" }
+# EC 分片完整性校验沿用 scrubber 的 CRC32 算法。
+crc32fast = "1.4"
 async-trait = "0.1"
 tokio = { version = "1.35", features = ["full"] }
 # S3 单段对象的 ETag 按协议为内容 MD5 的十六进制表示。

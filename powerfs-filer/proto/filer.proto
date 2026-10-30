@@ -401,6 +401,19 @@ message FuseAttributes {
     uint32 perm = 14;
 }
 
+// P6 EC Read: EC 布局。仅当对象已由 scrubber 转换为 EC 时存在。
+//
+// 存在即表示 Entry.chunks 是 **group-major** 分片列表：
+//   chunks[g * (data_shards + parity_shards) + i]
+// 其中 i < data_shards 为数据分片、i >= data_shards 为校验分片。
+// 数据分片 offset = group_start + i * shard_size，
+// 校验分片 offset = group_start（与数据分片 0 重叠，故不能用 offset 判断分片身份）。
+message EcLayout {
+    uint32 data_shards = 1;
+    uint32 parity_shards = 2;
+    uint32 shard_size = 3;  // 每分片字节数 (当前固定 1 MiB)
+}
+
 message Entry {
     string name = 1;
     string directory = 2;
@@ -416,6 +429,8 @@ message Entry {
     string owner = 12;
     uint64 generation = 13;
     uint64 version = 14;
+    // P6: EC 布局；非 EC 对象为空，读取方按平铺 chunks 处理。
+    EcLayout ec_layout = 15;
 }
 
 // Lease management types

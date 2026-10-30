@@ -35,6 +35,14 @@ impl EcTier {
     }
 }
 
+/// P6: EC 分片固定大小 (1 MiB)。
+///
+/// 每个 shard 不超过 TLV 单帧 2 MiB (`MAX_DATA_SIZE`) 限制；整个文件按
+/// stripe group 切分，每个 group = `data_shards × EC_SHARD_SIZE`，独立编码。
+/// 该值同时作为 `EcLayout.shard_size` 暴露给读路径
+/// (`powerfs-filer/src/grpc_service.rs`)，禁止在别处重复写 1 MiB 字面量。
+pub(crate) const EC_SHARD_SIZE: usize = 1024 * 1024;
+
 /// Scrubber 配置
 pub struct ScrubberConfig {
     /// 扫描间隔 (秒), 默认 30
@@ -718,7 +726,6 @@ impl ScrubberWorker {
 
         // EC shard 固定 1MB (= chunk_size), 确保每个 shard 不超过 TLV 2MB MAX_DATA_SIZE 限制.
         // 整个文件按 stripe group 切分, 每个 group = data_shards × 1MB, 独立 EC 编码.
-        const EC_SHARD_SIZE: usize = 1024 * 1024; // 1MB = chunk_size
         let group_data_size = data_shards * EC_SHARD_SIZE;
 
         // 2. EC 编码器

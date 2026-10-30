@@ -16,6 +16,7 @@ pub mod backend;
 pub mod bucket;
 pub mod capability;
 pub mod config;
+pub mod ec;
 pub mod error;
 pub mod filer;
 pub mod list;

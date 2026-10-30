@@ -1048,5 +1048,8 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
         owner: "".to_string(),
         generation: 0,
         version: inode.version,
+        // P6: 与 FilerMetaService 的 Entry 保持同一语义；此接口(Raft shard
+        // 内部诊断用)仅透传布局，读路径不在此处。
+        ec_layout: crate::grpc_service::ec_layout_from_inode(inode),
     }
 }

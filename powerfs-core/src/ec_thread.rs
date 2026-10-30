@@ -564,4 +564,87 @@ mod tests {
         recovered.truncate(original.len());
         assert_eq!(recovered, original);
     }
+
+    /// 确定性伪随机字节（避免引入 rand dev-dependency）。
+    fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((state >> 33) as u8);
+        }
+        out
+    }
+
+    /// 对拍 scrubber 的真实契约：固定 1MiB shard、EC(4+2)、每 group 4MiB、并行编码。
+    ///
+    /// P6 EC Read 的 S3 读路径依赖以下三条语义，本测试把它们钉死：
+    /// 1. `encode(正好 data*shard_size 的数据)` 产生 `data+parity` 个**定长**
+    ///    `shard_size` 分片（不会因末组填充而变长/变短）。
+    /// 2. `decode_missing` 返回**长度恰为 `data*shard_size`** 的拼接数据（含末组
+    ///    零填充），由调用方按原文件长度截断。
+    /// 3. 任意 ≤ `parity` 个分片丢失都可还原；超过则报错而不返回错数据。
+    #[test]
+    fn decode_missing_matches_scrubber_group_contract() {
+        const SHARD_SIZE: usize = 1024 * 1024; // scrubber 的 EC_SHARD_SIZE
+        const DATA: usize = 4;
+        const PARITY: usize = 2;
+
+        let encoder = EcEncoder::new(EcConfig {
+            k: DATA,
+            m: PARITY,
+            data_shards: DATA,
+            parity_shards: PARITY,
+            min_small_file_size: 0,
+            simd_backend: SimdBackend::None,
+            parallel_encoding: true, // scrubber 使用并行编码
+        });
+
+        let original = pseudo_random_bytes(DATA * SHARD_SIZE);
+        let shards = encoder.encode(&original);
+        assert_eq!(shards.len(), DATA + PARITY);
+        for (i, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard.len(),
+                SHARD_SIZE,
+                "分片 {} 长度必须恰为 shard_size",
+                i
+            );
+        }
+
+        // 仅丢数据分片、仅丢校验分片、混合丢失、丢满 parity 个
+        let erasure_sets: &[&[usize]] =
+            &[&[0], &[2], &[4], &[5], &[0, 1], &[2, 3], &[0, 4], &[3, 5]];
+        for set in erasure_sets {
+            let mut opt_shards: Vec<Option<Vec<u8>>> = shards.iter().cloned().map(Some).collect();
+            for &idx in *set {
+                opt_shards[idx] = None;
+            }
+            let recovered = encoder
+                .decode_missing(&mut opt_shards)
+                .unwrap_or_else(|e| panic!("丢失分片 {:?} 后应可还原，实际失败: {}", set, e));
+            assert_eq!(
+                recovered.len(),
+                DATA * SHARD_SIZE,
+                "decode_missing 返回值长度必须为 data × shard_size"
+            );
+            assert_eq!(
+                recovered, original,
+                "丢失分片 {:?} 后还原结果必须逐字节一致",
+                set
+            );
+        }
+
+        // 丢失 3 个数据分片（> parity）必须报错，绝不允许返回错数据
+        let mut opt_shards: Vec<Option<Vec<u8>>> = shards.iter().cloned().map(Some).collect();
+        for idx in [0usize, 1, 2] {
+            opt_shards[idx] = None;
+        }
+        assert!(
+            encoder.decode_missing(&mut opt_shards).is_err(),
+            "丢失 3 个数据分片（超过 parity=2）必须失败"
+        );
+    }
 }

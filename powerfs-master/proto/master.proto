@@ -946,6 +946,15 @@ message FuseAttributes {
     uint32 perm = 14;
 }
 
+// P6 EC Read: EC 布局。存在即表示 chunks 是 group-major 分片列表
+// （chunks[g*(data_shards+parity_shards)+i]，i < data_shards 为数据分片）。
+// master 内置 S3 读路径仅支持平铺 chunk，据此拒绝 EC 对象。
+message EcLayout {
+    uint32 data_shards = 1;
+    uint32 parity_shards = 2;
+    uint32 shard_size = 3;  // 每分片字节数（Filer 侧当前固定 1 MiB）
+}
+
 message Entry {
     string name = 1;
     string directory = 2;
@@ -961,6 +970,7 @@ message Entry {
     string owner = 12;  // 资源归属用户ID（空字符串表示无归属/系统资源）
     uint64 generation = 13;  // 代次号，每次元数据变更递增
     repeated FileChunk replica_chunks = 14;  // P4: 副本 chunk 列表 (读路径 failover)
+    EcLayout ec_layout = 15;  // P6: EC 布局（仅 scrubber 转换后存在）
 }
 
 enum StorageBackend {

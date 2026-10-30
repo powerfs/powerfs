@@ -2340,6 +2340,14 @@ impl ShardStore {
             if self.get_open_count(info.inode) > 0 {
                 continue;
             }
+            // P6: 带 EC 豁免标记的文件不参与 EC 转换。multipart 分块在完成时
+            // 按 chunk 顺序拼接，转成 group-major 分片会让最终对象错乱。
+            if info
+                .extended
+                .contains_key(powerfs_common::constants::EC_EXEMPT_EXT_KEY)
+            {
+                continue;
+            }
             // 文件大小检查
             let total_size: u64 = info.chunks.iter().map(|c| c.size).sum();
             if min_file_size > 0 && total_size < min_file_size {
@@ -3989,18 +3997,27 @@ impl ShardStore {
         // P4/P6: 如果文件已 Replicated 或 EC 但数据更新了 (追加写/截断),
         // 重置为 PendingReplicated 让 scrubber 重新走完整管线 (复制 → EC 编码).
         // 同时清空旧的 replica_chunks. EC shards 成为孤儿, 由 Volume GC 回收.
+        //
+        // P6 修复: `reliability` 必须一并复位。旧代码只改状态，留下
+        // `reliability = EC{data,parity}` 配新的平铺 chunks —— 任何按
+        // `reliability` 判断布局的读者（如 S3 读路径）都会用 EC 布局解析
+        // 平铺数据，读到校验分片垃圾。状态与策略必须始终自洽。
         if chunks_changed {
             match info.reliability_state {
                 powerfs_layout::reliability::ReliabilityState::Replicated
                 | powerfs_layout::reliability::ReliabilityState::EC => {
                     log::info!(
-                        "Shard {} P6: inode {} data changed, resetting {:?} -> PendingReplicated",
+                        "Shard {} P6: inode {} data changed, resetting {:?} -> PendingReplicated \
+                         (old reliability={:?}, chunks={})",
                         self.shard_id.0,
                         inode,
-                        info.reliability_state
+                        info.reliability_state,
+                        info.reliability,
+                        info.chunks.len()
                     );
                     info.reliability_state =
                         powerfs_layout::reliability::ReliabilityState::PendingReplicated;
+                    info.reliability = powerfs_layout::reliability::Reliability::default();
                     info.replica_chunks.clear();
                 }
                 _ => {}
@@ -6028,5 +6045,93 @@ mod tests {
         assert!(done.migration.is_none());
         assert_chunk_at(&done.chunks, T4_VID, T4_NID, 8192);
         assert!(done.inline_data.is_none());
+    }
+
+    /// P6: 数据变更时必须把 `reliability` 与 `reliability_state` 一并复位。
+    ///
+    /// 旧实现只改状态，留下 `reliability = EC{data,parity}` 配新的平铺
+    /// chunks；任何按 `reliability` 判断布局的读者（如 S3 读路径）会用
+    /// EC 布局解析平铺数据，读到校验分片垃圾。这里直接构造一个 EC 状态
+    /// 的 inode，再提交平铺 chunks，断言状态回到 PendingReplicated、策略
+    /// 回到默认、replica_chunks 被清空。
+    #[test]
+    fn test_p6_chunks_change_resets_reliability() {
+        use powerfs_layout::reliability::{Reliability, ReliabilityState};
+
+        let store = make_store();
+
+        // EC(4+2)：同一 group 的 6 个定长分片（数据 4 + 校验 2）。
+        let ec_chunk = |idx: u64| StoredFileChunk {
+            offset: idx * 4096,
+            size: 4096,
+            needle_id: 0xEC00 + idx,
+            volume_id: T4_VID,
+            crc32: 0,
+            mtime: 0,
+            is_reference: false,
+        };
+        let mut info = make_inode(1700, 1, "ec-object");
+        info.size = 8192;
+        info.blocks = 8192u64.div_ceil(512);
+        info.reliability = Reliability::EC { data: 4, parity: 2 };
+        info.reliability_state = ReliabilityState::EC;
+        info.chunks = (0..6).map(ec_chunk).collect();
+        info.replica_chunks = vec![flat_chunk(9, 0xEC01, 4096)];
+        store.inodes.write().unwrap().insert(1700, info);
+
+        // 数据更新（chunks 变化）→ 可靠性状态与策略必须自洽复位。
+        store
+            .update_inode_size_chunks_atomic(
+                1700,
+                4096,
+                vec![flat_chunk(T4_VID, 0xBEEF, 4096)],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let updated = store.get_inode(1700).unwrap();
+        assert_eq!(
+            updated.reliability_state,
+            ReliabilityState::PendingReplicated
+        );
+        assert_eq!(updated.reliability, Reliability::default());
+        assert!(updated.replica_chunks.is_empty(), "旧副本列表必须清空");
+        assert_eq!(updated.chunks.len(), 1, "新平铺布局已生效");
+        assert_eq!(updated.chunks[0].needle_id, 0xBEEF);
+    }
+
+    /// EC 待转换队列必须跳过带 `powerfs.ec-exempt` 标记的文件：
+    /// multipart 分块完成时按 chunk 顺序拼接，一旦被转成 group-major 的
+    /// EC 分片（含 offset 重叠的校验分片），最终对象会错乱。
+    #[test]
+    fn test_p6_list_pending_ec_skips_exempt() {
+        use powerfs_layout::reliability::ReliabilityState;
+
+        let store = make_store();
+
+        let mut normal = make_inode(1801, 1, "normal.bin");
+        normal.size = 4 * 1024 * 1024;
+        normal.blocks = (4 * 1024 * 1024u64).div_ceil(512);
+        normal.chunks = vec![flat_chunk(T4_VID, 0xA001, 4 * 1024 * 1024)];
+        normal.reliability_state = ReliabilityState::Replicated;
+        store.inodes.write().unwrap().insert(1801, normal);
+
+        let mut exempt = make_inode(1802, 1, "part.bin");
+        exempt.size = 4 * 1024 * 1024;
+        exempt.blocks = (4 * 1024 * 1024u64).div_ceil(512);
+        exempt.chunks = vec![flat_chunk(T4_VID, 0xA002, 4 * 1024 * 1024)];
+        exempt.reliability_state = ReliabilityState::Replicated;
+        exempt.extended.insert(
+            powerfs_common::constants::EC_EXEMPT_EXT_KEY.to_string(),
+            b"1".to_vec(),
+        );
+        store.inodes.write().unwrap().insert(1802, exempt);
+
+        let pending = store.list_pending_ec(1024 * 1024);
+        let inodes: Vec<u64> = pending.iter().map(|(inode, _)| *inode).collect();
+        assert!(inodes.contains(&1801), "普通大文件应进入待转换队列");
+        assert!(!inodes.contains(&1802), "带豁免标记的分块不得转换");
     }
 }

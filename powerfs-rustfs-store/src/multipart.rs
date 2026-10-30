@@ -146,6 +146,12 @@ impl PowerFsStore {
         let chunks = self.write_body_chunks(&body, now).await?;
         let mut extended = HashMap::new();
         extended.insert(EXT_PART_ETAG.to_string(), etag.clone().into_bytes());
+        // 分块最终会被完成流程按 chunk 顺序拼接，不能被 scrubber 转成 EC：
+        // 打上豁免标记，filer 的 EC 待转换队列会跳过该 inode。
+        extended.insert(
+            powerfs_common::constants::EC_EXEMPT_EXT_KEY.to_string(),
+            b"1".to_vec(),
+        );
         self.filer
             .put_object_meta(ObjectMetaWrite {
                 bucket: MPU_BUCKET,
@@ -340,6 +346,16 @@ impl PowerFsStore {
                     stored_etag,
                     requested.etag.clone().unwrap_or_default(),
                 ));
+            }
+
+            // 分块必须保持平铺 chunk 布局：EC 分片是 group-major 且校验分片
+            // offset 与数据分片重叠，直接平移偏移拼接会写出错乱对象。
+            // 正常链路已通过 `EC_EXEMPT_EXT_KEY` 阻止转换，这里兜底拒绝历史脏数据。
+            if entry.ec_layout.is_some() {
+                return Err(Error::other(format!(
+                    "multipart part {}/{:05} was EC-converted and cannot be concatenated",
+                    upload_id, requested.part_num
+                )));
             }
 
             // 末块允许小于 5 MiB，其余分块必须满足最小大小。

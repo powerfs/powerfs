@@ -5,6 +5,10 @@
 //!
 //! Filer 侧 `PutObjectMeta` 对已存在的 key 原地替换 size/chunks，
 //! 因此覆盖写是单次 RPC，不存在「删旧建新」的窗口。
+//!
+//! 读路径按 `Entry.ec_layout` 分叉：为空走平铺 chunk 拼接；存在则由
+//! scrubber 转换过 EC，`chunks` 是 group-major 分片，必须走
+//! [`crate::ec::read_ec_range`]（含缺失分片重建）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -199,28 +203,37 @@ impl PowerFsStore {
         };
 
         // 只拉取与 [want_start, want_end) 相交的 chunk，并裁掉区间外部分。
-        let mut body = Vec::with_capacity(usize::try_from(want_end - want_start).unwrap_or(0));
-        for chunk in &entry.chunks {
-            let chunk_start = chunk.offset;
-            let chunk_end = chunk.offset.saturating_add(chunk.size);
-            if chunk_end <= want_start || chunk_start >= want_end {
-                continue;
+        // P6: EC 对象的 chunks 是 group-major 分片（校验分片 offset 与数据
+        // 分片 0 重叠），不能按平铺 offset 拼接，必须走专用读路径。
+        let body = match entry.ec_layout.as_ref() {
+            Some(ec) => self.read_ec_range(&entry, ec, want_start, want_end).await?,
+            None => {
+                let mut body =
+                    Vec::with_capacity(usize::try_from(want_end - want_start).unwrap_or(0));
+                for chunk in &entry.chunks {
+                    let chunk_start = chunk.offset;
+                    let chunk_end = chunk.offset.saturating_add(chunk.size);
+                    if chunk_end <= want_start || chunk_start >= want_end {
+                        continue;
+                    }
+                    let address = self.volume_address(chunk.volume_id).await?;
+                    let needle = self
+                        .volumes
+                        .read_needle(&address, chunk.volume_id, chunk.needle_id)
+                        .await
+                        .map_err(crate::error::from_volume)?;
+                    // needle 数据即该 chunk 的完整内容，裁出与请求区间相交的部分。
+                    let from = usize::try_from(want_start.saturating_sub(chunk_start)).unwrap_or(0);
+                    let to = usize::try_from(want_end.min(chunk_end) - chunk_start)
+                        .unwrap_or(usize::MAX)
+                        .min(needle.len());
+                    if from < to {
+                        body.extend_from_slice(&needle[from..to]);
+                    }
+                }
+                body
             }
-            let address = self.volume_address(chunk.volume_id).await?;
-            let needle = self
-                .volumes
-                .read_needle(&address, chunk.volume_id, chunk.needle_id)
-                .await
-                .map_err(crate::error::from_volume)?;
-            // needle 数据即该 chunk 的完整内容，裁出与请求区间相交的部分。
-            let from = usize::try_from(want_start.saturating_sub(chunk_start)).unwrap_or(0);
-            let to = usize::try_from(want_end.min(chunk_end) - chunk_start)
-                .unwrap_or(usize::MAX)
-                .min(needle.len());
-            if from < to {
-                body.extend_from_slice(&needle[from..to]);
-            }
-        }
+        };
 
         Ok(GetObjectReader {
             stream: Box::new(std::io::Cursor::new(body)),
@@ -515,7 +528,7 @@ impl PowerFsStore {
     }
 
     /// 由 volume id 解析出 volume server 的数据面（TLV）地址。
-    async fn volume_address(&self, volume_id: u64) -> Result<String> {
+    pub(crate) async fn volume_address(&self, volume_id: u64) -> Result<String> {
         self.master
             .get_volume_data_endpoint(&VolumeId(volume_id))
             .await

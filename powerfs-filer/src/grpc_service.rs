@@ -12,13 +12,13 @@ use super::powerfs::{
     AddShardRequest, AddShardResponse, AllocInodeBatchRequest, AllocInodeBatchResponse,
     BucketRootInfo, CreateEntryRequest, CreateEntryResponse, DeleteBucketRootRequest,
     DeleteBucketRootResponse, DeleteEntryRequest, DeleteEntryResponse, DeleteObjectMetaRequest,
-    DeleteObjectMetaResponse, DrainShardRequest, EnsureBucketRootRequest, EnsureBucketRootResponse,
-    Entry as ProtoEntry, FileChunk as ProtoFileChunk, FindInodesByVolumeRequest,
-    FindInodesByVolumeResponse, FuseAttributes, GetBucketRootRequest, GetBucketRootResponse,
-    GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest, GetEntryResponse,
-    GetObjectMetaRequest, GetObjectMetaResponse, GetShardStatsRequest, GetShardStatsResponse,
-    InodeChunkEntry, LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest,
-    LeaseRenewResponse, LeaseRequest, LeaseResponse, ListBucketRootsRequest,
+    DeleteObjectMetaResponse, DrainShardRequest, EcLayout, EnsureBucketRootRequest,
+    EnsureBucketRootResponse, Entry as ProtoEntry, FileChunk as ProtoFileChunk,
+    FindInodesByVolumeRequest, FindInodesByVolumeResponse, FuseAttributes, GetBucketRootRequest,
+    GetBucketRootResponse, GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest,
+    GetEntryResponse, GetObjectMetaRequest, GetObjectMetaResponse, GetShardStatsRequest,
+    GetShardStatsResponse, InodeChunkEntry, LeaseReleaseRequest, LeaseReleaseResponse,
+    LeaseRenewRequest, LeaseRenewResponse, LeaseRequest, LeaseResponse, ListBucketRootsRequest,
     ListBucketRootsResponse, ListEntriesRequest, ListEntriesResponse, ListObjectMetasRequest,
     ListObjectMetasResponse, ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
     LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse, PushDeltaRequest,
@@ -1161,6 +1161,38 @@ impl FilerMetaService for FilerMetaServiceImpl {
         };
         let shard_id = self.inode_to_shard_id(inode);
 
+        // extended 属性先于 chunks 生效：EC 豁免标记（powerfs.ec-exempt）
+        // 必须在新 chunk 可见之前写入，否则 scrubber 可能先看到数据后看到标记，
+        // 把 multipart 分块转成 EC 分片导致完成拼接错乱。
+        let existing = self
+            .meta_shard_manager
+            .get_entry(inode, shard_id)
+            .await
+            .map(|info| info.extended)
+            .unwrap_or_default();
+        for (key, value) in &req.extended {
+            if existing.get(key) != Some(value) {
+                if let Err(error) = self
+                    .meta_shard_manager
+                    .set_xattr(inode, shard_id, key, value.clone())
+                    .await
+                {
+                    return failure(error);
+                }
+            }
+        }
+        for key in existing.keys() {
+            if key.starts_with(S3_META_PREFIX) && !req.extended.contains_key(key) {
+                if let Err(error) = self
+                    .meta_shard_manager
+                    .remove_xattr(inode, shard_id, key)
+                    .await
+                {
+                    return failure(error);
+                }
+            }
+        }
+
         let chunks: Vec<crate::shard_store::StoredFileChunk> =
             req.chunks.iter().map(stored_chunk_from_proto).collect();
         if let Err(error) = self
@@ -1201,35 +1233,6 @@ impl FilerMetaService for FilerMetaServiceImpl {
             .await
         {
             return failure(error);
-        }
-
-        let existing = self
-            .meta_shard_manager
-            .get_entry(inode, shard_id)
-            .await
-            .map(|info| info.extended)
-            .unwrap_or_default();
-        for (key, value) in &req.extended {
-            if existing.get(key) != Some(value) {
-                if let Err(error) = self
-                    .meta_shard_manager
-                    .set_xattr(inode, shard_id, key, value.clone())
-                    .await
-                {
-                    return failure(error);
-                }
-            }
-        }
-        for key in existing.keys() {
-            if key.starts_with(S3_META_PREFIX) && !req.extended.contains_key(key) {
-                if let Err(error) = self
-                    .meta_shard_manager
-                    .remove_xattr(inode, shard_id, key)
-                    .await
-                {
-                    return failure(error);
-                }
-            }
         }
 
         Ok(Response::new(PutObjectMetaResponse {
@@ -1386,7 +1389,78 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
         owner: "".to_string(),
         generation: 0,
         version: inode.version,
+        ec_layout: ec_layout_from_inode(inode),
     }
+}
+
+/// P6: 从 inode 的可靠性状态推导 `EcLayout`，仅对真正的 EC 对象返回 `Some`。
+///
+/// **状态是唯一权威**：`reliability_state == EC` 才认为 `chunks` 是
+/// group-major 分片列表。`reliability` 字段只用于拿 data/parity，并做
+/// 一致性校验 —— 两者不符说明元数据陈旧（例如数据变更后 `reliability`
+/// 未复位），此时记 warn 且返回 `None`，让读者退回平铺路径，**绝不**
+/// 用错布局解析用户数据。
+pub(crate) fn ec_layout_from_inode(inode: &crate::shard_store::InodeInfo) -> Option<EcLayout> {
+    ec_layout_from_parts(
+        inode.inode,
+        &inode.reliability_state,
+        &inode.reliability,
+        inode.chunks.len(),
+    )
+}
+
+/// `ec_layout_from_inode` 的纯函数部分（便于脱离 `InodeInfo` 做单测）。
+fn ec_layout_from_parts(
+    inode: u64,
+    state: &powerfs_layout::reliability::ReliabilityState,
+    reliability: &powerfs_layout::reliability::Reliability,
+    chunk_count: usize,
+) -> Option<EcLayout> {
+    use powerfs_layout::reliability::{Reliability, ReliabilityState};
+
+    if *state != ReliabilityState::EC {
+        return None;
+    }
+
+    let Reliability::EC { data, parity } = *reliability else {
+        log::warn!(
+            "P6: inode {} state=EC but reliability={:?} — metadata inconsistent, \
+             reporting flat layout (readers must not parse as EC)",
+            inode,
+            reliability
+        );
+        return None;
+    };
+
+    if data == 0 || parity == 0 || chunk_count == 0 {
+        log::warn!(
+            "P6: inode {} state=EC but layout invalid (data={}, parity={}, chunks={}) \
+             — reporting flat layout",
+            inode,
+            data,
+            parity,
+            chunk_count
+        );
+        return None;
+    }
+
+    let total = (data + parity) as usize;
+    if !chunk_count.is_multiple_of(total) {
+        log::warn!(
+            "P6: inode {} state=EC but chunks.len={} is not a multiple of data+parity={} \
+             — reporting flat layout",
+            inode,
+            chunk_count,
+            total
+        );
+        return None;
+    }
+
+    Some(EcLayout {
+        data_shards: data,
+        parity_shards: parity,
+        shard_size: crate::scrubber::EC_SHARD_SIZE as u32,
+    })
 }
 
 fn proto_chunk_from_stored(chunk: &crate::shard_store::StoredFileChunk) -> ProtoFileChunk {
@@ -1435,4 +1509,66 @@ fn validate_object_key(key: &str) -> Result<(), String> {
         return Err(format!("invalid object key: {key}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod ec_layout_tests {
+    use super::*;
+    use powerfs_layout::reliability::{Reliability, ReliabilityState};
+
+    fn ec(data: u32, parity: u32) -> Reliability {
+        Reliability::EC { data, parity }
+    }
+
+    #[test]
+    fn non_ec_states_report_flat_layout() {
+        for state in [
+            ReliabilityState::PendingReplicated,
+            ReliabilityState::Replicated,
+            ReliabilityState::PendingEC,
+            ReliabilityState::Degraded,
+        ] {
+            assert!(
+                ec_layout_from_parts(7, &state, &ec(4, 2), 12).is_none(),
+                "state {:?} 不应报告 EC 布局",
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn ec_state_with_matching_reliability_reports_layout() {
+        let layout = ec_layout_from_parts(42, &ReliabilityState::EC, &ec(4, 2), 12)
+            .expect("EC(4+2) 且 chunks 为 12 (2 组) 时应报告布局");
+        assert_eq!(layout.data_shards, 4);
+        assert_eq!(layout.parity_shards, 2);
+        assert_eq!(layout.shard_size, 1024 * 1024);
+    }
+
+    /// 关键防呆：状态 EC 但 reliability 仍是旧的 Replicated/SingleReplica
+    /// （即数据变更后 reliability 未复位的历史脏数据）必须退回平铺读。
+    #[test]
+    fn ec_state_with_stale_reliability_falls_back_to_flat() {
+        assert!(ec_layout_from_parts(
+            9,
+            &ReliabilityState::EC,
+            &Reliability::Replicated { count: 2 },
+            8
+        )
+        .is_none());
+        assert!(
+            ec_layout_from_parts(9, &ReliabilityState::EC, &Reliability::SingleReplica, 8)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ec_state_with_inconsistent_chunk_count_falls_back_to_flat() {
+        // 7 个 chunk 不是 4+2 的整数倍 → 布局不可信
+        assert!(ec_layout_from_parts(11, &ReliabilityState::EC, &ec(4, 2), 7).is_none());
+        // 空 chunks
+        assert!(ec_layout_from_parts(11, &ReliabilityState::EC, &ec(4, 2), 0).is_none());
+        // data=0 的非法配置
+        assert!(ec_layout_from_parts(11, &ReliabilityState::EC, &ec(0, 2), 2).is_none());
+    }
 }
