@@ -1669,6 +1669,7 @@ mod compression_tests {
             compression_algo: CompressionAlgo::None,
             compression_ratio_x100: 0,
             compression_original_size: 0,
+            compression_original_chunk_fp: None,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Flat,
             migration: None,

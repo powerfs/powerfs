@@ -185,6 +185,11 @@ pub struct InodeInfo {
     pub compression_ratio_x100: u16,
     #[serde(default)]
     pub compression_original_size: u64,
+    // P7: 压缩前原始 chunks 的 (volume_id, needle_id, offset, size) 指纹。
+    // 用于 set_chunks 区分「只读 open 回传的 stale 原始 chunks」与「真实覆写的新 chunks」：
+    // 命中指纹 → stale sync，不重置压缩态；不命中 → 真实覆写，重置压缩态。
+    #[serde(default)]
+    pub compression_original_chunk_fp: Option<Vec<u8>>,
     // P4: 副本位置信息 (Replicated 模式下, 记录副本所在的 volume_id + needle_id)
     // 主副本在 chunks[].volume_id / chunks[].needle_id, 副本在 replica_chunks[]
     #[serde(default)]
@@ -239,6 +244,7 @@ impl InodeInfo {
             compression_algo: powerfs_common::compression::CompressionAlgo::default(),
             compression_ratio_x100: 0,
             compression_original_size: 0,
+            compression_original_chunk_fp: None,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -297,6 +303,20 @@ pub struct StoredFileChunk {
     /// `crc32` 始终是存储（压缩后）字节的 CRC；None = 未压缩（默认）。
     #[serde(default)]
     pub compression: powerfs_common::compression::CompressionAlgo,
+}
+
+/// P7: 计算 chunks 的指纹（volume_id + needle_id + offset + size 的字节拼接）。
+/// 用于区分压缩前的原始 chunks 与覆写后的新 chunks：stale sync 回传的原始 chunks
+/// 指纹与压缩时记录的一致，真实覆写的新 chunks 指纹不同。
+fn chunk_fingerprint(chunks: &[StoredFileChunk]) -> Vec<u8> {
+    let mut fp = Vec::with_capacity(chunks.len() * 32);
+    for c in chunks {
+        fp.extend_from_slice(&c.volume_id.to_le_bytes());
+        fp.extend_from_slice(&c.needle_id.to_le_bytes());
+        fp.extend_from_slice(&c.offset.to_le_bytes());
+        fp.extend_from_slice(&c.size.to_le_bytes());
+    }
+    fp
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1711,6 +1731,7 @@ impl ShardStore {
             compression_algo: powerfs_common::compression::CompressionAlgo::default(),
             compression_ratio_x100: 0,
             compression_original_size: 0,
+            compression_original_chunk_fp: None,
             replica_chunks: Vec::new(),
             // Layout-prediction: new files start as Empty, layout decided
             // on first write by LayoutPredictor or auto_promote fallback.
@@ -1800,6 +1821,7 @@ impl ShardStore {
             compression_algo: powerfs_common::compression::CompressionAlgo::default(),
             compression_ratio_x100: 0,
             compression_original_size: 0,
+            compression_original_chunk_fp: None,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -2006,6 +2028,7 @@ impl ShardStore {
             compression_algo: powerfs_common::compression::CompressionAlgo::default(),
             compression_ratio_x100: 0,
             compression_original_size: 0,
+            compression_original_chunk_fp: None,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -3884,7 +3907,20 @@ impl ShardStore {
         // This cleanly separates concerns:
         //   - Data sync (this function): size, chunks, inline_data
         //   - Metadata sync (SETATTR via Raft): mode, uid, gid, mtime, atime
-        let chunks_changed = info.chunks != chunks;
+        let mut chunks_changed = info.chunks != chunks;
+
+        // P7: 压缩态下，FUSE 只读 open/release 会回传压缩前的原始（未压缩）chunks，
+        // 与已存储的压缩 chunks 必然不等，导致 chunks_changed=true 误触发压缩态重置。
+        // 用原始 chunks 指纹区分：命中 → stale sync，视为未变化（保留压缩态与压缩 chunks）；
+        // 不命中 → 真实覆写（新 needle_id），正常走重置流程。
+        if chunks_changed
+            && info.compression_state == powerfs_layout::reliability::CompressionState::Compressed
+        {
+            let fp_in = chunk_fingerprint(&chunks);
+            if info.compression_original_chunk_fp.as_deref() == Some(fp_in.as_slice()) {
+                chunks_changed = false;
+            }
+        }
 
         // IsAppend mode: atomically append inline_data to the existing
         // inline_data instead of overwriting. This prevents lost updates
@@ -4187,6 +4223,7 @@ impl ShardStore {
             info.compression_algo = powerfs_common::compression::CompressionAlgo::default();
             info.compression_ratio_x100 = 0;
             info.compression_original_size = 0;
+            info.compression_original_chunk_fp = None;
         }
         let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
         // sync 写保证 close sync 账本强持久化
@@ -4665,6 +4702,8 @@ impl ShardStore {
             ratio_x100,
             original_size
         );
+        // 记录原始（未压缩）chunks 指纹，供 set_chunks 区分 stale sync 与真实覆写。
+        info.compression_original_chunk_fp = Some(chunk_fingerprint(&info.chunks));
         info.chunks = chunks;
         info.replica_chunks = replica_chunks;
         info.compression_state = CompressionState::Compressed;
@@ -4828,6 +4867,7 @@ impl ShardStore {
             compression_algo: powerfs_common::compression::CompressionAlgo::default(),
             compression_ratio_x100: 0,
             compression_original_size: 0,
+            compression_original_chunk_fp: None,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -5061,6 +5101,7 @@ mod tests {
             compression_algo: powerfs_common::compression::CompressionAlgo::default(),
             compression_ratio_x100: 0,
             compression_original_size: 0,
+            compression_original_chunk_fp: None,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
