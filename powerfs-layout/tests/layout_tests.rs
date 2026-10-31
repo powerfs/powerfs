@@ -42,6 +42,7 @@ fn make_chunk(offset: u64, size: u64, needle: u64, vol: u64) -> ChunkRef {
         volume_id: vol,
         crc32: 0xDEAD_BEEF,
         mtime: 1700000000,
+        compression: powerfs_layout::encoding::CompressionAlgo::None,
     }
 }
 

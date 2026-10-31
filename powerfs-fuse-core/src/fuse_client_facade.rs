@@ -151,6 +151,8 @@ pub(crate) fn traits_entry_to_proto(entry: &powerfs_common::traits::Entry) -> Pr
         symlink_target: entry.symlink_target.clone(),
         owner: entry.owner.clone(),
         generation: entry.generation,
+        // FUSE 客户端不使用 master proto 的 EC 布局字段（P6 新增），显式占位。
+        ec_layout: None,
     }
 }
 

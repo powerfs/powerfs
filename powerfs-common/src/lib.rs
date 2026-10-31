@@ -1,4 +1,5 @@
 pub mod build_info;
+pub mod compression;
 pub mod config;
 pub mod constants;
 pub mod debug_config_poller;

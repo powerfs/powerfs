@@ -22,10 +22,20 @@
 //! | 24 | 8 | volume_id (u64) |
 //! | 32 | 4 | crc32 (u32) |
 //! | 36 | 8 | mtime (u64) |
+//!
+//! ## P7 压缩算法 trailing 区段（可选，追加在 chunk 列表之后）
+//!
+//! | 偏移 | 长度 | 字段 |
+//! |------|------|------|
+//! | 0  | 4 | algo_count (u32, 必须 == chunk 数) |
+//! | 4  | algo_count | 每 chunk 算法 tag (0=None, 1=Zstd) |
+//!
+//! 仅当存在任一压缩 chunk 时写入；旧解码器（含内核 powerfs_net_inode.c）
+//! 读完 `count × 44` 字节即停，天然忽略该区段。缺失/损坏一律按 None 处理。
 
 use powerfs_net::{FieldId, TlvDecoder, TlvEncoder};
 
-use crate::encoding::{ChunkEncoding, ChunkRef};
+use crate::encoding::{ChunkEncoding, ChunkRef, CompressionAlgo};
 use crate::error::{LayoutError, LayoutResult};
 use crate::layout::FileLayout;
 use crate::placement::Placement;
@@ -446,6 +456,7 @@ fn encode_encoding(enc: &mut TlvEncoder, encoding: &ChunkEncoding) -> LayoutResu
             for chunk in chunks {
                 encode_chunk_ref(&mut buf, chunk);
             }
+            encode_compression_trailer(&mut buf, chunks);
         }
         ChunkEncoding::StripeDescriptor {
             start_needle_id,
@@ -478,10 +489,27 @@ fn encode_encoding(enc: &mut TlvEncoder, encoding: &ChunkEncoding) -> LayoutResu
             for chunk in chunks {
                 encode_chunk_ref(&mut buf, chunk);
             }
+            encode_compression_trailer(&mut buf, chunks);
         }
     }
     enc.add_bytes(FieldId::ChunkLayout, &buf)?;
     Ok(())
+}
+
+/// P7 压缩算法 trailing 区段：仅当存在任一压缩 chunk 时，在 chunk 列表之后追加
+/// `[algo_count u32 LE][algo u8 × count]`。ChunkRef 固定 44 字节布局不变，
+/// 旧解码器（含内核 powerfs_net_inode.c）读完 `count × 44` 字节即停，天然忽略该区段。
+fn encode_compression_trailer(buf: &mut Vec<u8>, chunks: &[ChunkRef]) {
+    if chunks
+        .iter()
+        .all(|c| c.compression == CompressionAlgo::None)
+    {
+        return;
+    }
+    buf.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    for c in chunks {
+        buf.push(c.compression.to_tag());
+    }
 }
 
 /// 从复合 bytes 解码 ChunkEncoding
@@ -641,7 +669,10 @@ fn encode_chunk_ref(buf: &mut Vec<u8>, chunk: &ChunkRef) {
     buf.extend_from_slice(&chunk.mtime.to_le_bytes());
 }
 
-/// 从指定偏移解码 chunk 列表
+/// 从指定偏移解码 chunk 列表；并解析 P7 压缩算法 trailing 区段。
+///
+/// trailing 缺失（旧数据/旧客户端编码）或与 chunk 数不一致时，全部按 `None` 处理，
+/// 绝不因 trailing 损坏而让整个布局解析失败（避免误拒老数据）。
 fn decode_chunk_list(bytes: &[u8], offset: usize, count: usize) -> LayoutResult<Vec<ChunkRef>> {
     let needed = count * CHUNK_REF_SIZE;
     let slice = bytes.get(offset..offset + needed).ok_or_else(|| {
@@ -662,7 +693,24 @@ fn decode_chunk_list(bytes: &[u8], offset: usize, count: usize) -> LayoutResult<
             volume_id: u64::from_le_bytes(chunk_bytes[24..32].try_into().unwrap()),
             crc32: u32::from_le_bytes(chunk_bytes[32..36].try_into().unwrap()),
             mtime: u64::from_le_bytes(chunk_bytes[36..44].try_into().unwrap()),
+            compression: CompressionAlgo::None,
         });
+    }
+
+    // P7: 解析压缩算法 trailing 区段（见 encode_compression_trailer）。
+    if let Some(rest) = bytes.get(offset + needed..) {
+        if let Some(algo_count) = read_u32_at(rest, 0) {
+            let algo_count = algo_count as usize;
+            if algo_count == count {
+                if let Some(algos) = rest.get(4..4 + algo_count) {
+                    for (chunk, &tag) in chunks.iter_mut().zip(algos.iter()) {
+                        // 未知 tag 按 None 处理（前向兼容未来新增算法）
+                        chunk.compression =
+                            CompressionAlgo::from_tag(tag).unwrap_or(CompressionAlgo::None);
+                    }
+                }
+            }
+        }
     }
     Ok(chunks)
 }
@@ -753,6 +801,7 @@ mod tests {
             volume_id: vol,
             crc32: 0xDEAD_BEEF,
             mtime: 1700000000,
+            compression: CompressionAlgo::None,
         }
     }
 
@@ -998,6 +1047,117 @@ mod tests {
             let tag = compression_state_to_u8(state);
             let back = u8_to_compression_state(tag).unwrap();
             assert_eq!(&back, state);
+        }
+    }
+
+    // ---- P7: 逐 chunk 压缩算法 trailing 区段 ----
+
+    fn make_p7_chunk(needle_id: u64, algo: CompressionAlgo) -> ChunkRef {
+        ChunkRef {
+            offset: needle_id * 4096,
+            size: 4096,
+            needle_id,
+            volume_id: 7,
+            crc32: 0,
+            mtime: 0,
+            compression: algo,
+        }
+    }
+
+    #[test]
+    fn p7_compression_trailer_round_trip() {
+        // 混合算法 chunk：部分压缩部分不压缩
+        let layout = FileLayout {
+            placement: Placement::Flat,
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::Replicated,
+            compression: CompressionState::None,
+            encoding: ChunkEncoding::PerChunk {
+                chunks: vec![
+                    make_p7_chunk(1, CompressionAlgo::Zstd),
+                    make_p7_chunk(2, CompressionAlgo::None),
+                    make_p7_chunk(3, CompressionAlgo::Zstd),
+                ],
+            },
+        };
+        let decoded = round_trip(&layout);
+        match decoded.encoding {
+            ChunkEncoding::PerChunk { chunks } => {
+                assert_eq!(chunks.len(), 3);
+                assert_eq!(chunks[0].compression, CompressionAlgo::Zstd);
+                assert_eq!(chunks[1].compression, CompressionAlgo::None);
+                assert_eq!(chunks[2].compression, CompressionAlgo::Zstd);
+            }
+            other => panic!("unexpected encoding {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p7_no_trailer_when_all_uncompressed() {
+        // 全部未压缩：字节流必须与旧格式完全一致（无 trailing），保证旧解码器无感知。
+        let layout = FileLayout {
+            placement: Placement::Flat,
+            reliability: Reliability::SingleReplica,
+            reliability_state: ReliabilityState::Replicated,
+            compression: CompressionState::None,
+            encoding: ChunkEncoding::PerChunk {
+                chunks: vec![
+                    make_p7_chunk(1, CompressionAlgo::None),
+                    make_p7_chunk(2, CompressionAlgo::None),
+                ],
+            },
+        };
+        let mut enc = TlvEncoder::new();
+        encode_file_layout(&mut enc, &layout, 0).unwrap();
+        let bytes = enc.into_bytes();
+        // 找到 ChunkLayout 字段并确认其长度 == 1(tag) + 4(count) + 2*44（无 trailing）
+        let mut dec = powerfs_net::TlvDecoder::new(&bytes);
+        let mut found = false;
+        while let Some((field, length)) = dec.next_field() {
+            if field == powerfs_net::FieldId::ChunkLayout {
+                assert_eq!(length as usize, 1 + 4 + 2 * 44, "未压缩时必须无 trailing");
+                found = true;
+                break;
+            }
+            dec.skip(length).unwrap();
+        }
+        assert!(found);
+    }
+
+    #[test]
+    fn p7_decode_legacy_bytes_without_trailer() {
+        // 手工构造旧格式字节（无 trailing）：解码后 compression 全为 None。
+        let mut body = vec![1u8]; // PER_CHUNK tag
+        body.extend_from_slice(&1u32.to_le_bytes());
+        let c = make_p7_chunk(9, CompressionAlgo::Zstd);
+        encode_chunk_ref(&mut body, &c); // 只写 44 字节，不带 trailing
+        let enc = decode_encoding(&body).unwrap();
+        match enc {
+            ChunkEncoding::PerChunk { chunks } => {
+                assert_eq!(chunks.len(), 1);
+                assert_eq!(chunks[0].compression, CompressionAlgo::None);
+            }
+            other => panic!("unexpected encoding {:?}", other),
+        }
+    }
+
+    #[test]
+    fn p7_decode_corrupt_trailer_falls_back_to_none() {
+        // trailing 的 algo_count 与 chunk 数不一致 → 整体按 None，不报错。
+        let mut body = vec![1u8];
+        body.extend_from_slice(&2u32.to_le_bytes());
+        encode_chunk_ref(&mut body, &make_p7_chunk(1, CompressionAlgo::Zstd));
+        encode_chunk_ref(&mut body, &make_p7_chunk(2, CompressionAlgo::Zstd));
+        body.extend_from_slice(&99u32.to_le_bytes()); // 错误的 algo_count
+        body.extend_from_slice(&[1u8, 1u8]);
+        let enc = decode_encoding(&body).unwrap();
+        match enc {
+            ChunkEncoding::PerChunk { chunks } => {
+                assert!(chunks
+                    .iter()
+                    .all(|c| c.compression == CompressionAlgo::None));
+            }
+            other => panic!("unexpected encoding {:?}", other),
         }
     }
 
@@ -1474,6 +1634,7 @@ mod tests {
             volume_id: 0x3132_3334_3536_3738,
             crc32: 0x4142_4344,
             mtime: 0x5152_5354_5556_5758,
+            compression: CompressionAlgo::None,
         };
         let mut buf = Vec::new();
         encode_chunk_ref(&mut buf, &chunk);
@@ -1496,6 +1657,7 @@ mod tests {
             volume_id: 42,
             crc32: 0xCAFE_BABE,
             mtime: 1699999999,
+            compression: CompressionAlgo::None,
         };
         let mut buf = Vec::new();
         encode_chunk_ref(&mut buf, &chunk);
@@ -1658,6 +1820,7 @@ mod tests {
                 volume_id: 10 + (i % 4),
                 crc32: i as u32,
                 mtime: 1700000000 + i,
+                compression: CompressionAlgo::None,
             })
             .collect();
         let layout = FileLayout {

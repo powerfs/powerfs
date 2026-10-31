@@ -60,6 +60,8 @@ impl From<ChunkWire> for powerfs_layout::ChunkRef {
             volume_id: w.volume_id,
             crc32: w.crc32,
             mtime: w.mtime,
+            // ChunkWire 是 P2 遗留桥接格式，不含压缩信息；按未压缩处理。
+            compression: powerfs_layout::encoding::CompressionAlgo::None,
         }
     }
 }
@@ -183,6 +185,7 @@ mod tests {
             volume_id: 7,
             crc32: 0,
             mtime: 0,
+            compression: powerfs_layout::encoding::CompressionAlgo::None,
         };
         let wire: ChunkWire = chunk_ref.into();
         assert_eq!(wire.offset, 0);

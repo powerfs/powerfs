@@ -87,6 +87,8 @@ fn build_create_tlv_with_chunks(
                 volume_id: c.volume_id,
                 crc32: c.crc32,
                 mtime: c.mtime,
+                // 客户端写入的永远是未压缩数据（压缩仅由 Filer 后台 worker 产生）。
+                compression: powerfs_layout::encoding::CompressionAlgo::None,
             })
             .collect();
         let layout = FileLayout {

@@ -1566,6 +1566,8 @@ impl MetaShardClient {
                     volume_id: c.volume_id,
                     crc32: c.crc32,
                     mtime: c.mtime,
+                    // 客户端写入的永远是未压缩数据（压缩仅由 Filer 后台 worker 产生）。
+                    compression: powerfs_layout::encoding::CompressionAlgo::None,
                 })
                 .collect();
             let layout = FileLayout {
@@ -2392,6 +2394,9 @@ fn parse_replica_chunks_from_body(body: &[u8]) -> Vec<powerfs_layout::encoding::
             volume_id: u64::from_le_bytes(bytes[base + 24..base + 32].try_into().unwrap()),
             crc32: u32::from_le_bytes(bytes[base + 32..base + 36].try_into().unwrap()),
             mtime: u64::from_le_bytes(bytes[base + 36..base + 44].try_into().unwrap()),
+            // TODO(P7-Task5): 该手工解码未解析压缩 trailing 区段，
+            // 压缩 chunk 经此路径会丢算法标记；Task 5 统一改用 layout codec 并挂解压缓存。
+            compression: powerfs_layout::encoding::CompressionAlgo::None,
         });
     }
     chunks

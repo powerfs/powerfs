@@ -8,6 +8,8 @@
 
 use crate::error::LayoutError;
 
+pub use powerfs_common::compression::CompressionAlgo;
+
 /// 单 chunk 引用
 ///
 /// 从 `powerfs_coherence::ChunkWire` 演进, 替代其作为 chunk wire 格式.
@@ -15,16 +17,20 @@ use crate::error::LayoutError;
 pub struct ChunkRef {
     /// 文件内偏移
     pub offset: u64,
-    /// chunk 大小
+    /// chunk 大小（逻辑字节数；压缩 chunk 的 needle 实际字节会更短）
     pub size: u64,
     /// volume server 上的 needle id
     pub needle_id: u64,
     /// 所在 volume
     pub volume_id: u64,
-    /// CRC32 校验
+    /// CRC32 校验（对**存储字节**计算：压缩 chunk 校验压缩后的内容）
     pub crc32: u32,
     /// 修改时间 (Unix epoch)
     pub mtime: u64,
+    /// P7: 该 chunk needle 内容的压缩算法。`None` = 未压缩（旧数据默认）。
+    /// wire 编码见 `codec.rs` 的 ChunkLayout trailing 区段。
+    #[serde(default)]
+    pub compression: CompressionAlgo,
 }
 
 /// Chunk 编码方式
@@ -173,6 +179,7 @@ impl ChunkEncoding {
                             volume_id: volume_ids[vol_idx],
                             crc32: 0,
                             mtime: 0,
+                            compression: CompressionAlgo::None,
                         }
                     })
                     .collect()
@@ -206,6 +213,7 @@ impl ChunkEncoding {
                         volume_id: volume_ids[vol_idx],
                         crc32: 0,
                         mtime: 0,
+                        compression: CompressionAlgo::None,
                     });
                 }
                 Ok(ChunkEncoding::PerChunk { chunks })
@@ -239,6 +247,7 @@ mod tests {
                     volume_id: 10,
                     crc32: 0,
                     mtime: 0,
+                    compression: CompressionAlgo::None,
                 },
                 ChunkRef {
                     offset: 1024,
@@ -247,6 +256,7 @@ mod tests {
                     volume_id: 10,
                     crc32: 0,
                     mtime: 0,
+                    compression: CompressionAlgo::None,
                 },
             ],
         };
@@ -303,6 +313,7 @@ mod tests {
             volume_id: vol_id,
             crc32: 0,
             mtime: 0,
+            compression: CompressionAlgo::None,
         }
     }
 

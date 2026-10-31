@@ -1526,6 +1526,7 @@ impl FilerNetHandler {
                         volume_id: c.volume_id,
                         crc32: c.crc32,
                         mtime: c.mtime,
+                        compression: powerfs_layout::encoding::CompressionAlgo::None,
                     })
                     .collect();
 
@@ -1569,6 +1570,7 @@ impl FilerNetHandler {
                         volume_id: c.volume_id,
                         crc32: c.crc32,
                         mtime: c.mtime,
+                        compression: powerfs_layout::encoding::CompressionAlgo::None,
                     })
                     .collect();
 
@@ -1650,6 +1652,7 @@ impl FilerNetHandler {
                         volume_id: c.volume_id,
                         crc32: c.crc32,
                         mtime: c.mtime,
+                        compression: powerfs_layout::encoding::CompressionAlgo::None,
                     })
                     .collect();
 
@@ -2500,6 +2503,7 @@ impl FilerNetHandler {
                                 volume_id,
                                 crc32: 0,
                                 mtime: 0,
+                                compression: powerfs_layout::encoding::CompressionAlgo::None,
                             }],
                         },
                     };
@@ -2550,6 +2554,7 @@ impl FilerNetHandler {
                             volume_id: *vid,
                             crc32: 0,
                             mtime: 0,
+                            compression: powerfs_layout::encoding::CompressionAlgo::None,
                         })
                         .collect();
                     info!(

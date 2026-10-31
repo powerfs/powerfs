@@ -82,3 +82,5 @@ dashmap = { version = "5" }
 lru = { version = "0.12" }
 rocksdb = { version = "0.22", features = ["snappy", "zstd", "lz4"], default-features = false }
 clap = { version = "4.4", features = ["derive"] }
+# P7 副本压缩：zstd 编解码（纯 zstd-safe，不开多线程特性，压缩 worker 自身限流）。
+zstd = { version = "0.13", default-features = false }
