@@ -208,30 +208,11 @@ impl PowerFsStore {
         let body = match entry.ec_layout.as_ref() {
             Some(ec) => self.read_ec_range(&entry, ec, want_start, want_end).await?,
             None => {
-                let mut body =
-                    Vec::with_capacity(usize::try_from(want_end - want_start).unwrap_or(0));
-                for chunk in &entry.chunks {
-                    let chunk_start = chunk.offset;
-                    let chunk_end = chunk.offset.saturating_add(chunk.size);
-                    if chunk_end <= want_start || chunk_start >= want_end {
-                        continue;
-                    }
-                    let address = self.volume_address(chunk.volume_id).await?;
-                    let needle = self
-                        .volumes
-                        .read_needle(&address, chunk.volume_id, chunk.needle_id)
-                        .await
-                        .map_err(crate::error::from_volume)?;
-                    // needle 数据即该 chunk 的完整内容，裁出与请求区间相交的部分。
-                    let from = usize::try_from(want_start.saturating_sub(chunk_start)).unwrap_or(0);
-                    let to = usize::try_from(want_end.min(chunk_end) - chunk_start)
-                        .unwrap_or(usize::MAX)
-                        .min(needle.len());
-                    if from < to {
-                        body.extend_from_slice(&needle[from..to]);
-                    }
-                }
-                body
+                let this = self;
+                read_flat_range_with(&entry.chunks, want_start, want_end, move |volume_id, needle_id| async move {
+                    this.read_needle_raw(volume_id, needle_id).await
+                })
+                .await?
             }
         };
 
@@ -243,7 +224,68 @@ impl PowerFsStore {
             body_source: GetObjectBodySource::Unprobed,
         })
     }
+}
 
+/// `read_object` 平铺分支的可测试内核：needle 读取由 `load_needle` 注入。
+///
+/// 逐 chunk 读取 needle；若 `chunk.compression != 0` 则先解压并断言解压后
+/// 长度等于逻辑 `chunk.size`（不符视为元数据自洽失败，返回 IO 错误，
+/// 绝不把压缩字节或截断数据交给上层）。最后按 `[want_start, want_end)`
+/// 裁出与请求区间相交的字节。
+pub(crate) async fn read_flat_range_with<F, Fut>(
+    chunks: &[FileChunk],
+    want_start: u64,
+    want_end: u64,
+    mut load_needle: F,
+) -> Result<Vec<u8>>
+where
+    F: FnMut(u64, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>>>,
+{
+    use powerfs_common::compression::{decompress, CompressionAlgo};
+
+    let mut body = Vec::with_capacity(usize::try_from(want_end.saturating_sub(want_start)).unwrap_or(0));
+    for chunk in chunks {
+        let chunk_start = chunk.offset;
+        let chunk_end = chunk.offset.saturating_add(chunk.size);
+        if chunk_end <= want_start || chunk_start >= want_end {
+            continue;
+        }
+        let needle = load_needle(chunk.volume_id, chunk.needle_id).await?;
+        // P7: chunk 可能被 scrubber 压缩（compression tag != 0）。
+        // 解压后必须等于逻辑长度 chunk.size，否则元数据不自洽。
+        let algo = CompressionAlgo::from_tag(chunk.compression as u8)
+            .unwrap_or(CompressionAlgo::None);
+        let data = if algo.is_compressed() {
+            let plain = decompress(algo, &needle).map_err(|e| {
+                Error::other(format!(
+                    "decompress chunk failed (volume={} needle={:#x} algo={:?}): {}",
+                    chunk.volume_id, chunk.needle_id, algo, e
+                ))
+            })?;
+            if plain.len() as u64 != chunk.size {
+                return Err(Error::other(format!(
+                    "decompressed length mismatch: expected {} (chunk.size), got {} (volume={} needle={:#x})",
+                    chunk.size, plain.len(), chunk.volume_id, chunk.needle_id
+                )));
+            }
+            plain
+        } else {
+            needle
+        };
+        // data 为该 chunk 的完整逻辑内容，裁出与请求区间相交的部分。
+        let from = usize::try_from(want_start.saturating_sub(chunk_start)).unwrap_or(0);
+        let to = usize::try_from(want_end.min(chunk_end) - chunk_start)
+            .unwrap_or(usize::MAX)
+            .min(data.len());
+        if from < to {
+            body.extend_from_slice(&data[from..to]);
+        }
+    }
+    Ok(body)
+}
+
+impl PowerFsStore {
     /// 删除对象：先删元数据，再尽力删 needle。
     pub(crate) async fn remove_object(
         &self,
@@ -714,6 +756,21 @@ fn canonicalize_etag(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use powerfs_common::compression::{compress, CompressionAlgo};
+    use powerfs_master::filer_proto::powerfs::FileChunk;
+
+    /// 构造一个 FileChunk（默认未压缩）。
+    fn chunk(offset: u64, size: u64, needle_id: u64, compression: u32) -> FileChunk {
+        FileChunk {
+            offset,
+            size,
+            mtime: 0,
+            needle_id,
+            volume_id: 1,
+            crc32: 0,
+            compression,
+        }
+    }
 
     #[test]
     fn if_none_match_blocks_matching_etag() {
@@ -740,5 +797,96 @@ mod tests {
     #[test]
     fn blank_conditions_are_ignored() {
         assert!(!should_prevent_write(Some("abc"), Some("  "), Some("")));
+    }
+
+    /// P7 Task 4: 压缩 chunk 全量读返回解压后的原始数据。
+    #[tokio::test]
+    async fn compressed_chunk_full_read_returns_original() {
+        let plain = b"powerfs compression test line with repetitive content abcdefghij\n"
+            .iter()
+            .cycle()
+            .take(64 * 1024)
+            .copied()
+            .collect::<Vec<u8>>();
+        let compressed = compress(CompressionAlgo::Zstd, &plain).unwrap();
+        let chunks = vec![chunk(0, plain.len() as u64, 0x1001, CompressionAlgo::Zstd.to_tag() as u32)];
+
+        let body = read_flat_range_with(&chunks, 0, plain.len() as u64, |_v, _n| {
+            let c = compressed.clone();
+            async move { Ok(c) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(body, plain);
+    }
+
+    /// P7 Task 4: 压缩 chunk 区间读返回正确切片。
+    #[tokio::test]
+    async fn compressed_chunk_range_read_slices_correctly() {
+        let plain: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let compressed = compress(CompressionAlgo::Zstd, &plain).unwrap();
+        let chunks = vec![chunk(0, plain.len() as u64, 0x1002, CompressionAlgo::Zstd.to_tag() as u32)];
+
+        // 读 [100, 500)
+        let body = read_flat_range_with(&chunks, 100, 500, |_v, _n| {
+            let c = compressed.clone();
+            async move { Ok(c) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(body, &plain[100..500]);
+    }
+
+    /// P7 Task 4: 解压后长度与 chunk.size 不符必须报错（元数据自洽失败），
+    /// 绝不返回截断/错误数据。
+    #[tokio::test]
+    async fn compressed_chunk_length_mismatch_errors() {
+        let plain: Vec<u8> = (0..1024u32).map(|i| i as u8).collect();
+        let compressed = compress(CompressionAlgo::Zstd, &plain).unwrap();
+        // chunk.size 故意写错（比真实解压长度大）
+        let chunks = vec![chunk(0, 9999, 0x1003, CompressionAlgo::Zstd.to_tag() as u32)];
+
+        let result = read_flat_range_with(&chunks, 0, 9999, |_v, _n| {
+            let c = compressed.clone();
+            async move { Ok(c) }
+        })
+        .await;
+
+        assert!(result.is_err(), "长度不符必须报错");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("decompressed length mismatch"), "错误信息应说明长度不符: {msg}");
+    }
+
+    /// P7 Task 4: 混合 chunk（部分压缩、部分未压缩）按各自算法处理，
+    /// 拼接结果与原文一致。
+    #[tokio::test]
+    async fn mixed_compressed_and_plain_chunks_read_correctly() {
+        // 两个 chunk：第一个未压缩，第二个压缩。
+        let part0: Vec<u8> = (0..2048u32).map(|i| (i % 7) as u8).collect();
+        let part1: Vec<u8> = b"repetitive content for zstd compression ".iter().cycle().take(4096).copied().collect();
+        let part1_compressed = compress(CompressionAlgo::Zstd, &part1).unwrap();
+
+        let chunks = vec![
+            chunk(0, part0.len() as u64, 0x2001, CompressionAlgo::None.to_tag() as u32),
+            chunk(part0.len() as u64, part1.len() as u64, 0x2002, CompressionAlgo::Zstd.to_tag() as u32),
+        ];
+
+        let mut needles = std::collections::HashMap::new();
+        needles.insert((1u64, 0x2001u64), part0.clone());
+        needles.insert((1u64, 0x2002u64), part1_compressed.clone());
+
+        let total = (part0.len() + part1.len()) as u64;
+        let body = read_flat_range_with(&chunks, 0, total, move |_v, n| {
+            let data = needles.get(&(1, n)).cloned().unwrap();
+            async move { Ok(data) }
+        })
+        .await
+        .unwrap();
+
+        let mut expected = part0.clone();
+        expected.extend_from_slice(&part1);
+        assert_eq!(body, expected);
     }
 }

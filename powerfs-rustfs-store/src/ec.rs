@@ -163,7 +163,7 @@ impl PowerFsStore {
     }
 
     /// 读取一个 needle 的原始字节（不含任何校验），校验由调用方统一处理。
-    async fn read_needle_raw(&self, volume_id: u64, needle_id: u64) -> Result<Vec<u8>> {
+    pub(crate) async fn read_needle_raw(&self, volume_id: u64, needle_id: u64) -> Result<Vec<u8>> {
         let address = self.volume_address(volume_id).await?;
         self.volumes
             .read_needle(&address, volume_id, needle_id)
@@ -193,6 +193,12 @@ where
     let total = data + parity;
 
     if data == 0 || parity == 0 || shard_size == 0 {
+        return Err(Error::other(EcReadError::InvalidLayout { data, parity }));
+    }
+    // P7: EC 分片绝不应被压缩（scrubber 只对 Replicated 平铺 chunk 压缩，
+    // EC 转换与压缩互斥）。若遇到压缩 chunk 说明元数据不自洽，直接拒绝，
+    // 避免把压缩字节当 RS 分片输入导致解码乱码。
+    if entry.chunks.iter().any(|c| c.compression != 0) {
         return Err(Error::other(EcReadError::InvalidLayout { data, parity }));
     }
     if !entry.chunks.len().is_multiple_of(total) {
@@ -634,5 +640,31 @@ mod tests {
             assemble_group(&shards, DATA, PARITY),
             Err(EcReadError::DecodeFailed(_))
         ));
+    }
+
+    /// P7 Task 4: EC 分片若被标记压缩（元数据自洽失败），读路径必须拒绝，
+    /// 避免把压缩字节当 RS 分片输入。
+    #[tokio::test]
+    async fn ec_read_rejects_compressed_shards() {
+        let fixture = build_fixture(GROUP * 2);
+        // 篡改第一个 chunk 的 compression tag
+        let mut entry = fixture.entry.clone();
+        entry.chunks[0].compression = 1; // Zstd
+
+        let result = read_ec_range_with(
+            &entry,
+            &fixture.ec,
+            0,
+            fixture.object.len() as u64,
+            loader(&fixture.needles),
+        )
+        .await;
+
+        assert!(result.is_err(), "压缩 EC 分片必须被拒绝");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("invalid EC layout"),
+            "应返回 InvalidLayout 类错误，实际: {msg}"
+        );
     }
 }

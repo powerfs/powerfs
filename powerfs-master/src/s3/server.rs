@@ -749,6 +749,27 @@ pub mod handlers {
             return response;
         }
 
+        // P7: 压缩对象的 needle 存的是压缩字节，legacy S3 直读会把压缩字节
+        // 当原文返回。这里拒绝并提示走 RustFS gateway（其 read_object 已支持
+        // 解压），避免静默错数据。
+        if entry.chunks.iter().any(|c| c.compression != 0) {
+            eprintln!(
+                "Compressed object {}/{}: legacy S3 read unsupported, use RustFS gateway",
+                bucket, key
+            );
+            let mut response = build_error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "compressed object unsupported on legacy S3",
+            );
+            response.headers_mut().insert(
+                "x-powerfs-note",
+                "compressed object unsupported on legacy S3"
+                    .parse()
+                    .unwrap(),
+            );
+            return response;
+        }
+
         if entry.chunks.is_empty() {
             return (StatusCode::OK, "").into_response();
         }
