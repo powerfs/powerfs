@@ -4144,6 +4144,55 @@ impl MetaShardManager {
 
         Ok(())
     }
+
+    /// P7: 提交压缩结果 — 替换 chunks + replica_chunks 为压缩版本，
+    /// 置 compression_state=Compressed。通过 Raft 共识。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_to_compressed(
+        &self,
+        inode: u64,
+        shard_id: ShardId,
+        chunks: Vec<crate::shard_store::StoredFileChunk>,
+        replica_chunks: Vec<crate::shard_store::StoredFileChunk>,
+        algo: powerfs_common::compression::CompressionAlgo,
+        ratio_x100: u16,
+        original_size: u64,
+    ) -> Result<(), String> {
+        let cmd = ShardCommand::UpdateCompression {
+            inode,
+            chunks,
+            replica_chunks,
+            algo,
+            ratio_x100,
+            original_size,
+        };
+
+        self.propose_meta(shard_id, cmd.serialize()).await?;
+
+        if !self.is_async_meta_persist() {
+            let store = {
+                let stores = self.shard_stores.read().unwrap();
+                stores.get(&shard_id).cloned()
+            };
+            if let Some(store) = store {
+                let mut retries = 0;
+                while retries < 20 {
+                    if let Some(info) = store.get_inode(inode) {
+                        if info.compression_state
+                            == powerfs_layout::reliability::CompressionState::Compressed
+                        {
+                            return Ok(());
+                        }
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                    retries += 1;
+                }
+                return Err("update_to_compressed timeout waiting for apply".to_string());
+            }
+        }
+
+        Ok(())
+    }
     pub async fn create_symlink(
         &self,
         parent_inode: u64,

@@ -58,6 +58,16 @@ pub struct ScrubberConfig {
     /// 默认: 8KB-1MB → EC(2+1), 1MB-1GB → EC(4+2),
     ///       1GB-100GB → EC(8+4), >100GB → EC(16+4)
     pub ec_tiers: Vec<EcTier>,
+    /// P7: 是否启用后台压缩 (默认 false, 由 POWERFS_COMPRESS_ENABLED 控制)
+    pub compress_enabled: bool,
+    /// P7: 压缩最小文件大小 (字节), 默认 1MiB
+    pub compress_min_file_size: u64,
+    /// P7: 文件空闲秒数阈值 (max(atime,mtime) 距今), 默认 30 天
+    pub compress_idle_secs: u64,
+    /// P7: 每轮最多压缩的 inode 数, 默认 10
+    pub compress_max_inodes: usize,
+    /// P7: 压缩算法 (当前仅 zstd)
+    pub compress_algo: powerfs_common::compression::CompressionAlgo,
 }
 
 impl Default for ScrubberConfig {
@@ -89,11 +99,47 @@ impl Default for ScrubberConfig {
                     parity_shards: 4,
                 }, // >100GB → EC(16+4)
             ],
+            // P7 压缩默认关闭，阈值按 spec FR-7
+            compress_enabled: false,
+            compress_min_file_size: 1024 * 1024,
+            compress_idle_secs: 30 * 24 * 3600,
+            compress_max_inodes: 10,
+            compress_algo: powerfs_common::compression::CompressionAlgo::Zstd,
         }
     }
 }
 
 impl ScrubberConfig {
+    /// 从环境变量构建完整的 ScrubberConfig（EC 分层配置用默认值，
+    /// 其余字段均可被 POWERFS_* 覆盖）。集中解析，避免 main.rs 重复。
+    pub fn from_env() -> Self {
+        use powerfs_common::compression::CompressionAlgo;
+
+        let compress_algo = match std::env::var("POWERFS_COMPRESS_ALGO")
+            .ok()
+            .as_deref()
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("zstd") => CompressionAlgo::Zstd,
+            Some("none") | Some("off") => CompressionAlgo::None,
+            _ => CompressionAlgo::Zstd,
+        };
+
+        Self {
+            scan_interval_secs: parse_env_u64("POWERFS_SCRUBBER_SCAN_INTERVAL", 30),
+            max_inodes_per_scan: parse_env_usize("POWERFS_SCRUBBER_MAX_INODES", 50),
+            replica_count: 2,
+            ec_min_file_size: parse_env_u64("POWERFS_EC_MIN_FILE_SIZE", 0),
+            ec_tiers: Self::default().ec_tiers,
+            compress_enabled: parse_env_bool("POWERFS_COMPRESS_ENABLED", false),
+            compress_min_file_size: parse_env_u64("POWERFS_COMPRESS_MIN_FILE_SIZE", 1024 * 1024),
+            compress_idle_secs: parse_env_u64("POWERFS_COMPRESS_IDLE_SECS", 30 * 24 * 3600),
+            compress_max_inodes: parse_env_usize("POWERFS_COMPRESS_MAX_INODES", 10),
+            compress_algo,
+        }
+    }
+
     /// 按文件大小选择 EC tier 配置 (data_shards, parity_shards)
     fn select_ec_config(&self, file_size: u64) -> (u32, u32) {
         for tier in &self.ec_tiers {
@@ -136,6 +182,29 @@ pub struct ScrubberWorker {
 
 /// P6: EC 不可行时, 每隔多少轮扫描重新检查一次 volume 数量
 const EC_RECHECK_CYCLES: u32 = 10;
+
+/// P7: 环境变量解析辅助（解析失败时回退默认值，不 panic）。
+fn parse_env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key).ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") => true,
+        Some("0") | Some("false") | Some("FALSE") | Some("no") => false,
+        _ => default,
+    }
+}
 
 impl ScrubberWorker {
     pub fn new(
@@ -184,6 +253,10 @@ impl ScrubberWorker {
             // C-0.7: Fingerprint tombstone GC
             if let Err(e) = self.scan_fingerprint_tombstones().await {
                 error!("C0_SCRUBBER: fingerprint tombstone GC error: {}", e);
+            }
+            // P7: 后台压缩（仅 leader；未开启时直接跳过）
+            if let Err(e) = self.scan_and_compress().await {
+                error!("P7_SCRUBBER: compression scan error: {}", e);
             }
         }
     }
@@ -896,4 +969,376 @@ impl ScrubberWorker {
 
         Ok(())
     }
+
+    // ========================================================================
+    // P7: 后台压缩 (Replicated 冷数据 → zstd)
+    // ========================================================================
+
+    /// P7: 扫描冷副本文件并执行压缩（仅 leader，未开启时跳过）。
+    async fn scan_and_compress(&self) -> Result<(), String> {
+        if !self.config.compress_enabled {
+            return Ok(());
+        }
+        // 算法为 None 时无可执行压缩（配置误设防御）
+        if self.config.compress_algo == powerfs_common::compression::CompressionAlgo::None {
+            return Ok(());
+        }
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let pending = self.meta_shard_manager.list_pending_compress(
+            self.config.compress_min_file_size,
+            self.config.ec_min_file_size, // EC 优先：max_size = EC 阈值
+            self.config.compress_idle_secs,
+            now,
+            self.config.compress_max_inodes,
+        );
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let addr_map = self.volume_addr_map().await;
+
+        info!(
+            "P7_SCRUBBER: found {} compression candidates (min={}B idle={}s max_inodes={})",
+            pending.len(),
+            self.config.compress_min_file_size,
+            self.config.compress_idle_secs,
+            self.config.compress_max_inodes,
+        );
+
+        let mut processed = 0usize;
+        for (inode, _chunks) in pending {
+            if processed >= self.config.compress_max_inodes {
+                break;
+            }
+
+            let shard_id = self.meta_shard_manager.calculate_shard_id(inode);
+            if !self.meta_shard_manager.is_shard_leader(shard_id).await {
+                continue;
+            }
+
+            // 取完整 inode（含 replica_chunks）用于压缩 + CAS
+            let info = match self.meta_shard_manager.get_inode(inode) {
+                Some(i) => i,
+                None => continue,
+            };
+            if info.chunks.is_empty() {
+                continue;
+            }
+
+            match self
+                .compress_inode(inode, &info.chunks, &info.replica_chunks, &addr_map)
+                .await
+            {
+                Ok(layout) => {
+                    // CAS: 提交前再次比对 chunks / compression_state
+                    let current = self.meta_shard_manager.get_inode(inode);
+                    match current {
+                        Some(ref cur)
+                            if cur.chunks == info.chunks
+                                && cur.compression_state
+                                    == powerfs_layout::reliability::CompressionState::None =>
+                        {
+                            // 安全提交
+                        }
+                        _ => {
+                            // 数据/状态变化 → 丢弃新 needle，下一轮重试
+                            self.delete_compressed_orphans(
+                                &layout.primary_chunks,
+                                &layout.replica_chunks,
+                                &addr_map,
+                            )
+                            .await;
+                            debug!(
+                                "P7_SCRUBBER: inode {} changed during compression, aborting",
+                                inode
+                            );
+                            continue;
+                        }
+                    }
+
+                    match self
+                        .meta_shard_manager
+                        .update_to_compressed(
+                            inode,
+                            shard_id,
+                            layout.primary_chunks,
+                            layout.replica_chunks,
+                            self.config.compress_algo,
+                            layout.ratio_x100,
+                            layout.original_size,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            // 提交成功后 best-effort 回收旧 needle
+                            self.delete_compressed_orphans(
+                                &info.chunks,
+                                &info.replica_chunks,
+                                &addr_map,
+                            )
+                            .await;
+                            info!(
+                                "P7_SCRUBBER: inode {} compressed (ratio_x100={}, original={}B)",
+                                inode, layout.ratio_x100, layout.original_size
+                            );
+                            processed += 1;
+                        }
+                        Err(e) => {
+                            warn!("P7_SCRUBBER: inode {} commit failed: {}", inode, e);
+                        }
+                    }
+                }
+                Err(CompressError::NotCompressible) => {
+                    // 比率不达标：标记 skip 避免每轮重试
+                    if let Err(e) = self
+                        .meta_shard_manager
+                        .set_xattr(
+                            inode,
+                            shard_id,
+                            powerfs_common::constants::COMPRESS_SKIP_EXT_KEY,
+                            b"1".to_vec(),
+                        )
+                        .await
+                    {
+                        warn!(
+                            "P7_SCRUBBER: inode {} set compress-skip failed: {}",
+                            inode, e
+                        );
+                    } else {
+                        info!("P7_SCRUBBER: inode {} not compressible, marked skip", inode);
+                    }
+                }
+                Err(CompressError::Other(e)) => {
+                    warn!("P7_SCRUBBER: inode {} compression failed: {}", inode, e);
+                }
+            }
+        }
+
+        if processed > 0 {
+            info!("P7_SCRUBBER: compressed {} inodes this scan", processed);
+        }
+        Ok(())
+    }
+
+    /// P7: 压缩单个 inode 的全部 chunk（主副本 + 各副本）。
+    ///
+    /// 流程（FR-4）：
+    /// 1. 读主副本全部 chunk（CRC 校验，crc32==0 跳过）；
+    /// 2. 逐 chunk 压缩到内存，整体比率 < 阈值 → `NotCompressible`（不写任何 needle）；
+    /// 3. 主副本向 Master `assign_needle` 申请**同卷**新 key 并写压缩数据；
+    ///    每个副本向目标卷申请新 key 并写同一份压缩数据；
+    /// 4. 任一步失败 → 删除已写新 needle，返回错误。
+    ///
+    /// `size` 保持逻辑字节数不变；`crc32` 更新为压缩字节 CRC；
+    /// `offset`/`mtime` 不变；`compression = Zstd`。
+    async fn compress_inode(
+        &self,
+        inode: u64,
+        chunks: &[StoredFileChunk],
+        replica_chunks: &[StoredFileChunk],
+        addr_map: &std::collections::HashMap<u64, String>,
+    ) -> Result<CompressedLayout, CompressError> {
+        use powerfs_common::compression::{compress, should_compress, DEFAULT_MIN_RATIO};
+
+        let algo = self.config.compress_algo;
+
+        // 1+2: 读取并压缩全部主副本 chunk 到内存，同时校验 CRC
+        let mut compressed: Vec<Vec<u8>> = Vec::with_capacity(chunks.len());
+        let mut total_original: usize = 0;
+        let mut total_compressed: usize = 0;
+        for chunk in chunks {
+            let src_addr = addr_map
+                .get(&chunk.volume_id)
+                .ok_or_else(|| {
+                    CompressError::Other(format!("src volume {} addr not found", chunk.volume_id))
+                })?
+                .clone();
+            let data = self
+                .volume_client
+                .read_needle(&src_addr, chunk.volume_id, chunk.needle_id)
+                .await
+                .map_err(|e| {
+                    CompressError::Other(format!(
+                        "read_needle vol={} needle={:#x} failed: {}",
+                        chunk.volume_id, chunk.needle_id, e
+                    ))
+                })?;
+
+            if chunk.crc32 != 0 {
+                let actual_crc = crc32fast::hash(&data);
+                if actual_crc != chunk.crc32 {
+                    return Err(CompressError::Other(format!(
+                        "CRC32 mismatch during compression read: inode={} offset={} expected={:#x} actual={:#x}",
+                        inode, chunk.offset, chunk.crc32, actual_crc
+                    )));
+                }
+            }
+
+            let cdata = compress(algo, &data).map_err(|e| {
+                CompressError::Other(format!(
+                    "compress inode={} offset={} failed: {}",
+                    inode, chunk.offset, e
+                ))
+            })?;
+
+            total_original += chunk.size as usize;
+            total_compressed += cdata.len();
+            compressed.push(cdata);
+        }
+
+        // 整体比率判定（不可压缩时不分配任何 needle，避免空间泄漏）
+        if !should_compress(total_original, total_compressed, DEFAULT_MIN_RATIO) {
+            return Err(CompressError::NotCompressible);
+        }
+        let ratio_x100 = match (total_original * 100).checked_div(total_compressed) {
+            Some(r) => r.min(u16::MAX as usize) as u16,
+            None => u16::MAX,
+        };
+
+        // 3. 分配新 needle 并写入压缩数据（主副本 + 各副本）
+        let mut new_primary: Vec<StoredFileChunk> = Vec::with_capacity(chunks.len());
+        let mut new_replicas: Vec<StoredFileChunk> = Vec::with_capacity(replica_chunks.len());
+
+        // 主副本
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let cdata = &compressed[idx];
+            let new_needle = self
+                .master_client
+                .assign_needle(chunk.volume_id)
+                .await
+                .map_err(|e| {
+                    CompressError::Other(format!(
+                        "assign_needle primary vol={} failed: {}",
+                        chunk.volume_id, e
+                    ))
+                })?;
+            let addr = addr_map
+                .get(&chunk.volume_id)
+                .ok_or_else(|| {
+                    CompressError::Other(format!(
+                        "primary volume {} addr not found",
+                        chunk.volume_id
+                    ))
+                })?
+                .clone();
+            self.volume_client
+                .write_needle(&addr, chunk.volume_id, new_needle, cdata)
+                .await
+                .map_err(|e| {
+                    CompressError::Other(format!(
+                        "write_needle primary vol={} needle={:#x} failed: {}",
+                        chunk.volume_id, new_needle, e
+                    ))
+                })?;
+            new_primary.push(StoredFileChunk {
+                offset: chunk.offset,
+                size: chunk.size, // 逻辑长度不变
+                needle_id: new_needle,
+                volume_id: chunk.volume_id,
+                crc32: crc32fast::hash(cdata),
+                mtime: chunk.mtime,
+                is_reference: false,
+                compression: algo,
+            });
+        }
+
+        // 副本：每个副本写入同一份压缩数据
+        for rc in replica_chunks {
+            // 副本 chunk 的 offset 与主副本同 offset 的 chunk 对应
+            let idx = chunks
+                .iter()
+                .position(|c| c.offset == rc.offset)
+                .ok_or_else(|| {
+                    CompressError::Other(format!(
+                        "replica chunk offset {} has no matching primary",
+                        rc.offset
+                    ))
+                })?;
+            let cdata = &compressed[idx];
+            let new_needle = self
+                .master_client
+                .assign_needle(rc.volume_id)
+                .await
+                .map_err(|e| {
+                    CompressError::Other(format!(
+                        "assign_needle replica vol={} failed: {}",
+                        rc.volume_id, e
+                    ))
+                })?;
+            let addr = addr_map
+                .get(&rc.volume_id)
+                .ok_or_else(|| {
+                    CompressError::Other(format!("replica volume {} addr not found", rc.volume_id))
+                })?
+                .clone();
+            self.volume_client
+                .write_needle(&addr, rc.volume_id, new_needle, cdata)
+                .await
+                .map_err(|e| {
+                    CompressError::Other(format!(
+                        "write_needle replica vol={} needle={:#x} failed: {}",
+                        rc.volume_id, new_needle, e
+                    ))
+                })?;
+            new_replicas.push(StoredFileChunk {
+                offset: rc.offset,
+                size: rc.size,
+                needle_id: new_needle,
+                volume_id: rc.volume_id,
+                crc32: crc32fast::hash(cdata),
+                mtime: rc.mtime,
+                is_reference: false,
+                compression: algo,
+            });
+        }
+
+        Ok(CompressedLayout {
+            primary_chunks: new_primary,
+            replica_chunks: new_replicas,
+            ratio_x100,
+            original_size: total_original as u64,
+        })
+    }
+
+    /// P7: best-effort 删除压缩流程中遗留的 needle（提交失败的新 needle，
+    /// 或提交成功后的旧 needle）。失败仅告警，留给后续 GC。
+    async fn delete_compressed_orphans(
+        &self,
+        primary: &[StoredFileChunk],
+        replicas: &[StoredFileChunk],
+        addr_map: &std::collections::HashMap<u64, String>,
+    ) {
+        for c in primary.iter().chain(replicas.iter()) {
+            let Some(addr) = addr_map.get(&c.volume_id) else {
+                continue;
+            };
+            if let Err(e) = self
+                .volume_client
+                .delete_needle(addr, c.volume_id, c.needle_id)
+                .await
+            {
+                warn!(
+                    "P7_SCRUBBER: delete needle vol={} needle={:#x} failed (best-effort): {}",
+                    c.volume_id, c.needle_id, e
+                );
+            }
+        }
+    }
+}
+
+/// P7: `compress_inode` 成功产物
+struct CompressedLayout {
+    primary_chunks: Vec<StoredFileChunk>,
+    replica_chunks: Vec<StoredFileChunk>,
+    ratio_x100: u16,
+    original_size: u64,
+}
+
+/// P7: 压缩失败类型
+enum CompressError {
+    /// 整体压缩比低于阈值 → 标记 skip，不写元数据
+    NotCompressible,
+    /// 其他错误（IO/网络/CRC）→ 仅告警，下一轮重试
+    Other(String),
 }

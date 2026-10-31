@@ -1109,6 +1109,23 @@ impl ShardStore {
             } => {
                 self.update_to_ec(inode, reliability, reliability_state, ec_chunks);
             }
+            ShardCommand::UpdateCompression {
+                inode,
+                chunks,
+                replica_chunks,
+                algo,
+                ratio_x100,
+                original_size,
+            } => {
+                self.update_to_compressed(
+                    inode,
+                    chunks,
+                    replica_chunks,
+                    algo,
+                    ratio_x100,
+                    original_size,
+                );
+            }
             ShardCommand::BeginMigration {
                 inode,
                 epoch,
@@ -4600,6 +4617,68 @@ impl ShardStore {
         inodes.insert(inode, info);
     }
 
+    /// P7: 提交压缩结果 — 替换 chunks + replica_chunks 为压缩版本，
+    /// 置 compression_state=Compressed 并记录算法/比率/原始大小。
+    ///
+    /// `size` 保持逻辑长度不变（读端按逻辑偏移切片），`crc32` 为压缩字节 CRC。
+    pub fn update_to_compressed(
+        &self,
+        inode: u64,
+        chunks: Vec<StoredFileChunk>,
+        replica_chunks: Vec<StoredFileChunk>,
+        algo: powerfs_common::compression::CompressionAlgo,
+        ratio_x100: u16,
+        original_size: u64,
+    ) {
+        use powerfs_layout::reliability::CompressionState;
+
+        let cf_inodes = match self.db.cf_handle(CF_INODES) {
+            Some(cf) => cf,
+            None => {
+                log::error!(
+                    "Shard {}: CF_INODES not found for update_to_compressed",
+                    self.shard_id.0
+                );
+                return;
+            }
+        };
+        let mut info = match self.get_inode(inode) {
+            Some(i) => i,
+            None => {
+                log::warn!(
+                    "Shard {} update_to_compressed: inode {} not found",
+                    self.shard_id.0,
+                    inode
+                );
+                return;
+            }
+        };
+        log::info!(
+            "Shard {} P7 update_to_compressed: inode {} state {:?} -> Compressed, \
+             chunks={} replica_chunks={} algo={:?} ratio_x100={} original={}B",
+            self.shard_id.0,
+            inode,
+            info.compression_state,
+            chunks.len(),
+            replica_chunks.len(),
+            algo,
+            ratio_x100,
+            original_size
+        );
+        info.chunks = chunks;
+        info.replica_chunks = replica_chunks;
+        info.compression_state = CompressionState::Compressed;
+        info.compression_algo = algo;
+        info.compression_ratio_x100 = ratio_x100;
+        info.compression_original_size = original_size;
+        info.mtime = Self::current_time();
+        if let Ok(data) = serde_json::to_vec(&info) {
+            let _ = self.db.put_cf(cf_inodes, inode.to_be_bytes(), &data);
+        }
+        let mut inodes = self.inodes.write().unwrap();
+        inodes.insert(inode, info);
+    }
+
     /// Set inode attributes
     #[allow(clippy::too_many_arguments)]
     fn setattr(
@@ -6498,5 +6577,127 @@ mod tests {
         );
         assert!(!ec_candidates.contains(&1961), "已压缩文件不得 EC 转换");
         assert!(!ec_candidates.contains(&1962), "压缩中文件不得 EC 转换");
+    }
+
+    /// P7 Task 3: `update_to_compressed` 提交后 compression_state=Compressed，
+    /// chunks + replica_chunks 替换为压缩版本，size/offset/mtime 保持逻辑不变，
+    /// crc32 为压缩字节 CRC，compression=Zstd。
+    #[test]
+    fn test_p7_update_to_compressed_sets_state_and_chunks() {
+        use powerfs_common::compression::CompressionAlgo;
+        use powerfs_layout::reliability::CompressionState;
+
+        let store = make_store();
+
+        let mut info = make_inode(2201, 1, "data.bin");
+        info.size = 4 * 1024 * 1024;
+        info.blocks = (4 * 1024 * 1024u64).div_ceil(512);
+        info.chunks = vec![StoredFileChunk {
+            offset: 0,
+            size: 4 * 1024 * 1024,
+            needle_id: 0xC001,
+            volume_id: T4_VID,
+            crc32: 0xAAAA,
+            mtime: 12345,
+            is_reference: false,
+            compression: CompressionAlgo::None,
+        }];
+        info.replica_chunks = vec![StoredFileChunk {
+            offset: 0,
+            size: 4 * 1024 * 1024,
+            needle_id: 0xC002,
+            volume_id: 8,
+            crc32: 0xAAAA,
+            mtime: 12345,
+            is_reference: false,
+            compression: CompressionAlgo::None,
+        }];
+        store.inodes.write().unwrap().insert(2201, info);
+
+        let compressed_primary = vec![StoredFileChunk {
+            offset: 0,
+            size: 4 * 1024 * 1024, // 逻辑长度不变
+            needle_id: 0xD001,
+            volume_id: T4_VID,
+            crc32: 0xBBBB, // 压缩字节 CRC
+            mtime: 12345,
+            is_reference: false,
+            compression: CompressionAlgo::Zstd,
+        }];
+        let compressed_replicas = vec![StoredFileChunk {
+            offset: 0,
+            size: 4 * 1024 * 1024,
+            needle_id: 0xD002,
+            volume_id: 8,
+            crc32: 0xBBBB,
+            mtime: 12345,
+            is_reference: false,
+            compression: CompressionAlgo::Zstd,
+        }];
+
+        store.update_to_compressed(
+            2201,
+            compressed_primary,
+            compressed_replicas,
+            CompressionAlgo::Zstd,
+            230,
+            4 * 1024 * 1024,
+        );
+
+        let updated = store.get_inode(2201).unwrap();
+        assert_eq!(updated.compression_state, CompressionState::Compressed);
+        assert_eq!(updated.compression_algo, CompressionAlgo::Zstd);
+        assert_eq!(updated.compression_ratio_x100, 230);
+        assert_eq!(updated.compression_original_size, 4 * 1024 * 1024);
+
+        // size 保持逻辑长度
+        assert_eq!(updated.size, 4 * 1024 * 1024);
+        // chunks 替换
+        assert_eq!(updated.chunks.len(), 1);
+        assert_eq!(updated.chunks[0].needle_id, 0xD001);
+        assert_eq!(updated.chunks[0].size, 4 * 1024 * 1024); // 逻辑不变
+        assert_eq!(updated.chunks[0].offset, 0);
+        assert_eq!(updated.chunks[0].crc32, 0xBBBB); // 压缩字节 CRC
+        assert_eq!(updated.chunks[0].compression, CompressionAlgo::Zstd);
+        assert_eq!(updated.chunks[0].mtime, 12345);
+
+        // replica_chunks 替换
+        assert_eq!(updated.replica_chunks.len(), 1);
+        assert_eq!(updated.replica_chunks[0].needle_id, 0xD002);
+        assert_eq!(updated.replica_chunks[0].compression, CompressionAlgo::Zstd);
+    }
+
+    /// P7 Task 3: 比率不达标走 `should_compress` 判定 — 随机数据压缩比 < 1.05
+    /// 时返回 false（scrubber 据此写 skip 标记且不提交）。
+    #[test]
+    fn test_p7_should_compress_rejects_incompressible() {
+        use powerfs_common::compression::{
+            compress, should_compress, CompressionAlgo, DEFAULT_MIN_RATIO,
+        };
+
+        // 伪随机字节：压缩后体积几乎不变，甚至略膨胀。
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let data: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            })
+            .collect();
+        let compressed = compress(CompressionAlgo::Zstd, &data).unwrap();
+        assert!(
+            !should_compress(data.len(), compressed.len(), DEFAULT_MIN_RATIO),
+            "随机数据压缩比低于阈值，应判定为不可压缩"
+        );
+
+        // 可压缩数据：重复模式压缩比远高于 1.05。
+        let line = b"powerfs compression test line with repetitive content abcdefghij\n";
+        let repeat: Vec<u8> = line.iter().cycle().take(64 * 1024).copied().collect();
+        let c2 = compress(CompressionAlgo::Zstd, &repeat).unwrap();
+        assert!(
+            should_compress(repeat.len(), c2.len(), DEFAULT_MIN_RATIO),
+            "重复数据压缩比高于阈值，应判定为可压缩"
+        );
     }
 }

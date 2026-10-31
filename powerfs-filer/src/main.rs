@@ -1083,28 +1083,18 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                     },
                 ))
             };
-            let scrubber_config = powerfs_filer::scrubber::ScrubberConfig {
-                scan_interval_secs: std::env::var("POWERFS_SCRUBBER_SCAN_INTERVAL")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(30),
-                max_inodes_per_scan: std::env::var("POWERFS_SCRUBBER_MAX_INODES")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(50),
-                replica_count: 2,
-                ec_min_file_size: std::env::var("POWERFS_EC_MIN_FILE_SIZE")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0),
-                ec_tiers: powerfs_filer::scrubber::ScrubberConfig::default().ec_tiers,
-            };
+            let scrubber_config = powerfs_filer::scrubber::ScrubberConfig::from_env();
             info!(
-                "P4_SCRUBBER: config scan_interval={}s max_inodes={} ec_tiers={:?} min_file_size={}",
+                "P4_SCRUBBER: config scan_interval={}s max_inodes={} ec_tiers={:?} min_file_size={} compress={} min={}B idle={}s max_inodes={} algo={:?}",
                 scrubber_config.scan_interval_secs,
                 scrubber_config.max_inodes_per_scan,
                 scrubber_config.ec_tiers,
                 scrubber_config.ec_min_file_size,
+                scrubber_config.compress_enabled,
+                scrubber_config.compress_min_file_size,
+                scrubber_config.compress_idle_secs,
+                scrubber_config.compress_max_inodes,
+                scrubber_config.compress_algo,
             );
             let msm = meta_shard_manager.clone();
             let vcp = volume_client_pool.clone();
@@ -1115,22 +1105,7 @@ async fn run_filer(cfg: PowerFsConfig) -> powerfs_common::error::Result<()> {
                 let vcp = vcp.clone();
                 let nh = nh.clone();
                 let mc = mc.clone();
-                let config = powerfs_filer::scrubber::ScrubberConfig {
-                    scan_interval_secs: std::env::var("POWERFS_SCRUBBER_SCAN_INTERVAL")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(30),
-                    max_inodes_per_scan: std::env::var("POWERFS_SCRUBBER_MAX_INODES")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(50),
-                    replica_count: 2,
-                    ec_min_file_size: std::env::var("POWERFS_EC_MIN_FILE_SIZE")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0),
-                    ec_tiers: powerfs_filer::scrubber::ScrubberConfig::default().ec_tiers,
-                };
+                let config = powerfs_filer::scrubber::ScrubberConfig::from_env();
                 async move {
                     let scrubber =
                         powerfs_filer::scrubber::ScrubberWorker::new(msm, vcp, nh, mc, config);

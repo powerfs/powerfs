@@ -214,6 +214,16 @@ pub enum ShardCommand {
         reliability_state: powerfs_layout::reliability::ReliabilityState,
         ec_chunks: Vec<crate::shard_store::StoredFileChunk>,
     },
+    /// P7: 副本压缩提交 — 替换 chunks + replica_chunks 为压缩版本,
+    /// 置 compression_state=Compressed 并记录算法/比率/原始大小。
+    UpdateCompression {
+        inode: u64,
+        chunks: Vec<crate::shard_store::StoredFileChunk>,
+        replica_chunks: Vec<crate::shard_store::StoredFileChunk>,
+        algo: powerfs_common::compression::CompressionAlgo,
+        ratio_x100: u16,
+        original_size: u64,
+    },
 
     /// MC-108 Task 4: open the Inline→Flat/Stripe migration window.
     ///
