@@ -120,6 +120,8 @@ pub(crate) fn traits_entry_to_proto(entry: &powerfs_common::traits::Entry) -> Pr
             volume_id: c.volume_id,
             crc32: c.crc32,
             mtime: c.mtime,
+            // traits 层暂不携带压缩算法（P7 Task 5 扩展），按未压缩占位
+            compression: 0,
         })
         .collect();
 
@@ -133,6 +135,7 @@ pub(crate) fn traits_entry_to_proto(entry: &powerfs_common::traits::Entry) -> Pr
             volume_id: c.volume_id,
             crc32: c.crc32,
             mtime: c.mtime,
+            compression: 0,
         })
         .collect();
 
@@ -153,6 +156,8 @@ pub(crate) fn traits_entry_to_proto(entry: &powerfs_common::traits::Entry) -> Pr
         generation: entry.generation,
         // FUSE 客户端不使用 master proto 的 EC 布局字段（P6 新增），显式占位。
         ec_layout: None,
+        // 压缩信息同上（P7）：traits 层扩展前显式占位。
+        compression: None,
     }
 }
 

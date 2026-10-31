@@ -946,6 +946,9 @@ impl MetaShardManager {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode,
             migration: None,
@@ -1590,6 +1593,9 @@ impl MetaShardManager {
                 reliability: powerfs_layout::reliability::Reliability::default(),
                 reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
                 compression_state: powerfs_layout::reliability::CompressionState::default(),
+                compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+                compression_ratio_x100: 0,
+                compression_original_size: 0,
                 replica_chunks: Vec::new(),
                 storage_mode: self.predict_storage_mode(name, *parent_ino),
                 migration: None,
@@ -2003,6 +2009,9 @@ impl MetaShardManager {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -2072,6 +2081,9 @@ impl MetaShardManager {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -2795,6 +2807,26 @@ impl MetaShardManager {
         result
     }
 
+    /// P7: 跨 shard 聚合压缩候选（过滤语义见 `ShardStore::list_pending_compress`）。
+    /// 每个 shard 独立限流后合并，再由调用方（scrubber）做全局截断。
+    pub fn list_pending_compress(
+        &self,
+        min_size: u64,
+        max_size: u64,
+        idle_secs: u64,
+        now: u64,
+        limit: usize,
+    ) -> Vec<(u64, Vec<crate::shard_store::StoredFileChunk>)> {
+        let stores = self.shard_stores.read().unwrap();
+        let mut result = Vec::new();
+        for shard_store in stores.values() {
+            result.extend(
+                shard_store.list_pending_compress(min_size, max_size, idle_secs, now, limit),
+            );
+        }
+        result
+    }
+
     /// P4: 计算 inode 所属的 shard ID (供 scrubber 使用)
     pub fn calculate_shard_id(&self, inode: u64) -> ShardId {
         self.shard_strategy.calculate_shard(inode)
@@ -3063,6 +3095,9 @@ impl MetaShardManager {
                 reliability: powerfs_layout::reliability::Reliability::default(),
                 reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
                 compression_state: powerfs_layout::reliability::CompressionState::default(),
+                compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+                compression_ratio_x100: 0,
+                compression_original_size: 0,
                 replica_chunks: Vec::new(),
                 storage_mode: powerfs_layout::StorageMode::Inline,
                 migration: None,
@@ -3209,6 +3244,9 @@ impl MetaShardManager {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             // Layout-prediction: decide initial layout based on file name.
             // See docs/file-layout-prediction-design.md §3.2.
@@ -4142,6 +4180,9 @@ impl MetaShardManager {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -4739,6 +4780,9 @@ impl MetaShardManager {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -5342,15 +5386,7 @@ impl MetaShardManager {
                                         inode_info.chunks = setattr_op
                                             .chunks
                                             .iter()
-                                            .map(|c| crate::shard_store::StoredFileChunk {
-                                                offset: c.offset,
-                                                size: c.size,
-                                                mtime: c.mtime,
-                                                needle_id: c.needle_id,
-                                                volume_id: c.volume_id,
-                                                crc32: c.crc32,
-                                                is_reference: false,
-                                            })
+                                            .map(crate::grpc_service::stored_chunk_from_proto)
                                             .collect();
                                     }
                                     if !setattr_op.extended.is_empty() {
@@ -5552,6 +5588,9 @@ impl MetaShardManager {
                     reliability: powerfs_layout::reliability::Reliability::default(),
                     reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
                     compression_state: powerfs_layout::reliability::CompressionState::default(),
+                    compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+                    compression_ratio_x100: 0,
+                    compression_original_size: 0,
                     replica_chunks: Vec::new(),
                     storage_mode: powerfs_layout::StorageMode::Inline,
                     migration: None,
@@ -5620,15 +5659,7 @@ impl MetaShardManager {
                         inode_info.chunks = setattr_op
                             .chunks
                             .iter()
-                            .map(|c| crate::shard_store::StoredFileChunk {
-                                offset: c.offset,
-                                size: c.size,
-                                mtime: c.mtime,
-                                needle_id: c.needle_id,
-                                volume_id: c.volume_id,
-                                crc32: c.crc32,
-                                is_reference: false,
-                            })
+                            .map(crate::grpc_service::stored_chunk_from_proto)
                             .collect();
                     }
                     // Update extended if provided
@@ -6743,6 +6774,9 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,

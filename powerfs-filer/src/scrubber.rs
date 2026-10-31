@@ -425,6 +425,8 @@ impl ScrubberWorker {
             crc32: chunk.crc32,
             mtime: chunk.mtime,
             is_reference: false,
+            // 副本继承源 chunk 的压缩算法（复制的是同一份存储字节）
+            compression: chunk.compression,
         })
     }
 
@@ -814,6 +816,8 @@ impl ScrubberWorker {
                     crc32: crc,
                     mtime: now,
                     is_reference: false,
+                    // EC 与压缩互斥：EC 分片永不压缩
+                    compression: powerfs_common::compression::CompressionAlgo::None,
                 });
 
                 debug!(

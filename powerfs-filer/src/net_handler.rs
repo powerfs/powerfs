@@ -322,6 +322,19 @@ fn detect_placement_from_chunks(chunks: &[ChunkRef]) -> Placement {
     }
 }
 
+/// P7: Stripe chunk 列表是否仍可使用 compact anchor 编码（RAID0 数学寻址）。
+///
+/// compact 路径（`Placement::Stripe` + 每卷一个 anchor）依赖内核寻址假设：
+/// 每 needle = 1MiB 逻辑数据、同卷 needle 连续（`needle = file_key + idx`）、
+/// 按 stripe_size 步进。任一 chunk 被压缩后存储字节数与 needle 排布都破坏
+/// 该假设（压缩 chunk 的 needle 是重新申请的，且内容需解压），必须回退
+/// PerChunk 全量列表（Flat 语义），由读路径逐 chunk 定位并解压。
+///
+/// 未压缩列表的正则性由写路径既有不变式保证，P7 不重复校验。
+fn stripe_compact_encoding_valid(chunks: &[ChunkRef]) -> bool {
+    !chunks.iter().any(|c| c.compression.is_compressed())
+}
+
 impl FilerNetHandler {
     pub fn new(
         meta_shard_manager: Arc<MetaShardManager>,
@@ -1526,7 +1539,7 @@ impl FilerNetHandler {
                         volume_id: c.volume_id,
                         crc32: c.crc32,
                         mtime: c.mtime,
-                        compression: powerfs_layout::encoding::CompressionAlgo::None,
+                        compression: c.compression,
                     })
                     .collect();
 
@@ -1570,7 +1583,7 @@ impl FilerNetHandler {
                         volume_id: c.volume_id,
                         crc32: c.crc32,
                         mtime: c.mtime,
-                        compression: powerfs_layout::encoding::CompressionAlgo::None,
+                        compression: c.compression,
                     })
                     .collect();
 
@@ -1581,6 +1594,33 @@ impl FilerNetHandler {
                 // anchor, 越过第一个 group (offset>=4MiB) 即 -EINVAL.
                 let is_ec_converted = matches!(info.reliability, Reliability::EC { .. });
                 if is_ec_converted {
+                    let layout = FileLayout {
+                        placement: Placement::Flat,
+                        reliability: info.reliability.clone(),
+                        reliability_state: info.reliability_state.clone(),
+                        compression: info.compression_state.clone(),
+                        encoding: ChunkEncoding::PerChunk {
+                            chunks: chunks.clone(),
+                        },
+                    };
+                    encode_file_layout(enc, &layout, FEATURE_CHUNK_LAYOUT_V2).map_err(|e| {
+                        NetError::Protocol(format!("encode_file_layout failed: {}", e))
+                    })?;
+
+                    if let Some(first) = chunks.first() {
+                        enc.add_u64(FieldId::VolumeId, first.volume_id);
+                        enc.add_u64(FieldId::FileKey, first.needle_id);
+                    }
+                } else if !stripe_compact_encoding_valid(&chunks) {
+                    // P7: 含压缩 chunk 的 Stripe 文件 — compact anchor 编码的
+                    // RAID0 数学寻址假设已被破坏, 回退 PerChunk 全量列表
+                    // (Flat 语义), 读路径逐 chunk 定位并解压.
+                    info!(
+                        "P7: inode {} Stripe layout has compressed chunks — \
+                         falling back to PerChunk dense encoding ({} chunks)",
+                        info.inode,
+                        chunks.len()
+                    );
                     let layout = FileLayout {
                         placement: Placement::Flat,
                         reliability: info.reliability.clone(),
@@ -1652,7 +1692,7 @@ impl FilerNetHandler {
                         volume_id: c.volume_id,
                         crc32: c.crc32,
                         mtime: c.mtime,
-                        compression: powerfs_layout::encoding::CompressionAlgo::None,
+                        compression: c.compression,
                     })
                     .collect();
 
@@ -1688,6 +1728,19 @@ impl FilerNetHandler {
                 buf.extend_from_slice(&rc.volume_id.to_le_bytes());
                 buf.extend_from_slice(&rc.crc32.to_le_bytes());
                 buf.extend_from_slice(&rc.mtime.to_le_bytes());
+            }
+            // P7: 逐 chunk 压缩算法 trailing 区段 (与 codec.rs 同一约定):
+            // [algo_count u32 LE][algo u8 × count], 仅当存在压缩副本时写入.
+            // 旧解析器 (kernel/fuse-core) 只读 count×44 字节, 自动忽略尾部.
+            if info
+                .replica_chunks
+                .iter()
+                .any(|rc| rc.compression.is_compressed())
+            {
+                buf.extend_from_slice(&(info.replica_chunks.len() as u32).to_le_bytes());
+                for rc in &info.replica_chunks {
+                    buf.push(rc.compression.to_tag());
+                }
             }
             let _ = enc.add_bytes(FieldId::ReplicaChunks, &buf);
         }
@@ -3781,6 +3834,8 @@ impl FilerNetHandler {
                     volume_id: c.volume_id,
                     crc32: c.crc32,
                     is_reference: false,
+                    // 布局 ChunkRef 携带逐 chunk 压缩算法，透传到元数据
+                    compression: c.compression,
                 })
                 .collect(),
             _ => Vec::new(),
@@ -6410,5 +6465,58 @@ impl NetHandler for FilerNetHandler {
             "FILER_NET: client connected, id={}, type={:?}",
             _client_id, _client_type
         );
+    }
+}
+
+#[cfg(test)]
+mod p7_stripe_fallback_tests {
+    use super::*;
+    use powerfs_common::compression::CompressionAlgo;
+
+    fn chunk(vid: u64, nid: u64, offset: u64, compression: CompressionAlgo) -> ChunkRef {
+        ChunkRef {
+            offset,
+            size: 1024 * 1024,
+            needle_id: nid,
+            volume_id: vid,
+            crc32: 0,
+            mtime: 0,
+            compression,
+        }
+    }
+
+    /// 全未压缩的 Stripe chunk 列表保持 compact anchor 编码（行为零变化）。
+    #[test]
+    fn regular_uncompressed_stripe_list_stays_compact() {
+        let chunks = vec![
+            chunk(1, 100, 0, CompressionAlgo::None),
+            chunk(2, 200, 1024 * 1024, CompressionAlgo::None),
+            chunk(3, 300, 2 * 1024 * 1024, CompressionAlgo::None),
+            chunk(1, 101, 3 * 1024 * 1024, CompressionAlgo::None),
+        ];
+        assert!(stripe_compact_encoding_valid(&chunks));
+        // 空列表（新文件）同样保持 compact
+        assert!(stripe_compact_encoding_valid(&[]));
+    }
+
+    /// 任一 chunk 压缩即破坏 RAID0 数学寻址假设（needle 重申请、
+    /// 存储字节数变化）→ 必须回退 PerChunk 全量列表。
+    #[test]
+    fn any_compressed_chunk_forces_per_chunk_fallback() {
+        let mut chunks = vec![
+            chunk(1, 100, 0, CompressionAlgo::None),
+            chunk(2, 200, 1024 * 1024, CompressionAlgo::None),
+            chunk(3, 300, 2 * 1024 * 1024, CompressionAlgo::None),
+        ];
+        chunks[1].compression = CompressionAlgo::Zstd;
+        assert!(!stripe_compact_encoding_valid(&chunks));
+
+        // 首 chunk 压缩同样回退
+        let mut chunks2 = vec![
+            chunk(1, 100, 0, CompressionAlgo::Zstd),
+            chunk(2, 200, 1024 * 1024, CompressionAlgo::None),
+        ];
+        chunks2[0].size = 512 * 1024; // 压缩后存储字节变短
+        assert!(!stripe_compact_encoding_valid(&chunks2));
     }
 }

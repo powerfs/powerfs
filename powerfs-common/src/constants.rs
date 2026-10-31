@@ -44,5 +44,14 @@ pub const FILE_KEY_BLOCK_SIZE: u64 = 1_048_576; // 1M chunks per file = 2TB max 
 /// gateway 写分块时打上该标记，filer 的 EC 待转换队列据此跳过。
 pub const EC_EXEMPT_EXT_KEY: &str = "powerfs.ec-exempt";
 
+/// P7 压缩控制扩展属性：`powerfs.compress`。
+/// - `off`：该 inode 永不进入压缩候选；
+/// - `zstd`：强制压缩（忽略空闲阈值，由后台 worker 消费）。
+pub const COMPRESS_EXT_KEY: &str = "powerfs.compress";
+
+/// P7 不可压缩豁免键：worker 判定压缩比不足后写入 `1`，
+/// 避免每轮扫描对同一批随机数据重复压缩试错。
+pub const COMPRESS_SKIP_EXT_KEY: &str = "powerfs.compress-skip";
+
 pub const LRU_CACHE_SIZE: usize = 100_000;
 pub const INDEX_CACHE_SIZE: usize = 10_000;

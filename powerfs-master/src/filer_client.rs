@@ -218,6 +218,8 @@ impl FilerManagementClient {
                     needle_id: *needle_id,
                     volume_id: *volume_id,
                     crc32: *crc32,
+                    // 新写入的数据尚未压缩
+                    compression: 0,
                 }
             })
             .collect();

@@ -192,6 +192,8 @@ impl DirectoryTreeApi for RemoteDirectoryTree {
                     generation: 0,
                     replica_chunks: Vec::new(),
                     ec_layout: None,
+                    // 目录不涉及压缩
+                    compression: None,
                 };
 
                 let request = CreateEntryRequest {
@@ -358,6 +360,8 @@ impl LocalDirectoryTree {
                     generation: 0,
                     replica_chunks: Vec::new(),
                     ec_layout: None,
+                    // 目录不涉及压缩
+                    compression: None,
                 },
             ),
         );
@@ -468,6 +472,8 @@ impl DirectoryTreeApi for LocalDirectoryTree {
                     generation: 0,
                     replica_chunks: Vec::new(),
                     ec_layout: None,
+                    // 目录不涉及压缩
+                    compression: None,
                 };
 
                 self.entries

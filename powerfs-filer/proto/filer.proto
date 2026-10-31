@@ -382,6 +382,9 @@ message FileChunk {
     uint64 needle_id = 4;  // chunk-level storage key on volume server
     uint64 volume_id = 5;  // volume this chunk resides on (per-chunk for stripe)
     uint32 crc32 = 6;
+    // P7: 压缩算法 tag（0=None, 1=Zstd）。size 为逻辑（解压后）长度，
+    // crc32 为存储（压缩后）字节 CRC。缺省 0 = 未压缩，兼容旧数据。
+    uint32 compression = 7;
 }
 
 message FuseAttributes {
@@ -414,6 +417,15 @@ message EcLayout {
     uint32 shard_size = 3;  // 每分片字节数 (当前固定 1 MiB)
 }
 
+// P7: 整文件压缩状态与统计。仅当后台压缩 worker 提交后存在；
+// 缺省（state=0）表示未压缩。
+message CompressionInfo {
+    uint32 state = 1;          // CompressionState wire tag（0=None, 1=Pending, 2=Compressed）
+    uint32 algo = 2;           // CompressionAlgo tag（0=None, 1=Zstd）
+    uint32 ratio_x100 = 3;     // 原始字节/压缩后字节 × 100（0 = 未记录）
+    uint64 original_size = 4;  // 压缩前数据字节合计
+}
+
 message Entry {
     string name = 1;
     string directory = 2;
@@ -431,6 +443,8 @@ message Entry {
     uint64 version = 14;
     // P6: EC 布局；非 EC 对象为空，读取方按平铺 chunks 处理。
     EcLayout ec_layout = 15;
+    // P7: 压缩状态；为空或 state=0 表示未压缩。
+    CompressionInfo compression = 16;
 }
 
 // Lease management types

@@ -175,6 +175,16 @@ pub struct InodeInfo {
     pub reliability_state: powerfs_layout::reliability::ReliabilityState,
     #[serde(default)]
     pub compression_state: powerfs_layout::reliability::CompressionState,
+    // P7: 压缩统计（state == Compressed 时有意义）
+    // compression_algo: 整文件统一算法（当前仅 zstd；逐 chunk 算法在 chunks[].compression）
+    // compression_ratio_x100: 原始字节/压缩后字节 × 100（0 = 未记录）
+    // compression_original_size: 压缩前数据字节合计（用于收益统计与校验）
+    #[serde(default)]
+    pub compression_algo: powerfs_common::compression::CompressionAlgo,
+    #[serde(default)]
+    pub compression_ratio_x100: u16,
+    #[serde(default)]
+    pub compression_original_size: u64,
     // P4: 副本位置信息 (Replicated 模式下, 记录副本所在的 volume_id + needle_id)
     // 主副本在 chunks[].volume_id / chunks[].needle_id, 副本在 replica_chunks[]
     #[serde(default)]
@@ -226,6 +236,9 @@ impl InodeInfo {
             reliability: Reliability::default(),
             reliability_state: ReliabilityState::default(),
             compression_state: CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -280,6 +293,10 @@ pub struct StoredFileChunk {
     /// and GC awareness (decrement refcount on chunk removal).
     #[serde(default)]
     pub is_reference: bool,
+    /// P7: 该 chunk 的压缩算法。`size` 始终是逻辑（解压后）长度，
+    /// `crc32` 始终是存储（压缩后）字节的 CRC；None = 未压缩（默认）。
+    #[serde(default)]
+    pub compression: powerfs_common::compression::CompressionAlgo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1674,6 +1691,9 @@ impl ShardStore {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             // Layout-prediction: new files start as Empty, layout decided
             // on first write by LayoutPredictor or auto_promote fallback.
@@ -1760,6 +1780,9 @@ impl ShardStore {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -1963,6 +1986,9 @@ impl ShardStore {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -2202,6 +2228,8 @@ impl ShardStore {
                     volume_id,
                     crc32: 0,
                     is_reference: false,
+                    // 新写入的数据尚未压缩
+                    compression: powerfs_common::compression::CompressionAlgo::None,
                 });
 
                 // Persist to RocksDB
@@ -2348,6 +2376,13 @@ impl ShardStore {
             {
                 continue;
             }
+            // P7: 压缩与 EC 互斥。已压缩/压缩中的 inode 不参与 EC 转换，
+            // 否则 group-major 分片会让读端把压缩字节当 RS 分片解析。
+            if info.compression_state != powerfs_layout::reliability::CompressionState::None
+                || info.chunks.iter().any(|c| c.compression.is_compressed())
+            {
+                continue;
+            }
             // 文件大小检查
             let total_size: u64 = info.chunks.iter().map(|c| c.size).sum();
             if min_file_size > 0 && total_size < min_file_size {
@@ -2355,6 +2390,101 @@ impl ShardStore {
             }
             result.push((info.inode, info.chunks.clone()));
         }
+        result
+    }
+
+    /// P7: 列出可后台压缩的冷副本文件（FR-3）。
+    ///
+    /// 过滤条件（全部满足才入选）：
+    /// - 普通文件、未删除、无 inline 数据、chunks 非空；
+    /// - `compression_state == None` 且所有 chunk 未压缩；
+    /// - `reliability_state == Replicated`（压缩只作用于副本形态，EC 互斥由
+    ///   本条件 + `max_size = ec_min_file_size` 双重保证）；
+    /// - 无 `is_reference` chunk（指纹去重的 needle 不做压缩替换）；
+    /// - `max(atime, mtime)` 距今 ≥ `idle_secs`（`powerfs.compress=zstd` 豁免）；
+    /// - `size >= min_size` 且 `size < max_size`（EC 优先：大于等于 EC 阈值的
+    ///   文件走 EC，不参与压缩）；
+    /// - 未带 `powerfs.compress-skip` / `powerfs.compress=off` 标记。
+    ///
+    /// 返回 `(inode, chunks)`，按 inode 排序保证扫描确定性；最多 `limit` 条。
+    pub fn list_pending_compress(
+        &self,
+        min_size: u64,
+        max_size: u64,
+        idle_secs: u64,
+        now: u64,
+        limit: usize,
+    ) -> Vec<(u64, Vec<StoredFileChunk>)> {
+        use powerfs_layout::reliability::{CompressionState, ReliabilityState};
+        let inodes = self.inodes.read().unwrap();
+        let mut result: Vec<(u64, Vec<StoredFileChunk>)> = Vec::new();
+        for info in inodes.values() {
+            if info.file_type != FileType::File {
+                continue;
+            }
+            if info.delete_time > 0 {
+                continue;
+            }
+            if info.inline_data.is_some() || info.chunks.is_empty() {
+                continue;
+            }
+            if info.compression_state != CompressionState::None {
+                continue;
+            }
+            if info.reliability_state != ReliabilityState::Replicated {
+                continue;
+            }
+            if info
+                .chunks
+                .iter()
+                .any(|c| c.is_reference || c.compression.is_compressed())
+            {
+                continue;
+            }
+            // 正在被写的文件不参与压缩，避免替换到未完成的数据。
+            if self.get_open_count(info.inode) > 0 {
+                continue;
+            }
+            // 扩展属性控制：off 永不压缩；skip 已判定不可压缩。
+            if info
+                .extended
+                .contains_key(powerfs_common::constants::COMPRESS_SKIP_EXT_KEY)
+            {
+                continue;
+            }
+            let force = info
+                .extended
+                .get(powerfs_common::constants::COMPRESS_EXT_KEY)
+                .map(|v| v.as_slice() == b"zstd")
+                .unwrap_or(false);
+            if info
+                .extended
+                .get(powerfs_common::constants::COMPRESS_EXT_KEY)
+                .map(|v| v.as_slice() == b"off")
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !force {
+                let last_access = std::cmp::max(info.atime, info.mtime);
+                if now.saturating_sub(last_access) < idle_secs {
+                    continue;
+                }
+            }
+            if info.size < min_size {
+                continue;
+            }
+            // EC 优先：达到 EC 阈值的文件不属于压缩候选（max_size=0 表示不设上限，
+            // 仅供显式关闭 EC 分工的测试场景使用）。
+            if max_size > 0 && info.size >= max_size {
+                continue;
+            }
+            result.push((info.inode, info.chunks.clone()));
+        }
+        // 先排序再截断：HashMap 遍历顺序不定，按 inode 升序取前 limit 条
+        // 保证每轮扫描的候选集合确定、可复现。
+        result.sort_by_key(|(inode, _)| *inode);
+        result.truncate(limit);
         result
     }
 
@@ -4022,6 +4152,24 @@ impl ShardStore {
                 }
                 _ => {}
             }
+            // P7: 覆盖写/追加使 chunks 变化后，旧的压缩布局已失效——
+            // 新写入的 chunk 是未压缩字节。必须复位压缩状态与统计，
+            // 否则读端会把新数据按压缩格式解析（数据损坏）。
+            if info.compression_state != powerfs_layout::reliability::CompressionState::None {
+                log::info!(
+                    "Shard {} P7: inode {} data changed, resetting compression {:?} -> None \
+                     (old algo={:?}, new chunks={})",
+                    self.shard_id.0,
+                    inode,
+                    info.compression_state,
+                    info.compression_algo,
+                    info.chunks.len()
+                );
+                info.compression_state = powerfs_layout::reliability::CompressionState::None;
+            }
+            info.compression_algo = powerfs_common::compression::CompressionAlgo::default();
+            info.compression_ratio_x100 = 0;
+            info.compression_original_size = 0;
         }
         let data = serde_json::to_vec(&info).map_err(|e| format!("serialize inode: {}", e))?;
         // sync 写保证 close sync 账本强持久化
@@ -4228,6 +4376,8 @@ impl ShardStore {
             crc32: 0,
             mtime: now,
             is_reference: false,
+            // inline 迁移出的数据尚未压缩
+            compression: powerfs_common::compression::CompressionAlgo::None,
         };
         // The snapshot (≤8 KiB) always occupies stripe unit 0; subsequent
         // writes fan out to the other persisted stripe units via the normal
@@ -4596,6 +4746,9 @@ impl ShardStore {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -4826,6 +4979,9 @@ mod tests {
             reliability: powerfs_layout::reliability::Reliability::default(),
             reliability_state: powerfs_layout::reliability::ReliabilityState::default(),
             compression_state: powerfs_layout::reliability::CompressionState::default(),
+            compression_algo: powerfs_common::compression::CompressionAlgo::default(),
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
             replica_chunks: Vec::new(),
             storage_mode: powerfs_layout::StorageMode::Inline,
             migration: None,
@@ -5004,6 +5160,7 @@ mod tests {
             volume_id: 1,
             crc32: 0xDEADBEEF,
             is_reference: false,
+            compression: powerfs_common::compression::CompressionAlgo::None,
         };
 
         // 初始为空
@@ -5430,6 +5587,7 @@ mod tests {
             crc32: 0,
             mtime: 0,
             is_reference: false,
+            compression: powerfs_common::compression::CompressionAlgo::None,
         }
     }
 
@@ -6069,6 +6227,7 @@ mod tests {
             crc32: 0,
             mtime: 0,
             is_reference: false,
+            compression: powerfs_common::compression::CompressionAlgo::None,
         };
         let mut info = make_inode(1700, 1, "ec-object");
         info.size = 8192;
@@ -6133,5 +6292,211 @@ mod tests {
         let inodes: Vec<u64> = pending.iter().map(|(inode, _)| *inode).collect();
         assert!(inodes.contains(&1801), "普通大文件应进入待转换队列");
         assert!(!inodes.contains(&1802), "带豁免标记的分块不得转换");
+    }
+
+    /// P7: `list_pending_compress` 候选过滤矩阵（FR-3）。
+    ///
+    /// 基准候选：普通、已 Replicated、无 inline、无引用 chunk、足够空闲、
+    /// 尺寸在 [min,max) 内的文件必须入选；其余每一项违规都必须被排除。
+    #[test]
+    fn test_p7_list_pending_compress_filters() {
+        use powerfs_common::compression::CompressionAlgo;
+        use powerfs_common::constants::{COMPRESS_EXT_KEY, COMPRESS_SKIP_EXT_KEY};
+        use powerfs_layout::reliability::{CompressionState, ReliabilityState};
+
+        let store = make_store();
+        const NOW: u64 = 1_000_000;
+        const IDLE: u64 = 100;
+        const MIN: u64 = 1024;
+        const MAX: u64 = 8 * 1024 * 1024;
+
+        // 基准合格候选工厂：尺寸 1MiB、早就空闲、已 Replicated。
+        let mut next_ino = 1900u64;
+        let mut insert = |store: &ShardStore, tweak: &dyn Fn(&mut InodeInfo)| -> u64 {
+            next_ino += 1;
+            let mut info = make_inode(next_ino, 1, "cand");
+            info.size = 1024 * 1024;
+            info.blocks = (1024 * 1024u64).div_ceil(512);
+            info.chunks = vec![flat_chunk(T4_VID, 0xC000 + next_ino, 1024 * 1024)];
+            info.reliability_state = ReliabilityState::Replicated;
+            info.atime = NOW - 10 * IDLE;
+            info.mtime = NOW - 10 * IDLE;
+            tweak(&mut info);
+            store.inodes.write().unwrap().insert(next_ino, info);
+            next_ino
+        };
+
+        // 1) 合格候选入选
+        let ok = insert(&store, &|_| {});
+        // 2) EC 已转换 → 排除
+        let ec = insert(&store, &|i| {
+            i.reliability_state = ReliabilityState::EC;
+            i.reliability = powerfs_layout::reliability::Reliability::EC { data: 4, parity: 2 };
+        });
+        // 3) 压缩中 (Pending) → 排除
+        let pending_state = insert(&store, &|i| {
+            i.compression_state = CompressionState::Pending;
+        });
+        // 4) Inline 文件 → 排除
+        let inline = insert(&store, &|i| {
+            i.inline_data = Some(vec![0u8; 16]);
+        });
+        // 5) 引用 chunk（指纹去重 needle）→ 排除
+        let reference = insert(&store, &|i| {
+            i.chunks[0].is_reference = true;
+        });
+        // 6) 未到空闲阈值 → 排除
+        let hot = insert(&store, &|i| {
+            i.mtime = NOW - 1;
+        });
+        // 7) 已压缩 chunk → 排除
+        let already = insert(&store, &|i| {
+            i.chunks[0].compression = CompressionAlgo::Zstd;
+            i.compression_state = CompressionState::Compressed;
+        });
+        // 8) compress=off → 排除
+        let off = insert(&store, &|i| {
+            i.extended
+                .insert(COMPRESS_EXT_KEY.to_string(), b"off".to_vec());
+        });
+        // 9) 带 skip 标记 → 排除
+        let skip = insert(&store, &|i| {
+            i.extended
+                .insert(COMPRESS_SKIP_EXT_KEY.to_string(), b"1".to_vec());
+        });
+        // 10) compress=zstd 豁免空闲阈值（手动强制）→ 入选
+        let force = insert(&store, &|i| {
+            i.mtime = NOW; // 完全不空闲
+            i.atime = NOW;
+            i.extended
+                .insert(COMPRESS_EXT_KEY.to_string(), b"zstd".to_vec());
+        });
+        // 11) size >= max_size（EC 优先）→ 排除
+        let too_big = insert(&store, &|i| {
+            i.size = MAX;
+        });
+        // 12) size < min_size → 排除
+        let too_small = insert(&store, &|i| {
+            i.size = MIN - 1;
+        });
+
+        let got: Vec<u64> = store
+            .list_pending_compress(MIN, MAX, IDLE, NOW, 100)
+            .iter()
+            .map(|(ino, _)| *ino)
+            .collect();
+
+        assert!(got.contains(&ok), "合格候选必须入选");
+        assert!(got.contains(&force), "compress=zstd 必须豁免空闲阈值");
+        for (ino, why) in [
+            (ec, "EC 文件不得压缩"),
+            (pending_state, "压缩中不得重复入队"),
+            (inline, "inline 文件不得压缩"),
+            (reference, "引用 chunk 不得压缩"),
+            (hot, "未到空闲阈值不得压缩"),
+            (already, "已压缩文件不得重复压缩"),
+            (off, "compress=off 永不压缩"),
+            (skip, "skip 标记不参与压缩"),
+            (too_big, "达到 EC 阈值的文件走 EC"),
+            (too_small, "小于 min_size 不压缩"),
+        ] {
+            assert!(!got.contains(&ino), "{why}");
+        }
+
+        // limit 截断：排序后取前 N 条
+        let limited = store.list_pending_compress(MIN, MAX, IDLE, NOW, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].0, ok.min(force), "截断必须取 inode 最小者");
+    }
+
+    /// P7: 覆盖写/追加使 chunks 变化后，压缩状态与统计必须复位——
+    /// 新写入的是未压缩字节，不复位会让读端按压缩格式解析新数据（数据损坏）。
+    #[test]
+    fn test_p7_chunks_change_resets_compression() {
+        use powerfs_common::compression::CompressionAlgo;
+        use powerfs_layout::reliability::{CompressionState, ReliabilityState};
+
+        let store = make_store();
+
+        let mut info = make_inode(1950, 1, "compressed-obj");
+        info.size = 4096;
+        info.blocks = 8;
+        let mut zchunk = flat_chunk(T4_VID, 0xD001, 1024);
+        zchunk.compression = CompressionAlgo::Zstd;
+        info.chunks = vec![zchunk];
+        info.reliability_state = ReliabilityState::Replicated;
+        info.compression_state = CompressionState::Compressed;
+        info.compression_algo = CompressionAlgo::Zstd;
+        info.compression_ratio_x100 = 400;
+        info.compression_original_size = 4096;
+        store.inodes.write().unwrap().insert(1950, info);
+
+        store
+            .update_inode_size_chunks_atomic(
+                1950,
+                8192,
+                vec![flat_chunk(T4_VID, 0xD002, 8192)],
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+
+        let updated = store.get_inode(1950).unwrap();
+        assert_eq!(updated.compression_state, CompressionState::None);
+        assert_eq!(updated.compression_algo, CompressionAlgo::None);
+        assert_eq!(updated.compression_ratio_x100, 0);
+        assert_eq!(updated.compression_original_size, 0);
+        assert_eq!(updated.chunks.len(), 1);
+        assert_eq!(updated.chunks[0].needle_id, 0xD002);
+    }
+
+    /// P7: EC 待转换队列必须跳过已压缩/压缩中的 inode——
+    /// 压缩与 EC 互斥，否则 group-major 分片会把压缩字节当 RS 分片解析。
+    #[test]
+    fn test_p7_list_pending_ec_skips_compressed() {
+        use powerfs_common::compression::CompressionAlgo;
+        use powerfs_layout::reliability::{CompressionState, ReliabilityState};
+
+        let store = make_store();
+
+        let mut normal = make_inode(1960, 1, "plain.bin");
+        normal.size = 4 * 1024 * 1024;
+        normal.blocks = (4 * 1024 * 1024u64).div_ceil(512);
+        normal.chunks = vec![flat_chunk(T4_VID, 0xE001, 4 * 1024 * 1024)];
+        normal.reliability_state = ReliabilityState::Replicated;
+        store.inodes.write().unwrap().insert(1960, normal);
+
+        // 状态 Compressed + chunk 带算法
+        let mut compressed = make_inode(1961, 1, "z.bin");
+        compressed.size = 4 * 1024 * 1024;
+        compressed.blocks = (4 * 1024 * 1024u64).div_ceil(512);
+        let mut zchunk = flat_chunk(T4_VID, 0xE002, 1024 * 1024);
+        zchunk.compression = CompressionAlgo::Zstd;
+        compressed.chunks = vec![zchunk];
+        compressed.reliability_state = ReliabilityState::Replicated;
+        compressed.compression_state = CompressionState::Compressed;
+        store.inodes.write().unwrap().insert(1961, compressed);
+
+        // 仅状态 Pending（chunk 尚未替换）也不得做 EC
+        let mut pending = make_inode(1962, 1, "pending.bin");
+        pending.size = 4 * 1024 * 1024;
+        pending.blocks = (4 * 1024 * 1024u64).div_ceil(512);
+        pending.chunks = vec![flat_chunk(T4_VID, 0xE003, 4 * 1024 * 1024)];
+        pending.reliability_state = ReliabilityState::Replicated;
+        pending.compression_state = CompressionState::Pending;
+        store.inodes.write().unwrap().insert(1962, pending);
+
+        let ec_candidates: Vec<u64> = store
+            .list_pending_ec(1024 * 1024)
+            .iter()
+            .map(|(ino, _)| *ino)
+            .collect();
+        assert!(
+            ec_candidates.contains(&1960),
+            "未压缩文件应正常进入 EC 队列"
+        );
+        assert!(!ec_candidates.contains(&1961), "已压缩文件不得 EC 转换");
+        assert!(!ec_candidates.contains(&1962), "压缩中文件不得 EC 转换");
     }
 }

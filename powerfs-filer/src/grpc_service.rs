@@ -10,22 +10,22 @@ use crate::shard_strategy::ShardStrategy;
 use super::powerfs::filer_meta_service_server::FilerMetaService;
 use super::powerfs::{
     AddShardRequest, AddShardResponse, AllocInodeBatchRequest, AllocInodeBatchResponse,
-    BucketRootInfo, CreateEntryRequest, CreateEntryResponse, DeleteBucketRootRequest,
-    DeleteBucketRootResponse, DeleteEntryRequest, DeleteEntryResponse, DeleteObjectMetaRequest,
-    DeleteObjectMetaResponse, DrainShardRequest, EcLayout, EnsureBucketRootRequest,
-    EnsureBucketRootResponse, Entry as ProtoEntry, FileChunk as ProtoFileChunk,
-    FindInodesByVolumeRequest, FindInodesByVolumeResponse, FuseAttributes, GetBucketRootRequest,
-    GetBucketRootResponse, GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest,
-    GetEntryResponse, GetObjectMetaRequest, GetObjectMetaResponse, GetShardStatsRequest,
-    GetShardStatsResponse, InodeChunkEntry, LeaseReleaseRequest, LeaseReleaseResponse,
-    LeaseRenewRequest, LeaseRenewResponse, LeaseRequest, LeaseResponse, ListBucketRootsRequest,
-    ListBucketRootsResponse, ListEntriesRequest, ListEntriesResponse, ListObjectMetasRequest,
-    ListObjectMetasResponse, ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
-    LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse, PushDeltaRequest,
-    PushDeltaResponse, PutObjectMetaRequest, PutObjectMetaResponse, RaftMessageRequest,
-    RaftMessageResponse, RemoveShardRequest, RenameEntryRequest, RenameEntryResponse,
-    ShardControlResponse, UpdateEntryRequest, UpdateEntryResponse, UpdateInodeSizeChunksRequest,
-    UpdateInodeSizeChunksResponse,
+    BucketRootInfo, CompressionInfo, CreateEntryRequest, CreateEntryResponse,
+    DeleteBucketRootRequest, DeleteBucketRootResponse, DeleteEntryRequest, DeleteEntryResponse,
+    DeleteObjectMetaRequest, DeleteObjectMetaResponse, DrainShardRequest, EcLayout,
+    EnsureBucketRootRequest, EnsureBucketRootResponse, Entry as ProtoEntry,
+    FileChunk as ProtoFileChunk, FindInodesByVolumeRequest, FindInodesByVolumeResponse,
+    FuseAttributes, GetBucketRootRequest, GetBucketRootResponse, GetEntryByInodeRequest,
+    GetEntryByInodeResponse, GetEntryRequest, GetEntryResponse, GetObjectMetaRequest,
+    GetObjectMetaResponse, GetShardStatsRequest, GetShardStatsResponse, InodeChunkEntry,
+    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRequest,
+    LeaseResponse, ListBucketRootsRequest, ListBucketRootsResponse, ListEntriesRequest,
+    ListEntriesResponse, ListObjectMetasRequest, ListObjectMetasResponse, ListShardsRequest,
+    ListShardsResponse, LookupDirectoryEntryRequest, LookupDirectoryEntryResponse,
+    PullDeltaRequest, PullDeltaResponse, PushDeltaRequest, PushDeltaResponse, PutObjectMetaRequest,
+    PutObjectMetaResponse, RaftMessageRequest, RaftMessageResponse, RemoveShardRequest,
+    RenameEntryRequest, RenameEntryResponse, ShardControlResponse, UpdateEntryRequest,
+    UpdateEntryResponse, UpdateInodeSizeChunksRequest, UpdateInodeSizeChunksResponse,
 };
 
 /// S3 元数据在 inode `extended` 中的保留前缀；带此前缀但不在请求里的键会被清理。
@@ -709,19 +709,8 @@ impl FilerMetaService for FilerMetaServiceImpl {
         }
 
         // proto FileChunk -> StoredFileChunk
-        let chunks: Vec<crate::shard_store::StoredFileChunk> = req
-            .chunks
-            .into_iter()
-            .map(|c| crate::shard_store::StoredFileChunk {
-                offset: c.offset,
-                size: c.size,
-                mtime: c.mtime,
-                needle_id: c.needle_id,
-                volume_id: c.volume_id,
-                crc32: c.crc32,
-                is_reference: false,
-            })
-            .collect();
+        let chunks: Vec<crate::shard_store::StoredFileChunk> =
+            req.chunks.iter().map(stored_chunk_from_proto).collect();
 
         match self
             .meta_shard_manager
@@ -1390,7 +1379,44 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
         generation: 0,
         version: inode.version,
         ec_layout: ec_layout_from_inode(inode),
+        compression: compression_info_from_inode(inode),
     }
+}
+
+/// P7: 从 inode 推导 `CompressionInfo`。
+///
+/// 自洽规则（与 spec FR-2 一致）：
+/// - `compression_state == None` → 返回 `None`（绝大多数文件，零开销）；
+/// - `state != None` 但所有 chunk 都未压缩 → 元数据不自洽，`warn!` 并返回 `None`
+///   （读者按未压缩处理，绝不把状态字段当权威去解压原始字节）；
+/// - 否则填 state/algo/ratio/original_size。
+pub(crate) fn compression_info_from_inode(
+    inode: &crate::shard_store::InodeInfo,
+) -> Option<CompressionInfo> {
+    use powerfs_layout::reliability::CompressionState;
+
+    let state_tag = match inode.compression_state {
+        CompressionState::None => return None,
+        CompressionState::Pending => 1,
+        CompressionState::Compressed => 2,
+    };
+
+    if !inode.chunks.iter().any(|c| c.compression.is_compressed()) {
+        log::warn!(
+            "P7: inode {} compression_state={:?} but no chunk is compressed — \
+             metadata inconsistent, reporting no compression",
+            inode.inode,
+            inode.compression_state
+        );
+        return None;
+    }
+
+    Some(CompressionInfo {
+        state: state_tag,
+        algo: inode.compression_algo.to_tag() as u32,
+        ratio_x100: inode.compression_ratio_x100 as u32,
+        original_size: inode.compression_original_size,
+    })
 }
 
 /// P6: 从 inode 的可靠性状态推导 `EcLayout`，仅对真正的 EC 对象返回 `Some`。
@@ -1463,7 +1489,9 @@ fn ec_layout_from_parts(
     })
 }
 
-fn proto_chunk_from_stored(chunk: &crate::shard_store::StoredFileChunk) -> ProtoFileChunk {
+pub(crate) fn proto_chunk_from_stored(
+    chunk: &crate::shard_store::StoredFileChunk,
+) -> ProtoFileChunk {
     ProtoFileChunk {
         offset: chunk.offset,
         size: chunk.size,
@@ -1471,10 +1499,27 @@ fn proto_chunk_from_stored(chunk: &crate::shard_store::StoredFileChunk) -> Proto
         needle_id: chunk.needle_id,
         volume_id: chunk.volume_id,
         crc32: chunk.crc32,
+        compression: chunk.compression.to_tag() as u32,
     }
 }
 
-fn stored_chunk_from_proto(chunk: &ProtoFileChunk) -> crate::shard_store::StoredFileChunk {
+pub(crate) fn stored_chunk_from_proto(
+    chunk: &ProtoFileChunk,
+) -> crate::shard_store::StoredFileChunk {
+    // 未知算法 tag 降级为 None（warn 记录），绝不硬失败阻塞写入路径。
+    let compression =
+        match powerfs_common::compression::CompressionAlgo::from_tag(chunk.compression as u8) {
+            Some(algo) => algo,
+            None => {
+                log::warn!(
+                    "P7: unknown compression tag {} in proto chunk (needle={}), \
+                 treating as uncompressed",
+                    chunk.compression,
+                    chunk.needle_id
+                );
+                powerfs_common::compression::CompressionAlgo::None
+            }
+        };
     crate::shard_store::StoredFileChunk {
         offset: chunk.offset,
         size: chunk.size,
@@ -1483,6 +1528,7 @@ fn stored_chunk_from_proto(chunk: &ProtoFileChunk) -> crate::shard_store::Stored
         volume_id: chunk.volume_id,
         crc32: chunk.crc32,
         is_reference: false,
+        compression,
     }
 }
 
@@ -1570,5 +1616,128 @@ mod ec_layout_tests {
         assert!(ec_layout_from_parts(11, &ReliabilityState::EC, &ec(4, 2), 0).is_none());
         // data=0 的非法配置
         assert!(ec_layout_from_parts(11, &ReliabilityState::EC, &ec(0, 2), 2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use crate::shard_store::{FileType, InodeInfo, StoredFileChunk};
+    use powerfs_common::compression::CompressionAlgo;
+    use powerfs_layout::reliability::CompressionState;
+
+    fn chunk(compression: CompressionAlgo) -> StoredFileChunk {
+        StoredFileChunk {
+            offset: 0,
+            size: 4096,
+            mtime: 0,
+            needle_id: 100,
+            volume_id: 7,
+            crc32: 0,
+            is_reference: false,
+            compression,
+        }
+    }
+
+    fn inode_with(chunks: Vec<StoredFileChunk>) -> InodeInfo {
+        InodeInfo {
+            inode: 42,
+            name: "obj".to_string(),
+            parent_inode: 1,
+            file_type: FileType::File,
+            size: 4096,
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            blocks: 8,
+            fid: None,
+            volume_id: None,
+            etag: None,
+            chunks,
+            inline_data: None,
+            extended: Default::default(),
+            symlink_target: None,
+            nlink: 1,
+            version: 0,
+            delete_time: 0,
+            reliability: Default::default(),
+            reliability_state: Default::default(),
+            compression_state: CompressionState::None,
+            compression_algo: CompressionAlgo::None,
+            compression_ratio_x100: 0,
+            compression_original_size: 0,
+            replica_chunks: Vec::new(),
+            storage_mode: powerfs_layout::StorageMode::Flat,
+            migration: None,
+        }
+    }
+
+    /// stored → proto → stored 往返必须保留逐 chunk 压缩算法；
+    /// 未知 tag 必须降级为 None 而不是硬失败。
+    #[test]
+    fn chunk_proto_roundtrip_preserves_compression() {
+        for algo in [CompressionAlgo::None, CompressionAlgo::Zstd] {
+            let stored = chunk(algo);
+            let proto = proto_chunk_from_stored(&stored);
+            assert_eq!(proto.compression, algo.to_tag() as u32);
+            let back = stored_chunk_from_proto(&proto);
+            assert_eq!(back.compression, algo);
+            assert_eq!(back.needle_id, stored.needle_id);
+            assert!(!back.is_reference);
+        }
+
+        // 未知 tag (例如未来算法) → warn 降级 None，不阻塞写入路径
+        let mut proto = proto_chunk_from_stored(&chunk(CompressionAlgo::Zstd));
+        proto.compression = 99;
+        assert_eq!(
+            stored_chunk_from_proto(&proto).compression,
+            CompressionAlgo::None
+        );
+    }
+
+    /// state=None（绝大多数文件）必须返回 None，零额外 wire 开销。
+    #[test]
+    fn compression_info_none_for_uncompressed_inode() {
+        let info = inode_with(vec![chunk(CompressionAlgo::None)]);
+        assert!(compression_info_from_inode(&info).is_none());
+        assert!(proto_entry_from_inode(&info).compression.is_none());
+    }
+
+    /// state=Compressed 且 chunk 已压缩 → 填全量信息（state/algo/ratio/original）。
+    #[test]
+    fn compression_info_filled_for_compressed_inode() {
+        let mut info = inode_with(vec![chunk(CompressionAlgo::Zstd)]);
+        info.compression_state = CompressionState::Compressed;
+        info.compression_algo = CompressionAlgo::Zstd;
+        info.compression_ratio_x100 = 250;
+        info.compression_original_size = 8192;
+
+        let ci = compression_info_from_inode(&info).expect("已压缩 inode 必须携带信息");
+        assert_eq!(ci.state, 2);
+        assert_eq!(ci.algo, CompressionAlgo::Zstd.to_tag() as u32);
+        assert_eq!(ci.ratio_x100, 250);
+        assert_eq!(ci.original_size, 8192);
+
+        let entry = proto_entry_from_inode(&info);
+        assert_eq!(entry.chunks[0].compression, 1);
+        assert!(entry.compression.is_some());
+    }
+
+    /// 不自洽元数据（state 非 None 但所有 chunk 未压缩）必须降级 None——
+    /// 读者按未压缩处理，绝不拿状态字段去解压原始字节。
+    #[test]
+    fn compression_info_inconsistent_state_degrades_to_none() {
+        for state in [CompressionState::Pending, CompressionState::Compressed] {
+            let mut info = inode_with(vec![chunk(CompressionAlgo::None)]);
+            info.compression_state = state.clone();
+            info.compression_algo = CompressionAlgo::Zstd;
+            assert!(
+                compression_info_from_inode(&info).is_none(),
+                "state={state:?} 但无压缩 chunk 时必须返回 None"
+            );
+        }
     }
 }

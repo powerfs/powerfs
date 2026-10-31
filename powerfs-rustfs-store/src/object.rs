@@ -292,6 +292,8 @@ impl PowerFsStore {
                 needle_id: fid.file_key,
                 volume_id: fid.volume_id.0,
                 crc32: 0,
+                // 新写入的数据尚未压缩
+                compression: 0,
             });
         }
         Ok(chunks)
@@ -381,6 +383,8 @@ impl PowerFsStore {
                 needle_id: fid.file_key,
                 volume_id: fid.volume_id.0,
                 crc32: 0,
+                // 新写入的数据尚未压缩
+                compression: 0,
             });
         }
 

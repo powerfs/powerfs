@@ -429,6 +429,8 @@ mod tests {
                     needle_id,
                     volume_id,
                     crc32: crc32fast::hash(&shard),
+                    // EC 与压缩互斥：分片永不压缩
+                    compression: 0,
                 });
             }
         }

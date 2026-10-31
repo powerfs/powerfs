@@ -11,16 +11,15 @@ use super::powerfs::{
     AddShardRequest, AddShardResponse, AllocInodeBatchRequest, AllocInodeBatchResponse,
     CreateDirectoryRequest, CreateDirectoryResponse, CreateEntryRequest, CreateEntryResponse,
     DeleteEntryRequest, DeleteEntryResponse, DrainShardRequest, Entry as ProtoEntry,
-    FileChunk as ProtoFileChunk, FindInodesByVolumeRequest, FindInodesByVolumeResponse,
-    FuseAttributes, GetEntryByInodeRequest, GetEntryByInodeResponse, GetEntryRequest,
-    GetEntryResponse, GetShardStatsRequest, GetShardStatsResponse, InodeChunkEntry,
-    LeaseReleaseRequest, LeaseReleaseResponse, LeaseRenewRequest, LeaseRenewResponse, LeaseRequest,
-    LeaseResponse, ListEntriesRequest, ListEntriesResponse, ListShardsRequest, ListShardsResponse,
-    LookupDirectoryEntryRequest, LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse,
-    PushDeltaRequest, PushDeltaResponse, RaftMessageRequest, RaftMessageResponse,
-    RemoveShardRequest, RenameEntryRequest, RenameEntryResponse, ShardControlResponse,
-    UpdateEntryRequest, UpdateEntryResponse, UpdateInodeSizeChunksRequest,
-    UpdateInodeSizeChunksResponse,
+    FindInodesByVolumeRequest, FindInodesByVolumeResponse, FuseAttributes, GetEntryByInodeRequest,
+    GetEntryByInodeResponse, GetEntryRequest, GetEntryResponse, GetShardStatsRequest,
+    GetShardStatsResponse, InodeChunkEntry, LeaseReleaseRequest, LeaseReleaseResponse,
+    LeaseRenewRequest, LeaseRenewResponse, LeaseRequest, LeaseResponse, ListEntriesRequest,
+    ListEntriesResponse, ListShardsRequest, ListShardsResponse, LookupDirectoryEntryRequest,
+    LookupDirectoryEntryResponse, PullDeltaRequest, PullDeltaResponse, PushDeltaRequest,
+    PushDeltaResponse, RaftMessageRequest, RaftMessageResponse, RemoveShardRequest,
+    RenameEntryRequest, RenameEntryResponse, ShardControlResponse, UpdateEntryRequest,
+    UpdateEntryResponse, UpdateInodeSizeChunksRequest, UpdateInodeSizeChunksResponse,
 };
 
 const S_IFDIR: u32 = 0o170000;
@@ -752,16 +751,8 @@ impl PosixMetaService for PosixMetaServiceImpl {
 
         let chunks: Vec<crate::shard_store::StoredFileChunk> = req
             .chunks
-            .into_iter()
-            .map(|c| crate::shard_store::StoredFileChunk {
-                offset: c.offset,
-                size: c.size,
-                mtime: c.mtime,
-                needle_id: c.needle_id,
-                volume_id: c.volume_id,
-                crc32: c.crc32,
-                is_reference: false,
-            })
+            .iter()
+            .map(crate::grpc_service::stored_chunk_from_proto)
             .collect();
 
         match self
@@ -1029,14 +1020,7 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
         chunks: inode
             .chunks
             .iter()
-            .map(|c| ProtoFileChunk {
-                offset: c.offset,
-                size: c.size,
-                mtime: c.mtime,
-                needle_id: c.needle_id,
-                volume_id: c.volume_id,
-                crc32: c.crc32,
-            })
+            .map(crate::grpc_service::proto_chunk_from_stored)
             .collect(),
         hard_link_id: "".to_string(),
         hard_link_counter: 0,
@@ -1051,5 +1035,6 @@ fn proto_entry_from_inode(inode: &crate::shard_store::InodeInfo) -> ProtoEntry {
         // P6: 与 FilerMetaService 的 Entry 保持同一语义；此接口(Raft shard
         // 内部诊断用)仅透传布局，读路径不在此处。
         ec_layout: crate::grpc_service::ec_layout_from_inode(inode),
+        compression: crate::grpc_service::compression_info_from_inode(inode),
     }
 }

@@ -635,6 +635,8 @@ pub mod handlers {
             needle_id: fid.file_key,
             volume_id: fid.volume_id.0,
             crc32: 0,
+            // 新写入的数据尚未压缩
+            compression: 0,
         }];
 
         let mut extended = std::collections::HashMap::new();
@@ -671,6 +673,8 @@ pub mod handlers {
             generation: 0,
             replica_chunks: Vec::new(),
             ec_layout: None,
+            // 新建对象未压缩
+            compression: None,
         };
 
         let object_path = format!("/{}/{}", bucket, key);
@@ -1164,6 +1168,8 @@ pub mod handlers {
                 needle_id: part.needle_id,
                 volume_id: part.volume_id,
                 crc32: 0,
+                // 新写入的数据尚未压缩
+                compression: 0,
             });
             offset += part.size;
             total_size += part.size;
@@ -1203,6 +1209,8 @@ pub mod handlers {
             generation: 0,
             replica_chunks: Vec::new(),
             ec_layout: None,
+            // 新建对象未压缩
+            compression: None,
         };
 
         let object_path = format!("/{}/{}", bucket, key);
