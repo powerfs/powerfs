@@ -1,3 +1,4 @@
+pub mod chunk_compression_cache;
 pub mod circuit_breaker;
 pub mod client_error;
 pub mod client_identity;

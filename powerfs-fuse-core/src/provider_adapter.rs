@@ -225,6 +225,9 @@ fn parse_entry_from_tlv(data: &[u8], path: &str) -> Option<Entry> {
         compression: CompressionState::default(),
         encoding: ChunkEncoding::PerChunk { chunks: Vec::new() },
     });
+    // P7: 把 chunk 压缩算法登记到读路径缓存（键 volume_id+needle_id）。
+    // 解压发生在 facade read_blob 出口，此处只做登记，不改变任何布局语义。
+    crate::chunk_compression_cache::record_layout(&layout);
 
     let chunks: Vec<powerfs_common::traits::FileChunk> = match &layout.encoding {
         ChunkEncoding::PerChunk { chunks } => chunks
@@ -335,6 +338,10 @@ fn scan_tlv_for_field(buf: &[u8], target: powerfs_net::FieldId) -> Option<Vec<u8
 
 /// P4: 解析 FieldId::ReplicaChunks 的 payload.
 /// 格式: [count u32 LE] [ChunkRef * count] (每个 44 字节, 与 codec 格式一致).
+///
+/// P7: 其后可选压缩算法 trailing 区段 `[algo_count u32 LE][algo u8 × count]`
+/// （与 `powerfs-layout::codec` 同一约定）。解析后登记到压缩缓存，
+/// 使副本 failover 读也能解压；trailing 缺失/长度不符时全部按未压缩。
 fn parse_replica_chunks(bytes: &[u8]) -> Vec<powerfs_common::traits::FileChunk> {
     if bytes.len() < 4 {
         return Vec::new();
@@ -362,6 +369,28 @@ fn parse_replica_chunks(bytes: &[u8]) -> Vec<powerfs_common::traits::FileChunk> 
             mtime: u64::from_le_bytes(bytes[base + 36..base + 44].try_into().unwrap()),
         });
     }
+
+    // P7: 解析压缩 trailing 并登记（不影响返回值，仅供读路径解压）。
+    if let Some(rest) = bytes.get(4 + needed..) {
+        if let Some(algo_count_bytes) = rest.get(0..4) {
+            let algo_count = u32::from_le_bytes(algo_count_bytes.try_into().unwrap()) as usize;
+            if algo_count == count {
+                if let Some(algos) = rest.get(4..4 + algo_count) {
+                    for (chunk, &tag) in chunks.iter().zip(algos.iter()) {
+                        let algo = powerfs_layout::encoding::CompressionAlgo::from_tag(tag)
+                            .unwrap_or(powerfs_layout::encoding::CompressionAlgo::None);
+                        crate::chunk_compression_cache::record(
+                            chunk.volume_id,
+                            chunk.needle_id,
+                            algo,
+                            chunk.size,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     chunks
 }
 
@@ -504,6 +533,14 @@ fn build_read_tlv(volume_id: u64, file_key: u64, offset: i64, size: i32) -> Vec<
     enc.add_u64(FieldId::FileKey, file_key);
     enc.add_u64(FieldId::Offset, offset as u64);
     enc.add_u64(FieldId::Size, size as u64);
+    enc.into_bytes()
+}
+
+/// P7: 构建 ReadNeedle（整条 needle）的 TLV 请求体（无 offset/size）。
+fn build_needle_read_tlv(volume_id: u64, file_key: u64) -> Vec<u8> {
+    let mut enc = TlvEncoder::new();
+    enc.add_u64(FieldId::Ino, volume_id);
+    enc.add_u64(FieldId::FileKey, file_key);
     enc.into_bytes()
 }
 
@@ -1245,6 +1282,79 @@ impl FacadeStorageProvider {
 
         Ok(())
     }
+
+    /// P7: 读取一条被压缩的 needle：拉整条 needle → 解压 → 按 `offset/size` 切片。
+    ///
+    /// 解压后长度必须等于 chunk 逻辑 size（压缩后存储更短，但逻辑不变），
+    /// 否则元数据不自洽 → 返回 Internal 错误，绝不把压缩字节当数据返回。
+    async fn read_compressed_needle(
+        &self,
+        volume_id: u64,
+        file_key: u64,
+        offset: i64,
+        size: i32,
+        info: crate::chunk_compression_cache::ChunkCompressionInfo,
+    ) -> Result<Vec<u8>> {
+        let payload = build_needle_read_tlv(volume_id, file_key);
+        let result = self
+            .facade
+            .submit_data_request_with_type(
+                crate::request_state::RequestKind::Read,
+                volume_id,
+                payload,
+                powerfs_net::MsgType::ReadNeedle,
+            )
+            .await
+            .map_err(|e| {
+                PowerFsError::Internal(format!(
+                    "Facade ReadNeedle vol={} needle={:#x} failed: {}",
+                    volume_id, file_key, e
+                ))
+            })?;
+
+        // ReadNeedle 的内容在帧 DATA 段：客户端映射到 result.payload，
+        // 兼容映射到 result.data 的实现，两处都合并。
+        let mut raw = result.data.unwrap_or_default();
+        if let Some(payload) = result.payload {
+            if !payload.is_empty() {
+                raw.extend_from_slice(&payload);
+            }
+        }
+
+        let plain = powerfs_common::compression::decompress(info.algo, &raw).map_err(|e| {
+            PowerFsError::Internal(format!(
+                "decompress vol={} needle={:#x} algo={:?} failed: {}",
+                volume_id, file_key, info.algo, e
+            ))
+        })?;
+
+        decompress_chunk_slice(&plain, info.logical_size, offset, size)
+    }
+}
+
+/// 解压后的整 chunk 数据 → 按 `[offset, offset+size)` 切片。
+///
+/// `logical_size` 必须等于 `plain.len()`（压缩不改变逻辑长度），否则元数据
+/// 不自洽 → 返回 Internal 错误。请求越界部分自动 clamp 到 chunk 末尾。
+fn decompress_chunk_slice(
+    plain: &[u8],
+    logical_size: u64,
+    offset: i64,
+    size: i32,
+) -> Result<Vec<u8>> {
+    if plain.len() as u64 != logical_size {
+        return Err(PowerFsError::Internal(format!(
+            "decompressed length mismatch: expected {} got {}",
+            logical_size,
+            plain.len()
+        )));
+    }
+    let start = usize::try_from(offset.max(0))
+        .unwrap_or(usize::MAX)
+        .min(plain.len());
+    let len = usize::try_from(size.max(0)).unwrap_or(usize::MAX);
+    let end = start.saturating_add(len).min(plain.len());
+    Ok(plain[start..end].to_vec())
 }
 
 #[async_trait]
@@ -1346,6 +1456,16 @@ impl StorageProvider for FacadeStorageProvider {
         offset: i64,
         size: i32,
     ) -> Result<Vec<u8>> {
+        // P7: 该 needle 若被 scrubber 压缩，必须读整条再解压切片。
+        // 未命中缓存保持原 ReadNeedleBlob 语义（零行为变化）。
+        if let Some(info) = crate::chunk_compression_cache::lookup(volume_id, file_key) {
+            if info.algo.is_compressed() {
+                return self
+                    .read_compressed_needle(volume_id, file_key, offset, size, info)
+                    .await;
+            }
+        }
+
         let payload = build_read_tlv(volume_id, file_key, offset, size);
 
         let result = self
@@ -1447,5 +1567,88 @@ mod tests {
         let (host, port) = parse_volume_url("host:invalid", 9999);
         assert_eq!(host, "host");
         assert_eq!(port, 9999); // fallback to default
+    }
+
+    // ---- P7 Task 5: 压缩 chunk 读切片 ----
+
+    /// 全量读：offset=0、size=逻辑长度 → 返回完整原文。
+    #[test]
+    fn p7_decompress_slice_full_read() {
+        let plain = b"powerfs p7 compression slice test".repeat(64);
+        let got =
+            decompress_chunk_slice(&plain, plain.len() as u64, 0, plain.len() as i32).unwrap();
+        assert_eq!(got, plain);
+    }
+
+    /// 起始偏移读：从 chunk 中间开始取指定长度。
+    #[test]
+    fn p7_decompress_slice_from_offset() {
+        let plain: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let got = decompress_chunk_slice(&plain, plain.len() as u64, 1000, 512).unwrap();
+        assert_eq!(got, &plain[1000..1512]);
+    }
+
+    /// 末尾短读：size 超过剩余长度时 clamp 到 chunk 末尾（不越界 panic）。
+    #[test]
+    fn p7_decompress_slice_short_tail_clamped() {
+        let plain: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let got = decompress_chunk_slice(&plain, plain.len() as u64, 4000, 4096).unwrap();
+        assert_eq!(got, &plain[4000..4096]);
+    }
+
+    /// 起始偏移已越过 chunk 末尾 → 返回空，不 panic。
+    #[test]
+    fn p7_decompress_slice_past_end_is_empty() {
+        let plain = vec![7u8; 1024];
+        let got = decompress_chunk_slice(&plain, 1024, 2048, 100).unwrap();
+        assert!(got.is_empty());
+    }
+
+    /// 解压长度与逻辑 length 不符 → 报错（元数据不自洽）。
+    #[test]
+    fn p7_decompress_slice_length_mismatch_errors() {
+        let plain = vec![3u8; 1024];
+        let err = decompress_chunk_slice(&plain, 2048, 0, 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("length mismatch"),
+            "应报长度不符: {}",
+            err
+        );
+    }
+
+    /// 副本 chunk 压缩 trailing 解析后登记到读路径缓存。
+    #[test]
+    fn p7_replica_chunks_trailer_registers_cache() {
+        // count=2，两个 44 字节 ChunkRef，trailing 为 [count=2][Zstd, None]。
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        // chunk 0：vol=1 needle=0x11 size=4096
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&4096u64.to_le_bytes());
+        buf.extend_from_slice(&0x11u64.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // chunk 1：vol=1 needle=0x12 size=4096（未压缩）
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&4096u64.to_le_bytes());
+        buf.extend_from_slice(&0x12u64.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.push(powerfs_layout::encoding::CompressionAlgo::Zstd.to_tag());
+        buf.push(powerfs_layout::encoding::CompressionAlgo::None.to_tag());
+
+        let chunks = parse_replica_chunks(&buf);
+        assert_eq!(chunks.len(), 2);
+
+        let info = crate::chunk_compression_cache::lookup(1, 0x11).expect("压缩副本应登记");
+        assert_eq!(info.algo, powerfs_layout::encoding::CompressionAlgo::Zstd);
+        assert_eq!(info.logical_size, 4096);
+        assert!(
+            !crate::chunk_compression_cache::is_compressed(1, 0x12),
+            "未压缩副本不得登记"
+        );
     }
 }

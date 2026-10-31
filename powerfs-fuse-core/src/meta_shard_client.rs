@@ -2274,7 +2274,12 @@ fn parse_layout_from_body(body: &[u8]) -> Option<powerfs_layout::layout::FileLay
     // non-FileLayout fields (Ino/Mode/Name/ShardId). decode_file_layout
     // alone would stop at the first non-FileLayout field and return an
     // empty default layout, missing the Inline/Stripe placement.
-    powerfs_layout::codec::decode_file_layout_from_mixed(&mut dec).ok()
+    let layout = powerfs_layout::codec::decode_file_layout_from_mixed(&mut dec).ok();
+    // P7: 解码成功后把 chunk 压缩算法登记到读路径缓存（键 volume_id+needle_id）。
+    if let Some(ref l) = layout {
+        crate::chunk_compression_cache::record_layout(l);
+    }
+    layout
 }
 
 /// P2.5: 构造 MetadataAttr 并从响应 body 解析 FileLayout, 提取
@@ -2394,11 +2399,35 @@ fn parse_replica_chunks_from_body(body: &[u8]) -> Vec<powerfs_layout::encoding::
             volume_id: u64::from_le_bytes(bytes[base + 24..base + 32].try_into().unwrap()),
             crc32: u32::from_le_bytes(bytes[base + 32..base + 36].try_into().unwrap()),
             mtime: u64::from_le_bytes(bytes[base + 36..base + 44].try_into().unwrap()),
-            // TODO(P7-Task5): 该手工解码未解析压缩 trailing 区段，
-            // 压缩 chunk 经此路径会丢算法标记；Task 5 统一改用 layout codec 并挂解压缓存。
             compression: powerfs_layout::encoding::CompressionAlgo::None,
         });
     }
+
+    // P7: 解析压缩算法 trailing 区段 `[algo_count u32 LE][algo u8 × count]`
+    // （与 `powerfs-layout::codec` 同一约定）。缺失/长度不符时按未压缩；
+    // 未知 tag 也按未压缩（前向兼容）。解析结果回填 ChunkRef 并登记读路径缓存，
+    // 使副本 failover 读能解压。
+    if let Some(rest) = bytes.get(4 + needed..) {
+        if let Some(algo_count_bytes) = rest.get(0..4) {
+            let algo_count = u32::from_le_bytes(algo_count_bytes.try_into().unwrap()) as usize;
+            if algo_count == count {
+                if let Some(algos) = rest.get(4..4 + algo_count) {
+                    for (chunk, &tag) in chunks.iter_mut().zip(algos.iter()) {
+                        chunk.compression =
+                            powerfs_layout::encoding::CompressionAlgo::from_tag(tag)
+                                .unwrap_or(powerfs_layout::encoding::CompressionAlgo::None);
+                        crate::chunk_compression_cache::record(
+                            chunk.volume_id,
+                            chunk.needle_id,
+                            chunk.compression,
+                            chunk.size,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     chunks
 }
 

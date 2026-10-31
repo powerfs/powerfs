@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::info;
-use powerfs_common::traits::{MetadataProvider, VolumeProvider};
+use powerfs_common::traits::{MetadataProvider, StorageProvider, VolumeProvider};
 use powerfs_common::types::VolumeId;
 use powerfs_fuse_core::*;
 use powerfs_net::{FrameFlags, HandshakeRequest, HandshakeResponse, MsgType};
@@ -268,7 +268,16 @@ async fn test_facade_end_to_end_with_mock_servers() {
     info!("Mock Filer server on {}", filer_addr);
 
     // ---- Mock Volume Server (port 19344 - dedicated for this test) ----
-    let volume_server = MockServer::new(19344, |msg_type, body| {
+    // P7: 准备一条被 zstd 压缩的 needle，供 Test 5.5 走 ReadNeedle 解压路径。
+    let compressed_plain: Vec<u8> = b"powerfs p7 mock compressed chunk ".repeat(64);
+    let compressed_bytes = powerfs_common::compression::compress(
+        powerfs_layout::encoding::CompressionAlgo::Zstd,
+        &compressed_plain,
+    )
+    .expect("compress fixture");
+    let compressed_for_handler = compressed_bytes.clone();
+
+    let volume_server = MockServer::new(19344, move |msg_type, body| {
         match msg_type {
             MsgType::ReadNeedleBlob => {
                 // Return some dummy data
@@ -278,6 +287,8 @@ async fn test_facade_end_to_end_with_mock_servers() {
                 });
                 Some((0, success_response_json(&resp)))
             }
+            // P7: 整条 needle 读（压缩 chunk 走此路径），DATA 段返回压缩字节。
+            MsgType::ReadNeedle => Some((0, compressed_for_handler.clone())),
             MsgType::WriteNeedle => Some((0, success_response_json(&serde_json::json!({})))),
             MsgType::RangeLease => Some((
                 0,
@@ -332,9 +343,11 @@ async fn test_facade_end_to_end_with_mock_servers() {
         client_cert_pem: None,
     };
 
-    let facade = FuseClientFacade::new(config)
-        .await
-        .expect("Failed to create facade");
+    let facade = Arc::new(
+        FuseClientFacade::new(config)
+            .await
+            .expect("Failed to create facade"),
+    );
 
     // Initialize clients first (loads topology, sets state to Ready)
     // Need to set default filer addr before init for default routes
@@ -469,11 +482,38 @@ async fn test_facade_end_to_end_with_mock_servers() {
     );
     info!("Test 5 PASSED: Management request succeeded");
 
+    // ---- Test 5.5: P7 压缩 chunk 读（ReadNeedle → 解压 → 切片） ----
+    info!("Test 5.5: Compressed chunk read via facade...");
+    powerfs_fuse_core::chunk_compression_cache::record(
+        1,
+        300,
+        powerfs_layout::encoding::CompressionAlgo::Zstd,
+        compressed_plain.len() as u64,
+    );
+    let provider = FacadeStorageProvider::new(facade.clone());
+    // 起始偏移读：从压缩 chunk 中间取 256 字节。
+    let data = provider
+        .read_blob(1, 300, 128, 256)
+        .await
+        .expect("compressed read_blob should succeed");
+    assert_eq!(
+        data,
+        &compressed_plain[128..384],
+        "压缩 chunk 解压后应按 offset/size 正确切片"
+    );
+    // 全量读。
+    let full = provider
+        .read_blob(1, 300, 0, compressed_plain.len() as i32)
+        .await
+        .expect("compressed full read_blob should succeed");
+    assert_eq!(full, compressed_plain, "全量读应返回完整原文");
+    info!("Test 5.5 PASSED: Compressed chunk read succeeded");
+
     // ---- Test 6: Multiple concurrent requests ----
     info!("Test 6: Submitting concurrent requests...");
 
-    // Use original facade for concurrent test
-    let facade_arc = Arc::new(facade);
+    // Reuse the shared facade for the concurrent test
+    let facade_arc = facade.clone();
     let mut join_handles = Vec::new();
 
     for i in 0..3 {

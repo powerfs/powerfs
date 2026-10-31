@@ -6108,8 +6108,22 @@ impl FileSystem for PowerFsFs {
                     .map(|c| (c.offset, (c.volume_id, c.needle_id)))
                     .collect();
                 // Build crc_map for read-path data integrity verification
-                let crc_map: HashMap<u64, u32> =
-                    stripe_chunks.iter().map(|c| (c.offset, c.crc32)).collect();
+                // P7: 压缩 chunk 的 crc32 是压缩字节校验，而读路径返回的是解压后
+                // 数据，两者天然不同；置 0 跳过校验（解压后长度已由 facade 校验）。
+                let crc_map: HashMap<u64, u32> = stripe_chunks
+                    .iter()
+                    .map(|c| {
+                        let crc = if powerfs_fuse_core::chunk_compression_cache::is_compressed(
+                            c.volume_id,
+                            c.needle_id,
+                        ) {
+                            0
+                        } else {
+                            c.crc32
+                        };
+                        (c.offset, crc)
+                    })
+                    .collect();
 
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
                     .iter()
@@ -6487,8 +6501,23 @@ impl FileSystem for PowerFsFs {
                     .map(|c| (c.offset, (c.needle_id, c.volume_id)))
                     .collect();
                 // Build crc_map for read-path data integrity verification
-                let crc_map: HashMap<u64, u32> =
-                    entry.chunks.iter().map(|c| (c.offset, c.crc32)).collect();
+                // P7: 压缩 chunk 的 crc32 是压缩字节校验，读路径返回解压后数据，
+                // 天然不同；置 0 跳过（解压后长度已由 facade 校验）。
+                let crc_map: HashMap<u64, u32> = entry
+                    .chunks
+                    .iter()
+                    .map(|c| {
+                        let crc = if powerfs_fuse_core::chunk_compression_cache::is_compressed(
+                            c.volume_id,
+                            c.needle_id,
+                        ) {
+                            0
+                        } else {
+                            c.crc32
+                        };
+                        (c.offset, crc)
+                    })
+                    .collect();
 
                 // Build batch read requests
                 let requests: Vec<powerfs_fuse_core::ReadBlobRequest> = missing_chunks
