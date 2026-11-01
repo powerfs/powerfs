@@ -149,7 +149,7 @@
     （`powerfs-rustfs-store/src/object.rs` 的 `read_object`），既不知道该对象是 EC，也会把校验分片的 offset 当数据读。
   - 证据：单对象 30MiB PUT，EC 转换（约 +20s）前后 GET 由 OK 变 BAD，`body[:4MiB]` 相等、其后全错；关闭 EC 后探针 102/102 全绿。
   - 处置：暂将 EC 转换默认阈值调为 1TiB（`POWERFS_EC_MIN_FILE_SIZE`，`powerfs-ctl` 模板默认值），
-    EC 专项测试脚本显式 `=0` 覆盖，不受影响。EC 读路径补齐见 `docs/rustfs-p2d-issues.md`。
+    EC 专项测试脚本显式 `=0` 覆盖，不受影响。EC 读路径已排期为独立任务 `.trae/specs/p6-ec-read/`（见 `docs/rustfs-p2d-issues.md` 第 2 条）。
 - 遗留项（非 P2d 范围，已记录待排期）：
   - 校验和 `x-amz-checksum-*` 未实现（`test_multipart_checksum_sha256`、`test_multipart_reupload_checksum_and_etag`）
   - 批量删除条件请求：`ExternalBackend` 无 `delete_objects`，S3 层批量删除落回 native 路径，`test_delete_objects_if_match` 缺 `Errors`（建议随对象锁/删除语义阶段一并补）
