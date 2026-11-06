@@ -14,6 +14,10 @@ FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+ARG OCI_SOURCE=https://github.com/powerfs/powerfs
+LABEL org.opencontainers.image.source=${OCI_SOURCE}
+LABEL org.opencontainers.image.description="PowerFS single-container demo (redis+master+filer+volume+fuse in one)"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \

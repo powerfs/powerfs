@@ -596,7 +596,17 @@ jobs:
         IMAGE_TAG="ghcr.io/${{ github.repository }}"
         # 不传 --pull: 上面经镜像源拉取并打回 tag 的本地 ubuntu:20.04 会被
         # BuildKit 直接复用 (pull policy=missing), 不回源 registry-1.docker.io.
-        docker build -f docker/Dockerfile -t "${IMAGE_TAG}:latest" -t "${IMAGE_TAG}:${GITHUB_SHA}" .
+        #
+        # org.opencontainers.image.source 是 GHCR 判断"包属于哪个仓库"的唯一
+        # 可靠依据 —— 它决定了 Actions workflow 是否能自动继承包的写入权限.
+        # 当包的 visibility 改变 (private→public) 时, ghcr 会清掉手动配置的
+        # 仓库链接和 workflow 权限, 只有 build label 不会被重置.
+        docker build \
+          --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+          --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+          --label "org.opencontainers.image.version=${GITHUB_SHA::7}" \
+          -f docker/Dockerfile \
+          -t "${IMAGE_TAG}:latest" -t "${IMAGE_TAG}:${GITHUB_SHA}" .
         push_retry "${IMAGE_TAG}:latest"
         push_retry "${IMAGE_TAG}:${GITHUB_SHA}"
 
@@ -614,7 +624,11 @@ jobs:
         # Self-contained trial image (redis+master+filer+volume+fuse in one
         # container). Release tags get an additional :vX.Y.Z tag.
         DEMO_TAG="ghcr.io/${{ github.repository }}-demo"
-        docker build -f docker/demo/Dockerfile \
+        docker build \
+          --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+          --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+          --label "org.opencontainers.image.version=${GITHUB_SHA::7}" \
+          -f docker/demo/Dockerfile \
           -t "${DEMO_TAG}:latest" -t "${DEMO_TAG}:${GITHUB_SHA}" .
         if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
           docker tag "${DEMO_TAG}:latest" "${DEMO_TAG}:${GITHUB_REF_NAME}"

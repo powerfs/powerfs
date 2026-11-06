@@ -92,3 +92,8 @@ docker/certs/
 
 # Temporary kernel-debug notes / scratch markdown
 debug-kernel-*.md
+
+# Local powerfs-ctl render output (cluster configs, certs, state).
+# Never committed — user-specific cluster.toml, rendered configs, and
+# client registry JSON are generated per-deployment, not source.
+.powerfs/

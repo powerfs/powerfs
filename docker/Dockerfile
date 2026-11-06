@@ -2,6 +2,14 @@ FROM ubuntu:20.04 AS runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# OCI 标准 labels —— GHCR 用 org.opencontainers.image.source 来确定包属于哪个
+# 仓库, 从而自动授予仓库 Actions workflow 对包的写入权限. 这些 label 在 CI
+# 构建时会被 ci-cd.yml 的 --label 参数覆盖 (revision/version 动态化), 这里
+# 是本地 docker build 也能携带的静态 defaults.
+ARG OCI_SOURCE=https://github.com/powerfs/powerfs
+LABEL org.opencontainers.image.source=${OCI_SOURCE}
+LABEL org.opencontainers.image.description="PowerFS — high-performance distributed file system"
+
 # NOTE: ibverbs-providers installs rxe/mlx5 provider .so files (e.g. librxe-rdmav25.so).
 # Without it, libibverbs reports "No IB devices found" even when kernel rxe is running.
 RUN apt-get update && apt-get install -y --no-install-recommends \
